@@ -1,0 +1,4 @@
+node_modules/
+.shim-data/
+.wrangler/
+.dev.vars

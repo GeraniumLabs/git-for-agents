@@ -1,0 +1,25 @@
+{
+  "name": "loom",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Loom: a git platform where many agents work on one codebase at once. Built on Cloudflare Workers, Artifacts, Durable Objects and R2.",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --env local",
+    "shim": "node shim/artifacts-shim.mjs",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test test/"
+  },
+  "dependencies": {
+    "hono": "^4.13.13",
+    "isomorphic-git": "^1.43.0",
+    "node-diff3": "^3.2.1"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20261006.1",
+    "typescript": "^7.0.2",
+    "wrangler": "^4.147.0"
+  }
+}
