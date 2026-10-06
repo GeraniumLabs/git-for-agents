@@ -82,3 +82,29 @@ dialog button { margin-top: 10px; background: var(--chip); color: var(--ink); bo
 pre.diff { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; max-height: 50vh; }
 .add { color: var(--ok); } .del { color: var(--bad); } .hunk { color: var(--info); }
 .empty { color: var(--muted); font-size: 13px; padding: 6px 0; }
+
+button { background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: 13px; }
+button.ghost { background: var(--chip); color: var(--ink); border-color: var(--line); }
+button.bad { background: var(--bad); border-color: var(--bad); }
+button.mini, select.mini { padding: 2px 8px; font-size: 11.5px; margin-top: 4px; }
+input, textarea { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; font-size: 13px; min-width: 0; }
+textarea { width: 100%; }
+.row { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
+.row input { flex: 1; }
+.grow { flex: 1; min-width: 0; }
+.role.bad { color: var(--bad); }
+.agent.paused { opacity: .7; border-style: dashed; }
+#me { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 14px 20px 0; padding: 10px 14px; background: var(--panel); border: 1px solid var(--accent); border-radius: 10px; }
+.controls[hidden] { display: none; }
+.controls #dir-body { flex: 2; min-width: 200px; }
+.controls #protect-paths { flex: 1; min-width: 180px; }
+.controls .sep { width: 1px; align-self: stretch; background: var(--line); }
+.inbox { margin-bottom: 8px; }
+.inbox.q { border-left: 3px solid var(--warn); }
+.kicker { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 4px; }
+.post { font-size: 13px; padding: 2px 0; white-space: pre-wrap; }
+.ev.question { border-left-color: var(--warn); }
+.ev.directive { border-left-color: var(--accent); }
+.toast { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%); background: var(--ink); color: var(--bg); padding: 8px 14px; border-radius: 8px; z-index: 10; font-size: 13px; }
+@media (max-width: 700px) { header { flex-wrap: wrap; gap: 8px; } .controls .sep { display: none; } }

@@ -12,9 +12,22 @@
   <div class="brand"><span class="logo">⧉</span> Loom <span class="tag">a git platform for agent swarms</span></div>
   <div class="proj">
     <select id="project"></select>
+    <span id="me"></span>
     <span id="live" class="live off">offline</span>
   </div>
 </header>
+
+<section id="controls" class="controls" hidden>
+  <b>Steer</b>
+  <select id="dir-to"></select>
+  <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”">
+  <button id="dir-send">Send</button>
+  <span class="sep"></span>
+  <input id="protect-paths" placeholder="Protected paths, e.g. src/auth/, migrations/**">
+  <button id="protect-save" class="ghost">Protect</button>
+  <span class="sep"></span>
+  <button id="freeze" class="ghost">Freeze main</button>
+</section>
 
 <section class="stats" id="stats"></section>
 
@@ -27,6 +40,8 @@
   </section>
 
   <section class="col wide">
+    <h2>Needs a human <small id="inbox-count"></small></h2>
+    <div id="inbox"></div>
     <h2>Board</h2>
     <div id="board" class="board"></div>
     <h2>Changes &amp; merge queue</h2>

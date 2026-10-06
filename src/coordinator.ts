@@ -18,6 +18,7 @@ export interface Agent {
   id: string;
   name: string;
   role: Role;
+  paused?: string | null;
 }
 
 export interface LoomEvent {
@@ -63,6 +64,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private migrate() {
+    this.migrateTables();
+    for (const ddl of [
+      "ALTER TABLE agents ADD COLUMN paused TEXT",
+      "ALTER TABLE threads ADD COLUMN terms TEXT",
+      "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
+      "ALTER TABLE tasks ADD COLUMN parent INTEGER",
+    ]) {
+      try { this.sql.exec(ddl); } catch {}
+    }
+  }
+
+  private migrateTables() {
     this.sql.exec(`
       CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
       CREATE TABLE IF NOT EXISTS agents (
@@ -91,6 +104,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, actor TEXT,
         task_id INTEGER, change_id INTEGER, to_agent TEXT, data TEXT);
       CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, description TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS threads (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
+        task_id INTEGER, change_id INTEGER, path TEXT, line INTEGER, title TEXT,
+        created_by TEXT, to_agent TEXT, blocking INTEGER DEFAULT 0, prev_task_status TEXT,
+        status TEXT NOT NULL DEFAULT 'open', created_at INTEGER, updated_at INTEGER);
+      CREATE TABLE IF NOT EXISTS posts (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id INTEGER, author TEXT, body TEXT, created_at INTEGER);
     `);
   }
 
@@ -113,6 +133,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
   private get mainVersion(): number {
     return Number(this.meta("main_version") ?? "0");
+  }
+  private get protectedPaths(): string[] {
+    return JSON.parse(this.meta("protected_paths") ?? "[]");
   }
   private get requiredApprovals(): number {
     return Number(this.meta("required_approvals") ?? "1");
@@ -152,10 +175,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!key) throw new HttpError(401, "missing bearer token");
     if (this.env.LOOM_ADMIN_TOKEN && key === this.env.LOOM_ADMIN_TOKEN) return "admin";
     const hash = await sha256(key);
-    const row = this.sql.exec("SELECT id, name, role FROM agents WHERE key_hash = ?", hash).toArray()[0];
+    const row = this.sql.exec("SELECT id, name, role, paused FROM agents WHERE key_hash = ?", hash).toArray()[0];
     if (!row) throw new HttpError(401, "unknown agent key");
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
-    return { id: row.id as string, name: row.name as string, role: row.role as Role };
+    return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused as string | null) ?? null };
   }
 
   private remote(repo: string, token: string): Remote {
@@ -238,21 +261,39 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
       if (a === "files") return json(await this.readFiles(url.searchParams));
+      if (a === "threads" && b) return json(this.thread(Number(b)));
+      if (a === "threads") return json(this.threads(url.searchParams));
     }
 
     const who = await this.authenticate(req);
     const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human" } : who;
 
-    if (a === "agents" && m === "POST") {
+    if (a === "agents" && !b && m === "POST") {
       if (who !== "admin") throw new HttpError(403, "only an admin can add agents");
       return json(await this.addAgent(body.name, body.role ?? "builder"));
     }
     if (a === "settings" && m === "POST") {
       if (who !== "admin") throw new HttpError(403, "only an admin can change settings");
       if (body.requiredApprovals !== undefined) this.setMeta("required_approvals", String(body.requiredApprovals));
-      return json({ requiredApprovals: this.requiredApprovals });
+      if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths });
     }
-    if (a === "me") return json({ agent: actor, inbox: this.inbox(actor.id) });
+    if (a === "me") return json({ agent: actor, mainFrozen: this.meta("frozen"), inbox: this.inbox(actor.id) });
+
+    // Human controls. Humans (and the admin) steer; agents can't.
+    if (["directives", "pause", "resume", "freeze", "unfreeze", "assign", "protect"].includes(c ?? a)) {
+      if (actor.role !== "human") throw new HttpError(403, "only humans can steer agents");
+      if (a === "directives") return json(this.directive(actor, body));
+      if (a === "agents" && b && c === "pause") return json(this.pause(actor, b, body.reason));
+      if (a === "agents" && b && c === "resume") return json(this.resume(actor, b));
+      if (a === "freeze") return json(this.freeze(actor, body.reason));
+      if (a === "unfreeze") return json(await this.unfreeze(actor));
+      if (a === "tasks" && b && c === "assign") return json(this.assign(actor, Number(b), body.agent ?? null, body.note));
+      if (a === "protect") return json(this.protect(actor, body.paths ?? []));
+    }
+    // A paused agent can still read, talk and answer, but not change code.
+    const talking = a === "threads" || a === "messages" || a === "proposals";
+    if (actor.paused && !talking) throw new HttpError(423, `you are paused: ${actor.paused}. Wait for a human to resume you; you can still post in threads.`);
     if (a === "tasks" && !b && m === "POST") return json(this.createTask(actor, body));
     if (a === "tasks" && b && c === "claim") return json(await this.claim(actor, Number(b)));
     if (a === "tasks" && b && c === "release") return json(this.releaseTask(actor, Number(b), body.reason));
@@ -265,6 +306,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
     if (a === "tasks" && b && c === "sync") return json(await this.sync(actor, { taskId: Number(b) }, body.resolutions));
     if (a === "messages" && m === "POST") return json(this.message(actor, body));
+    if (a === "threads" && !b && m === "POST") return json(this.openThread(actor, body));
+    if (a === "proposals" && !b && m === "POST") return json(this.propose(actor, body));
+    if (a === "proposals" && b && c === "accept") return json(this.settle(actor, Number(b), true, body.body));
+    if (a === "proposals" && b && c === "reject") return json(this.settle(actor, Number(b), false, body.body));
+    if (a === "threads" && b && c === "posts") return json(this.post(actor, Number(b), body.body));
+    if (a === "threads" && b && c === "resolve") return json(this.resolveThread(actor, Number(b), body.body));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
   }
 
@@ -300,15 +347,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── tasks and workspaces ─────────────────────────────────────────────────
 
-  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[] }) {
+  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[]; parent?: number }) {
     if (!body.title) throw new HttpError(400, "title is required");
+    if (body.parent) this.task(body.parent);
     const now = Date.now();
     const row = this.sql
-      .exec("INSERT INTO tasks (title, description, depends_on, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
-        body.title, body.description ?? "", JSON.stringify(body.dependsOn ?? []), actor.id, now, now)
+      .exec("INSERT INTO tasks (title, description, depends_on, parent, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        body.title, body.description ?? "", JSON.stringify(body.dependsOn ?? []), body.parent ?? null, actor.id, now, now)
       .one();
     const id = row.id as number;
-    this.emit("task.created", { actor: actor.id, task: id, data: { title: body.title } });
+    this.emit("task.created", { actor: actor.id, task: id, data: { title: body.title, parent: body.parent ?? null } });
     return this.task(id);
   }
 
@@ -449,7 +497,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const existing = this.sql.exec("SELECT id FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray()[0];
     if (existing) return this.updateChange(actor, existing.id as number, body);
 
-    const status = this.requiredApprovals > 0 ? "review" : "queued";
+    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length ? "review" : "queued";
     const row = this.sql
       .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
@@ -472,7 +520,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const analysis = await this.analyze(ch.workspace);
     // The merge queue may have taken the change while we were analyzing.
     if (["merged", "merging"].includes(this.change(id).status)) throw new HttpError(409, `change ${id} was merged meanwhile`);
-    const status = this.requiredApprovals > 0 ? "review" : "queued";
+    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length ? "review" : "queued";
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), status, body.summary ?? null, Date.now(), id);
     await this.saveContext(id, actor, { ...body, summary: body.summary ?? ch.summary }, analysis.patch);
@@ -480,6 +528,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
     return this.change(id);
+  }
+
+  private guardedFiles(files: FileChange[]): string[] {
+    const prot = this.protectedPaths;
+    return files.map((f) => f.path).filter((f) => prot.some((p) => matches(p, f)));
   }
 
   /** Files a change touches that its task never declared an intent for. */
@@ -491,6 +544,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private requestReview(id: number, author: string) {
     const reviewers = this.sql.exec("SELECT id FROM agents WHERE role = 'reviewer' AND id != ?", author).toArray();
     this.emit("review.requested", { actor: author, change: id, task: this.change(id).task_id, data: { reviewers: reviewers.map((r) => r.id) } });
+    const ch = this.change(id);
+    const guarded = this.guardedFiles(ch.files);
+    if (guarded.length) this.emit("approval.needs_human", { change: id, task: ch.task_id, data: { paths: guarded, reason: "touches protected paths; a human must approve" } });
   }
 
   /** Head, merge base, changed files and patch of a workspace against main. */
@@ -539,8 +595,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (body.verdict === "request_changes") {
       this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
     } else if (body.verdict === "approve" && ch.status === "review") {
-      const approvals = this.sql.exec("SELECT COUNT(DISTINCT reviewer) AS n FROM reviews WHERE change_id = ? AND verdict = 'approve' AND head = ?", id, ch.head).one().n as number;
-      if (approvals >= this.requiredApprovals) await this.enqueue(id);
+      const approvers = this.sql.exec("SELECT DISTINCT r.reviewer, a.role FROM reviews r LEFT JOIN agents a ON a.id = r.reviewer WHERE r.change_id = ? AND r.verdict = 'approve' AND r.head = ?", id, ch.head).toArray();
+      const humanOk = approvers.some((r) => r.role === "human" || r.reviewer === "admin");
+      const guarded = this.guardedFiles(ch.files);
+      if (approvers.length >= this.requiredApprovals && (humanOk || !guarded.length)) await this.enqueue(id);
+
     }
     return this.change(id);
   }
@@ -555,11 +614,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
-    if (this.merging) return;
+    if (this.merging || this.meta("frozen")) return;
     this.merging = true;
     try {
       for (;;) {
-        const next = this.sql.exec("SELECT id FROM changes WHERE status = 'queued' ORDER BY updated_at, id LIMIT 1").toArray()[0];
+        // A change whose task agreed to land after another task waits its turn.
+        const next = this.sql.exec(`SELECT c.id FROM changes c JOIN tasks t ON t.id = c.task_id
+          WHERE c.status = 'queued' AND (t.waits_for IS NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.id = t.waits_for AND w.status = 'merged'))
+          ORDER BY c.updated_at, c.id LIMIT 1`).toArray()[0];
         if (!next) break;
         const before = this.sql.exec("SELECT status FROM changes WHERE id = ?", next.id).one().status;
         await this.mergeOne(next.id as number);
@@ -610,6 +672,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE workspaces SET status = 'merged' WHERE name = ?", ch.workspace);
       this.emit("change.merged", { actor: ch.agent_id, change: id, task: ch.task_id, data: { commit, version, files: landed } });
       this.adviseStale(id, landed.map((f) => f.path));
+      for (const w of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ?", ch.task_id).toArray()) {
+        this.emit("task.unblocked", { task: w.id as number, data: { after: ch.task_id } });
+      }
     } catch (e: any) {
       console.error("merge failed", e);
       this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + 5000, id);
@@ -700,6 +765,187 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { status: "synced", head: commit, change: ch ? this.change(ch.id) : null };
   }
 
+  // ── steering: how humans intervene ───────────────────────────────────────
+
+  private directive(actor: Agent, body: { to?: string; body: string; taskId?: number }) {
+    if (!body.body) throw new HttpError(400, "body is required");
+    const e = this.emit("directive", { actor: actor.id, to: body.to ?? null, task: body.taskId ?? null, data: { body: body.body, from: actor.name } });
+    return { seq: e.seq };
+  }
+
+  private pause(actor: Agent, agentId: string, reason?: string) {
+    const why = `${reason || "paused"} (by ${actor.name})`;
+    this.sql.exec("UPDATE agents SET paused = ? WHERE id = ?", why, agentId);
+    this.emit("agent.paused", { actor: actor.id, to: agentId, data: { reason: why } });
+    return { ok: true };
+  }
+
+  private resume(actor: Agent, agentId: string) {
+    this.sql.exec("UPDATE agents SET paused = NULL WHERE id = ?", agentId);
+    this.emit("agent.resumed", { actor: actor.id, to: agentId, data: {} });
+    return { ok: true };
+  }
+
+  private freeze(actor: Agent, reason?: string) {
+    this.setMeta("frozen", `${reason || "frozen"} (by ${actor.name})`);
+    this.emit("main.frozen", { actor: actor.id, data: { reason: reason ?? "" } });
+    return { frozen: true };
+  }
+
+  private async unfreeze(actor: Agent) {
+    this.sql.exec("DELETE FROM meta WHERE key = 'frozen'");
+    this.emit("main.unfrozen", { actor: actor.id, data: {} });
+    await this.ctx.storage.setAlarm(Date.now());
+    return { frozen: false };
+  }
+
+  /** Hand a task to a specific agent (or to nobody). The workspace and context go with it. */
+  private assign(actor: Agent, taskId: number, agentId: string | null, note?: string) {
+    const task = this.task(taskId);
+    this.sql.exec("UPDATE tasks SET assignee = ?, status = CASE WHEN ? IS NULL AND status = 'claimed' THEN 'open' ELSE status END, updated_at = ? WHERE id = ?", agentId, agentId, Date.now(), taskId);
+    if (task.workspace) this.sql.exec("UPDATE workspaces SET agent_id = ? WHERE name = ?", agentId, task.workspace);
+    this.sql.exec("UPDATE intents SET agent_id = ? WHERE task_id = ? AND released_at IS NULL", agentId, taskId);
+    this.sql.exec("UPDATE changes SET agent_id = ? WHERE task_id = ? AND status NOT IN ('merged','abandoned')", agentId, taskId);
+    this.emit("task.assigned", { actor: actor.id, task: taskId, to: agentId, data: { from: task.assignee, to: agentId, note: note ?? "" } });
+    if (task.assignee && task.assignee !== agentId) this.emit("task.unassigned", { actor: actor.id, task: taskId, to: task.assignee, data: { note: note ?? "" } });
+    return this.task(taskId);
+  }
+
+  private protect(actor: Agent, paths: string[]) {
+    this.setMeta("protected_paths", JSON.stringify(paths.map(normalizePattern)));
+    this.emit("paths.protected", { actor: actor.id, data: { paths: this.protectedPaths } });
+    return { protectedPaths: this.protectedPaths };
+  }
+
+  // ── proposals: agents settle overlaps between themselves ────────────────
+
+  /**
+   * Propose how to resolve an overlap with another agent's task.
+   *   split: each side keeps only the paths listed for it (intents are rewritten)
+   *   order: one task lands first; the other's change waits in the queue for it
+   */
+  private propose(actor: Agent, body: { taskId: number; theirTaskId: number; kind: "split" | "order"; mine?: string[]; theirs?: string[]; first?: "me" | "you"; body?: string }) {
+    const mine = this.task(body.taskId), theirs = this.task(body.theirTaskId);
+    if (mine.assignee !== actor.id && actor.role !== "human") throw new HttpError(403, `task ${body.taskId} is not yours`);
+    if (!["split", "order"].includes(body.kind)) throw new HttpError(400, "kind must be split or order");
+    if (body.kind === "split" && (!body.mine?.length || !body.theirs?.length)) throw new HttpError(400, "a split needs mine and theirs paths");
+    const terms = { kind: body.kind, taskId: body.taskId, theirTaskId: body.theirTaskId, mine: body.mine ?? [], theirs: body.theirs ?? [], first: body.first ?? "me" };
+    const summary = body.kind === "split"
+      ? `Split: task #${mine.id} keeps ${terms.mine.join(", ")}; task #${theirs.id} keeps ${terms.theirs.join(", ")}`
+      : `Order: task #${terms.first === "me" ? mine.id : theirs.id} lands first, then #${terms.first === "me" ? theirs.id : mine.id}`;
+    const t = this.openThread(actor, { silent: true, kind: "discussion", taskId: body.taskId, title: summary, body: body.body ? `${summary}\n\n${body.body}` : summary, to: theirs.assignee ?? undefined });
+    this.sql.exec("UPDATE threads SET kind = 'proposal', terms = ? WHERE id = ?", JSON.stringify(terms), t.id);
+    this.emit("proposal.made", { actor: actor.id, to: theirs.assignee, task: body.taskId, data: { thread: t.id, summary, terms } });
+    return this.thread(t.id);
+  }
+
+  private settle(actor: Agent, threadId: number, accept: boolean, text?: string) {
+    const t = this.thread(threadId);
+    if (t.kind !== "proposal" || t.status !== "open") throw new HttpError(409, "not an open proposal");
+    const terms = JSON.parse(t.terms);
+    const other = this.task(terms.theirTaskId);
+    if (other.assignee !== actor.id && actor.role !== "human") throw new HttpError(403, "only the other task's agent (or a human) can answer this proposal");
+    if (text) this.post(actor, threadId, text);
+    this.sql.exec("UPDATE threads SET status = ?, updated_at = ? WHERE id = ?", accept ? "accepted" : "rejected", Date.now(), threadId);
+    if (accept) {
+      const now = Date.now();
+      if (terms.kind === "split") {
+        for (const [taskId, paths] of [[terms.taskId, terms.mine], [terms.theirTaskId, terms.theirs]] as [number, string[]][]) {
+          const owner = this.task(taskId).assignee;
+          this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", now, taskId);
+          this.sql.exec("INSERT INTO intents (agent_id, task_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?)",
+            owner, taskId, JSON.stringify(paths.map(normalizePattern)), `agreed split (proposal #${threadId})`, now);
+        }
+      } else {
+        const [first, second] = terms.first === "me" ? [terms.taskId, terms.theirTaskId] : [terms.theirTaskId, terms.taskId];
+        this.sql.exec("UPDATE tasks SET waits_for = ? WHERE id = ?", first, second);
+      }
+    }
+    this.emit(accept ? "proposal.accepted" : "proposal.rejected", { actor: actor.id, to: t.created_by, task: terms.taskId, data: { thread: threadId, summary: t.title, reason: text ?? "" } });
+    return this.thread(threadId);
+  }
+
+  // ── threads: discussions and questions, for agents and humans alike ────
+
+  /**
+   * Open a thread anchored to a task, a change, or a file and line. kind
+   * "question" with to = "humans" (or an agent id) asks for an answer; a
+   * blocking question parks the task until someone answers.
+   */
+  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean }) {
+    if (!body.body) throw new HttpError(400, "body is required");
+    const kind = body.kind ?? "discussion";
+    const taskId = body.taskId ?? (body.changeId ? this.change(body.changeId).task_id : null);
+    const now = Date.now();
+    const blocking = kind === "question" && !!body.blocking && !!taskId;
+    const prev = blocking ? this.task(taskId!).status : null;
+    const row = this.sql
+      .exec(`INSERT INTO threads (kind, task_id, change_id, path, line, title, created_by, to_agent, blocking, prev_task_status, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+        kind, taskId, body.changeId ?? null, body.path ?? null, body.line ?? null, body.title ?? body.body.split("\n")[0].slice(0, 80),
+        actor.id, body.to ?? null, blocking ? 1 : 0, prev, now, now)
+      .one();
+    const id = row.id as number;
+    this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", id, actor.id, body.body, now);
+    if (blocking) this.sql.exec("UPDATE tasks SET status = 'blocked', updated_at = ? WHERE id = ?", now, taskId);
+    const to = body.to && body.to !== "humans" ? body.to : null;
+    if (!body.silent) this.emit(kind === "question" ? "question.asked" : kind === "contract" ? "contract.published" : "thread.opened", {
+      actor: actor.id, task: taskId, change: body.changeId ?? null, to,
+      data: { thread: id, title: body.title ?? null, body: body.body, path: body.path ?? null, line: body.line ?? null, audience: body.to ?? "everyone", blocking },
+    });
+    return this.thread(id);
+  }
+
+  private post(actor: Agent, threadId: number, text: string) {
+    if (!text) throw new HttpError(400, "body is required");
+    const t = this.thread(threadId);
+    this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", threadId, actor.id, text, Date.now());
+    this.sql.exec("UPDATE threads SET updated_at = ? WHERE id = ?", Date.now(), threadId);
+    // Everyone already in the thread hears about the reply.
+    const participants = new Set<string>([t.created_by, ...t.posts.map((p: any) => p.author)]);
+    participants.delete(actor.id);
+    this.emit("thread.reply", { actor: actor.id, task: t.task_id, change: t.change_id, data: { thread: threadId, body: text, participants: [...participants] } });
+    for (const p of participants) this.emit("thread.reply.notify", { actor: actor.id, to: p, task: t.task_id, data: { thread: threadId, body: text } });
+    // An answer from someone other than the asker settles a question.
+    if (t.kind === "question" && t.status === "open" && actor.id !== t.created_by) this.answer(t, actor, text);
+    return this.thread(threadId);
+  }
+
+  private answer(t: any, actor: Agent, text: string) {
+    this.sql.exec("UPDATE threads SET status = 'answered', updated_at = ? WHERE id = ?", Date.now(), t.id);
+    if (t.blocking && t.task_id) {
+      this.sql.exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'blocked'", t.prev_task_status ?? "claimed", Date.now(), t.task_id);
+    }
+    this.emit("question.answered", { actor: actor.id, to: t.created_by, task: t.task_id, data: { thread: t.id, question: t.title, answer: text, unblocked: !!t.blocking } });
+  }
+
+  private resolveThread(actor: Agent, threadId: number, text?: string) {
+    const t = this.thread(threadId);
+    if (text) this.post(actor, threadId, text);
+    if (t.kind === "question" && t.status === "open" && !text) this.answer(t, actor, "(closed without an answer)");
+    this.sql.exec("UPDATE threads SET status = 'resolved', updated_at = ? WHERE id = ?", Date.now(), threadId);
+    this.emit("thread.resolved", { actor: actor.id, task: t.task_id, data: { thread: threadId } });
+    return this.thread(threadId);
+  }
+
+  private thread(id: number) {
+    const t = this.sql.exec("SELECT * FROM threads WHERE id = ?", id).toArray()[0];
+    if (!t) throw new HttpError(404, `thread ${id} not found`);
+    const posts = this.sql.exec("SELECT * FROM posts WHERE thread_id = ? ORDER BY id", id).toArray().map((p) => ({ ...p, authorName: this.agentName(p.author as string) }));
+    return { ...t, blocking: !!t.blocking, createdByName: this.agentName(t.created_by as string), posts } as any;
+  }
+
+  private threads(q: URLSearchParams) {
+    const where: string[] = [];
+    const args: SqlStorageValue[] = [];
+    for (const [param, col] of [["task", "task_id"], ["change", "change_id"], ["path", "path"], ["status", "status"], ["kind", "kind"]] as const) {
+      const v = q.get(param);
+      if (v !== null) { where.push(`${col} = ?`); args.push(param === "task" || param === "change" ? Number(v) : v); }
+    }
+    const rows = this.sql.exec(`SELECT id FROM threads ${where.length ? "WHERE " + where.join(" AND ") : ""} ORDER BY updated_at DESC LIMIT 100`, ...args).toArray();
+    return rows.map((r) => this.thread(r.id as number));
+  }
+
   // ── messages, events, state ─────────────────────────────────────────────
 
   private message(actor: Agent, body: { to?: string; taskId?: number; body: string }) {
@@ -738,14 +984,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private state() {
-    const agents = this.sql.exec("SELECT id, name, role, created_at, last_seen FROM agents ORDER BY created_at").toArray();
+    const agents = this.sql.exec("SELECT id, name, role, paused, created_at, last_seen FROM agents ORDER BY created_at").toArray();
     const tasks = this.sql.exec("SELECT * FROM tasks ORDER BY id").toArray().map((t) => ({ ...t, depends_on: JSON.parse(t.depends_on as string) }));
     const changes = this.sql.exec("SELECT * FROM changes ORDER BY id").toArray().map((c) => ({ ...c, files: JSON.parse(c.files as string), undeclared: JSON.parse(c.undeclared as string), conflicts: c.conflicts ? JSON.parse(c.conflicts as string) : null }));
     const reviews = this.sql.exec("SELECT id, change_id, reviewer, verdict, body, created_at FROM reviews ORDER BY id").toArray();
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
-      project: { name: this.project, description: this.meta("description"), mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
+      threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
     };
   }
 

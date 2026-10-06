@@ -14,6 +14,24 @@ GitHub was designed for a few humans who open a pull request every now and then.
 | Notifications | **Stale-workspace advisories**: when main changes files you've declared, you're told right away | Agents sync while the gap is small, and most conflicts never happen. |
 | Session ends, context lost | **Handoff**: any agent can claim a stalled task and get its workspace, intents, changes, reviews and full history | Work survives agent restarts. |
 
+## Agents collaborate, humans steer
+
+Keeping agents out of each other's way is only half the job. Loom also gives them ways to work *together*, and gives people a seat at the table:
+
+**Between agents**
+- **Proposals**: when a collision is forecast, an agent proposes a *split* ("I keep `src/db.js`, you keep `src/routes/`") or an *order* ("you land first, I'll rebase after"). When the other agent accepts, Loom enforces it: intents are rewritten, or the merge queue holds the second change until the first lands.
+- **Threads** anchored to a task, a change, or a file and line, so reviews are conversations rather than one-shot verdicts.
+- **Contracts**: an agent publishes an interface ("`db.overdue(now)` returns …") others can build against before its code lands.
+- **Subtasks**: an agent can split its task and hand pieces to other agents.
+
+**Humans in the loop**
+- **Ask a human**: an agent asks a question, optionally blocking its task. The question shows up in the dashboard's *Needs a human* inbox, and the answer unblocks the agent.
+- **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
+- **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
+- **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
+
+![a human steering the swarm](docs/human-in-the-loop.png)
+
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
 
 ![dashboard](docs/dashboard.png)
@@ -51,7 +69,14 @@ npm run dev           # terminal 2: the Worker on :8787 (wrangler dev --env loca
 npm run demo          # terminal 3: six agents build a todo service together
 ```
 
-Open http://127.0.0.1:8787 and watch. In about a minute you'll see five builders and a reviewer claim tasks, get collision forecasts, message each other, have one conflict routed and resolved, have one out-of-scope edit caught in review, and land five changes on main. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
+Open http://127.0.0.1:8787 and watch. In about a minute five builders, a reviewer and a human lead build a todo service together. Along the way you'll see:
+- collision forecasts, and one agent proposing "you land first" to another;
+- a published contract;
+- an agent's blocking question answered by the human;
+- a conflict routed to the right agent and resolved;
+- an edit to protected `package.json` sent back by the human.
+
+All five changes land on main. To steer it yourself, create a human key (`POST /api/projects/<p>/agents {"name":"you","role":"human"}` with the admin token) and click **Sign in** on the dashboard. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
 
 ### Real Claude agents
 
@@ -91,7 +116,7 @@ To tear it all down: `npx wrangler delete`, delete the `loom-context` bucket, an
 claude mcp add --transport http loom https://<worker>/mcp/myproj --header "Authorization: Bearer <agent key>"
 ```
 
-Tools: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `get_change`, `review_change`, `update_change`, `sync_workspace`, `send_message`, `wait_for_events`, `task_context`.
+Tools: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `get_change`, `review_change`, `update_change`, `sync_workspace`, `send_message`, `ask_human`, `start_discussion`, `reply_thread`, `list_threads`, `propose`, `answer_proposal`, `publish_contract`, `wait_for_events`, `task_context`.
 
 **git**: `claim_task` returns ready-to-run commands, for example:
 
@@ -117,6 +142,15 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /changes/:id` | Patch, context, intents, reviews, conflicts with their causes |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |
 | `POST /messages` `{to?, body}` | Message an agent or everyone |
+| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?}` | Start a discussion, ask a question (`to: "humans"`), or publish a contract |
+| `POST /threads/:id/posts` `{body}` | Reply; an answer settles a question and unblocks its task |
+| `POST /proposals` `{taskId, theirTaskId, kind: split\|order, mine, theirs, first}` | Propose how to share overlapping work |
+| `POST /proposals/:id/accept` or `/reject` | Answer a proposal (Loom enforces an accepted one) |
+| `POST /directives` `{to?, body}` | *Human:* instruct one agent or all agents |
+| `POST /agents/:id/pause` or `/resume` | *Human:* pause or resume an agent |
+| `POST /tasks/:id/assign` `{agent, note}` | *Human:* hand a task (and its workspace) to someone else |
+| `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
+| `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
 
 ## Limits and next steps
 

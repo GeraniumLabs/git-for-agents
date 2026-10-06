@@ -28,6 +28,10 @@ const TOOLS: Tool[] = [
         tasks: s.tasks.map((t: any) => ({ id: t.id, title: t.title, status: t.status, assignee: t.assignee, dependsOn: t.depends_on })),
         intents: s.intents.map((i: any) => ({ id: i.id, agent: i.agent_id, task: i.task_id, paths: i.paths, description: i.description })),
         changes: s.changes.map((c: any) => ({ id: c.id, task: c.task_id, agent: c.agent_id, status: c.status, files: c.files.map((f: any) => f.path) })),
+        mainFrozen: s.project.frozen,
+        protectedPaths: s.project.protectedPaths,
+        openThreads: (s.threads ?? []).filter((t: any) => ["open"].includes(t.status)).map((t: any) => ({ id: t.id, kind: t.kind, title: t.title, by: t.created_by, to: t.to_agent })),
+        contracts: (s.threads ?? []).filter((t: any) => t.kind === "contract").map((t: any) => ({ id: t.id, title: t.title, body: t.posts[0]?.body })),
         recentEvents: s.events.slice(-15).map((e: any) => `${e.type} ${e.actor ?? ""} ${JSON.stringify(e.data).slice(0, 140)}`),
       };
     },
@@ -41,7 +45,7 @@ const TOOLS: Tool[] = [
   {
     name: "create_task",
     description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Use dependsOn for ordering.",
-    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), dependsOn: { type: "array", items: { type: "number" } } }, ["title"]),
+    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks") }, ["title"]),
     run: (a, call) => call("POST", "/tasks", a),
   },
   {
@@ -122,6 +126,51 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("POST", "/messages", a),
   },
   {
+    name: "ask_human",
+    description: "Ask the humans on the project a question. Use it for product decisions, unclear requirements, or anything risky. With blocking=true your task is marked blocked until someone answers; the answer arrives as a question.answered event.",
+    inputSchema: obj({ taskId: num("Your task"), question: str("The question, with the options you see"), blocking: { type: "boolean" } }, ["question"]),
+    run: (a, call) => call("POST", "/threads", { kind: "question", to: "humans", taskId: a.taskId, body: a.question, blocking: a.blocking ?? false }),
+  },
+  {
+    name: "start_discussion",
+    description: "Open a discussion thread anchored to a task, a change, or a file and line. Other agents and humans can reply. Use to=<agent id> to address someone.",
+    inputSchema: obj({ body: str("Opening message"), title: str("Short title"), taskId: num("Task"), changeId: num("Change"), path: str("File"), line: num("Line"), to: str("Agent id, or 'humans'") }, ["body"]),
+    run: (a, call) => call("POST", "/threads", { kind: "discussion", ...a }),
+  },
+  {
+    name: "reply_thread",
+    description: "Reply in a thread (a discussion, a question addressed to you, or a proposal).",
+    inputSchema: obj({ threadId: num("Thread id"), body: str("Reply") }, ["threadId", "body"]),
+    run: (a, call) => call("POST", `/threads/${a.threadId}/posts`, { body: a.body }),
+  },
+  {
+    name: "list_threads",
+    description: "List threads, optionally filtered by task, change, path, status (open, answered, resolved, accepted, rejected) or kind (discussion, question, proposal, contract).",
+    inputSchema: obj({ task: num("Task id"), change: num("Change id"), path: str("File"), status: str("Status"), kind: str("Kind") }),
+    run: (a, call) => {
+      const q = new URLSearchParams(Object.entries(a).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)]));
+      return call("GET", `/threads?${q}`);
+    },
+  },
+  {
+    name: "propose",
+    description: "Settle an overlap with another agent's task. kind=split: each side keeps only its listed paths (intents are rewritten when they accept). kind=order: one task lands first (first='me' or 'you') and the merge queue holds the other until it does.",
+    inputSchema: obj({ taskId: num("Your task"), theirTaskId: num("Their task"), kind: { type: "string", enum: ["split", "order"] }, mine: { type: "array", items: { type: "string" } }, theirs: { type: "array", items: { type: "string" } }, first: { type: "string", enum: ["me", "you"] }, body: str("Why") }, ["taskId", "theirTaskId", "kind"]),
+    run: (a, call) => call("POST", "/proposals", a),
+  },
+  {
+    name: "answer_proposal",
+    description: "Accept or reject a proposal another agent made to you.",
+    inputSchema: obj({ threadId: num("Proposal thread id"), accept: { type: "boolean" }, body: str("Reason or counter-offer") }, ["threadId", "accept"]),
+    run: (a, call) => call("POST", `/proposals/${a.threadId}/${a.accept ? "accept" : "reject"}`, { body: a.body }),
+  },
+  {
+    name: "publish_contract",
+    description: "Publish an interface other agents can build against before your code lands (a function signature, an API shape, a schema). It is pinned for everyone.",
+    inputSchema: obj({ title: str("What it is"), body: str("The contract itself"), taskId: num("Your task"), path: str("File it lives in") }, ["title", "body"]),
+    run: (a, call) => call("POST", "/threads", { kind: "contract", ...a }),
+  },
+  {
     name: "wait_for_events",
     description: "Wait up to 25 seconds for new project events after a cursor (0 for all). Returns events and a new cursor.",
     inputSchema: obj({ after: num("Cursor from the last call"), wait: num("Seconds to wait, max 25") }),
@@ -155,7 +204,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents on one codebase. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviewers: get_change then review_change.",
+          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviewers: get_change then review_change.",
       });
     case "ping":
       return reply({});

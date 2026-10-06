@@ -18,6 +18,47 @@ const ago = (ts) => {
 };
 const api = (p) => fetch(`/api/projects/${project}${p}`).then((r) => r.json());
 
+// ── signing in as a human ────────────────────────────────────────────────
+let me = null;
+const store = {
+  get: (k) => { try { return localStorage.getItem(k); } catch { return null; } },
+  set: (k, v) => { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
+};
+const keyName = () => `loom-key:${project}`;
+async function act(method, path, body) {
+  const res = await fetch(`/api/projects/${project}${path}`, {
+    method,
+    headers: { authorization: `Bearer ${store.get(keyName())}`, "content-type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(data.error ?? `HTTP ${res.status}`); throw new Error(data.error); }
+  return data;
+}
+function toast(msg) {
+  const t = document.createElement("div");
+  t.className = "toast";
+  t.textContent = msg;
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 4000);
+}
+async function signIn(key) {
+  if (key) store.set(keyName(), key);
+  if (!store.get(keyName())) { me = null; renderMe(); return; }
+  try { me = (await act("GET", "/me")).agent; } catch { me = null; store.set(keyName(), null); }
+  renderMe();
+  if (state) render(false);
+}
+const isHuman = () => me?.role === "human";
+function renderMe() {
+  $("#me").innerHTML = me
+    ? `<span class="who-me">${esc(me.name)} <span class="role">${me.role}</span></span><button id="signout" class="ghost">Sign out</button>`
+    : `<button id="signin">Sign in</button>`;
+  if (me) $("#signout").onclick = () => { store.set(keyName(), null); signIn(); };
+  else $("#signin").onclick = () => { const k = prompt("Your Loom key for this project (humans get one from the project admin):"); if (k) signIn(k.trim()); };
+  $("#controls").hidden = !isHuman();
+}
+
 async function boot() {
   const projects = await fetch("/api/projects").then((r) => r.json());
   if (!project) project = projects[0]?.name;
@@ -29,6 +70,7 @@ async function boot() {
     return;
   }
   connect();
+  signIn();
 }
 
 function connect() {
@@ -65,6 +107,8 @@ async function refreshFiles() {
 }
 
 function render(full) {
+  renderInbox();
+  renderControls();
   renderStats();
   renderAgents();
   renderBoard();
@@ -96,10 +140,16 @@ function renderStats() {
 function renderAgents() {
   $("#agents").innerHTML = state.agents.map((a) => {
     const task = state.tasks.find((t) => t.assignee === a.id && t.status !== "merged");
-    return `<li class="card agent"><span class="dot" style="background:${color(a.id)}"></span>
-      <div><div><b>${esc(a.name)}</b><span class="role">${a.role}</span></div>
-      <div class="meta">${task ? `#${task.id} ${esc(task.title)}` : a.role === "reviewer" ? "reviewing" : "idle"} · ${ago(a.last_seen)}</div></div></li>`;
+    const ctl = isHuman() && a.role !== "human" ? `<button class="mini" data-agent="${a.id}" data-op="${a.paused ? "resume" : "pause"}">${a.paused ? "Resume" : "Pause"}</button>` : "";
+    return `<li class="card agent ${a.paused ? "paused" : ""}"><span class="dot" style="background:${color(a.id)}"></span>
+      <div class="grow"><div><b>${esc(a.name)}</b><span class="role">${a.role}</span>${a.paused ? `<span class="role bad">paused</span>` : ""}</div>
+      <div class="meta">${task ? `#${task.id} ${esc(task.title)}` : a.role === "reviewer" ? "reviewing" : a.role === "human" ? "steering" : "idle"} · ${ago(a.last_seen)}</div></div>${ctl}</li>`;
   }).join("") || `<li class="empty">No agents yet.</li>`;
+  for (const b of document.querySelectorAll("[data-agent]")) b.onclick = async () => {
+    const reason = b.dataset.op === "pause" ? prompt("Why pause this agent? (they will see this)") : undefined;
+    if (b.dataset.op === "pause" && reason === null) return;
+    await act("POST", `/agents/${b.dataset.agent}/${b.dataset.op}`, { reason });
+  };
 }
 
 function matches(pattern, file) {
@@ -124,10 +174,19 @@ function renderTerritory() {
 function renderBoard() {
   const lanes = [["open", "Open"], ["claimed", "In progress"], ["in_review", "In review"], ["conflict", "Conflict"], ["merged", "Merged"]];
   $("#board").innerHTML = lanes.map(([k, label]) => {
-    const tasks = state.tasks.filter((t) => t.status === k);
+    const tasks = state.tasks.filter((t) => t.status === k || (k === "claimed" && t.status === "blocked"));
+    const builders = state.agents.filter((a) => a.role !== "reviewer");
     return `<div class="lane"><h3>${label} · ${tasks.length}</h3>${tasks.map((t) => `<div class="task" style="border-left:3px solid ${t.assignee ? color(t.assignee) : "var(--line)"}">
-      #${t.id} ${esc(t.title)}<div class="who">${t.assignee ? esc(name(t.assignee)) : t.depends_on.length ? `waits on #${t.depends_on.join(", #")}` : "unclaimed"}</div></div>`).join("")}</div>`;
+      #${t.id} ${esc(t.title)}${t.parent ? ` <span class="role">sub of #${t.parent}</span>` : ""}
+      <div class="who">${t.assignee ? esc(name(t.assignee)) : t.depends_on.length ? `waits on #${t.depends_on.join(", #")}` : "unclaimed"}${t.waits_for ? ` · lands after #${t.waits_for}` : ""}</div>
+      ${t.status === "blocked" ? `<div class="why">Blocked: waiting on a human</div>` : ""}
+      ${isHuman() && t.status !== "merged" ? `<select class="mini" data-assign="${t.id}"><option value="">Assign…</option>${builders.map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join("")}<option value="__none">Unassign</option></select>` : ""}</div>`).join("")}</div>`;
   }).join("");
+  for (const sel of document.querySelectorAll("[data-assign]")) sel.onchange = async () => {
+    if (!sel.value) return;
+    const note = prompt("Note for the agent taking it (optional):") ?? "";
+    await act("POST", `/tasks/${sel.dataset.assign}/assign`, { agent: sel.value === "__none" ? null : sel.value, note });
+  };
 }
 
 function renderChanges() {
@@ -172,13 +231,35 @@ function describe(e) {
     case "change.conflict": return ["conflict", `#${e.change_id} conflicts in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Routed to ${to}.`];
     case "workspace.stale": return ["stale", `Main moved under ${to}: <span class="mono">${d.paths.map(esc).join(", ")}</span> changed. Told to sync now.`];
     case "workspace.synced": return ["merged", `${who} synced main into their workspace${d.resolved?.length ? `, resolving ${d.resolved.map(esc).join(", ")}` : ""}`];
+    case "question.asked": return ["question", `${who} asks ${d.audience === "humans" ? "the humans" : to || "everyone"}${d.blocking ? " (blocking)" : ""}: “${esc(d.body)}”`];
+    case "question.answered": return ["merged", `${who} answered ${to}: “${esc(d.answer)}”${d.unblocked ? ". Task unblocked." : ""}`];
+    case "thread.opened": return ["message", `${who} started a discussion${d.path ? ` on <span class="mono">${esc(d.path)}${d.line ? `:${d.line}` : ""}</span>` : ""}: “${esc(d.body)}”`];
+    case "thread.reply": return ["message", `${who} replied in thread #${d.thread}: “${esc(d.body)}”`];
+    case "thread.reply.notify": return null;
+    case "thread.resolved": return ["", `${who} resolved thread #${d.thread}`];
+    case "contract.published": return ["message", `${who} published a contract: <b>${esc(d.title ?? "")}</b>`];
+    case "proposal.made": return ["collision", `${who} proposed to ${to}: ${esc(d.summary)}`];
+    case "proposal.accepted": return ["merged", `${who} accepted: ${esc(d.summary)}`];
+    case "proposal.rejected": return ["stale", `${who} rejected: ${esc(d.summary)}${d.reason ? ` (“${esc(d.reason)}”)` : ""}`];
+    case "directive": return ["directive", `Directive from ${who}${to ? ` to ${to}` : " to all agents"}: “${esc(d.body)}”`];
+    case "agent.paused": return ["directive", `${who} paused ${to}: ${esc(d.reason)}`];
+    case "agent.resumed": return ["directive", `${who} resumed ${to}`];
+    case "main.frozen": return ["directive", `${who} froze main${d.reason ? `: ${esc(d.reason)}` : ""}. The merge queue is holding.`];
+    case "main.unfrozen": return ["directive", `${who} unfroze main`];
+    case "task.assigned": return ["directive", `${who} assigned task #${e.task_id} to ${to || "nobody"}${d.note ? `: “${esc(d.note)}”` : ""}`];
+    case "task.unassigned": return null;
+    case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
+    case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
+    case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
     case "message": return ["message", `${who}${to ? ` → ${to}` : " → everyone"}: “${esc(d.body)}”`];
     default: return ["", `${esc(e.type)} ${esc(JSON.stringify(d)).slice(0, 120)}`];
   }
 }
 
 function prependEvent(e, isNew) {
-  const [cls, html] = describe(e);
+  const described = describe(e);
+  if (!described) return;
+  const [cls, html] = described;
   const li = document.createElement("li");
   li.className = `ev ${cls} ${isNew ? "new" : ""}`;
   li.innerHTML = `<time>${new Date(e.ts).toLocaleTimeString()}</time>${html}`;
@@ -196,9 +277,76 @@ async function showChange(id) {
     ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
     ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
-    <h2>Patch</h2><pre class="diff">${patch}</pre>`;
+    <h2>Patch</h2><pre class="diff">${patch}</pre>
+    ${me && c.status !== "merged" && me.id !== c.agent_id ? `<h2>Your review</h2><textarea id="rv-body" rows="3" placeholder="Comment (optional)"></textarea>
+      <div class="row"><button data-verdict="approve">Approve</button><button data-verdict="request_changes" class="ghost">Request changes</button><button data-verdict="comment" class="ghost">Comment</button></div>` : ""}`;
+  for (const b of document.querySelectorAll("[data-verdict]")) b.onclick = async () => {
+    await act("POST", `/changes/${id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value });
+    $("#detail").close();
+  };
   $("#detail").showModal();
 }
+
+// ── what needs a human ──────────────────────────────────────────────────
+function needsHuman() {
+  const items = [];
+  for (const t of state.threads ?? []) {
+    if (t.kind === "question" && t.status === "open" && (t.to_agent === "humans" || t.to_agent === me?.id)) items.push({ type: "question", t });
+    if (t.kind === "proposal" && t.status === "open") items.push({ type: "proposal", t });
+  }
+  const askedHuman = new Set(state.events.filter((e) => e.type === "approval.needs_human").map((e) => e.change_id));
+  for (const c of state.changes) if (c.status === "review" && askedHuman.has(c.id)) items.push({ type: "approval", c });
+  return items;
+}
+
+function renderInbox() {
+  const items = needsHuman();
+  const discussions = (state.threads ?? []).filter((t) => t.kind === "discussion" || t.kind === "contract").slice(0, 6);
+  $("#inbox-count").textContent = items.length ? `${items.length} waiting` : "nothing waiting";
+  const box = (inner, cls = "") => `<div class="card inbox ${cls}">${inner}</div>`;
+  const posts = (t) => t.posts.map((p) => `<div class="post"><b style="color:${color(p.author)}">${esc(p.authorName)}</b> ${esc(p.body)}</div>`).join("");
+  const replyBox = (t, label = "Reply") => me ? `<div class="row"><input data-reply="${t.id}" placeholder="${label}…"><button data-send="${t.id}">Send</button></div>` : "";
+  $("#inbox").innerHTML = items.map((it) => {
+    if (it.type === "question") return box(`<div class="kicker">Question${it.t.blocking ? " · blocking task #" + it.t.task_id : ""}</div>${posts(it.t)}${replyBox(it.t, "Answer")}`, "q");
+    if (it.type === "proposal") return box(`<div class="kicker">Proposal between agents</div>${posts(it.t)}<div class="meta">Waiting on ${esc(name(it.t.to_agent))}</div>`);
+    return box(`<div class="kicker">Needs a human approval</div><div><b>#${it.c.id}</b> ${esc(it.c.title)} · ${esc(name(it.c.agent_id))}</div><div class="files mono">${it.c.files.map((f) => esc(f.path)).join("  ")}</div>${me ? `<div class="row"><button data-open="${it.c.id}">Review</button></div>` : ""}`, "q");
+  }).join("") + (discussions.length ? `<h2>Discussions &amp; contracts</h2>` + discussions.map((t) => box(`<div class="kicker">${t.kind === "contract" ? "Contract" : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""} · ${t.status}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}${replyBox(t)}`)).join("") : "")
+    || `<p class="empty">Nothing needs a human right now.</p>`;
+  for (const b of document.querySelectorAll("[data-send]")) b.onclick = async () => {
+    const input = document.querySelector(`[data-reply="${b.dataset.send}"]`);
+    if (!input.value.trim()) return;
+    await act("POST", `/threads/${b.dataset.send}/posts`, { body: input.value.trim() });
+    input.value = "";
+  };
+  for (const b of document.querySelectorAll("[data-open]")) b.onclick = () => showChange(Number(b.dataset.open));
+}
+
+function renderControls() {
+  if (!isHuman()) return;
+  const frozen = state.project.frozen;
+  $("#freeze").textContent = frozen ? "Unfreeze main" : "Freeze main";
+  $("#freeze").className = frozen ? "bad" : "ghost";
+  const sel = $("#dir-to");
+  const current = sel.value;
+  sel.innerHTML = `<option value="">All agents</option>` + state.agents.filter((a) => a.role !== "human").map((a) => `<option value="${a.id}">${esc(a.name)}</option>`).join("");
+  sel.value = current;
+  if (document.activeElement !== $("#protect-paths")) $("#protect-paths").value = (state.project.protectedPaths ?? []).join(", ");
+}
+
+$("#dir-send").onclick = async () => {
+  const body = $("#dir-body").value.trim();
+  if (!body) return;
+  await act("POST", "/directives", { to: $("#dir-to").value || undefined, body });
+  $("#dir-body").value = "";
+};
+$("#freeze").onclick = async () => {
+  if (state.project.frozen) await act("POST", "/unfreeze", {});
+  else await act("POST", "/freeze", { reason: prompt("Why freeze main?") ?? "" });
+};
+$("#protect-save").onclick = async () => {
+  await act("POST", "/protect", { paths: $("#protect-paths").value.split(",").map((p) => p.trim()).filter(Boolean) });
+  toast("Protected paths saved");
+};
 
 setInterval(() => state && renderAgents(), 10_000);
 boot();
