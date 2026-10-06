@@ -111,9 +111,9 @@ const TOOLS: Tool[] = [
   },
   {
     name: "sync_workspace",
-    description: "Merge the latest main into your change's workspace. Clean merges are committed for you. On conflict you get each conflicting hunk (base, yours, theirs) and which change caused it; call again with resolutions to finish.",
-    inputSchema: obj({ changeId: num("Your change id"), resolutions: { type: "object", description: "path -> full merged file content (null deletes)", additionalProperties: { type: ["string", "null"] } } }, ["changeId"]),
-    run: (a, call) => call("POST", `/changes/${a.changeId}/sync`, { resolutions: a.resolutions }),
+    description: "Merge the latest main into your task's workspace. Clean merges are committed for you. On conflict you get each conflicting hunk (base, yours, theirs) and which change caused it; call again with resolutions to finish. If the task has a change in flight it goes back to review.",
+    inputSchema: obj({ taskId: num("Your task id"), resolutions: { type: "object", description: "path -> full merged file content (null deletes)", additionalProperties: { type: ["string", "null"] } } }, ["taskId"]),
+    run: (a, call) => call("POST", `/tasks/${a.taskId}/sync`, { resolutions: a.resolutions }),
   },
   {
     name: "send_message",

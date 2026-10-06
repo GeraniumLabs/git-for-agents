@@ -99,9 +99,13 @@ export class Workspace {
   }
 
   async flatten(commit: string | null): Promise<FlatTree> {
-    const out: FlatTree = new Map();
-    if (!commit) return out;
+    if (!commit) return new Map();
     const { commit: c } = await git.readCommit({ fs: this.fs, dir: DIR, oid: commit });
+    return this.flattenTree(c.tree);
+  }
+
+  async flattenTree(tree: string): Promise<FlatTree> {
+    const out: FlatTree = new Map();
     const walk = async (treeOid: string, prefix: string) => {
       const { tree } = await git.readTree({ fs: this.fs, dir: DIR, oid: treeOid });
       for (const e of tree) {
@@ -110,7 +114,7 @@ export class Workspace {
         else out.set(p, { oid: e.oid, mode: e.mode });
       }
     };
-    await walk(c.tree, "");
+    await walk(tree, "");
     return out;
   }
 

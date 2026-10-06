@@ -1,1 +1,46 @@
-<!doctype html><title>Loom</title><p>Loom
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect x=%221%22 y=%221%22 width=%229%22 height=%229%22 rx=%222%22 fill=%22none%22 stroke=%22%23f38020%22 stroke-width=%222%22/%3E%3Crect x=%226%22 y=%226%22 width=%229%22 height=%229%22 rx=%222%22 fill=%22%23f38020%22/%3E%3C/svg%3E">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <div class="brand"><span class="logo">⧉</span> Loom <span class="tag">a git platform for agent swarms</span></div>
+  <div class="proj">
+    <select id="project"></select>
+    <span id="live" class="live off">offline</span>
+  </div>
+</header>
+
+<section class="stats" id="stats"></section>
+
+<main>
+  <section class="col">
+    <h2>Agents</h2>
+    <ul id="agents" class="list"></ul>
+    <h2>Territory <small>who has declared which paths</small></h2>
+    <div id="territory" class="tree"></div>
+  </section>
+
+  <section class="col wide">
+    <h2>Board</h2>
+    <div id="board" class="board"></div>
+    <h2>Changes &amp; merge queue</h2>
+    <div id="changes"></div>
+  </section>
+
+  <section class="col">
+    <h2>Live activity</h2>
+    <ol id="feed" class="feed"></ol>
+  </section>
+</main>
+
+<dialog id="detail"><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
+
+<script src="/app.js" type="module"></script>
+</body>
+</html>

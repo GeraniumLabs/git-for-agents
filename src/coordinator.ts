@@ -4,7 +4,7 @@
 // into main through a queue. Main is only ever written by this object.
 
 import { DurableObject } from "cloudflare:workers";
-import { Workspace, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
+import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
@@ -164,8 +164,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private remoteUrl(repo: string): string {
     return this.meta(`remote:${repo}`) ?? "";
   }
+  /** Short-lived tokens for Loom's own git operations, reused while fresh. */
+  private tokens = new Map<string, { token: string; until: number }>();
+  private async token(repo: string, scope: "read" | "write"): Promise<string> {
+    const key = `${repo}:${scope}`;
+    const hit = this.tokens.get(key);
+    if (hit && hit.until > Date.now()) return hit.token;
+    const token = await this.store.token(repo, scope, 3600);
+    this.tokens.set(key, { token, until: Date.now() + 50 * 60_000 });
+    return token;
+  }
+
   private async mainRemote(scope: "read" | "write"): Promise<Remote> {
-    return this.remote(this.mainRepo, await this.store.token(this.mainRepo, scope, 600));
+    return this.remote(this.mainRepo, await this.token(this.mainRepo, scope));
   }
 
   private task(id: number) {
@@ -251,7 +262,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
-    if (a === "changes" && b && c === "sync") return json(await this.sync(actor, Number(b), body.resolutions));
+    if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
+    if (a === "tasks" && b && c === "sync") return json(await this.sync(actor, { taskId: Number(b) }, body.resolutions));
     if (a === "messages" && m === "POST") return json(this.message(actor, body));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
   }
@@ -399,7 +411,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async commitToWorkspace(actor: Agent, name: string, body: { files: Record<string, string | null>; message: string }) {
     const ws = this.workspaceFor(actor, name);
     if (!body.files || !Object.keys(body.files).length) throw new HttpError(400, "files is required");
-    const remote = this.remote(name, await this.store.token(name, "write", 600));
+    const remote = this.remote(name, await this.token(name, "write"));
     const w = await Workspace.open(remote);
     const parent = await w.head();
     const commit = await w.commitFiles(parent, body.files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
@@ -417,7 +429,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (content === null) throw new HttpError(404, `${path} not found at ${ref}`);
       return { repo, ref, path, content };
     }
-    const w = await Workspace.open(this.remote(repo, await this.store.token(repo, "read", 600)));
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
     const flat = await w.flatten(await w.head());
     return { repo, ref, files: [...flat.keys()].sort() };
   }
@@ -431,9 +443,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
 
-    // Compare what changed with what the agent said it would change.
-    const declared = this.sql.exec("SELECT paths FROM intents WHERE task_id = ?", body.taskId).toArray().flatMap((r) => JSON.parse(r.paths as string) as string[]);
-    const undeclared = analysis.files.map((f) => f.path).filter((f) => !declared.some((p) => matches(p, f)));
+    const undeclared = this.undeclared(body.taskId, analysis.files);
 
     const now = Date.now();
     const existing = this.sql.exec("SELECT id FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray()[0];
@@ -458,15 +468,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }) {
     const ch = this.change(id);
     if (ch.agent_id !== actor.id) throw new HttpError(403, "not your change");
+    if (ch.status === "merged" || ch.status === "merging") throw new HttpError(409, `change ${id} is ${ch.status}`);
     const analysis = await this.analyze(ch.workspace);
+    // The merge queue may have taken the change while we were analyzing.
+    if (["merged", "merging"].includes(this.change(id).status)) throw new HttpError(409, `change ${id} was merged meanwhile`);
     const status = this.requiredApprovals > 0 ? "review" : "queued";
-    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
-      analysis.head, analysis.base, JSON.stringify(analysis.files), status, body.summary ?? null, Date.now(), id);
+    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
+      analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), status, body.summary ?? null, Date.now(), id);
     await this.saveContext(id, actor, { ...body, summary: body.summary ?? ch.summary }, analysis.patch);
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
     return this.change(id);
+  }
+
+  /** Files a change touches that its task never declared an intent for. */
+  private undeclared(taskId: number, files: FileChange[]): string[] {
+    const declared = this.sql.exec("SELECT paths FROM intents WHERE task_id = ?", taskId).toArray().flatMap((r) => JSON.parse(r.paths as string) as string[]);
+    return files.map((f) => f.path).filter((f) => !declared.some((p) => matches(p, f)));
   }
 
   private requestReview(id: number, author: string) {
@@ -478,10 +497,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async analyze(wsName: string) {
     const w = await Workspace.open(await this.mainRemote("read"));
     const main = (await w.head())!;
-    const head = await w.fetchFrom("ws", this.remote(wsName, await this.store.token(wsName, "read", 600)));
+    const head = await w.fetchFrom("ws", this.remote(wsName, await this.token(wsName, "read")));
     const base = (await w.mergeBase(main, head)) ?? main;
-    const files = await w.changes(base, head);
-    const [B, H] = [await w.flatten(base), await w.flatten(head)];
+    // What would land: main versus main-with-this-change-merged. This stays
+    // right after the workspace has merged main into itself, where a plain
+    // base..head diff can pick up other agents' work.
+    const merged = await w.merge(main, head);
+    const B = merged.tree ? await w.flatten(main) : await w.flatten(base);
+    const H = merged.tree ? await w.flattenTree(merged.tree) : await w.flatten(head);
+    const files = diffFlat(B, H);
     let patch = "";
     for (const f of files) {
       const before = B.get(f.path), after = H.get(f.path);
@@ -555,7 +579,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const mainW = await this.mainRemote("write");
       const w = await Workspace.open(mainW);
       const main = (await w.head())!;
-      const head = await w.fetchFrom("ws", this.remote(ch.workspace, await this.store.token(ch.workspace, "read", 600)));
+      const head = await w.fetchFrom("ws", this.remote(ch.workspace, await this.token(ch.workspace, "read")));
       if (head !== ch.head) {
         // The agent pushed after review. Approval covered a different commit.
         this.sql.exec("UPDATE changes SET status = 'review', head = ?, updated_at = ? WHERE id = ?", head, Date.now(), id);
@@ -571,12 +595,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
         await w.push(mainW, commit);
       } else {
         const result = await w.merge(main, head);
-        if (!result.tree) return this.recordConflict(ch, result.conflicts, w);
+        if (!result.tree) return this.recordConflict(ch, result.conflicts);
         commit = await w.commit(result.tree, [main, head], `Merge change #${id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim(), MERGE_IDENTITY);
         await w.push(mainW, commit);
       }
       const landed = await w.changes(main, commit);
-      const version = this.mainVersion + 1;
+      const version = commit === main ? this.mainVersion : this.mainVersion + 1;
       this.setMeta("main_version", String(version));
       this.setMeta("main_head", commit);
       const now = Date.now();
@@ -606,54 +630,74 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
   }
 
-  private recordConflict(ch: any, conflicts: FileConflict[], _w: Workspace) {
-    // Explain each conflict in terms of the change that caused it.
-    const causes = this.sql.exec("SELECT id, task_id, agent_id, title, summary, files FROM changes WHERE status = 'merged' AND merged_version > ?", ch.base_version ?? 0).toArray();
-    const explained = conflicts.map((c) => ({
+  /** Attach to each conflict the merged changes (since `sinceVersion`) that touched the same file. */
+  private explain(conflicts: FileConflict[], sinceVersion: number) {
+    const causes = this.sql.exec("SELECT id, task_id, agent_id, title, summary, files FROM changes WHERE status = 'merged' AND merged_version > ?", sinceVersion).toArray();
+    return conflicts.map((c) => ({
       ...c,
       causedBy: causes
         .filter((x) => (JSON.parse(x.files as string) as FileChange[]).some((f) => f.path === c.path))
-        .map((x) => ({ change: x.id, task: x.task_id, agent: x.agent_id, agentName: this.agentName(x.agent_id as string), title: x.title, summary: x.summary })),
+        .map((x) => ({ change: x.id as number, task: x.task_id, agent: x.agent_id, agentName: this.agentName(x.agent_id as string), title: x.title, summary: x.summary })),
     }));
+  }
+
+  private recordConflict(ch: any, conflicts: FileConflict[]) {
+    const explained = this.explain(conflicts, ch.base_version ?? 0);
     this.sql.exec("UPDATE changes SET status = 'conflict', conflicts = ?, updated_at = ? WHERE id = ?", JSON.stringify(explained), Date.now(), ch.id);
     this.sql.exec("UPDATE tasks SET status = 'conflict', updated_at = ? WHERE id = ?", Date.now(), ch.task_id);
     this.emit("change.conflict", {
       change: ch.id, task: ch.task_id, to: ch.agent_id,
-      data: { conflicts: explained.map((c) => ({ path: c.path, kind: c.kind, hunks: c.hunks.length, causedBy: c.causedBy.map((x) => `#${x.change} ${x.title} (${x.agentName})`) })), advice: "Call sync_workspace to see the conflicting hunks, then resolve_conflicts with the merged file contents." },
+      data: { conflicts: explained.map((c) => ({ path: c.path, kind: c.kind, hunks: c.hunks.length, causedBy: c.causedBy.map((x) => `#${x.change} ${x.title} (${x.agentName})`) })), advice: "Call sync_workspace to see the conflicting hunks, then call it again with resolutions." },
     });
   }
 
   /**
-   * Merge main into a change's workspace. Without resolutions this reports
-   * conflicts (with base/ours/theirs hunks). With resolutions, it writes the
-   * merge commit to the workspace and puts the change back in line.
+   * Merge main into a task's workspace. Without resolutions this reports
+   * conflicts (with base/ours/theirs hunks and the change that caused each).
+   * With resolutions, it writes the merge commit to the workspace and, if the
+   * task has a change in flight, puts it back in line.
    */
-  private async sync(actor: Agent, id: number, resolutions?: Record<string, string | null>) {
-    const ch = this.change(id);
-    if (ch.agent_id !== actor.id && actor.id !== "admin") throw new HttpError(403, "not your change");
-    const wsRemote = this.remote(ch.workspace, await this.store.token(ch.workspace, "write", 600));
+  private async sync(actor: Agent, target: { taskId?: number; changeId?: number }, resolutions?: Record<string, string | null>) {
+    const open = target.taskId ? this.sql.exec("SELECT id FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", target.taskId).toArray()[0] : undefined;
+    const ch = target.changeId ? this.change(target.changeId) : open ? this.change(open.id as number) : null;
+    if (ch?.status === "merging") throw new HttpError(409, "this change is being merged right now; wait for the result");
+    const taskId = ch?.task_id ?? target.taskId!;
+    const task = this.task(taskId);
+    if (task.assignee !== actor.id && actor.id !== "admin") throw new HttpError(403, "not your task");
+    if (!task.workspace) throw new HttpError(400, "task has no workspace yet; claim it first");
+    const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).one() as any;
+    const wsRemote = this.remote(task.workspace, await this.token(task.workspace, "write"));
     const w = await Workspace.open(wsRemote);
     const ours = (await w.head())!;
     const main = await w.fetchFrom("main", await this.mainRemote("read"));
     if (await w.isAncestor(main, ours)) return { status: "up-to-date", head: ours };
     const result = await w.merge(ours, main, resolutions ?? {});
     if (!result.tree) {
+      const conflicts = this.explain(result.conflicts, wsRow.base_version ?? 0);
+      if (!resolutions) {
+        this.emit("workspace.conflict", {
+          actor: actor.id, task: taskId, change: ch?.id ?? null, to: task.assignee,
+          data: { conflicts: conflicts.map((c) => ({ path: c.path, kind: c.kind, hunks: c.hunks.length, causedBy: c.causedBy.map((x) => `#${x.change} ${x.title} (${x.agentName})`) })) },
+        });
+      }
       return {
         status: "conflict",
-        conflicts: result.conflicts.map((c) => ({ ...c, causedBy: (ch.conflicts ?? []).find((x: any) => x.path === c.path)?.causedBy ?? [] })),
+        conflicts,
         instructions: "For each path, write the full merged file content and call again with resolutions: { path: content }. Use null to delete a file.",
       };
     }
-    const commit = await w.commit(result.tree, [ours, main], `Merge main into workspace${resolutions ? " (conflicts resolved)" : ""}`, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const author = actor.id === "admin" ? { name: "admin", email: "admin@loom.dev" } : { name: actor.name, email: `${actor.id}@agents.loom.dev` };
+    const commit = await w.commit(result.tree, [ours, main], `Merge main into workspace${resolutions ? " (conflicts resolved)" : ""}`, author);
     await w.push(wsRemote, commit);
-    this.sql.exec("UPDATE workspaces SET base_commit = ?, base_version = ? WHERE name = ?", main, this.mainVersion, ch.workspace);
-    this.sql.exec("UPDATE changes SET base_version = ? WHERE id = ?", this.mainVersion, id);
-    this.emit("workspace.synced", { actor: actor.id, change: id, task: ch.task_id, data: { commit, resolved: Object.keys(resolutions ?? {}) } });
-    if (["conflict", "queued", "review", "changes_requested"].includes(ch.status)) {
-      this.sql.exec("UPDATE tasks SET status = 'in_review' WHERE id = ?", ch.task_id);
-      await this.updateChange(actor.id === "admin" ? { id: ch.agent_id, name: this.agentName(ch.agent_id)!, role: "builder" } : actor, id, { summary: ch.summary });
+    this.sql.exec("UPDATE workspaces SET base_commit = ?, base_version = ? WHERE name = ?", main, this.mainVersion, task.workspace);
+    this.emit("workspace.synced", { actor: actor.id, change: ch?.id ?? null, task: taskId, data: { commit, resolved: Object.keys(resolutions ?? {}) } });
+    if (ch && !["merged", "merging"].includes(this.change(ch.id).status)) {
+      this.sql.exec("UPDATE changes SET base_version = ? WHERE id = ?", this.mainVersion, ch.id);
+      this.sql.exec("UPDATE tasks SET status = 'in_review' WHERE id = ?", taskId);
+      const owner = actor.id === "admin" ? { id: ch.agent_id, name: this.agentName(ch.agent_id)!, role: "builder" as Role } : actor;
+      await this.updateChange(owner, ch.id, { summary: ch.summary });
     }
-    return { status: "synced", head: commit, change: this.change(id) };
+    return { status: "synced", head: commit, change: ch ? this.change(ch.id) : null };
   }
 
   // ── messages, events, state ─────────────────────────────────────────────
