@@ -7,8 +7,11 @@
 //
 // Set PACE=0 to run as fast as possible (for tests), PACE=1.5 to slow down.
 //
-// A human ("jo") takes part too: protects package.json, sets a ground rule,
-// answers an agent's blocking question, and approves the protected change.
+// A human ("jo") takes part too: protects package.json and README.md, sets a
+// ground rule, and briefs jev, the humans' delegate, to answer questions and
+// approve docs changes within that brief. jev settles what its house rules or
+// TypeSafe's Jev model (with TYPESAFE_API_KEY set on the Worker) can settle
+// confidently; jo gets the rest, with jev's reason.
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -52,7 +55,8 @@ export function overdue(now = Date.now()) {
   },
   {
     agent: "bex", task: "Validate new todos",
-    question: "What should the maximum title length be? I'd pick 200 characters unless you want something else.",
+    question: "What should the maximum title length be?",
+    options: { "200": "200 characters: room for a sentence, still fits one line in the UI", "1000": "1000 characters: allows short notes in the title", "none": "No limit" },
     paths: ["src/util/validate.js", "src/routes/todos.js"],
     intent: "Reject POST bodies without a non-empty title (400)",
     edits: {
@@ -102,6 +106,8 @@ export function overdue(now = Date.now()) {
 
 const TEST_PLAN = {
   agent: "dax", task: "Test the validator", dependsOnAgent: "bex",
+  question: "Which test runner should I use, node:test or vitest?",
+  options: { "node:test": "Built into Node, no new dependency", vitest: "Nicer output and watch mode, adds a dev dependency" },
   paths: ["test/"],
   intent: "Unit tests for validateTodo",
   edits: {
@@ -171,11 +177,11 @@ async function builder(admin, keys, plan, taskId) {
     log(plan.agent, `published contract: ${plan.contract.title}`);
   }
   if (plan.question) {
-    const q = await me.req("POST", "/threads", { kind: "question", to: "humans", taskId, body: plan.question, blocking: true });
+    const q = await me.req("POST", "/threads", { kind: "question", to: "humans", taskId, body: plan.question, options: plan.options, blocking: true });
     log(plan.agent, `asked the humans (blocking): ${plan.question}`);
     for (;;) {
       const t = await me.req("GET", `/threads/${q.id}`);
-      if (t.status !== "open") { log(plan.agent, `got an answer: “${t.posts.at(-1).body}”`); break; }
+      if (t.status !== "open") { log(plan.agent, `got an answer from ${t.posts.at(-1).authorName}: “${t.posts.at(-1).body}”`); break; }
       await pause(1);
     }
   }
@@ -284,32 +290,50 @@ async function proposalDesk(admin, keys, done) {
   }
 }
 
-/** A human tech lead: sets rules, answers questions, approves protected changes. */
+/** A human tech lead: sets rules, briefs jev, and takes what jev hands back. */
 async function human(admin, key, done) {
   const me = admin.as(key);
-  await me.req("POST", "/protect", { paths: ["package.json"] });
-  log("jo", "protected package.json: changes there need a human");
+  await me.req("POST", "/protect", { paths: ["package.json", "README.md"] });
+  log("jo", "protected package.json and README.md: changes there need a human");
   await me.req("POST", "/directives", { body: "Keep each change to its task. Ask before adding dependencies or changing package.json." });
   log("jo", "sent a directive to all agents");
+  await me.req("POST", "/delegate", {
+    enabled: true,
+    guidance: "Keep things simple and dependency-free. Validation should be strict but practical: a todo title is one line, so cap it at 200 characters. Versions change at release time, never in feature changes. Documentation-only changes are welcome.",
+    questions: { enabled: true, topics: [], minConfidence: 0.85 },
+    approvals: { enabled: true, paths: ["README.md", "docs/**"], requireAgentReview: true, minConfidence: 0.9 },
+    rules: [{ pattern: "test runner|node:test|vitest|jest", answer: "Use node:test. It's built in, and we don't add dependencies for tests." }],
+  });
+  log("jo", "briefed jev: answer questions, approve README and docs changes, escalate the rest");
   const handled = new Set();
   while (!done.value) {
     const s = await me.state();
-    for (const t of (s.threads ?? []).filter((t) => t.kind === "question" && t.status === "open" && t.to_agent === "humans")) {
+    // jo only picks up what jev handed back.
+    for (const t of (s.threads ?? []).filter((t) => t.kind === "question" && t.status === "open" && t.to_agent === "humans" && t.escalated)) {
       if (handled.has(`q${t.id}`)) continue;
       handled.add(`q${t.id}`);
+      log("jo", `jev passed ${t.created_by}'s question on: ${t.escalated}`);
       await pause(4);
       await me.req("POST", `/threads/${t.id}/posts`, { body: "200 is right. Return the error message in the response body so the UI can show it." });
       log("jo", `answered ${t.created_by}'s question`);
     }
+    const escalated = new Set(s.events.filter((e) => e.type === "delegate.escalated" && e.change_id).map((e) => e.change_id));
     const needs = new Set(s.events.filter((e) => e.type === "approval.needs_human").map((e) => e.change_id));
-    const guarded = (c) => c.files.some((f) => (s.project.protectedPaths ?? []).includes(f.path));
-    for (const c of s.changes.filter((c) => c.status === "review" && needs.has(c.id) && guarded(c))) {
+    const touches = (c, p) => c.files.some((f) => f.path === p);
+    for (const c of s.changes.filter((c) => c.status === "review" && needs.has(c.id))) {
       const k = `c${c.id}:${c.head}`;
       if (handled.has(k)) continue;
-      handled.add(k);
-      await pause(3);
-      await me.review(c.id, "request_changes", "Version bumps happen at release time, not in feature changes. Please drop the package.json edit.", [{ path: "package.json", body: "revert this" }]);
-      log("jo", `requested changes on #${c.id}: no version bumps in feature changes`);
+      if (touches(c, "package.json")) {
+        handled.add(k);
+        await pause(3);
+        await me.review(c.id, "request_changes", "Version bumps happen at release time, not in feature changes. Please drop the package.json edit.", [{ path: "package.json", body: "revert this" }]);
+        log("jo", `requested changes on #${c.id}: no version bumps in feature changes`);
+      } else if (escalated.has(c.id) && s.reviews.some((r) => r.change_id === c.id && r.verdict === "approve")) {
+        handled.add(k);
+        await pause(3);
+        await me.review(c.id, "approve", "Docs look good.");
+        log("jo", `approved #${c.id} after jev passed it on`);
+      }
     }
     await pause(1);
   }

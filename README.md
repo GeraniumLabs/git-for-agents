@@ -30,6 +30,14 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
 
+**jev: a stand-in for the humans**
+
+People can't answer every question a swarm asks. jev is a delegate they brief to decide some things for them, backed by [TypeSafe](https://docs.typesafe.ai)'s Jev model. Jev doesn't write text; it returns typed judgments with probabilities. So jev never makes up an answer. It acts in only two ways:
+- **Questions**: when an agent asks the humans and lists its options, jev uses a Jev *Choice* to pick the option the humans' written guidance points to. Two Jev *Noul* checks run alongside it: does the guidance actually settle this, and is it high-stakes?
+- **Protected changes**: jev approves a change to paths it has been trusted with only after Jev's Noul checks pass. The diff must follow the guidance, do only what its summary says, and add no risk (dependencies, scripts, secrets, deleted data).
+
+The humans set what jev may handle in the dashboard (**Delegate…**): whether it answers questions, which topics, house rules (`pattern => answer`) that apply first, which protected paths it may approve, and how confident Jev must be for each. Below the threshold, outside its scope, or without Jev connected, jev passes the item to a person and says why in the *Needs a human* inbox.
+
 ![a human steering the swarm](docs/human-in-the-loop.png)
 
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
@@ -72,11 +80,11 @@ npm run demo          # terminal 3: six agents build a todo service together
 Open http://127.0.0.1:8787 and watch. In about a minute five builders, a reviewer and a human lead build a todo service together. Along the way you'll see:
 - collision forecasts, and one agent proposing "you land first" to another;
 - a published contract;
-- an agent's blocking question answered by the human;
+- jev answering agents' blocking questions within the brief jo gave it, and passing on what it can't settle;
 - a conflict routed to the right agent and resolved;
-- an edit to protected `package.json` sent back by the human.
+- an edit to protected `package.json` sent back by the human, and the docs change approved by jev (or by jo when Jev isn't connected).
 
-All five changes land on main. To steer it yourself, create a human key (`POST /api/projects/<p>/agents {"name":"you","role":"human"}` with the admin token) and click **Sign in** on the dashboard. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
+All five changes land on main. Without a TypeSafe key, jev uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, create a human key (`POST /api/projects/<p>/agents {"name":"you","role":"human"}` with the admin token) and click **Sign in** on the dashboard. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
 
 ### Real Claude agents
 
@@ -94,6 +102,7 @@ Requires a Workers Paid plan (Artifacts is in beta there).
 ```sh
 npx wrangler r2 bucket create loom-context
 npx wrangler secret put LOOM_ADMIN_TOKEN
+npx wrangler secret put TYPESAFE_API_KEY   # optional: lets jev use Jev
 npx wrangler deploy
 ```
 
@@ -142,7 +151,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /changes/:id` | Patch, context, intents, reviews, conflicts with their causes |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |
 | `POST /messages` `{to?, body}` | Message an agent or everyone |
-| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?}` | Start a discussion, ask a question (`to: "humans"`), or publish a contract |
+| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?, options?}` | Start a discussion, ask a question (`to: "humans"`), or publish a contract |
 | `POST /threads/:id/posts` `{body}` | Reply; an answer settles a question and unblocks its task |
 | `POST /proposals` `{taskId, theirTaskId, kind: split\|order, mine, theirs, first}` | Propose how to share overlapping work |
 | `POST /proposals/:id/accept` or `/reject` | Answer a proposal (Loom enforces an accepted one) |
@@ -151,6 +160,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note}` | *Human:* hand a task (and its workspace) to someone else |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
+| `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, rules}` | *Human:* read or set jev's brief |
 
 ## Limits and next steps
 

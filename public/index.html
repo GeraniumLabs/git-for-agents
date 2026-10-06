@@ -27,6 +27,8 @@
   <button id="protect-save" class="ghost">Protect</button>
   <span class="sep"></span>
   <button id="freeze" class="ghost">Freeze main</button>
+  <span class="sep"></span>
+  <button id="jev-open" class="ghost">Delegate…</button>
 </section>
 
 <section class="stats" id="stats"></section>
@@ -53,6 +55,31 @@
     <ol id="feed" class="feed"></ol>
   </section>
 </main>
+
+<dialog id="jev">
+  <form id="jev-form" method="dialog" class="jev-form">
+    <h3><span id="jev-title">jev</span>: a stand-in for the humans</h3>
+    <p class="meta">Decide what jev may handle for you. It answers only within this brief, using house rules and TypeSafe's Jev model, and hands everything else to a person with the reason. <span id="jev-status"></span></p>
+    <label class="check"><input type="checkbox" name="enabled"> Let jev act for the humans</label>
+    <label>Name <input name="name" maxlength="24"></label>
+    <label>Guidance <small>what jev judges by, in your words</small>
+      <textarea name="guidance" rows="4" placeholder="e.g. Prefer the stricter option on validation. Keep the API backwards compatible. No new runtime dependencies."></textarea></label>
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" name="q_enabled"> Answer agents' questions</label></legend>
+      <label>Only about <input name="q_topics" placeholder="any topic, or e.g. naming, validation, tests"></label>
+      <label><span>Act when Jev is at least <output id="q_conf_out"></output> sure</span> <input type="range" name="q_conf" min="0.5" max="0.99" step="0.01"></label>
+      <label>House rules <small>one per line: <span class="mono">pattern =&gt; answer</span></small>
+        <textarea name="rules" rows="3" class="mono" placeholder="max.*length => 200 characters"></textarea></label>
+    </fieldset>
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" name="a_enabled"> Approve changes to protected paths</label></legend>
+      <label>Only these paths <input name="a_paths" placeholder="e.g. README.md, docs/**"></label>
+      <label class="check"><input type="checkbox" name="a_review"> Only after an agent reviewer approved</label>
+      <label><span>Act when Jev is at least <output id="a_conf_out"></output> sure</span> <input type="range" name="a_conf" min="0.5" max="0.99" step="0.01"></label>
+    </fieldset>
+    <div class="row"><button value="save">Save</button><button value="cancel" class="ghost" formnovalidate>Cancel</button></div>
+  </form>
+</dialog>
 
 <dialog id="detail"><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
 

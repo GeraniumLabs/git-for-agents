@@ -142,8 +142,8 @@ function renderAgents() {
     const task = state.tasks.find((t) => t.assignee === a.id && t.status !== "merged");
     const ctl = isHuman() && a.role !== "human" ? `<button class="mini" data-agent="${a.id}" data-op="${a.paused ? "resume" : "pause"}">${a.paused ? "Resume" : "Pause"}</button>` : "";
     return `<li class="card agent ${a.paused ? "paused" : ""}"><span class="dot" style="background:${color(a.id)}"></span>
-      <div class="grow"><div><b>${esc(a.name)}</b><span class="role">${a.role}</span>${a.paused ? `<span class="role bad">paused</span>` : ""}</div>
-      <div class="meta">${task ? `#${task.id} ${esc(task.title)}` : a.role === "reviewer" ? "reviewing" : a.role === "human" ? "steering" : "idle"} · ${ago(a.last_seen)}</div></div>${ctl}</li>`;
+      <div class="grow"><div><b>${esc(a.name)}</b><span class="role">${a.id === "delegate" ? "delegate" : a.role}</span>${a.paused ? `<span class="role bad">paused</span>` : ""}</div>
+      <div class="meta">${task ? `#${task.id} ${esc(task.title)}` : a.role === "reviewer" ? "reviewing" : a.id === "delegate" ? (state.delegate?.enabled ? "standing in for the humans" : "off") : a.role === "human" ? "steering" : "idle"} · ${ago(a.last_seen)}</div></div>${ctl}</li>`;
   }).join("") || `<li class="empty">No agents yet.</li>`;
   for (const b of document.querySelectorAll("[data-agent]")) b.onclick = async () => {
     const reason = b.dataset.op === "pause" ? prompt("Why pause this agent? (they will see this)") : undefined;
@@ -251,6 +251,9 @@ function describe(e) {
     case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
     case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
+    case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];
+    case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : "house rule"}): “${esc(d.decision)}”`];
+    case "delegate.escalated": return ["question", `${who} handed ${d.thread ? `question #${d.thread}` : `#${e.change_id}`} to a person: ${esc(d.reason)}`];
     case "message": return ["message", `${who}${to ? ` → ${to}` : " → everyone"}: “${esc(d.body)}”`];
     default: return ["", `${esc(e.type)} ${esc(JSON.stringify(d)).slice(0, 120)}`];
   }
@@ -307,9 +310,13 @@ function renderInbox() {
   const posts = (t) => t.posts.map((p) => `<div class="post"><b style="color:${color(p.author)}">${esc(p.authorName)}</b> ${esc(p.body)}</div>`).join("");
   const replyBox = (t, label = "Reply") => me ? `<div class="row"><input data-reply="${t.id}" placeholder="${label}…"><button data-send="${t.id}">Send</button></div>` : "";
   $("#inbox").innerHTML = items.map((it) => {
-    if (it.type === "question") return box(`<div class="kicker">Question${it.t.blocking ? " · blocking task #" + it.t.task_id : ""}</div>${posts(it.t)}${replyBox(it.t, "Answer")}`, "q");
+    if (it.type === "question") {
+      const opts = it.t.options ? `<div class="opts">${Object.entries(it.t.options).map(([k, v]) => me ? `<button class="ghost mini" data-pick="${it.t.id}" data-opt="${esc(k)}" title="${esc(v)}">${esc(k)}</button>` : `<span class="pill" title="${esc(v)}">${esc(k)}</span>`).join("")}</div>` : "";
+      return box(`<div class="kicker">Question${it.t.blocking ? " · blocking task #" + it.t.task_id : ""}</div>${posts(it.t)}${opts}${escalation(it.t.escalated)}${replyBox(it.t, "Answer")}`, "q");
+    }
     if (it.type === "proposal") return box(`<div class="kicker">Proposal between agents</div>${posts(it.t)}<div class="meta">Waiting on ${esc(name(it.t.to_agent))}</div>`);
-    return box(`<div class="kicker">Needs a human approval</div><div><b>#${it.c.id}</b> ${esc(it.c.title)} · ${esc(name(it.c.agent_id))}</div><div class="files mono">${it.c.files.map((f) => esc(f.path)).join("  ")}</div>${me ? `<div class="row"><button data-open="${it.c.id}">Review</button></div>` : ""}`, "q");
+    const why = state.events.filter((e) => e.type === "delegate.escalated" && e.change_id === it.c.id).at(-1)?.data.reason;
+    return box(`<div class="kicker">Needs a human approval</div><div><b>#${it.c.id}</b> ${esc(it.c.title)} · ${esc(name(it.c.agent_id))}</div><div class="files mono">${it.c.files.map((f) => esc(f.path)).join("  ")}</div>${escalation(why)}${me ? `<div class="row"><button data-open="${it.c.id}">Review</button></div>` : ""}`, "q");
   }).join("") + (discussions.length ? `<h2>Discussions &amp; contracts</h2>` + discussions.map((t) => box(`<div class="kicker">${t.kind === "contract" ? "Contract" : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""} · ${t.status}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}${replyBox(t)}`)).join("") : "")
     || `<p class="empty">Nothing needs a human right now.</p>`;
   for (const b of document.querySelectorAll("[data-send]")) b.onclick = async () => {
@@ -319,7 +326,49 @@ function renderInbox() {
     input.value = "";
   };
   for (const b of document.querySelectorAll("[data-open]")) b.onclick = () => showChange(Number(b.dataset.open));
+  for (const b of document.querySelectorAll("[data-pick]")) b.onclick = () => act("POST", `/threads/${b.dataset.pick}/posts`, { body: `Go with “${b.dataset.opt}”.` });
 }
+const escalation = (reason) => reason && state.delegate?.enabled ? `<div class="warn">${esc(state.delegate.name)} passed this to you: ${esc(reason)}</div>` : "";
+
+// ── jev: what the humans let their stand-in decide ──────────────────────
+const jevForm = $("#jev-form");
+const field = (n) => jevForm.elements.namedItem(n);
+const listOf = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
+function fillJev() {
+  const d = state.delegate;
+  $("#jev-title").textContent = d.name;
+  $("#jev-status").textContent = d.jevConnected ? "Jev is connected." : "Jev isn't connected (no TYPESAFE_API_KEY), so only house rules apply.";
+  field("enabled").checked = d.enabled;
+  field("name").value = d.name;
+  field("guidance").value = d.guidance;
+  field("q_enabled").checked = d.questions.enabled;
+  field("q_topics").value = d.questions.topics.join(", ");
+  field("q_conf").value = d.questions.minConfidence;
+  field("rules").value = d.rules.map((r) => `${r.pattern} => ${r.answer}`).join("\n");
+  field("a_enabled").checked = d.approvals.enabled;
+  field("a_paths").value = d.approvals.paths.join(", ");
+  field("a_review").checked = d.approvals.requireAgentReview;
+  field("a_conf").value = d.approvals.minConfidence;
+  showConf();
+}
+function showConf() {
+  $("#q_conf_out").textContent = `${Math.round(field("q_conf").value * 100)}%`;
+  $("#a_conf_out").textContent = `${Math.round(field("a_conf").value * 100)}%`;
+}
+jevForm.oninput = showConf;
+$("#jev-open").onclick = () => { fillJev(); $("#jev").showModal(); };
+$("#jev").onclose = async () => {
+  if ($("#jev").returnValue !== "save") return;
+  await act("POST", "/delegate", {
+    enabled: field("enabled").checked,
+    name: field("name").value.trim() || "jev",
+    guidance: field("guidance").value.trim(),
+    questions: { enabled: field("q_enabled").checked, topics: listOf(field("q_topics").value), minConfidence: Number(field("q_conf").value) },
+    approvals: { enabled: field("a_enabled").checked, paths: listOf(field("a_paths").value), requireAgentReview: field("a_review").checked, minConfidence: Number(field("a_conf").value) },
+    rules: field("rules").value.split("\n").map((l) => l.split("=>")).filter((p) => p.length === 2 && p[0].trim() && p[1].trim()).map(([pattern, answer]) => ({ pattern: pattern.trim(), answer: answer.trim() })),
+  });
+  toast(`Saved ${field("name").value.trim() || "jev"}'s brief`);
+};
 
 function renderControls() {
   if (!isHuman()) return;

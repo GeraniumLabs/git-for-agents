@@ -127,9 +127,14 @@ const TOOLS: Tool[] = [
   },
   {
     name: "ask_human",
-    description: "Ask the humans on the project a question. Use it for product decisions, unclear requirements, or anything risky. With blocking=true your task is marked blocked until someone answers; the answer arrives as a question.answered event.",
-    inputSchema: obj({ taskId: num("Your task"), question: str("The question, with the options you see"), blocking: { type: "boolean" } }, ["question"]),
-    run: (a, call) => call("POST", "/threads", { kind: "question", to: "humans", taskId: a.taskId, body: a.question, blocking: a.blocking ?? false }),
+    description: "Ask the humans on the project a question. Use it for product decisions, unclear requirements, or anything risky. With blocking=true your task is marked blocked until someone answers; the answer arrives as a question.answered event. List the options you see: then the humans' delegate (jev), if they've enabled it, can pick one for them when their guidance clearly settles it, and a person gets the rest.",
+    inputSchema: obj({
+      taskId: num("Your task"),
+      question: str("The question"),
+      options: { type: "object", additionalProperties: { type: "string" }, description: "The options you see, as option -> what it means (at least two)" },
+      blocking: { type: "boolean" },
+    }, ["question"]),
+    run: (a, call) => call("POST", "/threads", { kind: "question", to: "humans", taskId: a.taskId, body: a.question, options: a.options, blocking: a.blocking ?? false }),
   },
   {
     name: "start_discussion",

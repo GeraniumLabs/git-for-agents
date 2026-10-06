@@ -8,8 +8,10 @@ import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, t
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
+import { DEFAULT_DELEGATE, decideApproval, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
 
 const TOKEN_TTL = 6 * 3600;
+const DELEGATE_ID = "delegate";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
 
 export type Role = "builder" | "reviewer" | "human";
@@ -70,6 +72,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN terms TEXT",
       "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
+      "ALTER TABLE threads ADD COLUMN escalated TEXT",
+      "ALTER TABLE threads ADD COLUMN options TEXT",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -156,6 +160,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     for (const wake of this.waiters) wake();
     this.waiters.clear();
+    if (["question.asked", "approval.needs_human", "review.submitted"].includes(type) && e.actor !== DELEGATE_ID) {
+      this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)));
+    }
     return event;
   }
 
@@ -261,6 +268,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
       if (a === "files") return json(await this.readFiles(url.searchParams));
+      if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
     }
@@ -281,7 +289,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "me") return json({ agent: actor, mainFrozen: this.meta("frozen"), inbox: this.inbox(actor.id) });
 
     // Human controls. Humans (and the admin) steer; agents can't.
-    if (["directives", "pause", "resume", "freeze", "unfreeze", "assign", "protect"].includes(c ?? a)) {
+    if (["directives", "pause", "resume", "freeze", "unfreeze", "assign", "protect", "delegate"].includes(c ?? a)) {
       if (actor.role !== "human") throw new HttpError(403, "only humans can steer agents");
       if (a === "directives") return json(this.directive(actor, body));
       if (a === "agents" && b && c === "pause") return json(this.pause(actor, b, body.reason));
@@ -290,6 +298,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "unfreeze") return json(await this.unfreeze(actor));
       if (a === "tasks" && b && c === "assign") return json(this.assign(actor, Number(b), body.agent ?? null, body.note));
       if (a === "protect") return json(this.protect(actor, body.paths ?? []));
+      if (a === "delegate") return json(await this.configureDelegate(actor, body));
     }
     // A paused agent can still read, talk and answer, but not change code.
     const talking = a === "threads" || a === "messages" || a === "proposals";
@@ -817,6 +826,97 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { protectedPaths: this.protectedPaths };
   }
 
+  // ── jev: the humans' delegate ────────────────────────────────────────────
+
+  private get delegateConfig(): DelegateConfig {
+    const raw = this.meta("delegate");
+    if (!raw) return DEFAULT_DELEGATE;
+    const cfg = JSON.parse(raw);
+    return { ...DEFAULT_DELEGATE, ...cfg, questions: { ...DEFAULT_DELEGATE.questions, ...cfg.questions }, approvals: { ...DEFAULT_DELEGATE.approvals, ...cfg.approvals } };
+  }
+
+  private delegateActor(): Agent {
+    return { id: DELEGATE_ID, name: this.delegateConfig.name, role: "human" };
+  }
+
+  private async configureDelegate(actor: Agent, body: Partial<DelegateConfig>) {
+    if (actor.id === DELEGATE_ID) throw new HttpError(403, "the delegate can't change its own brief");
+    const cfg: DelegateConfig = { ...this.delegateConfig, ...body };
+    cfg.questions = { ...this.delegateConfig.questions, ...(body.questions ?? {}) };
+    cfg.approvals = { ...this.delegateConfig.approvals, ...(body.approvals ?? {}) };
+    this.setMeta("delegate", JSON.stringify(cfg));
+    // jev is a member like any other, so its decisions are attributed to it.
+    this.sql.exec("INSERT OR IGNORE INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, 'human', ?, ?, ?)",
+      DELEGATE_ID, cfg.name, `delegate:${randomId(16)}`, Date.now(), Date.now());
+    this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", cfg.name, DELEGATE_ID);
+    this.emit("delegate.configured", { actor: actor.id, data: { enabled: cfg.enabled, name: cfg.name, questions: cfg.questions, approvals: cfg.approvals, rules: cfg.rules.length } });
+    return cfg;
+  }
+
+  /** Let jev act on an event if its brief covers it; otherwise say why a human is needed. */
+  private async delegateOn(e: LoomEvent) {
+    const cfg = this.delegateConfig;
+    if (!cfg.enabled) return;
+    const jev = this.delegateActor();
+    this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), DELEGATE_ID);
+
+    if (e.type === "question.asked" && e.data.audience === "humans") {
+      const t = this.thread(e.data.thread);
+      if (t.status !== "open") return;
+      const task = t.task_id ? this.task(t.task_id) : null;
+      const v = await decideQuestion(cfg, {
+        question: e.data.body,
+        options: t.options,
+        task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
+      }, this.judge);
+      if (this.thread(t.id).status !== "open") return; // a human got there first
+      if (v.act) {
+        this.post(jev, t.id, v.answer);
+        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, data: { thread: t.id, kind: "question", via: v.via, decision: v.answer, scores: v.scores ?? null } });
+      } else this.escalate(t.id, null, t.task_id, v.reason, v.scores);
+      return;
+    }
+
+    const changeId = e.change_id;
+    if (!changeId) return;
+    if (e.type === "review.submitted" && e.data.verdict !== "approve") return;
+    const ch = this.change(changeId);
+    if (ch.status !== "review") return;
+    const guarded = this.guardedFiles(ch.files);
+    if (!guarded.length) return;
+    const reviews = this.sql.exec("SELECT r.reviewer, r.verdict, a.role FROM reviews r LEFT JOIN agents a ON a.id = r.reviewer WHERE r.change_id = ? AND r.head = ?", changeId, ch.head).toArray();
+    if (reviews.some((r) => r.reviewer === DELEGATE_ID)) return;
+    if (reviews.some((r) => r.verdict === "request_changes")) return;
+    const agentApprovals = reviews.filter((r) => r.verdict === "approve" && r.role !== "human").length;
+    const detail = await this.changeDetail(changeId);
+    const v = await decideApproval(cfg, {
+      guarded, agentApprovals, undeclared: ch.undeclared,
+      title: ch.title, summary: ch.summary ?? "",
+      intent: detail.intents.map((i: any) => `${i.description} (${i.paths.join(", ")})`).join("; "),
+      patch: detail.patch,
+    }, this.judge);
+    if (this.change(changeId).head !== ch.head || this.change(changeId).status !== "review") return; // moved on meanwhile
+    if (v.act) {
+      await this.review(jev, changeId, { verdict: "approve", body: v.answer });
+      this.emit("delegate.decided", { actor: DELEGATE_ID, change: changeId, task: ch.task_id, data: { kind: "approval", via: v.via, decision: v.answer, scores: v.scores ?? null } });
+    } else if (v.reason !== "waiting for an agent review first") {
+      this.escalate(null, changeId, ch.task_id, v.reason, v.scores);
+    }
+  }
+
+  private escalated = new Set<string>();
+  private get judge() {
+    return { apiKey: this.env.TYPESAFE_API_KEY, url: this.env.TYPESAFE_URL };
+  }
+
+  private escalate(threadId: number | null, changeId: number | null, taskId: number | null, reason: string, scores?: Record<string, number>) {
+    const key = `${threadId}:${changeId}:${changeId ? this.change(changeId).head : ""}`;
+    if (this.escalated.has(key)) return;
+    this.escalated.add(key);
+    if (threadId) this.sql.exec("UPDATE threads SET escalated = ? WHERE id = ?", reason, threadId);
+    this.emit("delegate.escalated", { actor: DELEGATE_ID, task: taskId, change: changeId, data: { thread: threadId, reason, scores: scores ?? null } });
+  }
+
   // ── proposals: agents settle overlaps between themselves ────────────────
 
   /**
@@ -872,18 +972,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * "question" with to = "humans" (or an agent id) asks for an answer; a
    * blocking question parks the task until someone answers.
    */
-  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean }) {
+  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean; options?: unknown }) {
     if (!body.body) throw new HttpError(400, "body is required");
     const kind = body.kind ?? "discussion";
     const taskId = body.taskId ?? (body.changeId ? this.change(body.changeId).task_id : null);
     const now = Date.now();
     const blocking = kind === "question" && !!body.blocking && !!taskId;
     const prev = blocking ? this.task(taskId!).status : null;
+    const options = kind === "question" ? normalizeOptions(body.options) : null;
     const row = this.sql
-      .exec(`INSERT INTO threads (kind, task_id, change_id, path, line, title, created_by, to_agent, blocking, prev_task_status, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      .exec(`INSERT INTO threads (kind, task_id, change_id, path, line, title, created_by, to_agent, blocking, prev_task_status, options, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         kind, taskId, body.changeId ?? null, body.path ?? null, body.line ?? null, body.title ?? body.body.split("\n")[0].slice(0, 80),
-        actor.id, body.to ?? null, blocking ? 1 : 0, prev, now, now)
+        actor.id, body.to ?? null, blocking ? 1 : 0, prev, options ? JSON.stringify(options) : null, now, now)
       .one();
     const id = row.id as number;
     this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", id, actor.id, body.body, now);
@@ -891,7 +992,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const to = body.to && body.to !== "humans" ? body.to : null;
     if (!body.silent) this.emit(kind === "question" ? "question.asked" : kind === "contract" ? "contract.published" : "thread.opened", {
       actor: actor.id, task: taskId, change: body.changeId ?? null, to,
-      data: { thread: id, title: body.title ?? null, body: body.body, path: body.path ?? null, line: body.line ?? null, audience: body.to ?? "everyone", blocking },
+      data: { thread: id, title: body.title ?? null, body: body.body, path: body.path ?? null, line: body.line ?? null, audience: body.to ?? "everyone", blocking, options },
     });
     return this.thread(id);
   }
@@ -932,7 +1033,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const t = this.sql.exec("SELECT * FROM threads WHERE id = ?", id).toArray()[0];
     if (!t) throw new HttpError(404, `thread ${id} not found`);
     const posts = this.sql.exec("SELECT * FROM posts WHERE thread_id = ? ORDER BY id", id).toArray().map((p) => ({ ...p, authorName: this.agentName(p.author as string) }));
-    return { ...t, blocking: !!t.blocking, createdByName: this.agentName(t.created_by as string), posts } as any;
+    return { ...t, blocking: !!t.blocking, options: t.options ? JSON.parse(t.options as string) : null, createdByName: this.agentName(t.created_by as string), posts } as any;
   }
 
   private threads(q: URLSearchParams) {
@@ -990,6 +1091,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const reviews = this.sql.exec("SELECT id, change_id, reviewer, verdict, body, created_at FROM reviews ORDER BY id").toArray();
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
+      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.env.TYPESAFE_API_KEY },
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
