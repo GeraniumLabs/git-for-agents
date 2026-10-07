@@ -10,10 +10,21 @@ import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
 import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
+import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
+/** Project-wide events every agent hears about, whatever it is working on. */
+const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
+/** Events a person might care about, shown on the overview instead of the full stream. */
+const NOTABLE = ["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"];
+/** Most queued changes merged together in one pass of the queue. */
+const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
+const CHATTER_LIMIT = 20;
+const MERGE_BATCH = 8;
 
 export type Role = "builder" | "reviewer" | "human";
 
@@ -56,7 +67,8 @@ function randomId(bytes = 12): string {
 export class ProjectCoordinator extends DurableObject<Env> {
   private sql: SqlStorage;
   private store: RepoStore;
-  private waiters = new Set<() => void>();
+  /** Long-polls waiting for events; each is woken only by events it would receive. */
+  private waiters = new Set<{ wants: (e: LoomEvent) => boolean; wake: () => void }>();
   private merging = false;
 
   constructor(ctx: DurableObjectState, env: Env) {
@@ -76,6 +88,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN escalated TEXT",
       "ALTER TABLE threads ADD COLUMN options TEXT",
       "ALTER TABLE tasks ADD COLUMN related TEXT",
+      "ALTER TABLE changes ADD COLUMN symbols TEXT",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -122,6 +135,23 @@ export class ProjectCoordinator extends DurableObject<Env> {
         by TEXT, paths TEXT DEFAULT '[]', task_id INTEGER, change_id INTEGER, thread_id INTEGER,
         created_at INTEGER, retired_at INTEGER);
       CREATE TABLE IF NOT EXISTS consult_hints (a TEXT, b TEXT, path TEXT, PRIMARY KEY (a, b, path));
+      CREATE TABLE IF NOT EXISTS familiarity (
+        agent_id TEXT, path TEXT, symbol TEXT, kind TEXT, n INTEGER, last_at INTEGER,
+        PRIMARY KEY (agent_id, path, symbol, kind));
+      CREATE INDEX IF NOT EXISTS familiarity_path ON familiarity (path);
+      CREATE TABLE IF NOT EXISTS review_requests (
+        change_id INTEGER, reviewer TEXT, requested_by TEXT, reason TEXT, status TEXT, created_at INTEGER, done_at INTEGER,
+        PRIMARY KEY (change_id, reviewer));
+      CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
+      CREATE INDEX IF NOT EXISTS events_actor ON events (actor, ts);
+      CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
+      CREATE INDEX IF NOT EXISTS events_to ON events (to_agent, seq);
+      CREATE INDEX IF NOT EXISTS events_type ON events (type, seq);
+      CREATE INDEX IF NOT EXISTS events_change ON events (change_id, type);
+      CREATE INDEX IF NOT EXISTS changes_status ON changes (status);
+      CREATE INDEX IF NOT EXISTS changes_task ON changes (task_id);
+      CREATE INDEX IF NOT EXISTS tasks_assignee ON tasks (assignee);
+      CREATE INDEX IF NOT EXISTS intents_live ON intents (released_at, task_id);
     `);
   }
 
@@ -165,8 +195,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const ws of this.ctx.getWebSockets()) {
       try { ws.send(msg); } catch {}
     }
-    for (const wake of this.waiters) wake();
-    this.waiters.clear();
+    for (const w of this.waiters) {
+      if (w.wants(event)) { this.waiters.delete(w); w.wake(); }
+    }
     if (["question.asked", "approval.needs_human", "review.submitted", "dispute.ready"].includes(type) && e.actor !== DELEGATE_ID) {
       this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)));
     }
@@ -229,6 +260,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       files: JSON.parse(c.files as string),
       undeclared: JSON.parse(c.undeclared as string),
       conflicts: c.conflicts ? JSON.parse(c.conflicts as string) : null,
+      symbols: c.symbols ? JSON.parse(c.symbols as string) : {},
     } as any;
   }
   private activeIntents(excludeAgent?: string) {
@@ -271,9 +303,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Reads are open so the dashboard can render without a key.
     if (m === "GET") {
       if (a === "state") return json(this.state());
-      if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent")));
+      if (a === "overview") return json(this.overview());
+      if (a === "search") return json(this.search(url.searchParams));
+      if (a === "agents" && b) return json(this.profile(b));
+      if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent"), url.searchParams.get("mine") === "1"));
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
+      if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
+      if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
@@ -324,6 +361,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "intents" && b && m === "DELETE") return json(this.releaseIntent(actor, Number(b)));
     if (a === "workspaces" && b && c === "commit") return json(await this.commitToWorkspace(actor, b, body));
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
+    if (a === "changes" && b && c === "reviewers" && m === "POST") return json(this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
@@ -341,6 +379,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "threads" && b && c === "posts") return json(this.post(actor, Number(b), body.body));
     if (a === "threads" && b && c === "resolve") return json(this.resolveThread(actor, Number(b), body.body));
     if (a === "consults" && !b && m === "POST") return json(this.consult(actor, body));
+    if (a === "questions" && b === "answer" && m === "POST") return json(this.answerGroup(actor, body.threads ?? [], body.body));
     if (a === "disputes" && !b && m === "POST") return json(this.openDispute(actor, body));
     if (a === "disputes" && b && c === "position") return json(this.statePosition(actor, Number(b), body.position));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
@@ -537,10 +576,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length ? "review" : "queued";
     const row = this.sql
-      .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, symbols, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         body.taskId, actor.id, task.workspace, body.title ?? task.title, body.summary ?? "", analysis.head, analysis.base, wsRow.base_version,
-        status, JSON.stringify(analysis.files), JSON.stringify(undeclared), now, now)
+        status, JSON.stringify(analysis.files), JSON.stringify(undeclared), JSON.stringify(analysis.symbols), now, now)
       .one();
     const id = row.id as number;
     await this.saveContext(id, actor, body, analysis.patch);
@@ -548,7 +587,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
-    return this.change(id);
+    // Who already knows this code, so the author can ask them to review it.
+    return { ...this.change(id), suggestedReviewers: status === "review" ? this.reviewerCandidates(id, 3) : [] };
   }
 
   private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }) {
@@ -559,8 +599,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // The merge queue may have taken the change while we were analyzing.
     if (["merged", "merging"].includes(this.change(id).status)) throw new HttpError(409, `change ${id} was merged meanwhile`);
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length ? "review" : "queued";
-    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
-      analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), status, body.summary ?? null, Date.now(), id);
+    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
+      analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
     await this.saveContext(id, actor, { ...body, summary: body.summary ?? ch.summary }, analysis.patch);
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files } });
     if (status === "review") this.requestReview(id, actor.id);
@@ -601,11 +641,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const H = merged.tree ? await w.flattenTree(merged.tree) : await w.flatten(head);
     const files = diffFlat(B, H);
     let patch = "";
+    const symbols: Record<string, string[]> = {};
     for (const f of files) {
       const before = B.get(f.path), after = H.get(f.path);
-      patch += unifiedDiff(f.path, before ? await w.readText(before.oid) : null, after ? await w.readText(after.oid) : null);
+      const a = before ? await w.readText(before.oid) : null, b = after ? await w.readText(after.oid) : null;
+      patch += unifiedDiff(f.path, a, b);
+      const names = symbolsTouched(a, b);
+      if (names.length) symbols[f.path] = names;
     }
-    return { head, base, files, patch };
+    return { head, base, files, patch, symbols };
   }
 
   private async saveContext(id: number, actor: Agent, body: { summary?: string; context?: any }, patch: string) {
@@ -630,6 +674,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       id, actor.id, body.verdict, body.body ?? "", JSON.stringify(body.comments ?? []), ch.head, Date.now());
     this.emit("review.submitted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { verdict: body.verdict, body: body.body ?? "", comments: body.comments ?? [] } });
+    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND reviewer = ? AND status = 'open'", Date.now(), id, actor.id);
+    if (body.verdict !== "comment") this.learn(actor.id, "reviewed", ch.files, ch.symbols);
     if (body.verdict === "request_changes") {
       this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
       if (actor.role === "human" && body.body) {
@@ -667,67 +713,102 @@ export class ProjectCoordinator extends DurableObject<Env> {
     try {
       for (;;) {
         // A change whose task agreed to land after another task waits its turn.
-        const next = this.sql.exec(`SELECT c.id FROM changes c JOIN tasks t ON t.id = c.task_id
-          WHERE c.status = 'queued' AND (t.waits_for IS NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.id = t.waits_for AND w.status = 'merged'))
-          ORDER BY c.updated_at, c.id LIMIT 1`).toArray()[0];
-        if (!next) break;
-        const before = this.sql.exec("SELECT status FROM changes WHERE id = ?", next.id).one().status;
-        await this.mergeOne(next.id as number);
-        // A failed attempt goes back to 'queued' with a delay; leave it to the next alarm.
-        if (before === "queued" && this.sql.exec("SELECT status FROM changes WHERE id = ?", next.id).one().status === "queued") break;
+        const ids = this.sql.exec(`SELECT c.id FROM changes c JOIN tasks t ON t.id = c.task_id
+          WHERE c.status = 'queued' AND c.updated_at <= ? AND (t.waits_for IS NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.id = t.waits_for AND w.status = 'merged'))
+          ORDER BY c.updated_at, c.id LIMIT ?`, Date.now(), MERGE_BATCH).toArray().map((r) => r.id as number);
+        if (!ids.length) break;
+        await this.mergeBatch(ids);
+        if (this.meta("frozen")) break;
       }
     } finally {
       this.merging = false;
     }
+    // Retries wait a little; make sure someone comes back for them.
+    const retry = this.sql.exec("SELECT MIN(updated_at) AS t FROM changes WHERE status = 'queued'").one().t as number | null;
+    if (retry) await this.ctx.storage.setAlarm(Math.max(retry, Date.now() + 100));
   }
 
-  private async mergeOne(id: number) {
-    const ch = this.change(id);
-    this.sql.exec("UPDATE changes SET status = 'merging', updated_at = ? WHERE id = ?", Date.now(), id);
-    this.emit("merge.started", { change: id, task: ch.task_id, data: {} });
+  /**
+   * Merge a batch of queued changes into main in one pass: fetch main once,
+   * fold each change in on top of the previous one (a commit per change, so
+   * history stays per change), and push once. A change that conflicts with
+   * main or with an earlier change in the batch is routed back to its agent;
+   * the rest still land. With many agents this is what keeps the queue moving:
+   * the cost of a pass is mostly fetching and pushing main.
+   */
+  private async mergeBatch(ids: number[]) {
+    const now = () => Date.now();
+    for (const id of ids) {
+      this.sql.exec("UPDATE changes SET status = 'merging', updated_at = ? WHERE id = ?", now(), id);
+      this.emit("merge.started", { change: id, task: this.change(id).task_id, data: { batch: ids.length } });
+    }
+    const landed: { ch: any; before: string; commit: string }[] = [];
+    let w: Workspace, mainW: Remote, main: string;
     try {
-      const mainW = await this.mainRemote("write");
-      const w = await Workspace.open(mainW);
-      const main = (await w.head())!;
-      const head = await w.fetchFrom("ws", this.remote(ch.workspace, await this.token(ch.workspace, "read")));
-      if (head !== ch.head) {
-        // The agent pushed after review. Approval covered a different commit.
-        this.sql.exec("UPDATE changes SET status = 'review', head = ?, updated_at = ? WHERE id = ?", head, Date.now(), id);
-        this.emit("change.updated", { change: id, task: ch.task_id, data: { head, reason: "workspace moved after approval; review again" } });
-        this.requestReview(id, ch.agent_id);
-        return;
+      mainW = await this.mainRemote("write");
+      w = await Workspace.open(mainW);
+      main = (await w.head())!;
+    } catch (e: any) {
+      return this.retryMerge(ids, e);
+    }
+    let tip = main;
+    for (const id of ids) {
+      const ch = this.change(id);
+      try {
+        const head = await w.fetchFrom(`ws${id}`, this.remote(ch.workspace, await this.token(ch.workspace, "read")));
+        if (head !== ch.head) {
+          // The agent pushed after review. Approval covered a different commit.
+          this.sql.exec("UPDATE changes SET status = 'review', head = ?, updated_at = ? WHERE id = ?", head, now(), id);
+          this.emit("change.updated", { change: id, task: ch.task_id, data: { head, reason: "workspace moved after approval; review again" } });
+          this.requestReview(id, ch.agent_id);
+          continue;
+        }
+        let commit: string;
+        if (await w.isAncestor(head, tip)) commit = tip;
+        else if (await w.isAncestor(tip, head)) commit = head;
+        else {
+          const result = await w.merge(tip, head);
+          if (!result.tree) { this.recordConflict(ch, result.conflicts); continue; }
+          commit = await w.commit(result.tree, [tip, head], `Merge change #${id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim(), MERGE_IDENTITY);
+        }
+        landed.push({ ch, before: tip, commit });
+        tip = commit;
+      } catch (e: any) {
+        await this.retryMerge([id], e);
       }
-      let commit: string;
-      if (await w.isAncestor(head, main)) {
-        commit = main;
-      } else if (await w.isAncestor(main, head)) {
-        commit = head;
-        await w.push(mainW, commit);
-      } else {
-        const result = await w.merge(main, head);
-        if (!result.tree) return this.recordConflict(ch, result.conflicts);
-        commit = await w.commit(result.tree, [main, head], `Merge change #${id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim(), MERGE_IDENTITY);
-        await w.push(mainW, commit);
-      }
-      const landed = await w.changes(main, commit);
-      const version = commit === main ? this.mainVersion : this.mainVersion + 1;
+    }
+    if (!landed.length) return;
+    try {
+      if (tip !== main) await w.push(mainW, tip);
+    } catch (e: any) {
+      return this.retryMerge(landed.map((l) => l.ch.id), e);
+    }
+    let version = this.mainVersion;
+    for (const { ch, before, commit } of landed) {
+      const files = await w.changes(before, commit);
+      if (commit !== before) version++;
+      const t = now();
+      this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, updated_at = ? WHERE id = ?", commit, version, t, ch.id);
+      this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?", t, ch.task_id);
+      this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", t, ch.task_id);
+      this.sql.exec("UPDATE workspaces SET status = 'merged' WHERE name = ?", ch.workspace);
       this.setMeta("main_version", String(version));
       this.setMeta("main_head", commit);
-      const now = Date.now();
-      this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, updated_at = ? WHERE id = ?", commit, version, now, id);
-      this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?", now, ch.task_id);
-      this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", now, ch.task_id);
-      this.sql.exec("UPDATE workspaces SET status = 'merged' WHERE name = ?", ch.workspace);
-      this.emit("change.merged", { actor: ch.agent_id, change: id, task: ch.task_id, data: { commit, version, files: landed } });
-      this.adviseStale(id, landed.map((f) => f.path));
-      for (const w of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ?", ch.task_id).toArray()) {
-        this.emit("task.unblocked", { task: w.id as number, data: { after: ch.task_id } });
+      this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, batch: landed.length } });
+      this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
+      this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status = 'open'", Date.now(), ch.id);
+      this.adviseStale(ch.id, files.map((f) => f.path));
+      for (const r of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ?", ch.task_id).toArray()) {
+        this.emit("task.unblocked", { task: r.id as number, data: { after: ch.task_id } });
       }
-    } catch (e: any) {
-      console.error("merge failed", e);
+    }
+  }
+
+  private async retryMerge(ids: number[], e: any) {
+    console.error("merge failed", e);
+    for (const id of ids) {
       this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + 5000, id);
-      this.emit("merge.retry", { change: id, task: ch.task_id, data: { error: String(e?.message ?? e) } });
-      await this.ctx.storage.setAlarm(Date.now() + 5000);
+      this.emit("merge.retry", { change: id, task: this.change(id).task_id, data: { error: String(e?.message ?? e) } });
     }
   }
 
@@ -1032,6 +1113,378 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     this.emit(accept ? "proposal.accepted" : "proposal.rejected", { actor: actor.id, to: t.created_by, task: terms.taskId, data: { thread: threadId, summary: t.title, reason: text ?? "" } });
     return this.thread(threadId);
+  }
+
+  // ── overview: what a person looks at, whether there are 5 agents or 1000 ──
+  //
+  // People don't watch agents. The overview is about the work: what needs a
+  // person, what is stuck, how the work is flowing, and where in the codebase
+  // it is happening. Agents are found by search when someone needs one.
+
+  /** What each agent is doing, derived from what it holds. */
+  private agentStates(where = "", ...args: SqlStorageValue[]) {
+    const now = Date.now();
+    return this.sql.exec(`SELECT a.id, a.name, a.role, a.paused, a.last_seen,
+        (SELECT t.id FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_id,
+        (SELECT t.status FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_status,
+        (SELECT t.title FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_title
+      FROM agents a ${where}`, ...args).toArray().map((r) => {
+      const quiet = now - (r.last_seen as number) > PRESENT_MS;
+      const st = r.task_status as string | null;
+      const state = r.paused ? "paused"
+        : r.role === "human" || r.id === DELEGATE_ID ? "human"
+        : st === "blocked" ? "waiting"
+        : st === "conflict" ? "conflict"
+        : st && quiet ? "quiet"
+        : st ? "working"
+        : quiet ? "away" : "idle";
+      return { id: r.id as string, name: r.name as string, role: r.role as string, state, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null };
+    });
+  }
+
+  // Agent-to-agent chatter is worth watching in a small swarm and noise in a big one.
+  private notable(agentCount: number) {
+    const types = agentCount > CHATTER_LIMIT ? NOTABLE.filter((t) => !CHATTER.has(t)) : NOTABLE;
+    return this.rowsToEvents(this.sql.exec(`SELECT * FROM events WHERE type IN (${types.map(() => "?").join(",")}) ORDER BY seq DESC LIMIT 60`, ...types).toArray());
+  }
+
+  private overview() {
+    const now = Date.now();
+    const agents = this.agentStates();
+    const byState: Record<string, number> = {};
+    for (const a of agents) if (a.state !== "human") byState[a.state] = (byState[a.state] ?? 0) + 1;
+    const taskCounts = Object.fromEntries(this.sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").toArray().map((r) => [r.status, r.n]));
+    const changeCounts = Object.fromEntries(this.sql.exec("SELECT status, COUNT(*) AS n FROM changes GROUP BY status").toArray().map((r) => [r.status, r.n]));
+
+    // Flow over the last 30 minutes, per minute.
+    const since = now - 30 * 60_000;
+    const minute = (ts: number) => Math.floor((ts - since) / 60_000);
+    const series = { merged: Array(30).fill(0), conflict: Array(30).fill(0), question: Array(30).fill(0), submitted: Array(30).fill(0) };
+    const keyOf: Record<string, keyof typeof series> = { "change.merged": "merged", "change.conflict": "conflict", "question.asked": "question", "change.submitted": "submitted" };
+    for (const r of this.sql.exec("SELECT type, ts FROM events WHERE ts > ? AND type IN ('change.merged','change.conflict','question.asked','change.submitted')", since).toArray()) {
+      const i = minute(r.ts as number);
+      if (i >= 0 && i < 30) series[keyOf[r.type as string]][i]++;
+    }
+    const lastHour = (type: string) => this.sql.exec("SELECT COUNT(*) AS n FROM events WHERE type = ? AND ts > ?", type, now - 3600_000).one().n as number;
+    const mergedHour = lastHour("change.merged"), conflictsHour = lastHour("change.conflict");
+    const queued = this.sql.exec("SELECT c.id, c.title, c.agent_id, c.status, c.updated_at, c.task_id FROM changes c WHERE c.status IN ('queued','merging') ORDER BY c.status DESC, c.updated_at, c.id").toArray();
+    const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
+
+    return {
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals },
+      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.env.TYPESAFE_API_KEY },
+      health: {
+        agents: { total: agents.filter((a) => a.state !== "human").length, byState },
+        tasks: taskCounts, changes: changeCounts,
+        queue: { depth: queued.length, oldestWaitMs: queued.length ? now - Math.min(...queued.slice(0, 50).map((q) => waitedFor(q.id as number))) : 0 },
+        mergedLastHour: mergedHour, conflictsLastHour: conflictsHour,
+        conflictRate: mergedHour + conflictsHour ? conflictsHour / (mergedHour + conflictsHour) : 0,
+        series,
+      },
+      attention: this.attention(agents),
+      areas: this.areas(),
+      queue: queued.slice(0, 12).map((q) => ({ id: q.id, title: q.title, agent: q.agent_id, agentName: this.agentName(q.agent_id as string), status: q.status, waitingMs: now - waitedFor(q.id as number) })),
+      recentlyMerged: this.sql.exec("SELECT id, title, agent_id, merged_version, updated_at FROM changes WHERE status = 'merged' ORDER BY updated_at DESC LIMIT 8").toArray()
+        .map((c) => ({ id: c.id, title: c.title, agent: c.agent_id, agentName: this.agentName(c.agent_id as string), version: c.merged_version, at: c.updated_at })),
+      decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 30"),
+      discussions: this.sql.exec("SELECT id FROM threads WHERE kind IN ('discussion','contract') AND status = 'open' ORDER BY updated_at DESC LIMIT 6").toArray().map((r) => this.thread(r.id as number)),
+      notable: this.notable(agents.length),
+      names: Object.fromEntries(this.sql.exec("SELECT id, name FROM agents WHERE id IN (SELECT DISTINCT actor FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events) UNION SELECT DISTINCT to_agent FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events)) OR role = 'human'").toArray().map((r) => [r.id, r.name])),
+      lastSeq: (this.sql.exec("SELECT MAX(seq) AS s FROM events").one().s as number) ?? 0,
+    };
+  }
+
+  /** What needs a person, then what is stuck. Similar questions are grouped. */
+  private attention(agents: ReturnType<ProjectCoordinator["agentStates"]>) {
+    const now = Date.now();
+    const items: any[] = [];
+    const open = this.sql.exec("SELECT id FROM threads WHERE status = 'open' AND kind IN ('question','dispute','proposal') ORDER BY created_at").toArray().map((r) => this.thread(r.id as number));
+    const groups = new Map<string, any>();
+    for (const t of open.filter((t) => t.kind === "question" && t.to_agent === "humans")) {
+      const q = (t.posts[0]?.body ?? t.title) as string;
+      const key = q.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
+      const g = groups.get(key) ?? { kind: "question", question: q, options: t.options, threads: [], askers: [], blocking: 0, escalated: t.escalated, since: t.created_at };
+      g.threads.push(t.id);
+      g.askers.push(t.created_by);
+      if (t.blocking) g.blocking++;
+      g.escalated = g.escalated ?? t.escalated;
+      groups.set(key, g);
+    }
+    items.push(...groups.values());
+    for (const t of open.filter((t) => t.kind === "dispute")) {
+      const terms = JSON.parse(t.terms);
+      items.push({ kind: "dispute", thread: t.id, question: terms.question, parties: terms.parties, positions: terms.positions, change: terms.changeId, escalated: t.escalated, since: t.created_at });
+    }
+    const asked = new Set(this.sql.exec("SELECT DISTINCT change_id FROM events WHERE type = 'approval.needs_human'").toArray().map((r) => r.change_id));
+    for (const c of this.sql.exec("SELECT id, title, agent_id, files, updated_at FROM changes WHERE status = 'review'").toArray()) {
+      if (!asked.has(c.id)) continue;
+      const files = (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path);
+      if (!this.guardedFiles(files.map((path) => ({ path } as FileChange))).length) continue;
+      const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
+      items.push({ kind: "approval", change: c.id, title: c.title, agent: c.agent_id, files, escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
+    }
+    // Stuck: nobody asked for a person, but work isn't moving.
+    for (const t of open.filter((t) => t.kind === "proposal" && now - t.created_at > 10 * 60_000)) {
+      items.push({ kind: "stuck", reason: "proposal unanswered", detail: t.title, agent: t.to_agent, thread: t.id, since: t.created_at });
+    }
+    for (const c of this.sql.exec("SELECT id, title, agent_id, updated_at FROM changes WHERE status = 'conflict' AND updated_at < ?", now - 5 * 60_000).toArray()) {
+      items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
+    }
+    // A change waiting on review that nobody has reviewed: say who was asked, if anyone.
+    for (const c of this.sql.exec(`SELECT c.id, c.title, c.agent_id, c.updated_at, (SELECT GROUP_CONCAT(reviewer) FROM review_requests r WHERE r.change_id = c.id AND r.status = 'open') AS asked
+                                   FROM changes c WHERE c.status = 'review' AND c.updated_at < ? AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = c.id AND v.head = c.head) LIMIT 50`, now - 10 * 60_000).toArray()) {
+      const asked = c.asked ? (c.asked as string).split(",").map((r) => this.agentName(r)).join(", ") : null;
+      items.push({ kind: "stuck", reason: asked ? `review requested from ${asked}, no answer` : "waiting for review, nobody asked", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
+    }
+    for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
+      items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
+    }
+    for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
+      items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
+    }
+    const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, stuck: 3 };
+    return items.sort((a, b) => rank[a.kind] - rank[b.kind] || a.since - b.since);
+  }
+
+  /** Where in the codebase work is happening: folders with live intents, changes in flight, recent merges and conflicts. */
+  private areas() {
+    const now = Date.now();
+    const folder = (p: string) => {
+      const parts = p.replace(/\*.*$/, "").split("/").filter(Boolean);
+      return parts.length <= 1 ? "(root)" : parts.slice(0, Math.min(2, parts.length - 1)).join("/") + "/";
+    };
+    const areas = new Map<string, { path: string; agents: Set<string>; intents: number; inFlight: number; merged: number; conflicts: number }>();
+    const get = (p: string, isFolder = false) => {
+      const k = isFolder ? p : folder(p);
+      if (!areas.has(k)) areas.set(k, { path: k, agents: new Set(), intents: 0, inFlight: 0, merged: 0, conflicts: 0 });
+      return areas.get(k)!;
+    };
+    for (const i of this.activeIntents()) for (const p of new Set((i.paths as string[]).map(folder))) { const a = get(p, true); a.intents++; a.agents.add(i.agent_id); }
+    for (const c of this.sql.exec("SELECT files, agent_id FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested')").toArray()) {
+      for (const f of new Set((JSON.parse(c.files as string) as FileChange[]).map((f) => f.path))) { const a = get(f); a.inFlight++; a.agents.add(c.agent_id as string); }
+    }
+    for (const r of this.sql.exec("SELECT type, data FROM events WHERE ts > ? AND type IN ('change.merged','change.conflict')", now - 3600_000).toArray()) {
+      const d = JSON.parse(r.data as string);
+      const paths = r.type === "change.merged" ? (d.files ?? []).map((f: any) => f.path) : (d.conflicts ?? []).map((c: any) => c.path);
+      for (const p of new Set(paths as string[])) { const a = get(p); if (r.type === "change.merged") a.merged++; else a.conflicts++; }
+    }
+    return [...areas.values()]
+      .map((a) => ({ path: a.path, agents: a.agents.size, intents: a.intents, inFlight: a.inFlight, mergedLastHour: a.merged, conflictsLastHour: a.conflicts }))
+      .sort((a, b) => b.agents + b.inFlight + b.conflictsLastHour * 2 - (a.agents + a.inFlight + a.conflictsLastHour * 2) || a.path.localeCompare(b.path))
+      .slice(0, 24);
+  }
+
+  /** Find agents, tasks, changes and files by name, title, path or number. */
+  private search(q: URLSearchParams) {
+    const text = (q.get("q") ?? "").trim();
+    const state = q.get("state");
+    const limit = Math.min(Number(q.get("limit") ?? 20), 200);
+    const like = `%${text.toLowerCase()}%`;
+    const num = Number(text.replace(/^#/, ""));
+    let agents = this.agentStates(
+      text ? "WHERE lower(a.name) LIKE ? OR lower(a.id) LIKE ? OR a.id IN (SELECT assignee FROM tasks WHERE lower(title) LIKE ? OR id = ?) OR a.id IN (SELECT agent_id FROM intents WHERE released_at IS NULL AND lower(paths) LIKE ?) OR a.id IN (SELECT agent_id FROM changes WHERE id = ?)" : "",
+      ...(text ? [like, like, like, num || -1, like, num || -1] : []),
+    ).filter((a) => a.state !== "human" || !state);
+    if (state) agents = agents.filter((a) => a.state === state);
+    const total = agents.length;
+    const tasks = text ? this.sql.exec("SELECT id, title, status, assignee FROM tasks WHERE lower(title) LIKE ? OR id = ? ORDER BY updated_at DESC LIMIT 8", like, num || -1).toArray().map((t) => ({ ...t, assigneeName: this.agentName(t.assignee as string) })) : [];
+    const changes = text ? this.sql.exec("SELECT id, title, status, agent_id FROM changes WHERE lower(title) LIKE ? OR id = ? OR lower(files) LIKE ? ORDER BY updated_at DESC LIMIT 8", like, num || -1, like).toArray().map((c) => ({ ...c, agentName: this.agentName(c.agent_id as string) })) : [];
+    return { agents: agents.slice(0, limit), total, tasks, changes };
+  }
+
+  /** One agent, when someone needs to track it down. */
+  // ── reviewers: who already knows this code ─────────────────────────────
+
+  /** Note that an agent wrote or reviewed these files and symbols. */
+  private learn(agent: string, kind: "wrote" | "reviewed", files: FileChange[], symbols: Record<string, string[]>) {
+    const now = Date.now();
+    for (const f of files) {
+      for (const sym of ["", ...(symbols[f.path] ?? [])]) {
+        this.sql.exec(`INSERT INTO familiarity (agent_id, path, symbol, kind, n, last_at) VALUES (?, ?, ?, ?, 1, ?)
+                       ON CONFLICT (agent_id, path, symbol, kind) DO UPDATE SET n = n + 1, last_at = excluded.last_at`, agent, f.path, sym, kind, now);
+      }
+    }
+  }
+
+  /**
+   * Rank agents to review a change by what of it they already know: the same
+   * functions and classes first, then the same files, then the same folder.
+   * Recent knowledge counts more, present agents more, busy reviewers less.
+   * Reviewer-class agents fill any gap, least busy first.
+   */
+  private reviewerCandidates(id: number, limit = 5): Candidate[] {
+    const ch = this.change(id);
+    const files = (ch.files as FileChange[]).map((f) => f.path);
+    const symbols: Record<string, string[]> = ch.symbols ?? {};
+    const folders = [...new Set(files.map(folderOf).filter(Boolean))];
+    const reviewed = new Set(this.sql.exec("SELECT reviewer FROM reviews WHERE change_id = ? AND head = ?", id, ch.head).toArray().map((r) => r.reviewer as string));
+    const now = Date.now();
+    const scores = new Map<string, { score: number; reasons: { w: number; text: string }[] }>();
+    const add = (agent: string, w: number, text: string) => {
+      if (agent === ch.agent_id || reviewed.has(agent)) return;
+      const s = scores.get(agent) ?? { score: 0, reasons: [] };
+      s.score += w;
+      s.reasons.push({ w, text });
+      scores.set(agent, s);
+    };
+    const recency = (t: number) => 1 / (1 + (now - t) / (7 * 86400_000));
+    const where = [...files.map(() => "path = ?"), ...folders.map(() => "path LIKE ?")].join(" OR ");
+    const rows = where ? this.sql.exec(`SELECT * FROM familiarity WHERE ${where} LIMIT 5000`, ...files, ...folders.map((f) => `${f}/%`)).toArray() : [];
+    for (const r of rows) {
+      const path = r.path as string, sym = r.symbol as string, wrote = r.kind === "wrote";
+      const n = Math.min(3, r.n as number) * recency(r.last_at as number);
+      if (files.includes(path)) {
+        if (sym && symbols[path]?.includes(sym)) add(r.agent_id as string, (wrote ? 5 : 3) * n, `${wrote ? "wrote" : "reviewed"} ${sym} in ${path}`);
+        else if (!sym) add(r.agent_id as string, (wrote ? 3 : 2) * n, `${wrote ? "wrote" : "reviewed"} ${path}`);
+      } else if (!sym) {
+        const folder = folders.filter((f) => path.startsWith(`${f}/`)).sort((x, y) => y.length - x.length)[0] ?? folderOf(path);
+        add(r.agent_id as string, (wrote ? 0.6 : 0.4) * n, `${wrote ? "worked" : "reviewed"} in ${folder}/`);
+      }
+    }
+    const load = new Map(this.sql.exec("SELECT reviewer, COUNT(*) AS n FROM review_requests WHERE status = 'open' GROUP BY reviewer").toArray().map((r) => [r.reviewer as string, r.n as number]));
+    const people = new Map(this.sql.exec("SELECT id, name, role, paused, last_seen FROM agents").toArray().map((a) => [a.id as string, a]));
+    const present = (a: any) => a && now - ((a.last_seen as number) ?? 0) < PRESENT_MS;
+    const out: Candidate[] = [];
+    for (const [agent, s] of scores) {
+      const a = people.get(agent);
+      if (!a || a.paused || a.role === "human" || agent === DELEGATE_ID) continue;
+      const open = load.get(agent) ?? 0;
+      // Fold a folder's many small reasons into one line.
+      const reasons = [...new Map(s.reasons.sort((x, y) => y.w - x.w).map((r) => [r.text, r])).values()].slice(0, 3).map((r) => r.text);
+      out.push({ agent, name: a.name as string, role: a.role as string, score: Math.round((s.score * (present(a) ? 1.3 : 1)) / (1 + 0.5 * open) * 100) / 100, reasons, openReviews: open, present: present(a) });
+    }
+    out.sort((x, y) => y.score - x.score);
+    if (out.length < limit) {
+      for (const a of people.values()) {
+        if (a.role !== "reviewer" || a.paused || a.id === ch.agent_id || reviewed.has(a.id as string) || out.some((c) => c.agent === a.id)) continue;
+        const open = load.get(a.id as string) ?? 0;
+        out.push({ agent: a.id as string, name: a.name as string, role: "reviewer", score: 0, reasons: [`on the reviewer rota, ${open} open review${open === 1 ? "" : "s"}`], openReviews: open, present: present(a) });
+      }
+      out.sort((x, y) => y.score - x.score || x.openReviews - y.openReviews || Number(y.present) - Number(x.present));
+    }
+    return out.slice(0, limit);
+  }
+
+  private reviewRequests(id: number): any[] {
+    return this.sql.exec("SELECT * FROM review_requests WHERE change_id = ? ORDER BY created_at", id).toArray()
+      .map((r) => ({ ...r, reviewerName: this.agentName(r.reviewer as string), requestedByName: this.agentName(r.requested_by as string) }));
+  }
+
+  /** Ask specific agents to review a change: named ones, or the best-placed few. */
+  private requestReviewers(actor: Agent, id: number, body: { reviewers?: string[]; count?: number; note?: string }) {
+    const ch = this.change(id);
+    if (ch.agent_id !== actor.id && actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "only the author or a human can request reviewers");
+    if (!["review", "changes_requested"].includes(ch.status)) throw new HttpError(409, `change ${id} is ${ch.status}, not in review`);
+    let picked: { agent: string; reason: string }[];
+    if (body.reviewers?.length) {
+      const known = this.reviewerCandidates(id, 50);
+      picked = body.reviewers.map((r) => {
+        const a = this.sql.exec("SELECT id FROM agents WHERE id = ? OR name = ?", r, r).toArray()[0];
+        if (!a) throw new HttpError(404, `no agent ${r}`);
+        if (a.id === ch.agent_id) throw new HttpError(400, "agents cannot review their own change");
+        return { agent: a.id as string, reason: known.find((c) => c.agent === a.id)?.reasons[0] ?? `asked by ${actor.name}` };
+      });
+    } else {
+      const want = Math.max(1, Math.min(5, body.count ?? Math.max(1, this.requiredApprovals)));
+      const open = new Set(this.reviewRequests(id).filter((r) => r.status === "open").map((r) => r.reviewer as string));
+      picked = this.reviewerCandidates(id, want + open.size).filter((c) => !open.has(c.agent)).slice(0, want).map((c) => ({ agent: c.agent, reason: c.reasons[0] }));
+    }
+    for (const p of picked) this.assignReviewer(id, p.agent, actor.id, p.reason, body.note);
+    return { requested: this.reviewRequests(id) };
+  }
+
+  private assignReviewer(id: number, reviewer: string, by: string, reason: string, note?: string) {
+    const ch = this.change(id);
+    const fresh = this.sql.exec(`INSERT INTO review_requests (change_id, reviewer, requested_by, reason, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)
+                   ON CONFLICT (change_id, reviewer) DO UPDATE SET status = 'open', reason = excluded.reason, created_at = excluded.created_at WHERE status != 'open'
+                   RETURNING change_id`, id, reviewer, by, reason, Date.now()).toArray().length;
+    if (fresh) this.emit("review.assigned", { actor: by, change: id, task: ch.task_id, to: reviewer, data: { title: ch.title, reason, note: note ?? "", files: (ch.files as FileChange[]).map((f) => f.path) } });
+  }
+
+  // ── contribution activity, for the grids ───────────────────────────────
+
+  /** Commits, changes and reviews per time bucket: a year of days, or finer for a young project. */
+  private activity(agent: string | null, range: string | null) {
+    const now = Date.now();
+    const types = { "workspace.committed": "commits", "change.submitted": "changes", "review.submitted": "reviews" } as const;
+    const id = agent ? this.sql.exec("SELECT id FROM agents WHERE id = ? OR name = ?", agent, agent).toArray()[0]?.id as string : null;
+    if (agent && !id) throw new HttpError(404, `no agent ${agent}`);
+    const first = (this.sql.exec(`SELECT MIN(ts) AS t FROM events WHERE type IN ('workspace.committed','change.submitted','review.submitted')${id ? " AND actor = ?" : ""}`, ...(id ? [id] : [])).one().t as number) ?? now;
+    const year = range === "year" || (range !== "recent" && now - first > 7 * 86400_000);
+    let start: number, bucketMs: number, n: number;
+    if (year) {
+      // GitHub's layout: 53 week columns ending this week, Sunday at the top.
+      bucketMs = 86400_000;
+      const today = new Date(now); today.setHours(0, 0, 0, 0);
+      start = today.getTime() - (52 * 7 + today.getDay()) * bucketMs;
+      n = 53 * 7;
+    } else {
+      // Pick the smallest tidy square size that fits the project's life in 26 columns.
+      n = 26 * 7;
+      const span = Math.max(now - first, 5 * 60_000);
+      const NICE = [2, 5, 10, 15, 30, 60, 120, 300, 600, 900, 1800, 3600, 7200, 10800, 21600, 43200, 86400].map((s) => s * 1000);
+      bucketMs = NICE.find((b) => b * n >= span * 1.1) ?? 86400_000;
+      start = Math.floor((now - bucketMs * (n - 1)) / bucketMs) * bucketMs;
+    }
+    const cells = Array.from({ length: n }, () => ({ commits: 0, changes: 0, reviews: 0 }));
+    const rows = this.sql.exec(`SELECT CAST((ts - ?) / ? AS INTEGER) AS b, type, COUNT(*) AS n FROM events
+                                WHERE ts >= ? AND type IN ('workspace.committed','change.submitted','review.submitted')${id ? " AND actor = ?" : ""} GROUP BY b, type`,
+      start, bucketMs, start, ...(id ? [id] : [])).toArray();
+    for (const r of rows) {
+      const c = cells[r.b as number];
+      if (c) c[types[r.type as keyof typeof types]] += r.n as number;
+    }
+    return { range: year ? "year" : "recent", start, bucketMs, now, agent: id, cells };
+  }
+
+  /** What an agent has reviewed, and how fast it answers review requests. */
+  private reviewStats(id: string) {
+    const v = this.sql.exec("SELECT verdict, COUNT(*) AS n FROM reviews WHERE reviewer = ? GROUP BY verdict", id).toArray();
+    const waits = this.sql.exec("SELECT done_at - created_at AS w FROM review_requests WHERE reviewer = ? AND status = 'done' AND done_at IS NOT NULL ORDER BY w", id).toArray().map((r) => r.w as number);
+    const by = Object.fromEntries(v.map((r) => [r.verdict, r.n]));
+    return { approved: by.approve ?? 0, changesRequested: by.request_changes ?? 0, comments: by.comment ?? 0, answered: waits.length, medianResponseMs: waits.length ? waits[Math.floor(waits.length / 2)] : null };
+  }
+
+  /** The code an agent knows best: files it wrote or reviewed, with the symbols it touched. */
+  private knows(id: string) {
+    const rows = this.sql.exec("SELECT path, symbol, kind, n, last_at FROM familiarity WHERE agent_id = ? ORDER BY last_at DESC LIMIT 400", id).toArray();
+    const byPath = new Map<string, { path: string; wrote: number; reviewed: number; symbols: string[]; last: number }>();
+    for (const r of rows) {
+      const k = byPath.get(r.path as string) ?? { path: r.path as string, wrote: 0, reviewed: 0, symbols: [], last: 0 };
+      if (!r.symbol) k[r.kind === "wrote" ? "wrote" : "reviewed"] += r.n as number;
+      else if (!k.symbols.includes(r.symbol as string)) k.symbols.push(r.symbol as string);
+      k.last = Math.max(k.last, r.last_at as number);
+      byPath.set(k.path, k);
+    }
+    return [...byPath.values()].sort((x, y) => y.wrote * 2 + y.reviewed - (x.wrote * 2 + x.reviewed) || y.last - x.last).slice(0, 12);
+  }
+
+  private profile(id: string) {
+    const a = this.agentStates("WHERE a.id = ? OR a.name = ?", id, id)[0];
+    if (!a) throw new HttpError(404, `no agent ${id}`);
+    return {
+      agent: a,
+      tasks: this.sql.exec("SELECT id, title, status, updated_at FROM tasks WHERE assignee = ? OR id IN (SELECT task_id FROM changes WHERE agent_id = ?) ORDER BY updated_at DESC LIMIT 20", a.id, a.id).toArray(),
+      intents: this.activeIntents().filter((i) => i.agent_id === a.id),
+      changes: this.sql.exec("SELECT id, title, status, files, updated_at FROM changes WHERE agent_id = ? ORDER BY id DESC LIMIT 20", a.id).toArray().map((c) => ({ ...c, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path) })),
+      threads: this.sql.exec("SELECT id FROM threads WHERE created_by = ? OR to_agent = ? ORDER BY updated_at DESC LIMIT 10", a.id, a.id).toArray().map((r) => this.thread(r.id as number)),
+      events: this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE actor = ? OR to_agent = ? ORDER BY seq DESC LIMIT 60", a.id, a.id).toArray()),
+      reviewQueue: this.sql.exec("SELECT r.change_id, r.reason, r.created_at, r.requested_by, c.title, c.status FROM review_requests r JOIN changes c ON c.id = r.change_id WHERE r.reviewer = ? AND r.status = 'open' ORDER BY r.created_at LIMIT 20", a.id).toArray()
+        .map((r) => ({ ...r, requestedByName: this.agentName(r.requested_by as string) })),
+      reviewStats: this.reviewStats(a.id),
+      knows: this.knows(a.id),
+    };
+  }
+
+  /** Answer several agents' copies of the same question at once: one decision, every asker unblocked. */
+  private answerGroup(actor: Agent, threads: number[], text: string) {
+    if (!text) throw new HttpError(400, "body is required");
+    const open = threads.map((id) => this.thread(id)).filter((t) => t.kind === "question" && t.status === "open");
+    open.forEach((t, i) => {
+      this.citing = i > 0;
+      try { this.post(actor, t.id, text); } finally { this.citing = false; }
+    });
+    return { answered: open.map((t) => t.id) };
   }
 
   // ── memory: what the humans decided, and what earlier agents tried ──────
@@ -1368,18 +1821,54 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE to_agent = ? ORDER BY seq DESC LIMIT 20", agentId).toArray());
   }
 
-  private async events(after: number, wait: number, agent: string | null) {
-    const read = () =>
-      this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE seq > ? AND (? IS NULL OR to_agent IS NULL OR to_agent = ?) ORDER BY seq LIMIT 200", after, agent, agent).toArray());
-    let rows = read();
-    if (!rows.length && wait > 0) {
-      await new Promise<void>((res) => {
-        const t = setTimeout(res, Math.min(wait, 25) * 1000);
-        this.waiters.add(() => { clearTimeout(t); res(); });
+  /**
+   * Events after a cursor, optionally waiting for one. With an agent, events
+   * addressed to someone else are left out; with mine, so are project-wide
+   * events that aren't about the agent's own tasks and changes (directives and
+   * other steering always come through, and reviewers also get review
+   * requests). With hundreds of agents, mine keeps each agent's stream, and
+   * the wakeups behind it, proportional to its own work.
+   */
+  private async events(after: number, wait: number, agent: string | null, mine = false) {
+    const wants = this.eventFilter(agent, mine);
+    const read = () => {
+      const out: LoomEvent[] = [];
+      let cursor = after;
+      for (;;) {
+        const rows = this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE seq > ? AND (? IS NULL OR to_agent IS NULL OR to_agent = ?) ORDER BY seq LIMIT 500", cursor, agent, agent).toArray());
+        if (!rows.length) break;
+        cursor = rows[rows.length - 1].seq;
+        out.push(...rows.filter(wants));
+        if (out.length >= 200 || rows.length < 500) break;
+      }
+      return { events: out.slice(0, 200), cursor: out.length > 200 ? out[199].seq : cursor };
+    };
+    let res = read();
+    if (!res.events.length && wait > 0) {
+      await new Promise<void>((done) => {
+        const w = { wants, wake: () => { clearTimeout(t); done(); } };
+        const t = setTimeout(() => { this.waiters.delete(w); done(); }, Math.min(wait, 25) * 1000);
+        this.waiters.add(w);
       });
-      rows = read();
+      res = read();
     }
-    return { events: rows, cursor: rows.length ? rows[rows.length - 1].seq : after };
+    return res;
+  }
+
+  private eventFilter(agent: string | null, mine: boolean): (e: LoomEvent) => boolean {
+    if (!agent) return () => true;
+    if (!mine) return (e) => !e.to_agent || e.to_agent === agent;
+    const role = this.sql.exec("SELECT role FROM agents WHERE id = ?", agent).toArray()[0]?.role;
+    const tasks = new Set(this.sql.exec("SELECT id FROM tasks WHERE assignee = ?", agent).toArray().map((r) => r.id as number));
+    const changes = new Set(this.sql.exec("SELECT id FROM changes WHERE agent_id = ?", agent).toArray().map((r) => r.id as number));
+    // Changes this agent was asked to review: it hears when they're updated or merged.
+    for (const r of this.sql.exec("SELECT change_id FROM review_requests WHERE reviewer = ? AND status = 'open'", agent).toArray()) changes.add(r.change_id as number);
+    return (e) => {
+      if (e.to_agent) return e.to_agent === agent;
+      if (STEERING.has(e.type)) return true;
+      if (role === "reviewer" && (e.type === "review.requested" || e.type === "change.updated")) return true;
+      return (e.task_id !== null && tasks.has(e.task_id)) || (e.change_id !== null && changes.has(e.change_id));
+    };
   }
 
   private async handoff(taskId: number) {
@@ -1419,5 +1908,6 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   async webSocketMessage(ws: WebSocket, msg: string | ArrayBuffer) {
     if (msg === "state") ws.send(JSON.stringify({ kind: "state", state: this.state() }));
+    if (msg === "overview") ws.send(JSON.stringify({ kind: "overview", overview: this.overview() }));
   }
 }

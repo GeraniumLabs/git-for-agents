@@ -91,9 +91,21 @@ const TOOLS: Tool[] = [
   },
   {
     name: "submit_change",
-    description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions); it is stored with the change so reviewers and any agent who takes over can read it.",
+    description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions); it is stored with the change so reviewers and any agent who takes over can read it. The result lists suggestedReviewers: agents who already wrote or reviewed the functions, files or folders you changed. Ask the best of them with request_review.",
     inputSchema: obj({ taskId: num("Your task"), title: str("Change title"), summary: str("What changed and why"), context: { type: "object", description: "Free-form working context: plan, decisions, tests run, files read, follow-ups" } }, ["taskId", "summary"]),
     run: (a, call) => call("POST", "/changes", a),
+  },
+  {
+    name: "suggest_reviewers",
+    description: "Who should review a change: agents ranked by how much of it they already know (they wrote or reviewed the same functions and classes, then the same files, then the same folder), favoring recent work, agents who are present, and reviewers who aren't busy. Each comes with the reasons. Reviewer agents fill any gap.",
+    inputSchema: obj({ changeId: num("Change id"), limit: num("How many (default 5)") }, ["changeId"]),
+    run: (a, call) => call("GET", `/changes/${a.changeId}/reviewers?limit=${a.limit ?? 5}`),
+  },
+  {
+    name: "request_review",
+    description: "Ask specific agents to review your change. Name them (ids or names, e.g. from suggest_reviewers), or omit reviewers to ask the best-placed few automatically. Each gets a review.assigned event with why they were picked and your note.",
+    inputSchema: obj({ changeId: num("Change id"), reviewers: { type: "array", items: { type: "string" }, description: "Agent ids or names" }, count: num("If reviewers is omitted: how many to pick (default: the approvals required)"), note: str("What you'd like them to look at") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/reviewers`, { reviewers: a.reviewers, count: a.count, note: a.note }),
   },
   {
     name: "get_change",
@@ -177,9 +189,12 @@ const TOOLS: Tool[] = [
   },
   {
     name: "wait_for_events",
-    description: "Wait up to 25 seconds for new project events after a cursor (0 for all). Returns events and a new cursor.",
-    inputSchema: obj({ after: num("Cursor from the last call"), wait: num("Seconds to wait, max 25") }),
-    run: (a, call) => call("GET", `/events?after=${a.after ?? 0}&wait=${a.wait ?? 20}`),
+    description: "Wait up to 25 seconds for new events after a cursor (0 for all). By default you get only what concerns you: events addressed to you, about your tasks and changes, and steering from humans. Pass all=true for every project event. Returns events and a new cursor.",
+    inputSchema: obj({ after: num("Cursor from the last call"), wait: num("Seconds to wait, max 25"), all: { type: "boolean" } }),
+    run: async (a, call) => {
+      const me = (await call("GET", "/me")).agent;
+      return call("GET", `/events?after=${a.after ?? 0}&wait=${a.wait ?? 20}&agent=${encodeURIComponent(me.id)}${a.all ? "" : "&mine=1"}`);
+    },
   },
   {
     name: "task_context",
@@ -233,7 +248,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviewers: get_change then review_change.",
+          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested.",
       });
     case "ping":
       return reply({});

@@ -10,6 +10,10 @@
 <body>
 <header>
   <div class="brand"><span class="logo">⧉</span> Loom <span class="tag">a git platform for agent swarms</span></div>
+  <div class="finder">
+    <input id="search" type="search" placeholder="Find an agent, task, change or file…" autocomplete="off">
+    <div id="search-results" class="results" hidden></div>
+  </div>
   <div class="proj">
     <select id="project"></select>
     <span id="me"></span>
@@ -19,7 +23,7 @@
 
 <section id="controls" class="controls" hidden>
   <b>Steer</b>
-  <select id="dir-to"></select>
+  <select id="dir-to"><option value="">All agents</option></select>
   <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”">
   <button id="dir-send">Send</button>
   <span class="sep"></span>
@@ -31,36 +35,47 @@
   <button id="jev-open" class="ghost">Delegate…</button>
 </section>
 
-<section class="stats" id="stats"></section>
+<section class="health" id="health"></section>
 
 <main>
   <section class="col">
-    <h2>Agents</h2>
-    <ul id="agents" class="list"></ul>
-    <h2>Territory <small>who has declared which paths</small></h2>
-    <div id="territory" class="tree"></div>
-    <h2>Decisions <small id="decisions-count"></small></h2>
-    <div id="decision-add" class="card" hidden>
-      <input id="decision-text" placeholder="Record a decision, e.g. “Dates are ISO strings”" class="grow" style="width:100%">
-      <div class="row"><input id="decision-paths" placeholder="for paths (blank = whole project)"><button id="decision-save" class="ghost">Record</button></div>
-    </div>
-    <ul id="decisions" class="list decisions"></ul>
-  </section>
-
-  <section class="col wide">
-    <h2>Needs a human <small id="inbox-count"></small></h2>
-    <div id="inbox"></div>
-    <h2>Board</h2>
-    <div id="board" class="board"></div>
-    <h2>Changes &amp; merge queue</h2>
-    <div id="changes"></div>
+    <h2>Needs a person <small id="attention-count"></small></h2>
+    <div id="attention"></div>
+    <h2>Stuck <small>work that isn't moving and nobody asked about</small></h2>
+    <div id="stuck"></div>
+    <h2>Discussions &amp; contracts</h2>
+    <div id="discussions"></div>
   </section>
 
   <section class="col">
-    <h2>Live activity</h2>
+    <h2>Contributions</h2>
+    <div id="contrib" class="card contrib-card"></div>
+    <h2>Flow <small>last 30 minutes</small></h2>
+    <div id="flow" class="card"></div>
+    <h2>Merge queue <small id="queue-count"></small></h2>
+    <div id="queue"></div>
+    <h2>Where the work is</h2>
+    <div id="areas" class="card"></div>
+  </section>
+
+  <section class="col">
+    <h2>Decisions <small id="decisions-count"></small></h2>
+    <div id="decision-add" class="card" hidden>
+      <input id="decision-text" placeholder="Record a decision, e.g. “Dates are ISO strings”" style="width:100%">
+      <div class="row"><input id="decision-paths" placeholder="for paths (blank = whole project)"><button id="decision-save" class="ghost">Record</button></div>
+    </div>
+    <ul id="decisions" class="list decisions"></ul>
+    <h2>Activity
+      <span class="seg" role="tablist">
+        <button id="feed-notable" class="on" role="tab">Notable</button><button id="feed-all" role="tab">Everything</button>
+      </span>
+    </h2>
+    <input id="feed-filter" placeholder="Filter by agent, file, #change…" class="feed-filter">
     <ol id="feed" class="feed"></ol>
   </section>
 </main>
+
+<dialog id="detail"><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
 
 <dialog id="jev">
   <form id="jev-form" method="dialog" class="jev-form">
@@ -91,8 +106,6 @@
     <div class="row"><button value="save">Save</button><button value="cancel" class="ghost" formnovalidate>Cancel</button></div>
   </form>
 </dialog>
-
-<dialog id="detail"><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
 
 <script src="/app.js" type="module"></script>
 </body>

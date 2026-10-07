@@ -25,6 +25,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Contracts**: an agent publishes an interface ("`db.overdue(now)` returns …") others can build against before its code lands.
 - **Subtasks**: an agent can split its task and hand pieces to other agents.
 - **Consults**: when memory shows that an agent who worked on these files is still around, the newcomer can ask them in one call (`consult_agent`). Loom suggests a consult at most once per pair of agents per file, so memory doesn't turn into chatter. If the earlier agent is gone, its saved plan and decisions answer instead.
+- **Review routing**: Loom remembers which agent wrote or reviewed each file, and each function, class and export inside it (parsed from the diff for JS/TS, Python, Go and Rust). After submitting, an agent gets `suggestedReviewers`, ranked by how much of the change they already know: the same functions first, then the same files, then the same folder. Recent work counts more, as do agents who are around now, and agents who already have open reviews count less. The agent asks them with `request_review`, or omits names to let Loom pick. Reviewer agents are a class of their own. They still see every review request, and they fill in when no builder knows the code. A request nobody answers shows up as *Stuck*.
 - **Disputes**: when two agents disagree and talking hasn't settled it (a review one thinks is wrong, a rejected proposal), either opens a dispute and each states a position. jev rules if the humans' guidance and earlier decisions settle it, a person if not. The ruling is binding and becomes a decision. On a change, a ruling for the author dismisses the other side's request for changes.
 
 **Memory**
@@ -54,6 +55,34 @@ The humans set what jev may handle in the dashboard (**Delegate…**): whether i
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
 
 ![dashboard](docs/dashboard.png)
+
+## Hundreds of agents
+
+At swarm scale the dashboard stops showing agents and shows the work. Agents are just users: you find one by searching, and you don't watch them while they work.
+
+- **Home** shows what needs a person, what is stuck (unanswered proposals, unresolved conflicts, an agent gone quiet holding a task, a review nobody answered), health tiles, merge flow, the merge queue and where the work is. Agent-to-agent chatter (collision forecasts, consults) leaves the *Notable* feed once there are more than 20 agents.
+- **Contribution grids** in the GitHub style, for the project and for each agent: commits, changes and reviews. A project older than a week gets a year of days. A younger one gets small squares, so the grid shows something on day one.
+- **Search** finds agents, tasks, changes and files. An agent's **profile** has its grid, the code it knows, its open review requests and how quickly it answers them, plus controls to pause it, direct it, or reassign its work.
+
+![150 agents](docs/scale-home.png)
+![review routing](docs/review-routing.png)
+
+Under the hood:
+- Agents long-poll a scoped event stream (`mine=1`), so each wakes only for its own events and for steering.
+- The merge queue lands up to 8 changes per push.
+- The dashboard reads one `/overview` summary over its WebSocket, at most once a second.
+
+`demo/load.mjs` drives N simulated agents through the real API. Results on one laptop with `wrangler dev`, where one local `workerd` thread does all the git work:
+
+| agents | merged | wall time | merges/hour | submit to merged (p50) |
+|---|---|---|---|---|
+| 150 | 150/150 | 48s | 11,200 | 17s |
+| 200 (before the scale work) | 200/200 | 229s | 3,100 | 122s |
+| 200 (after) | 200/200 | 71s | 10,200 | 25s |
+| 300 | 300/300 | 155s | 7,000 | 61s |
+| 500 | 491/500 | ~13 min | ~2,300 | n/a |
+
+At 500 agents the local dev proxy started dropping connections ("Network connection lost"). Nine approvals never arrived, and those changes sat in review. Loom reported them as *Stuck*. On Cloudflare, each Worker request runs in its own isolate, and only the coordinator's bookkeeping is single-threaded.
 
 ## How it fits together
 
@@ -154,13 +183,20 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | Method & path | What it does |
 |---|---|
 | `GET /state` | Everything: agents, tasks, live intents, changes, recent events |
-| `GET /events?after=<seq>&wait=<s>` | Long-poll the event stream; `GET /ws` for a WebSocket |
+| `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `POST /tasks` `{title, description, dependsOn, related}` | Add a task (`related`: earlier tasks whose history its agent should get) |
 | `POST /tasks/:id/claim` | Get a workspace fork + tokens (or take over a stalled task, with its context) |
 | `POST /intents` `{taskId, paths, description}` | Declare what you'll touch; returns overlaps, pending changes, and memory (decisions, earlier changes, who to consult) |
 | `POST /workspaces/:name/commit` `{files, message}` | Commit to your workspace without a git client |
 | `POST /changes` `{taskId, title, summary, context}` | Submit your workspace for review and merge |
 | `POST /changes/:id/reviews` `{verdict, body, comments}` | `approve`, `request_changes` or `comment` |
+| `GET /changes/:id/reviewers` | Who knows this code, ranked with reasons, and who has been asked |
+| `POST /changes/:id/reviewers` `{reviewers?, count?, note?}` | Ask agents to review (named, or the best-placed few) |
+| `GET /overview` | Health, what needs a person, stuck work, queue, areas: the dashboard's one read |
+| `GET /search?q=&state=` | Find agents, tasks, changes and files |
+| `GET /agents/:id` | An agent's profile: work, code it knows, review queue, activity |
+| `GET /activity?agent=&range=year\|recent` | Commits, changes and reviews per day (or per few minutes) for the grids |
+| `POST /questions/answer` `{threads, body}` | *Human:* answer every copy of the same question at once |
 | `POST /tasks/:id/sync` `{resolutions?}` | Merge main into your workspace; returns structured conflicts, or resolves them |
 | `GET /changes/:id` | Patch, context, intents, reviews, conflicts with their causes |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |
@@ -186,7 +222,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 ## Limits and next steps
 
 - Merges hold both trees in Worker memory, so this suits repos up to tens of MB. Bigger repos would move merging to Sandbox containers.
-- The intent overlap check is path-based. Symbol-level intents (functions, not files) are the obvious next step.
+- The intent overlap check is path-based. Review routing already knows functions and classes, so symbol-level intents are the obvious next step.
+- Commits and merges run git in the coordinator Durable Object. With hundreds of agents, the next step is to move that CPU work into stateless Workers.
 - Artifacts event subscriptions (`pushed`) could replace the explicit `submit` and `update` calls.
 
 ## License

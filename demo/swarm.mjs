@@ -260,6 +260,12 @@ async function builder(admin, keys, plan, taskId) {
 
   let change = await me.submit(taskId, plan.task, plan.intent, plan.context);
   log(plan.agent, `submitted change #${change.id}${change.undeclared.length ? ` (outside intent: ${change.undeclared.join(", ")})` : ""}`);
+  // Ask a peer who already knows this code to review it, alongside the reviewer.
+  const peer = (change.suggestedReviewers ?? []).find((c) => c.role === "builder" && c.score > 0);
+  if (peer) {
+    await me.req("POST", `/changes/${change.id}/reviewers`, { reviewers: [peer.agent], note: "You know this code; does my change fit how you built it?" });
+    log(plan.agent, `asked ${peer.name} to review #${change.id} (${peer.name} ${peer.reasons[0]})`);
+  }
 
   // React to what the platform tells us until the change lands.
   let handledReviews = 0;
@@ -314,6 +320,29 @@ async function builder(admin, keys, plan, taskId) {
   }
 }
 builder.seen = {};
+
+// Builders review when a peer asks them to: they know the code they wrote.
+async function peerDesk(admin, keys, done) {
+  const peers = Object.entries(keys);
+  const cursors = {};
+  while (!done.value) {
+    for (const [name, k] of peers) {
+      const me = admin.as(k.key);
+      const r = await me.req("GET", `/events?after=${cursors[name] ?? 0}&agent=${k.id}&mine=1`).catch(() => null);
+      if (!r) continue;
+      cursors[name] = r.cursor;
+      for (const e of r.events.filter((e) => e.type === "review.assigned" && e.to_agent === k.id)) {
+        const c = await me.change(e.change_id);
+        if (!["review", "changes_requested"].includes(c.status)) continue;
+        await pause(1);
+        await me.review(c.id, "approve", `Fits how I built it (${e.data.reason}).`).catch(() => {});
+        log(name, `approved #${c.id} on request: ${e.data.reason}`);
+      }
+    }
+    await pause(1);
+  }
+}
+
 builder.waiting = {};
 builder.disputed = {};
 
@@ -458,9 +487,10 @@ async function main() {
   const rev = reviewer(admin, keys.rex.key, done);
   const lead = human(admin, jo.key, done);
   const desk = proposalDesk(admin, keys, done);
+  const peers = peerDesk(admin, Object.fromEntries(["ada", "bex", "cyd", "dax", "eli", "fen"].map((n) => [n, keys[n]])), done);
   await Promise.all([...PLANS, TEST_PLAN, FOLLOW_PLAN].map((p) => builder(admin, keys, p, tasks[p.agent])));
   done.value = true;
-  await Promise.all([rev, lead, desk]);
+  await Promise.all([rev, lead, desk, peers]);
 
   const s = await admin.state();
   console.log(`\nAll ${s.changes.length} changes merged. main is v${s.project.mainVersion} at ${s.project.mainHead.slice(0, 7)}.`);
