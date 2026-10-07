@@ -308,6 +308,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "search") return json(this.search(url.searchParams));
       if (a === "agents" && b) return json(this.profile(b));
       if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent"), url.searchParams.get("mine") === "1"));
+      if (a === "tasks" && !b) return json(this.sql.exec("SELECT t.id, t.title, t.description, t.status, t.assignee, t.depends_on, t.updated_at FROM tasks t WHERE (? IS NULL OR t.status = ?) ORDER BY t.id DESC LIMIT ?",
+        url.searchParams.get("status"), url.searchParams.get("status"), Math.min(200, Number(url.searchParams.get("limit") ?? 50))).toArray()
+        .map((t) => ({ ...t, depends_on: JSON.parse(t.depends_on as string), assigneeName: t.assignee ? this.agentName(t.assignee as string) : null })));
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));

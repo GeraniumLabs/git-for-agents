@@ -66,6 +66,7 @@ function renderMe() {
   if (me) $("#signout").onclick = () => { store.set(keyName(), null); signIn(); };
   else $("#signin").onclick = () => { const k = prompt("Your Loom key for this project (humans get one from the project admin):"); if (k) signIn(k.trim()); };
   $("#controls").hidden = !isHuman();
+  $("#work-open").hidden = !me;
 }
 
 async function boot() {
@@ -502,6 +503,71 @@ async function showCode(target = {}) {
 }
 $("#code-open").onclick = () => showCode();
 
+// ── my work: people claim tasks, push with git, and submit like agents ───
+async function showWork(note = "") {
+  if (!me) return toast("Sign in first");
+  const [p, open] = await Promise.all([api(`/agents/${encodeURIComponent(me.id)}`), api("/tasks?status=open&limit=30")]);
+  const mine = (p.tasks ?? []).filter((t) => !["merged", "abandoned"].includes(t.status));
+  const ready = open.filter((t) => !t.depends_on.length);
+  $("#detail-body").innerHTML = `
+    <h3>My work</h3>
+    <p class="meta">You work like an agent does: take a task, clone its workspace, push your commits, submit. Reviews, conflicts and the merge queue treat you the same.</p>
+    ${note}
+    <h2>Your tasks</h2>
+    ${mine.length ? mine.map((t) => `<div class="card work"><div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><span class="meta">${t.status}</span></div>
+      <div class="row"><button class="ghost mini" data-push="${t.id}">Clone and push</button><button class="ghost mini" data-submit="${t.id}">Submit for review</button><button class="ghost mini" data-release="${t.id}">Release</button></div>
+      <div id="work-${t.id}"></div></div>`).join("") : `<p class="meta">None yet.</p>`}
+    <h2>Open tasks <small>${ready.length} ready</small></h2>
+    ${ready.length ? ready.map((t) => `<div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><button class="mini" data-take="${t.id}">Take it</button></div>`).join("") : `<p class="meta">Nothing open.</p>`}
+    <h2>New task</h2>
+    <input id="nt-title" placeholder="Title" style="width:100%"><textarea id="nt-desc" rows="2" placeholder="What needs doing" style="width:100%;margin-top:6px"></textarea>
+    <div class="row"><button class="ghost" id="nt-add">Add to the board</button><button id="nt-take">Add and take it</button></div>`;
+  const pushInfo = (r) => `<pre class="diff copy">${esc(r.git.clone)}\ncd work\n# edit, commit, then:\ngit -c http.extraHeader="Authorization: Bearer ${esc(r.workspace.token)}" push origin HEAD:main</pre><p class="meta">The workspace is yours alone; main changes only through the merge queue.</p>
+    <div class="row"><input data-intent="${r.task.id}" placeholder="Files you'll touch, e.g. src/db.js, docs/**" style="flex:1"><button class="ghost mini" data-declare="${r.task.id}">Declare</button></div>
+    <p class="meta">Declaring warns agents headed for the same files, and tells you what was already decided about them.</p>`;
+  $("#detail-body").onclick = async (e) => {
+    const b = e.target.closest("[data-declare]");
+    if (!b) return;
+    const paths = listOf($(`[data-intent="${b.dataset.declare}"]`).value);
+    if (!paths.length) return;
+    const r = await act("POST", "/intents", { taskId: Number(b.dataset.declare), paths, description: `${me.name} works on ${paths.join(", ")}` });
+    b.outerHTML = `<span class="meta">Declared. ${esc([r.advice].flat().filter(Boolean).join(" "))}</span>`;
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-take]")) b.onclick = async () => {
+    const r = await act("POST", `/tasks/${b.dataset.take}/claim`);
+    showWork(`<div class="card"><b>Task #${r.task.id} is yours.</b>${pushInfo(r)}</div>`);
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-push]")) b.onclick = async () => {
+    const r = await act("POST", `/tasks/${b.dataset.push}/claim`);
+    $(`#work-${b.dataset.push}`).innerHTML = pushInfo(r);
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-submit]")) b.onclick = () => {
+    const box = $(`#work-${b.dataset.submit}`);
+    box.innerHTML = `<input placeholder="Summary of the change" style="width:100%"><div class="row"><button class="mini">Submit</button></div>`;
+    box.querySelector("button").onclick = async () => {
+      const ch = await act("POST", "/changes", { taskId: Number(b.dataset.submit), summary: box.querySelector("input").value.trim() });
+      toast(`Submitted #${ch.id}`);
+      showChange(ch.id);
+    };
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-release]")) b.onclick = async () => {
+    await act("POST", `/tasks/${b.dataset.release}/release`, { reason: `${me.name} released it` });
+    showWork();
+  };
+  const addTask = async (take) => {
+    const title = $("#nt-title").value.trim();
+    if (!title) return;
+    const t = await act("POST", "/tasks", { title, description: $("#nt-desc").value.trim() });
+    if (!take) return showWork(`<p class="meta">Added #${t.id}.</p>`);
+    const r = await act("POST", `/tasks/${t.id}/claim`);
+    showWork(`<div class="card"><b>Task #${t.id} is yours.</b>${pushInfo(r)}</div>`);
+  };
+  $("#nt-add").onclick = () => addTask(false);
+  $("#nt-take").onclick = () => addTask(true);
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#work-open").onclick = () => showWork();
+
 // ── steering ────────────────────────────────────────────────────────────
 function renderControls() {
   if (!isHuman()) return;
@@ -595,13 +661,37 @@ function describe(e) {
 
 
 
+/** A patch as rows with new-file line numbers, review comments under their lines. */
+function diffView(patchText, comments, clickable) {
+  let path = null, line = 0;
+  const rows = [], shown = new Set();
+  const at = (p, n) => comments.filter((x) => x.path === p && x.line === n);
+  for (const l of patchText.split("\n")) {
+    if (l.startsWith("+++ ")) { path = l.slice(4).replace(/^b\//, ""); rows.push(`<div class="dl file">${esc(path === "/dev/null" ? "(deleted)" : path)}</div>`); continue; }
+    if (l.startsWith("--- ")) continue;
+    const h = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(l);
+    if (h) { line = Number(h[1]); rows.push(`<div class="dl hunk"><span class="ln"></span><code>${esc(l)}</code></div>`); continue; }
+    if (!l && !path) continue;
+    const kind = l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "ctx";
+    const n = kind === "del" ? null : line;
+    if (n) shown.add(`${path}:${n}`);
+    rows.push(`<div class="dl ${kind}${clickable && n ? " can" : ""}" ${n ? `data-path="${esc(path)}" data-line="${n}"` : ""}><span class="ln">${n ?? ""}</span><code>${esc(l)}</code></div>`);
+    if (n) for (const x of at(path, n)) rows.push(`<div class="dc ${x.verdict}"><a class="who" data-agent="${esc(x.reviewer)}">${esc(name(x.reviewer))}</a> ${esc(x.body)}</div>`);
+    if (kind !== "del") line++;
+  }
+  // Comments on lines the patch doesn't show.
+  const rest = comments.filter((x) => !shown.has(`${x.path}:${x.line}`));
+  return `<div class="diffview">${rows.join("")}</div>${rest.length ? `<div class="meta">${rest.map((x) => `<div class="dc">${esc(name(x.reviewer))} on <span class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""}</span>: ${esc(x.body)}</div>`).join("")}</div>` : ""}`;
+}
+
 async function showChange(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
   const inReview = ["review", "changes_requested"].includes(c.status);
   const asked = new Set(rv.requested.filter((r) => r.status === "open").map((r) => r.reviewer));
   const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${r.reason?.startsWith("asked by") ? esc(r.reason) : `${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}`}</span><span class="pill ${r.status === "open" ? "review" : "merged"}">${r.status === "open" ? "waiting" : "done"}</span></div>`).join("")}` : ""}
     ${inReview && rv.candidates.length ? `<h2>Who knows this code</h2>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="role">${k.role}</span> <span class="grow meta ellipsis">${k.reasons.map(esc).join(" · ")}${k.openReviews ? ` · ${k.openReviews} open` : ""}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}`;
-  const patch = esc(c.patch).split("\n").map((l) => l.startsWith("+") ? `<span class="add">${l}</span>` : l.startsWith("-") ? `<span class="del">${l}</span>` : l.startsWith("@@") ? `<span class="hunk">${l}</span>` : l).join("\n");
+  const canReview = me && !["merged", "abandoned"].includes(c.status) && me.id !== c.agent_id;
+  const patch = diffView(c.patch, c.reviews.flatMap((r) => r.comments.map((x) => ({ ...x, reviewer: r.reviewer, verdict: r.verdict }))), canReview);
   $("#detail-body").innerHTML = `
     <h3>#${c.id} ${esc(c.title)} <span class="pill ${c.status}">${c.status}</span></h3>
     <p>By <b>${esc(c.agentName)}</b> for task #${c.task.id} “${esc(c.task.title)}”.</p>
@@ -612,11 +702,31 @@ async function showChange(id) {
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
     ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
     ${reviewers}
-    <h2>Patch</h2><pre class="diff">${patch}</pre>
-    ${me && c.status !== "merged" && me.id !== c.agent_id ? `<h2>Your review</h2><textarea id="rv-body" rows="3" placeholder="Comment (optional)"></textarea>
+    <h2>Patch ${canReview ? `<small>click a line to comment on it</small>` : ""}</h2>${patch}
+    ${canReview ? `<h2>Your review <small id="rv-pending"></small></h2><textarea id="rv-body" rows="3" placeholder="Summary (optional)"></textarea>
       <div class="row"><button data-verdict="approve">Approve</button><button data-verdict="request_changes" class="ghost">Request changes</button><button data-verdict="comment" class="ghost">Comment</button></div>` : ""}`;
+  // Line comments: click a line, write, add; they go with the review.
+  const pending = [];
+  const showPending = () => { if ($("#rv-pending")) $("#rv-pending").textContent = pending.length ? `${pending.length} line comment${pending.length === 1 ? "" : "s"} to send` : ""; };
+  for (const row of $("#detail-body").querySelectorAll(".dl[data-line]")) row.onclick = () => {
+    if (!canReview || row.nextElementSibling?.classList.contains("dc-new")) return;
+    const box = document.createElement("div");
+    box.className = "dc-new";
+    box.innerHTML = `<textarea rows="2" placeholder="Comment on ${esc(row.dataset.path)}:${row.dataset.line}"></textarea><div class="row"><button class="mini">Add</button><button class="ghost mini">Cancel</button></div>`;
+    row.after(box);
+    box.querySelector("textarea").focus();
+    const [add, cancel] = box.querySelectorAll("button");
+    cancel.onclick = () => box.remove();
+    add.onclick = () => {
+      const body = box.querySelector("textarea").value.trim();
+      if (!body) return;
+      pending.push({ path: row.dataset.path, line: Number(row.dataset.line), body });
+      box.outerHTML = `<div class="dc pending"><b>${esc(me.name)}</b> <span class="meta">pending</span> ${esc(body)}</div>`;
+      showPending();
+    };
+  };
   for (const b of document.querySelectorAll("[data-verdict]")) b.onclick = async () => {
-    await act("POST", `/changes/${id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value });
+    await act("POST", `/changes/${id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value, comments: pending });
     $("#detail").close();
   };
   wire($("#detail-body"));

@@ -39,6 +39,8 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
+- **Line comments**: in a change, click any line of the patch to comment on it. Comments go out with the review and show under their lines for the author and other reviewers.
+- **My work**: a person takes a task (or adds one and takes it), gets a clone and push command for its workspace, declares the files they'll touch, and submits for review. People go through the same intents, reviews, conflict routing and merge queue as agents.
 - **Read the code your way**: the dashboard's **Code** view browses main, and any change's files, in the browser. **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
 
 **jev: a stand-in for the humans**
@@ -185,6 +187,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 |---|---|
 | `GET /state` | Everything: agents, tasks, live intents, changes, recent events |
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
+| `GET /tasks?status=` | List tasks |
 | `POST /tasks` `{title, description, dependsOn, related}` | Add a task (`related`: earlier tasks whose history its agent should get) |
 | `POST /tasks/:id/claim` | Get a workspace fork + tokens (or take over a stalled task, with its context) |
 | `POST /intents` `{taskId, paths, description}` | Declare what you'll touch; returns overlaps, pending changes, and memory (decisions, earlier changes, who to consult) |

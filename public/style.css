@@ -217,3 +217,20 @@ a.button { display: inline-block; text-decoration: none; cursor: pointer; border
 .code-view #file { margin: 0; max-height: 64vh; overflow: auto; min-width: 0; }
 pre.copy { white-space: pre-wrap; overflow-wrap: anywhere; }
 @media (max-width: 720px) { .code-view { grid-template-columns: 1fr; } }
+
+/* diff with line comments */
+.diffview { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 6px 0; overflow: auto; max-height: 60vh; font: 12.5px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; }
+.dl { display: flex; white-space: pre; min-width: max-content; }
+.dl .ln { width: 44px; flex: none; text-align: right; padding-right: 10px; color: var(--muted); user-select: none; }
+.dl code { font: inherit; padding-right: 12px; }
+.dl.file { padding: 4px 10px; font-weight: 600; color: var(--ink); border-top: 1px solid var(--line); }
+.dl.file:first-child { border-top: 0; }
+.dl.hunk code { color: var(--info); }
+.dl.add { color: var(--ok); background: color-mix(in srgb, var(--ok) 8%, transparent); }
+.dl.del { color: var(--bad); background: color-mix(in srgb, var(--bad) 8%, transparent); }
+.dl.can { cursor: pointer; }
+.dl.can:hover .ln { color: var(--accent); }
+.dl.can:hover .ln::before { content: "+ "; }
+.dc, .dc-new { margin: 4px 12px 6px 54px; padding: 6px 10px; border: 1px solid var(--line); border-left: 3px solid var(--info); border-radius: 6px; background: var(--panel); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; white-space: normal; }
+.dc.request_changes { border-left-color: var(--bad); } .dc.approve { border-left-color: var(--ok); } .dc.pending { border-left-color: var(--accent); }
+.dc-new textarea { width: 100%; }
