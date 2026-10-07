@@ -11,6 +11,7 @@ import type { Env } from "./env";
 import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
+import { zip } from "./zip";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
@@ -312,6 +313,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
+      if (a === "archive") return await this.archive(url.searchParams);
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
@@ -332,6 +334,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
       return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths });
     }
+    if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json({ agent: actor, mainFrozen: this.meta("frozen"), inbox: this.inbox(actor.id) });
 
     // Human controls. Humans (and the admin) steer; agents can't.
@@ -545,8 +548,56 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { commit, files: Object.keys(body.files) };
   }
 
+  /** main, a named workspace, or the workspace behind a change. */
+  private repoFor(q: { workspace?: string | null; change?: string | number | null }): { repo: string; label: string } {
+    if (q.change) {
+      const ch = this.change(Number(q.change));
+      return { repo: ch.workspace, label: `change-${ch.id}` };
+    }
+    if (q.workspace && q.workspace !== this.mainRepo) {
+      if (!this.sql.exec("SELECT 1 FROM workspaces WHERE name = ?", q.workspace).toArray().length) throw new HttpError(404, `no workspace ${q.workspace}`);
+      return { repo: q.workspace, label: q.workspace };
+    }
+    return { repo: this.mainRepo, label: "main" };
+  }
+
+  /**
+   * A read-only clone of main, an agent's workspace, or a change, for anyone on
+   * the project: people review locally with their own tools. Writing still goes
+   * through a claimed task's workspace, and main only through the merge queue.
+   */
+  private async checkout(actor: Agent, body: { workspace?: string; change?: number }) {
+    const { repo, label } = this.repoFor(body);
+    const ttl = 3600;
+    const token = await this.store.token(repo, "read", ttl);
+    const remote = this.remoteUrl(repo);
+    const dir = `${this.project}-${label}`;
+    return {
+      repo, remote, token, expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
+      clone: `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} ${dir}`,
+      ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:loom-main && git diff loom-main...HEAD` } : {}),
+      note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
+    };
+  }
+
+  /** The files of main, a workspace or a change as a zip. */
+  private async archive(q: URLSearchParams) {
+    const { repo, label } = this.repoFor({ workspace: q.get("workspace"), change: q.get("change") });
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+    const flat = await w.flatten(await w.head());
+    const files: { path: string; data: Uint8Array }[] = [];
+    let size = 0;
+    for (const [path, e] of flat) {
+      const data = await w.readBytes(e.oid);
+      size += data.length;
+      if (size > 64 * 1024 * 1024) throw new HttpError(413, "too big to zip here; clone it with git instead");
+      files.push({ path: `${this.project}-${label}/${path}`, data });
+    }
+    return new Response(zip(files), { headers: { "content-type": "application/zip", "content-disposition": `attachment; filename="${this.project}-${label}.zip"` } });
+  }
+
   private async readFiles(q: URLSearchParams) {
-    const repo = q.get("workspace") ?? this.mainRepo;
+    const repo = this.repoFor({ workspace: q.get("workspace"), change: q.get("change") }).repo;
     const ref = q.get("ref") ?? "main";
     const path = q.get("path");
     if (path) {
@@ -1222,6 +1273,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (!this.guardedFiles(files.map((path) => ({ path } as FileChange))).length) continue;
       const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
       items.push({ kind: "approval", change: c.id, title: c.title, agent: c.agent_id, files, escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
+    }
+    // Reviews an agent asked a person for.
+    for (const r of this.sql.exec(`SELECT r.change_id, r.reviewer, r.requested_by, r.reason, r.created_at, c.title FROM review_requests r
+                                   JOIN changes c ON c.id = r.change_id JOIN agents a ON a.id = r.reviewer
+                                   WHERE r.status = 'open' AND a.role = 'human' AND c.status IN ('review','changes_requested') LIMIT 50`).toArray()) {
+      items.push({ kind: "review", change: r.change_id, title: r.title, agent: r.requested_by, reviewer: r.reviewer, reason: r.reason, since: r.created_at });
     }
     // Stuck: nobody asked for a person, but work isn't moving.
     for (const t of open.filter((t) => t.kind === "proposal" && now - t.created_at > 10 * 60_000)) {

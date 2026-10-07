@@ -173,6 +173,9 @@ function renderAttention() {
       const sides = it.parties.map((p) => `<div class="side">${who(p)} ${it.positions[p] ? esc(it.positions[p]) : `<i class="meta">hasn't stated a position yet</i>`}${me && it.positions[p] ? ` <button class="mini" data-rule="${it.thread}" data-for="${esc(p)}">Rule for ${esc(name(p))}</button>` : ""}</div>`).join("");
       return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}`, "q");
     }
+    if (it.kind === "review") {
+      return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : ""}`, "q");
+    }
     return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : ""}`, "q");
   }).join("") || `<p class="empty">Nothing needs a person right now.</p>`;
   wire($("#attention"));
@@ -462,6 +465,43 @@ function wireGrid(el, data) {
   sc.scrollLeft = sc.scrollWidth;
 }
 
+// ── code: browse, download and check out, for people ──────────────────
+async function showClone(box, target) {
+  if (!me) { box.innerHTML = `<p class="meta">Sign in to get a clone command; it carries a read-only token for an hour.</p>`; return; }
+  const r = await act("POST", "/checkout", target);
+  if (!r || r.error) return;
+  box.innerHTML = `<pre class="diff copy">${esc(r.clone)}${r.compare ? `\n${esc(r.compare)}` : ""}</pre><p class="meta">${esc(r.note)} <button class="ghost mini" id="copy-clone">Copy</button></p>`;
+  $("#copy-clone").onclick = () => navigator.clipboard?.writeText(r.clone + (r.compare ? `\n${r.compare}` : "")).then(() => toast("Copied"));
+}
+async function showCode(target = {}) {
+  const q = target.change ? `change=${target.change}` : target.workspace ? `workspace=${encodeURIComponent(target.workspace)}` : "";
+  const list = await api(`/files?${q}`);
+  if (list.error) return toast(list.error);
+  $("#detail-body").innerHTML = `
+    <h3>Code <small class="meta">${esc(target.label ?? `main · v${state.project.mainVersion}`)}</small></h3>
+    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}" download>Download zip</a><button class="ghost mini" id="code-clone">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
+    <div id="code-clone-box"></div>
+    <div class="code-view">
+      <div class="tree"><input id="tree-filter" placeholder="Filter ${list.files.length} files"><ol id="tree"></ol></div>
+      <pre id="file" class="diff"><span class="meta">Pick a file.</span></pre>
+    </div>`;
+  const draw = (f) => { $("#tree").innerHTML = list.files.filter((p) => p.toLowerCase().includes(f)).slice(0, 500).map((p) => `<li><a data-path="${esc(p)}">${esc(p)}</a></li>`).join(""); };
+  draw("");
+  $("#tree-filter").oninput = (e) => draw(e.target.value.trim().toLowerCase());
+  $("#tree").onclick = async (e) => {
+    const a = e.target.closest("[data-path]");
+    if (!a) return;
+    for (const x of $("#tree").querySelectorAll(".on")) x.classList.remove("on");
+    a.classList.add("on");
+    const f = await api(`/files?${q}&path=${encodeURIComponent(a.dataset.path)}`);
+    $("#file").textContent = f.error ?? f.content;
+  };
+  $("#code-clone").onclick = () => showClone($("#code-clone-box"), target.change ? { change: target.change } : target.workspace ? { workspace: target.workspace } : {});
+  wire($("#detail-body"));
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#code-open").onclick = () => showCode();
+
 // ── steering ────────────────────────────────────────────────────────────
 function renderControls() {
   if (!isHuman()) return;
@@ -559,12 +599,14 @@ async function showChange(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
   const inReview = ["review", "changes_requested"].includes(c.status);
   const asked = new Set(rv.requested.filter((r) => r.status === "open").map((r) => r.reviewer));
-  const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}</span><span class="pill ${r.status === "open" ? "review" : "merged"}">${r.status === "open" ? "waiting" : "done"}</span></div>`).join("")}` : ""}
+  const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${r.reason?.startsWith("asked by") ? esc(r.reason) : `${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}`}</span><span class="pill ${r.status === "open" ? "review" : "merged"}">${r.status === "open" ? "waiting" : "done"}</span></div>`).join("")}` : ""}
     ${inReview && rv.candidates.length ? `<h2>Who knows this code</h2>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="role">${k.role}</span> <span class="grow meta ellipsis">${k.reasons.map(esc).join(" · ")}${k.openReviews ? ` · ${k.openReviews} open` : ""}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}`;
   const patch = esc(c.patch).split("\n").map((l) => l.startsWith("+") ? `<span class="add">${l}</span>` : l.startsWith("-") ? `<span class="del">${l}</span>` : l.startsWith("@@") ? `<span class="hunk">${l}</span>` : l).join("\n");
   $("#detail-body").innerHTML = `
     <h3>#${c.id} ${esc(c.title)} <span class="pill ${c.status}">${c.status}</span></h3>
     <p>By <b>${esc(c.agentName)}</b> for task #${c.task.id} “${esc(c.task.title)}”.</p>
+    <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
+    <div id="clone-box"></div>
     ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
     ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
@@ -578,6 +620,8 @@ async function showChange(id) {
     $("#detail").close();
   };
   wire($("#detail-body"));
+  $("#detail-body").querySelector("[data-browse]").onclick = () => showCode({ change: c.id, label: `change #${c.id} (${c.agentName}'s workspace)` });
+  $("#detail-body").querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of $("#detail-body").querySelectorAll("[data-ask]")) b.onclick = async () => { await act("POST", `/changes/${id}/reviewers`, { reviewers: [b.dataset.ask] }); showChange(id); };
   if (!$("#detail").open) $("#detail").showModal();
 }

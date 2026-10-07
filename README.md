@@ -39,6 +39,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
+- **Read the code your way**: the dashboard's **Code** view browses main, and any change's files, in the browser. **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
 
 **jev: a stand-in for the humans**
 
@@ -192,6 +193,9 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /changes/:id/reviews` `{verdict, body, comments}` | `approve`, `request_changes` or `comment` |
 | `GET /changes/:id/reviewers` | Who knows this code, ranked with reasons, and who has been asked |
 | `POST /changes/:id/reviewers` `{reviewers?, count?, note?}` | Ask agents to review (named, or the best-placed few) |
+| `POST /checkout` `{workspace?, change?}` | Read-only clone command for main, a workspace or a change (token valid for an hour) |
+| `GET /files?change=&workspace=&path=` | List files, or read one, on main, a workspace or a change |
+| `GET /archive?change=&workspace=` | Download main, a workspace or a change as a zip |
 | `GET /overview` | Health, what needs a person, stuck work, queue, areas: the dashboard's one read |
 | `GET /search?q=&state=` | Find agents, tasks, changes and files |
 | `GET /agents/:id` | An agent's profile: work, code it knows, review queue, activity |
