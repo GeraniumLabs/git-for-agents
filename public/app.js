@@ -114,6 +114,7 @@ function render(full) {
   renderBoard();
   renderChanges();
   renderTerritory();
+  renderDecisions();
   if (full) {
     $("#feed").innerHTML = "";
     for (const e of state.events) prependEvent(e, false);
@@ -252,8 +253,16 @@ function describe(e) {
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
     case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];
-    case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : "house rule"}): “${esc(d.decision)}”`];
-    case "delegate.escalated": return ["question", `${who} handed ${d.thread ? `question #${d.thread}` : `#${e.change_id}`} to a person: ${esc(d.reason)}`];
+    case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : d.kind === "dispute" ? `settled dispute #${d.thread}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : d.via === "precedent" ? `earlier decision${d.precedent ? ` #${d.precedent}` : ""}` : "house rule"}): “${esc(d.decision)}”`];
+    case "decision.recorded": return ["directive", `Decision #${d.decision} recorded (${esc(d.kind)}, by ${who})${d.paths.length ? ` for <span class="mono">${d.paths.map(esc).join(", ")}</span>` : ""}: “${esc(d.text.slice(0, 140))}”`];
+    case "decision.retired": return ["", `${who} retired decision #${d.decision}`];
+    case "memory.recalled": return ["message", `${who} recalled ${[d.decisions.length && `${d.decisions.length} decision${d.decisions.length > 1 ? "s" : ""}`, d.efforts.length && `${d.efforts.length} earlier change${d.efforts.length > 1 ? "s" : ""}`].filter(Boolean).join(" and ")} on <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.consult.length ? `; ${d.consult.map(name).map(esc).join(", ")} worked there and ${d.consult.length > 1 ? "are" : "is"} still around` : ""}`];
+    case "consult.requested": return ["message", `${who} consults ${to}${d.path ? ` about <span class="mono">${esc(d.path)}</span>` : ""}: “${esc(d.question)}”`];
+    case "dispute.opened": return ["collision", `${who} opened a dispute with ${to}: “${esc(d.question)}”`];
+    case "dispute.position": return ["collision", `${who} stated a position in dispute #${d.thread}: “${esc(d.position)}”`];
+    case "dispute.ruled": return ["merged", `${who} ruled on dispute #${d.thread}: ${esc(d.ruling)}${d.enforced ? `. ${esc(d.enforced)}` : ""}`];
+    case "dispute.ready": case "dispute.ruled.notify": return null;
+    case "delegate.escalated": return ["question", `${who} handed ${d.thread ? `${d.kind === "dispute" ? "dispute" : "question"} #${d.thread}` : `#${e.change_id}`} to a person: ${esc(d.reason)}`];
     case "message": return ["message", `${who}${to ? ` → ${to}` : " → everyone"}: “${esc(d.body)}”`];
     default: return ["", `${esc(e.type)} ${esc(JSON.stringify(d)).slice(0, 120)}`];
   }
@@ -294,6 +303,7 @@ async function showChange(id) {
 function needsHuman() {
   const items = [];
   for (const t of state.threads ?? []) {
+    if (t.kind === "dispute" && t.status === "open") items.push({ type: "dispute", t });
     if (t.kind === "question" && t.status === "open" && (t.to_agent === "humans" || t.to_agent === me?.id)) items.push({ type: "question", t });
     if (t.kind === "proposal" && t.status === "open") items.push({ type: "proposal", t });
   }
@@ -314,10 +324,15 @@ function renderInbox() {
       const opts = it.t.options ? `<div class="opts">${Object.entries(it.t.options).map(([k, v]) => me ? `<button class="ghost mini" data-pick="${it.t.id}" data-opt="${esc(k)}" title="${esc(v)}">${esc(k)}</button>` : `<span class="pill" title="${esc(v)}">${esc(k)}</span>`).join("")}</div>` : "";
       return box(`<div class="kicker">Question${it.t.blocking ? " · blocking task #" + it.t.task_id : ""}</div>${posts(it.t)}${opts}${escalation(it.t.escalated)}${replyBox(it.t, "Answer")}`, "q");
     }
+    if (it.type === "dispute") {
+      const terms = JSON.parse(it.t.terms);
+      const sides = terms.parties.map((p) => `<div class="side"><b style="color:${color(p)}">${esc(name(p))}</b> ${terms.positions[p] ? esc(terms.positions[p]) : `<i class="meta">hasn't stated a position yet</i>`}${me && terms.positions[p] ? ` <button class="mini" data-rule="${it.t.id}" data-for="${p}">Rule for ${esc(name(p))}</button>` : ""}</div>`).join("");
+      return box(`<div class="kicker">Dispute${it.t.change_id ? ` · change #${it.t.change_id}` : it.t.task_id ? ` · task #${it.t.task_id}` : ""}</div><div><b>${esc(terms.question)}</b></div>${sides}${escalation(it.t.escalated)}`, "q");
+    }
     if (it.type === "proposal") return box(`<div class="kicker">Proposal between agents</div>${posts(it.t)}<div class="meta">Waiting on ${esc(name(it.t.to_agent))}</div>`);
     const why = state.events.filter((e) => e.type === "delegate.escalated" && e.change_id === it.c.id).at(-1)?.data.reason;
     return box(`<div class="kicker">Needs a human approval</div><div><b>#${it.c.id}</b> ${esc(it.c.title)} · ${esc(name(it.c.agent_id))}</div><div class="files mono">${it.c.files.map((f) => esc(f.path)).join("  ")}</div>${escalation(why)}${me ? `<div class="row"><button data-open="${it.c.id}">Review</button></div>` : ""}`, "q");
-  }).join("") + (discussions.length ? `<h2>Discussions &amp; contracts</h2>` + discussions.map((t) => box(`<div class="kicker">${t.kind === "contract" ? "Contract" : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""} · ${t.status}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}${replyBox(t)}`)).join("") : "")
+  }).join("") + (discussions.length ? `<h2>Discussions &amp; contracts</h2>` + discussions.map((t) => box(`<div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(t.createdByName)} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""} · ${t.status}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}${replyBox(t)}`)).join("") : "")
     || `<p class="empty">Nothing needs a human right now.</p>`;
   for (const b of document.querySelectorAll("[data-send]")) b.onclick = async () => {
     const input = document.querySelector(`[data-reply="${b.dataset.send}"]`);
@@ -326,6 +341,11 @@ function renderInbox() {
     input.value = "";
   };
   for (const b of document.querySelectorAll("[data-open]")) b.onclick = () => showChange(Number(b.dataset.open));
+  for (const b of document.querySelectorAll("[data-rule]")) b.onclick = async () => {
+    const note = prompt(`Ruling for ${name(b.dataset.for)}. Add a reason the agents will see (optional):`);
+    if (note === null) return;
+    await act("POST", `/disputes/${b.dataset.rule}/rule`, { for: b.dataset.for, note: note.trim() || undefined });
+  };
   for (const b of document.querySelectorAll("[data-pick]")) b.onclick = () => act("POST", `/threads/${b.dataset.pick}/posts`, { body: `Go with “${b.dataset.opt}”.` });
 }
 const escalation = (reason) => reason && state.delegate?.enabled ? `<div class="warn">${esc(state.delegate.name)} passed this to you: ${esc(reason)}</div>` : "";
@@ -349,11 +369,14 @@ function fillJev() {
   field("a_paths").value = d.approvals.paths.join(", ");
   field("a_review").checked = d.approvals.requireAgentReview;
   field("a_conf").value = d.approvals.minConfidence;
+  field("d_enabled").checked = d.disputes.enabled;
+  field("d_conf").value = d.disputes.minConfidence;
   showConf();
 }
 function showConf() {
   $("#q_conf_out").textContent = `${Math.round(field("q_conf").value * 100)}%`;
   $("#a_conf_out").textContent = `${Math.round(field("a_conf").value * 100)}%`;
+  $("#d_conf_out").textContent = `${Math.round(field("d_conf").value * 100)}%`;
 }
 jevForm.oninput = showConf;
 $("#jev-open").onclick = () => { fillJev(); $("#jev").showModal(); };
@@ -365,6 +388,7 @@ $("#jev").onclose = async () => {
     guidance: field("guidance").value.trim(),
     questions: { enabled: field("q_enabled").checked, topics: listOf(field("q_topics").value), minConfidence: Number(field("q_conf").value) },
     approvals: { enabled: field("a_enabled").checked, paths: listOf(field("a_paths").value), requireAgentReview: field("a_review").checked, minConfidence: Number(field("a_conf").value) },
+    disputes: { enabled: field("d_enabled").checked, minConfidence: Number(field("d_conf").value) },
     rules: field("rules").value.split("\n").map((l) => l.split("=>")).filter((p) => p.length === 2 && p[0].trim() && p[1].trim()).map(([pattern, answer]) => ({ pattern: pattern.trim(), answer: answer.trim() })),
   });
   toast(`Saved ${field("name").value.trim() || "jev"}'s brief`);
@@ -399,3 +423,21 @@ $("#protect-save").onclick = async () => {
 
 setInterval(() => state && renderAgents(), 10_000);
 boot();
+
+// ── decisions: the project's memory of what humans settled ──────────────
+const KIND = { answer: "Answer", directive: "Directive", review: "Review", ruling: "Ruling", note: "Note" };
+function renderDecisions() {
+  const list = state.decisions ?? [];
+  $("#decisions-count").textContent = list.length ? `${list.length} on record` : "";
+  $("#decision-add").hidden = !isHuman();
+  $("#decisions").innerHTML = list.map((d) => `<li class="card decision"><div class="kicker">${KIND[d.kind] ?? d.kind} #${d.id} · ${esc(d.byName ?? d.by)}${d.paths.length ? ` · <span class="mono">${d.paths.map(esc).join(", ")}</span>` : " · whole project"}</div>${d.question ? `<div class="meta">${esc(d.question)}</div>` : ""}<div>${esc(d.decision)}</div>${isHuman() ? `<button class="ghost mini" data-retire="${d.id}">Retire</button>` : ""}</li>`).join("")
+    || `<li class="empty">Nothing decided yet. Answers, directives, objections and rulings land here, and agents get them when they work on the same files.</li>`;
+  for (const b of document.querySelectorAll("[data-retire]")) b.onclick = () => act("POST", `/decisions/${b.dataset.retire}/retire`, {});
+}
+$("#decision-save").onclick = async () => {
+  const decision = $("#decision-text").value.trim();
+  if (!decision) return;
+  await act("POST", "/decisions", { decision, paths: $("#decision-paths").value.split(",").map((p) => p.trim()).filter(Boolean) });
+  $("#decision-text").value = "";
+  $("#decision-paths").value = "";
+};

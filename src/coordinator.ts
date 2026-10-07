@@ -8,7 +8,8 @@ import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, t
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
-import { DEFAULT_DELEGATE, decideApproval, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
+import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
+import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
@@ -74,6 +75,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
       "ALTER TABLE threads ADD COLUMN escalated TEXT",
       "ALTER TABLE threads ADD COLUMN options TEXT",
+      "ALTER TABLE tasks ADD COLUMN related TEXT",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -115,6 +117,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
         status TEXT NOT NULL DEFAULT 'open', created_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS posts (
         id INTEGER PRIMARY KEY AUTOINCREMENT, thread_id INTEGER, author TEXT, body TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS decisions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL, question TEXT, decision TEXT NOT NULL,
+        by TEXT, paths TEXT DEFAULT '[]', task_id INTEGER, change_id INTEGER, thread_id INTEGER,
+        created_at INTEGER, retired_at INTEGER);
+      CREATE TABLE IF NOT EXISTS consult_hints (a TEXT, b TEXT, path TEXT, PRIMARY KEY (a, b, path));
     `);
   }
 
@@ -160,7 +167,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     for (const wake of this.waiters) wake();
     this.waiters.clear();
-    if (["question.asked", "approval.needs_human", "review.submitted"].includes(type) && e.actor !== DELEGATE_ID) {
+    if (["question.asked", "approval.needs_human", "review.submitted", "dispute.ready"].includes(type) && e.actor !== DELEGATE_ID) {
       this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)));
     }
     return event;
@@ -212,7 +219,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private task(id: number) {
     const t = this.sql.exec("SELECT * FROM tasks WHERE id = ?", id).toArray()[0];
     if (!t) throw new HttpError(404, `task ${id} not found`);
-    return { ...t, depends_on: JSON.parse(t.depends_on as string) } as any;
+    return { ...t, depends_on: JSON.parse(t.depends_on as string), related: JSON.parse((t.related as string) ?? "[]") } as any;
   }
   private change(id: number) {
     const c = this.sql.exec("SELECT * FROM changes WHERE id = ?", id).toArray()[0];
@@ -271,6 +278,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
+      if (a === "decisions") return json(this.listDecisions(url.searchParams));
+      if (a === "tasks" && b && c === "memory") return json(await this.taskMemory(Number(b)));
     }
 
     const who = await this.authenticate(req);
@@ -289,24 +298,29 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "me") return json({ agent: actor, mainFrozen: this.meta("frozen"), inbox: this.inbox(actor.id) });
 
     // Human controls. Humans (and the admin) steer; agents can't.
-    if (["directives", "pause", "resume", "freeze", "unfreeze", "assign", "protect", "delegate"].includes(c ?? a)) {
+    const ruling = a === "disputes" && c === "rule";
+    const deciding = a === "decisions" && m === "POST";
+    if (["directives", "pause", "resume", "freeze", "unfreeze", "assign", "protect", "delegate"].includes(c ?? a) || ruling || deciding) {
       if (actor.role !== "human") throw new HttpError(403, "only humans can steer agents");
       if (a === "directives") return json(this.directive(actor, body));
       if (a === "agents" && b && c === "pause") return json(this.pause(actor, b, body.reason));
       if (a === "agents" && b && c === "resume") return json(this.resume(actor, b));
       if (a === "freeze") return json(this.freeze(actor, body.reason));
       if (a === "unfreeze") return json(await this.unfreeze(actor));
-      if (a === "tasks" && b && c === "assign") return json(this.assign(actor, Number(b), body.agent ?? null, body.note));
+      if (a === "tasks" && b && c === "assign") return json(this.assign(actor, Number(b), body.agent ?? null, body.note, body.related));
       if (a === "protect") return json(this.protect(actor, body.paths ?? []));
       if (a === "delegate") return json(await this.configureDelegate(actor, body));
+      if (ruling) return json(this.ruleDispute(actor, Number(b), body.for, body.note));
+      if (a === "decisions" && !b) return json(this.recordDecision("note", actor, { question: body.question ?? "", decision: body.decision, paths: body.paths ?? [], task: body.taskId ?? null }));
+      if (a === "decisions" && b && c === "retire") return json(this.retireDecision(actor, Number(b)));
     }
     // A paused agent can still read, talk and answer, but not change code.
-    const talking = a === "threads" || a === "messages" || a === "proposals";
+    const talking = ["threads", "messages", "proposals", "consults", "disputes"].includes(a);
     if (actor.paused && !talking) throw new HttpError(423, `you are paused: ${actor.paused}. Wait for a human to resume you; you can still post in threads.`);
     if (a === "tasks" && !b && m === "POST") return json(this.createTask(actor, body));
     if (a === "tasks" && b && c === "claim") return json(await this.claim(actor, Number(b)));
     if (a === "tasks" && b && c === "release") return json(this.releaseTask(actor, Number(b), body.reason));
-    if (a === "intents" && !b && m === "POST") return json(this.declareIntent(actor, body));
+    if (a === "intents" && !b && m === "POST") return json(await this.declareIntent(actor, body));
     if (a === "intents" && b && m === "DELETE") return json(this.releaseIntent(actor, Number(b)));
     if (a === "workspaces" && b && c === "commit") return json(await this.commitToWorkspace(actor, b, body));
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
@@ -315,12 +329,20 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
     if (a === "tasks" && b && c === "sync") return json(await this.sync(actor, { taskId: Number(b) }, body.resolutions));
     if (a === "messages" && m === "POST") return json(this.message(actor, body));
-    if (a === "threads" && !b && m === "POST") return json(this.openThread(actor, body));
+    if (a === "threads" && !b && m === "POST") {
+      const t = this.openThread(actor, body);
+      // Before anyone answers: what the humans already decided that may cover it.
+      if (t.kind === "question" && t.to_agent === "humans") return json({ ...t, precedents: this.relevantDecisions(this.threadPaths(t), body.body, 5) });
+      return json(t);
+    }
     if (a === "proposals" && !b && m === "POST") return json(this.propose(actor, body));
     if (a === "proposals" && b && c === "accept") return json(this.settle(actor, Number(b), true, body.body));
     if (a === "proposals" && b && c === "reject") return json(this.settle(actor, Number(b), false, body.body));
     if (a === "threads" && b && c === "posts") return json(this.post(actor, Number(b), body.body));
     if (a === "threads" && b && c === "resolve") return json(this.resolveThread(actor, Number(b), body.body));
+    if (a === "consults" && !b && m === "POST") return json(this.consult(actor, body));
+    if (a === "disputes" && !b && m === "POST") return json(this.openDispute(actor, body));
+    if (a === "disputes" && b && c === "position") return json(this.statePosition(actor, Number(b), body.position));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
   }
 
@@ -356,13 +378,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── tasks and workspaces ─────────────────────────────────────────────────
 
-  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[]; parent?: number }) {
+  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[]; parent?: number; related?: number[] }) {
     if (!body.title) throw new HttpError(400, "title is required");
     if (body.parent) this.task(body.parent);
     const now = Date.now();
     const row = this.sql
-      .exec("INSERT INTO tasks (title, description, depends_on, parent, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
-        body.title, body.description ?? "", JSON.stringify(body.dependsOn ?? []), body.parent ?? null, actor.id, now, now)
+      .exec("INSERT INTO tasks (title, description, depends_on, parent, related, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        body.title, body.description ?? "", JSON.stringify(body.dependsOn ?? []), body.parent ?? null, JSON.stringify(body.related ?? []), actor.id, now, now)
       .one();
     const id = row.id as number;
     this.emit("task.created", { actor: actor.id, task: id, data: { title: body.title, parent: body.parent ?? null } });
@@ -413,6 +435,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         pullMain: `git -c http.extraHeader="Authorization: Bearer ${mainToken}" pull --no-rebase ${this.remoteUrl(this.mainRepo)} main`,
       },
       context: resumed ? await this.handoff(taskId) : null,
+      memory: await this.taskMemory(taskId, actor.id),
     };
   }
 
@@ -424,7 +447,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── intents: say what you'll touch before you touch it ──────────────────
 
-  private declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string }) {
+  private async declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string }) {
     const paths = (body.paths ?? []).map(normalizePattern).filter(Boolean);
     if (!paths.length) throw new HttpError(400, "paths is required");
     const row = this.sql
@@ -447,7 +470,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const pending = this.sql.exec("SELECT id, agent_id, title, files FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested')").toArray()
       .map((c) => ({ change: c.id, agent: c.agent_id, title: c.title, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path).filter((f) => paths.some((p) => matches(p, f))) }))
       .filter((c) => c.files.length && c.agent !== actor.id);
-    return { intent: id, paths, overlaps, pendingChanges: pending, advice: overlaps.length || pending.length ? "Another agent is working in these paths. Message them (send_message) to split the work, or narrow your intent." : "Clear: no one else has declared these paths." };
+    const memory = await this.recall(actor, paths, body.taskId ?? null, body.description ?? "");
+    const advice = [
+      overlaps.length || pending.length ? "Another agent is working in these paths. Message them (send_message) to split the work, or narrow your intent." : "Clear: no one else has declared these paths.",
+      memory.decisions.length ? `The humans already decided ${memory.decisions.length} thing(s) here: follow them rather than asking again.` : "",
+      memory.consult.length ? `${memory.consult.map((c) => c.agentName).join(", ")} worked on these files before and is still around: consult them (consult_agent) if their reasons matter to you.` : "",
+    ].filter(Boolean).join(" ");
+    return { intent: id, paths, overlaps, pendingChanges: pending, memory, advice };
   }
 
   private releaseIntent(actor: Agent, id: number) {
@@ -603,14 +632,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.emit("review.submitted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { verdict: body.verdict, body: body.body ?? "", comments: body.comments ?? [] } });
     if (body.verdict === "request_changes") {
       this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
+      if (actor.role === "human" && body.body) {
+        const paths = body.comments?.length ? [...new Set(body.comments.map((x) => x.path))] : (ch.files as FileChange[]).map((f) => f.path);
+        this.recordDecision("review", actor, { question: `Change #${id}: ${ch.title}`, decision: body.body, paths, task: ch.task_id, change: id });
+      }
     } else if (body.verdict === "approve" && ch.status === "review") {
-      const approvers = this.sql.exec("SELECT DISTINCT r.reviewer, a.role FROM reviews r LEFT JOIN agents a ON a.id = r.reviewer WHERE r.change_id = ? AND r.verdict = 'approve' AND r.head = ?", id, ch.head).toArray();
-      const humanOk = approvers.some((r) => r.role === "human" || r.reviewer === "admin");
-      const guarded = this.guardedFiles(ch.files);
-      if (approvers.length >= this.requiredApprovals && (humanOk || !guarded.length)) await this.enqueue(id);
-
+      await this.maybeEnqueue(id);
     }
     return this.change(id);
+  }
+
+  /** Queue a change once it has enough approvals (a human's, if it touches protected paths). */
+  private async maybeEnqueue(id: number) {
+    const ch = this.change(id);
+    if (ch.status !== "review") return;
+    const approvers = this.sql.exec("SELECT DISTINCT r.reviewer, a.role FROM reviews r LEFT JOIN agents a ON a.id = r.reviewer WHERE r.change_id = ? AND r.verdict = 'approve' AND r.head = ?", id, ch.head).toArray();
+    const humanOk = approvers.some((r) => r.role === "human" || r.reviewer === "admin");
+    const guarded = this.guardedFiles(ch.files);
+    if (approvers.length >= this.requiredApprovals && (humanOk || !guarded.length)) await this.enqueue(id);
   }
 
   // ── merge queue ──────────────────────────────────────────────────────────
@@ -779,6 +818,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private directive(actor: Agent, body: { to?: string; body: string; taskId?: number }) {
     if (!body.body) throw new HttpError(400, "body is required");
     const e = this.emit("directive", { actor: actor.id, to: body.to ?? null, task: body.taskId ?? null, data: { body: body.body, from: actor.name } });
+    if (!body.to) this.recordDecision("directive", actor, { question: "", decision: body.body, paths: [], task: body.taskId ?? null });
     return { seq: e.seq };
   }
 
@@ -809,8 +849,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** Hand a task to a specific agent (or to nobody). The workspace and context go with it. */
-  private assign(actor: Agent, taskId: number, agentId: string | null, note?: string) {
+  private assign(actor: Agent, taskId: number, agentId: string | null, note?: string, related?: number[]) {
     const task = this.task(taskId);
+    if (related?.length) this.sql.exec("UPDATE tasks SET related = ? WHERE id = ?", JSON.stringify([...new Set([...task.related, ...related])]), taskId);
     this.sql.exec("UPDATE tasks SET assignee = ?, status = CASE WHEN ? IS NULL AND status = 'claimed' THEN 'open' ELSE status END, updated_at = ? WHERE id = ?", agentId, agentId, Date.now(), taskId);
     if (task.workspace) this.sql.exec("UPDATE workspaces SET agent_id = ? WHERE name = ?", agentId, task.workspace);
     this.sql.exec("UPDATE intents SET agent_id = ? WHERE task_id = ? AND released_at IS NULL", agentId, taskId);
@@ -832,7 +873,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const raw = this.meta("delegate");
     if (!raw) return DEFAULT_DELEGATE;
     const cfg = JSON.parse(raw);
-    return { ...DEFAULT_DELEGATE, ...cfg, questions: { ...DEFAULT_DELEGATE.questions, ...cfg.questions }, approvals: { ...DEFAULT_DELEGATE.approvals, ...cfg.approvals } };
+    return { ...DEFAULT_DELEGATE, ...cfg, questions: { ...DEFAULT_DELEGATE.questions, ...cfg.questions }, approvals: { ...DEFAULT_DELEGATE.approvals, ...cfg.approvals }, disputes: { ...DEFAULT_DELEGATE.disputes, ...cfg.disputes } };
   }
 
   private delegateActor(): Agent {
@@ -844,12 +885,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const cfg: DelegateConfig = { ...this.delegateConfig, ...body };
     cfg.questions = { ...this.delegateConfig.questions, ...(body.questions ?? {}) };
     cfg.approvals = { ...this.delegateConfig.approvals, ...(body.approvals ?? {}) };
+    cfg.disputes = { ...this.delegateConfig.disputes, ...(body.disputes ?? {}) };
     this.setMeta("delegate", JSON.stringify(cfg));
     // jev is a member like any other, so its decisions are attributed to it.
     this.sql.exec("INSERT OR IGNORE INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, 'human', ?, ?, ?)",
       DELEGATE_ID, cfg.name, `delegate:${randomId(16)}`, Date.now(), Date.now());
     this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", cfg.name, DELEGATE_ID);
-    this.emit("delegate.configured", { actor: actor.id, data: { enabled: cfg.enabled, name: cfg.name, questions: cfg.questions, approvals: cfg.approvals, rules: cfg.rules.length } });
+    this.emit("delegate.configured", { actor: actor.id, data: { enabled: cfg.enabled, name: cfg.name, questions: cfg.questions, approvals: cfg.approvals, disputes: cfg.disputes, rules: cfg.rules.length } });
     return cfg;
   }
 
@@ -868,12 +910,39 @@ export class ProjectCoordinator extends DurableObject<Env> {
         question: e.data.body,
         options: t.options,
         task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
+        precedents: this.relevantDecisions(this.threadPaths(t), e.data.body),
       }, this.judge);
       if (this.thread(t.id).status !== "open") return; // a human got there first
       if (v.act) {
-        this.post(jev, t.id, v.answer);
-        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, data: { thread: t.id, kind: "question", via: v.via, decision: v.answer, scores: v.scores ?? null } });
+        // House rules and precedents are already on record; a fresh pick by Jev becomes a decision.
+        this.citing = true;
+        try { this.post(jev, t.id, v.answer); } finally { this.citing = false; }
+        if (v.via === "jev" && v.option) {
+          const meaning = t.options?.[v.option];
+          this.recordDecision("answer", jev, { question: e.data.body, decision: meaning && meaning !== v.option ? `${v.option}: ${meaning}` : v.option, paths: this.threadPaths(t), task: t.task_id, change: t.change_id, thread: t.id });
+        }
+        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, data: { thread: t.id, kind: "question", via: v.via, decision: v.answer, precedent: v.decision ?? null, scores: v.scores ?? null } });
       } else this.escalate(t.id, null, t.task_id, v.reason, v.scores);
+      return;
+    }
+
+    if (e.type === "dispute.ready") {
+      const t = this.thread(e.data.thread);
+      if (t.status !== "open") return;
+      const terms = JSON.parse(t.terms);
+      const names: Record<string, string> = Object.fromEntries(terms.parties.map((p: string) => [this.agentName(p) ?? p, p]));
+      const task = terms.taskId ? this.task(terms.taskId) : null;
+      const v = await decideDispute(cfg, {
+        question: terms.question,
+        positions: Object.fromEntries(Object.entries(names).map(([n, id]) => [n, terms.positions[id]])),
+        task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
+        precedents: this.relevantDecisions(this.threadPaths(t), terms.question),
+      }, this.judge);
+      if (this.thread(t.id).status !== "open") return;
+      if (v.act && v.option && names[v.option]) {
+        this.ruleDispute(jev, t.id, names[v.option], v.answer);
+        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, change: terms.changeId, data: { thread: t.id, kind: "dispute", via: v.via, decision: `Ruled for ${v.option}. ${v.answer}`, scores: v.scores ?? null } });
+      } else this.escalate(t.id, null, t.task_id, v.act ? "Jev's ruling didn't match either party" : v.reason, v.scores);
       return;
     }
 
@@ -914,7 +983,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (this.escalated.has(key)) return;
     this.escalated.add(key);
     if (threadId) this.sql.exec("UPDATE threads SET escalated = ? WHERE id = ?", reason, threadId);
-    this.emit("delegate.escalated", { actor: DELEGATE_ID, task: taskId, change: changeId, data: { thread: threadId, reason, scores: scores ?? null } });
+    this.emit("delegate.escalated", { actor: DELEGATE_ID, task: taskId, change: changeId, data: { thread: threadId, kind: threadId ? this.thread(threadId).kind : "approval", reason, scores: scores ?? null } });
   }
 
   // ── proposals: agents settle overlaps between themselves ────────────────
@@ -962,6 +1031,243 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }
     }
     this.emit(accept ? "proposal.accepted" : "proposal.rejected", { actor: actor.id, to: t.created_by, task: terms.taskId, data: { thread: threadId, summary: t.title, reason: text ?? "" } });
+    return this.thread(threadId);
+  }
+
+  // ── memory: what the humans decided, and what earlier agents tried ──────
+
+  /** Set while jev cites an earlier decision, so the citation isn't recorded as a new one. */
+  private citing = false;
+
+  private decisionRows(where: string, ...args: SqlStorageValue[]): Decision[] {
+    return this.sql.exec(`SELECT * FROM decisions WHERE ${where}`, ...args).toArray()
+      .map((r) => ({ ...r, paths: JSON.parse(r.paths as string), byName: this.agentName(r.by as string) })) as any;
+  }
+
+  private recordDecision(kind: Decision["kind"], actor: Agent, d: { question: string; decision: string; paths: string[]; task?: number | null; change?: number | null; thread?: number | null }) {
+    if (!d.decision?.trim()) throw new HttpError(400, "decision is required");
+    const paths = d.paths.map(normalizePattern).filter(Boolean);
+    const row = this.sql.exec("INSERT INTO decisions (kind, question, decision, by, paths, task_id, change_id, thread_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      kind, d.question, d.decision, actor.id, JSON.stringify(paths), d.task ?? null, d.change ?? null, d.thread ?? null, Date.now()).one();
+    const id = row.id as number;
+    this.emit("decision.recorded", { actor: actor.id, task: d.task ?? null, change: d.change ?? null, data: { decision: id, kind, question: d.question, text: d.decision, paths } });
+    return this.decisionRows("id = ?", id)[0];
+  }
+
+  private retireDecision(actor: Agent, id: number) {
+    this.sql.exec("UPDATE decisions SET retired_at = ? WHERE id = ?", Date.now(), id);
+    this.emit("decision.retired", { actor: actor.id, data: { decision: id } });
+    return { ok: true };
+  }
+
+  /** Decisions that bear on these paths (or the whole project), most relevant first. */
+  private relevantDecisions(paths: string[], text = "", limit = 12): Decision[] {
+    const all = this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 300");
+    const scored = all
+      .map((d) => {
+        const onPaths = d.paths.length > 0 && paths.length > 0 && anyOverlap(d.paths, paths).length > 0;
+        const projectWide = d.paths.length === 0;
+        const sim = text ? (sameQuestion(text, d.question) ? 1 : Math.max(similarity(text, d.question), similarity(text, `${d.question} ${d.decision}`))) : 0;
+        return { d, score: (onPaths ? 2 : 0) + (projectWide ? 0.5 : 0) + sim * 2 };
+      })
+      .filter((x) => x.score >= 0.5);
+    return scored.sort((a, b) => b.score - a.score || b.d.id - a.d.id).slice(0, limit).map((x) => x.d);
+  }
+
+  private listDecisions(q: URLSearchParams) {
+    const paths = (q.get("paths") ?? "").split(",").map((p) => p.trim()).filter(Boolean);
+    const text = q.get("q") ?? "";
+    if (!paths.length && !text) return this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 100");
+    return this.relevantDecisions(paths, text, 30);
+  }
+
+  /** Paths a thread is about: its anchor, or else what its task declared. */
+  private threadPaths(t: any): string[] {
+    if (t.path) return [t.path];
+    if (t.change_id) return (this.change(t.change_id).files as FileChange[]).map((f) => f.path);
+    if (t.task_id) return this.sql.exec("SELECT paths FROM intents WHERE task_id = ?", t.task_id).toArray().flatMap((r) => JSON.parse(r.paths as string) as string[]);
+    return [];
+  }
+
+  private isPresent(agentId: string | null): boolean {
+    if (!agentId) return false;
+    const a = this.sql.exec("SELECT last_seen, paused, role FROM agents WHERE id = ?", agentId).toArray()[0];
+    return !!a && a.role !== "human" && !a.paused && Date.now() - (a.last_seen as number) < PRESENT_MS;
+  }
+
+  /** What an earlier change on these files did, why, and what people objected to. */
+  private async effort(changeRow: Record<string, SqlStorageValue>, paths: string[]) {
+    const id = changeRow.id as number;
+    const ctx = await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`);
+    const saved = ctx ? ((await ctx.json()) as any) : null;
+    const files = (JSON.parse(changeRow.files as string) as FileChange[]).map((f) => f.path);
+    const objections = this.sql.exec("SELECT reviewer, body FROM reviews WHERE change_id = ? AND verdict = 'request_changes' AND body != '' ORDER BY id", id).toArray()
+      .map((r) => ({ by: this.agentName(r.reviewer as string), body: r.body }));
+    const agent = changeRow.agent_id as string;
+    return {
+      change: id, task: changeRow.task_id, title: changeRow.title, status: changeRow.status,
+      agent, agentName: this.agentName(agent), present: this.isPresent(agent),
+      files: files.filter((f) => paths.length === 0 || paths.some((p) => matches(p, f))),
+      summary: changeRow.summary ?? "",
+      decisions: saved?.context?.decisions ?? [],
+      objections,
+    };
+  }
+
+  /**
+   * Memory for an agent about to work on some paths: decisions that apply,
+   * earlier changes there, and who of those agents is still around to ask.
+   */
+  private async recall(actor: Agent, paths: string[], taskId: number | null, text: string) {
+    const decisions = this.relevantDecisions(paths, text);
+    // Finished work only: changes still in flight show up as overlaps instead.
+    const rows = this.sql.exec("SELECT * FROM changes WHERE task_id IS NOT ? AND status IN ('merged','abandoned') ORDER BY id DESC LIMIT 200", taskId).toArray()
+      .filter((c) => (JSON.parse(c.files as string) as FileChange[]).some((f) => paths.some((p) => matches(p, f.path))))
+      .slice(0, 5);
+    const pastEfforts = await Promise.all(rows.map((c) => this.effort(c, paths)));
+    // Suggest a consult once per pair of agents and file, so memory doesn't turn into noise.
+    const consult: { agent: string; agentName: string | null; change: number; files: string[] }[] = [];
+    for (const e of pastEfforts) {
+      if (!e.present || e.agent === actor.id || consult.some((c) => c.agent === e.agent)) continue;
+      const fresh = e.files.filter((f) => this.sql.exec("INSERT OR IGNORE INTO consult_hints (a, b, path) VALUES (?, ?, ?) RETURNING a", actor.id, e.agent, f).toArray().length > 0);
+      if (fresh.length) consult.push({ agent: e.agent, agentName: e.agentName, change: e.change, files: fresh });
+    }
+    if (decisions.some((d) => d.paths.length) || pastEfforts.length) {
+      this.emit("memory.recalled", {
+        actor: actor.id, task: taskId,
+        data: { paths, decisions: decisions.map((d) => d.id), efforts: pastEfforts.map((e) => e.change), consult: consult.map((c) => c.agent) },
+      });
+    }
+    return { decisions, pastEfforts, consult };
+  }
+
+  /**
+   * Memory for a task being claimed or handed over: earlier tasks like it
+   * (named by a human, or similar in wording), what they did, and what was
+   * decided along the way.
+   */
+  private async taskMemory(taskId: number, forAgent?: string) {
+    const task = this.task(taskId);
+    const about = `${task.title} ${task.description ?? ""}`;
+    const others = this.sql.exec("SELECT id, title, description FROM tasks WHERE id != ? AND id IN (SELECT task_id FROM changes)", taskId).toArray();
+    const named = new Set<number>(task.related);
+    const similar = others
+      .map((t) => ({ id: t.id as number, score: similarity(about, `${t.title} ${t.description ?? ""}`) }))
+      .filter((t) => t.score >= 0.2 && !named.has(t.id))
+      .sort((a, b) => b.score - a.score)
+      .slice(0, 3);
+    const related = await Promise.all([...named, ...similar.map((t) => t.id)].map(async (id) => {
+      const t = this.task(id);
+      const changes = this.sql.exec("SELECT * FROM changes WHERE task_id = ? ORDER BY id", id).toArray();
+      const efforts = await Promise.all(changes.map((c) => this.effort(c, [])));
+      const holder = (t.assignee ?? changes.at(-1)?.agent_id ?? null) as string | null;
+      return {
+        task: id, title: t.title, status: t.status, why: named.has(id) ? "named by a human" : "similar wording",
+        agent: holder, agentName: this.agentName(holder), present: holder !== forAgent && this.isPresent(holder),
+        changes: efforts,
+      };
+    }));
+    const files = related.flatMap((r) => r.changes.flatMap((c) => c.files));
+    return { related, decisions: this.relevantDecisions(files, about) };
+  }
+
+  /** Ask an agent who worked on something before. Opens a thread they're notified about. */
+  private consult(actor: Agent, body: { agent: string; question: string; path?: string; changeId?: number; taskId?: number }) {
+    if (!body.agent || !body.question) throw new HttpError(400, "agent and question are required");
+    const other = this.sql.exec("SELECT id, name FROM agents WHERE id = ? OR name = ?", body.agent, body.agent).toArray()[0];
+    if (!other) throw new HttpError(404, `no agent ${body.agent}`);
+    const t = this.openThread(actor, {
+      silent: true, kind: "discussion", taskId: body.taskId, changeId: body.changeId, path: body.path,
+      title: `Consult: ${body.question.split("\n")[0].slice(0, 70)}`, body: body.question, to: other.id as string,
+    });
+    this.emit("consult.requested", {
+      actor: actor.id, to: other.id as string, task: body.taskId ?? null, change: body.changeId ?? null,
+      data: { thread: t.id, question: body.question, path: body.path ?? null, present: this.isPresent(other.id as string) },
+    });
+    return { thread: t, present: this.isPresent(other.id as string), note: this.isPresent(other.id as string) ? "They're active; their reply arrives as a thread.reply event." : "They haven't been active lately; their saved context (task_context) may answer you sooner." };
+  }
+
+  // ── disputes: when agents can't settle it themselves ───────────────────
+
+  /**
+   * Open a dispute with another agent. Each side states a position; jev rules
+   * if the humans' guidance and earlier decisions settle it, a person if not.
+   * A ruling becomes a decision, and on a change it is enforced: a ruling for
+   * the author dismisses the other side's request for changes.
+   */
+  private openDispute(actor: Agent, body: { with: string; question: string; position: string; theirPosition?: string; taskId?: number; changeId?: number }) {
+    if (!body.with || !body.question || !body.position) throw new HttpError(400, "with, question and position are required");
+    const other = this.sql.exec("SELECT id, name FROM agents WHERE id = ? OR name = ?", body.with, body.with).toArray()[0];
+    if (!other || other.id === actor.id) throw new HttpError(400, "dispute with another agent");
+    const taskId = body.taskId ?? (body.changeId ? this.change(body.changeId).task_id : null);
+    const positions: Record<string, string> = { [actor.id]: body.position };
+    if (body.theirPosition) positions[other.id as string] = body.theirPosition;
+    const t = this.openThread(actor, {
+      silent: true, kind: "discussion", taskId: taskId ?? undefined, changeId: body.changeId,
+      title: `Dispute: ${body.question.split("\n")[0].slice(0, 70)}`,
+      body: `${body.question}\n\n${actor.name}: ${body.position}${body.theirPosition ? `\n${other.name} (as ${actor.name} understands it): ${body.theirPosition}` : ""}`,
+      to: "humans",
+    });
+    const terms = { question: body.question, parties: [actor.id, other.id], positions, changeId: body.changeId ?? null, taskId };
+    this.sql.exec("UPDATE threads SET kind = 'dispute', terms = ? WHERE id = ?", JSON.stringify(terms), t.id);
+    this.emit("dispute.opened", { actor: actor.id, to: other.id as string, task: taskId, change: body.changeId ?? null, data: { thread: t.id, question: body.question, position: body.position, with: other.id } });
+    this.disputeReady(t.id);
+    return this.thread(t.id);
+  }
+
+  private statePosition(actor: Agent, threadId: number, position: string) {
+    const t = this.thread(threadId);
+    if (t.kind !== "dispute" || t.status !== "open") throw new HttpError(409, "not an open dispute");
+    const terms = JSON.parse(t.terms);
+    if (!terms.parties.includes(actor.id)) throw new HttpError(403, "only the two parties state positions");
+    if (!position) throw new HttpError(400, "position is required");
+    terms.positions[actor.id] = position;
+    this.sql.exec("UPDATE threads SET terms = ?, updated_at = ? WHERE id = ?", JSON.stringify(terms), Date.now(), threadId);
+    this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", threadId, actor.id, `My position: ${position}`, Date.now());
+    this.emit("dispute.position", { actor: actor.id, task: terms.taskId, change: terms.changeId, data: { thread: threadId, position } });
+    this.disputeReady(threadId);
+    return this.thread(threadId);
+  }
+
+  private disputeReady(threadId: number) {
+    const t = this.thread(threadId);
+    const terms = JSON.parse(t.terms);
+    if (terms.parties.every((p: string) => terms.positions[p])) {
+      this.emit("dispute.ready", { task: terms.taskId, change: terms.changeId, data: { thread: threadId } });
+    }
+  }
+
+  private ruleDispute(actor: Agent, threadId: number, winner: string, note?: string) {
+    const t = this.thread(threadId);
+    if (t.kind !== "dispute" || t.status !== "open") throw new HttpError(409, "not an open dispute");
+    const terms = JSON.parse(t.terms);
+    const win = terms.parties.find((p: string) => p === winner || this.agentName(p) === winner);
+    if (!win) throw new HttpError(400, `rule for one of: ${terms.parties.map((p: string) => this.agentName(p)).join(", ")}`);
+    if (!terms.positions[win]) throw new HttpError(409, `${this.agentName(win)} hasn't stated a position yet`);
+    const lose = terms.parties.find((p: string) => p !== win);
+    const text = `${this.agentName(win)}'s position: ${terms.positions[win]}`;
+    this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", threadId, actor.id, `Ruling: ${text}${note ? `\n${note}` : ""}`, Date.now());
+    this.sql.exec("UPDATE threads SET status = 'ruled', updated_at = ? WHERE id = ?", Date.now(), threadId);
+    const decision = this.recordDecision("ruling", actor, { question: terms.question, decision: text + (note ? ` (${note})` : ""), paths: this.threadPaths(t), task: terms.taskId, change: terms.changeId, thread: threadId });
+    // Enforce it on the change: a ruling for the author lifts the loser's objection.
+    let enforced = "";
+    if (terms.changeId) {
+      const ch = this.change(terms.changeId);
+      if (ch.agent_id === win) {
+        const n = this.sql.exec("UPDATE reviews SET verdict = 'dismissed' WHERE change_id = ? AND reviewer = ? AND verdict = 'request_changes' AND head = ? RETURNING id", ch.id, lose, ch.head).toArray().length;
+        const stillBlocked = this.sql.exec("SELECT 1 FROM reviews WHERE change_id = ? AND verdict = 'request_changes' AND head = ?", ch.id, ch.head).toArray().length > 0;
+        if (n && ch.status === "changes_requested" && !stillBlocked) {
+          this.sql.exec("UPDATE changes SET status = 'review', updated_at = ? WHERE id = ?", Date.now(), ch.id);
+          enforced = `${this.agentName(lose)}'s request for changes on #${ch.id} is dismissed; the change is back in review.`;
+          this.ctx.waitUntil(this.maybeEnqueue(ch.id));
+        }
+      } else {
+        enforced = `#${ch.id} needs ${this.agentName(win)}'s requested changes before it can land.`;
+      }
+    }
+    const data = { thread: threadId, winner: win, loser: lose, ruling: text, note: note ?? "", enforced, decision: decision.id };
+    this.emit("dispute.ruled", { actor: actor.id, task: terms.taskId, change: terms.changeId, data });
+    for (const p of terms.parties) this.emit("dispute.ruled.notify", { actor: actor.id, to: p, task: terms.taskId, change: terms.changeId, data });
     return this.thread(threadId);
   }
 
@@ -1014,6 +1320,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private answer(t: any, actor: Agent, text: string) {
     this.sql.exec("UPDATE threads SET status = 'answered', updated_at = ? WHERE id = ?", Date.now(), t.id);
+    if (t.to_agent === "humans" && (actor.role === "human" || actor.id === "admin") && !this.citing) {
+      this.recordDecision("answer", actor, { question: t.posts[0]?.body ?? t.title, decision: text, paths: this.threadPaths(t), task: t.task_id, change: t.change_id, thread: t.id });
+    }
     if (t.blocking && t.task_id) {
       this.sql.exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'blocked'", t.prev_task_status ?? "claimed", Date.now(), t.task_id);
     }
@@ -1081,6 +1390,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       intents: this.sql.exec("SELECT * FROM intents WHERE task_id = ? ORDER BY id", taskId).toArray().map((r) => ({ ...r, paths: JSON.parse(r.paths as string) })),
       changes: await Promise.all(changes.map((c) => this.changeDetail(c.id as number))),
       history: this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE task_id = ? ORDER BY seq", taskId).toArray()),
+      memory: await this.taskMemory(taskId),
     };
   }
 
@@ -1094,6 +1404,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.env.TYPESAFE_API_KEY },
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
+      decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
     };
   }

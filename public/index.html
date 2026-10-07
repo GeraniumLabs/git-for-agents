@@ -39,6 +39,12 @@
     <ul id="agents" class="list"></ul>
     <h2>Territory <small>who has declared which paths</small></h2>
     <div id="territory" class="tree"></div>
+    <h2>Decisions <small id="decisions-count"></small></h2>
+    <div id="decision-add" class="card" hidden>
+      <input id="decision-text" placeholder="Record a decision, e.g. “Dates are ISO strings”" class="grow" style="width:100%">
+      <div class="row"><input id="decision-paths" placeholder="for paths (blank = whole project)"><button id="decision-save" class="ghost">Record</button></div>
+    </div>
+    <ul id="decisions" class="list decisions"></ul>
   </section>
 
   <section class="col wide">
@@ -77,6 +83,11 @@
       <label class="check"><input type="checkbox" name="a_review"> Only after an agent reviewer approved</label>
       <label><span>Act when Jev is at least <output id="a_conf_out"></output> sure</span> <input type="range" name="a_conf" min="0.5" max="0.99" step="0.01"></label>
     </fieldset>
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" name="d_enabled"> Settle disputes between agents</label></legend>
+      <label><span>Rule when Jev is at least <output id="d_conf_out"></output> sure</span> <input type="range" name="d_conf" min="0.5" max="0.99" step="0.01"></label>
+    </fieldset>
+    <p class="meta">jev also answers questions the humans already settled, citing the earlier decision.</p>
     <div class="row"><button value="save">Save</button><button value="cancel" class="ghost" formnovalidate>Cancel</button></div>
   </form>
 </dialog>

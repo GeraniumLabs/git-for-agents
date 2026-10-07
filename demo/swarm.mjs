@@ -7,11 +7,16 @@
 //
 // Set PACE=0 to run as fast as possible (for tests), PACE=1.5 to slow down.
 //
-// A human ("jo") takes part too: protects package.json and README.md, sets a
-// ground rule, and briefs jev, the humans' delegate, to answer questions and
-// approve docs changes within that brief. jev settles what its house rules or
-// TypeSafe's Jev model (with TYPESAFE_API_KEY set on the Worker) can settle
-// confidently; jo gets the rest, with jev's reason.
+// A human ("jo", scripted) takes part too: protects package.json and
+// README.md, sets a ground rule, and briefs jev, the humans' delegate, to
+// answer questions, settle disputes and approve docs changes within that
+// brief. jev settles what its house rules, earlier decisions or TypeSafe's Jev
+// model (with TYPESAFE_API_KEY set on the Worker) can settle confidently; jo
+// gets the rest, with jev's reason.
+//
+// Memory: every human answer, directive and ruling becomes a decision. dax
+// asks a question jo already answered and gets the earlier decision back; fen
+// starts on files ada changed, sees what ada did and why, and consults ada.
 
 import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
@@ -36,6 +41,7 @@ const insertAfter = (anchor, text) => (s) => (s.includes(text) ? s : s.replace(a
 const PLANS = [
   {
     agent: "ada", task: "Add due dates and an overdue filter",
+    consultAnswer: "Yes, same convention: optional fields are null when absent, never undefined, so every record has the key and JSON output stays stable. overdue() relies on that (it checks t.due).",
     paths: ["src/db.js", "src/routes/todos.js"],
     intent: "Store an optional due date on each todo; GET ?overdue=1 returns overdue items",
     useGit: true,
@@ -90,6 +96,10 @@ export function overdue(now = Date.now()) {
     paths: ["README.md"],
     intent: "Describe the endpoints",
     sneaky: true,
+    dispute: {
+      question: "Should the change that documents the API also bump the package version?",
+      position: "Documenting the API is a user-visible milestone, so 0.2.0 belongs with it. A separate task just for the bump is overhead.",
+    },
     edits: {
       "README.md": [append(`
 ## API
@@ -106,8 +116,10 @@ export function overdue(now = Date.now()) {
 
 const TEST_PLAN = {
   agent: "dax", task: "Test the validator", dependsOnAgent: "bex",
-  question: "Which test runner should I use, node:test or vitest?",
-  options: { "node:test": "Built into Node, no new dependency", vitest: "Nicer output and watch mode, adds a dev dependency" },
+  questions: [
+    { q: "Which test runner should I use, node:test or vitest?", options: { "node:test": "Built into Node, no new dependency", vitest: "Nicer output and watch mode, adds a dev dependency" } },
+    { q: "What should the maximum title length be?", options: { "200": "200 characters", "1000": "1000 characters", none: "No limit" } },
+  ],
   paths: ["test/"],
   intent: "Unit tests for validateTodo",
   edits: {
@@ -121,6 +133,29 @@ test("accepts a title", () => assert.equal(validateTodo({ title: "ship it" }), n
 `],
   },
   context: { plan: ["three cases"], tested: ["node --test test/"] },
+};
+
+// A second wave: fen starts after ada's work has landed, on the same files.
+// Loom's memory tells fen what ada did and why, and that ada is still around.
+const FOLLOW_PLAN = {
+  agent: "fen", task: "Add a priority level and a priority filter", dependsOnAgent: "ada",
+  paths: ["src/db.js", "src/routes/todos.js"],
+  intent: "Store an optional priority on each todo; GET ?priority=high filters by it",
+  consult: { agent: "ada", path: "src/db.js", question: "You added `due` to the record in src/db.js. Should `priority` follow the same convention, null when absent rather than undefined?" },
+  edits: {
+    "src/db.js": [
+      replace("due: todo.due ?? null }", "due: todo.due ?? null, priority: todo.priority ?? null }"),
+      append(`
+export function byPriority(priority) {
+  return list().filter((t) => t.priority === priority);
+}
+`),
+    ],
+    "src/routes/todos.js": [
+      insertAfter('  if (req.method === "GET") {\n', '    if (url.searchParams.get("priority")) return json(db.byPriority(url.searchParams.get("priority")));\n'),
+    ],
+  },
+  context: { plan: ["add priority to record", "byPriority() query", "wire ?priority="], decisions: ["priority is null when absent, like due (confirmed with ada)"], tested: ["GET ?priority=high"] },
 };
 
 async function apply(loom, workspace, edits, onMain) {
@@ -160,9 +195,24 @@ async function builder(admin, keys, plan, taskId) {
     }
   }
   log(plan.agent, `claimed #${taskId} → workspace ${claim.workspace.name}`);
+  for (const r of claim.memory?.related ?? []) log(plan.agent, `memory: related earlier task #${r.task} “${r.title}” by ${r.agentName} (${r.status}, ${r.why})`);
   await pause(1);
 
   const intent = await me.intent(taskId, plan.paths, plan.intent);
+  const mem = intent.memory;
+  for (const d of mem.decisions.filter((d) => d.paths.length)) log(plan.agent, `memory: decision #${d.id} by ${d.byName} applies: “${d.decision}”`);
+  for (const e of mem.pastEfforts) log(plan.agent, `memory: ${e.agentName}'s change #${e.change} “${e.title}” touched ${e.files.join(", ")}${e.decisions.length ? `; decided: ${e.decisions.join("; ")}` : ""}`);
+  const hint = plan.consult && mem.consult.find((c) => c.agentName === plan.consult.agent);
+  if (hint) {
+    const { thread } = await me.req("POST", "/consults", { agent: hint.agent, question: plan.consult.question, path: plan.consult.path, changeId: hint.change, taskId });
+    log(plan.agent, `consulting ${hint.agentName}, who is still around: ${plan.consult.question}`);
+    for (;;) {
+      const t = await me.req("GET", `/threads/${thread.id}`);
+      const answer = t.posts.find((p) => p.author === hint.agent);
+      if (answer) { log(plan.agent, `${hint.agentName} replied: “${answer.body}”`); break; }
+      await pause(1);
+    }
+  }
   for (const o of intent.overlaps) {
     log(plan.agent, `collision forecast with ${o.agentName} on ${o.paths.join(", ")}`);
     if (plan.proposeOrderWith && o.agentName === plan.proposeOrderWith) {
@@ -176,9 +226,9 @@ async function builder(admin, keys, plan, taskId) {
     await me.req("POST", "/threads", { kind: "contract", taskId, path: "src/db.js", title: plan.contract.title, body: plan.contract.body });
     log(plan.agent, `published contract: ${plan.contract.title}`);
   }
-  if (plan.question) {
-    const q = await me.req("POST", "/threads", { kind: "question", to: "humans", taskId, body: plan.question, options: plan.options, blocking: true });
-    log(plan.agent, `asked the humans (blocking): ${plan.question}`);
+  for (const { q: text, options } of plan.questions ?? (plan.question ? [{ q: plan.question, options: plan.options }] : [])) {
+    const q = await me.req("POST", "/threads", { kind: "question", to: "humans", taskId, body: text, options, blocking: true });
+    log(plan.agent, `asked the humans (blocking): ${text}`);
     for (;;) {
       const t = await me.req("GET", `/threads/${q.id}`);
       if (t.status !== "open") { log(plan.agent, `got an answer from ${t.posts.at(-1).authorName}: “${t.posts.at(-1).body}”`); break; }
@@ -236,6 +286,22 @@ async function builder(admin, keys, plan, taskId) {
         handledReviews += fresh.length;
         log(plan.agent, `review asks: “${fresh.at(-1).body}”`);
         await pause(2);
+        const objector = fresh.find((r) => s.agents.find((a) => a.id === r.reviewer)?.role === "reviewer");
+        if (plan.dispute && objector && !builder.disputed[plan.agent]) {
+          builder.disputed[plan.agent] = true;
+          const d = await me.req("POST", "/disputes", { with: objector.reviewer, changeId: c.id, question: plan.dispute.question, position: plan.dispute.position });
+          log(plan.agent, `disagrees with ${s.agents.find((a) => a.id === objector.reviewer).name}; opened a dispute: ${plan.dispute.question}`);
+          let t;
+          for (;;) {
+            t = await me.req("GET", `/threads/${d.id}`);
+            if (t.status !== "open") break;
+            await pause(1);
+          }
+          const ruling = t.posts.at(-1);
+          log(plan.agent, `dispute ruled by ${ruling.authorName}: “${ruling.body.split("\n")[0]}”`);
+          if (ruling.body.includes(`${plan.agent}'s position`)) continue;
+          log(plan.agent, "lost the dispute; dropping the version bump");
+        }
         // Put back every file we touched outside our declared intent.
         const revert = {};
         for (const path of c.undeclared) revert[path] = await me.read(path).catch(() => null);
@@ -249,12 +315,21 @@ async function builder(admin, keys, plan, taskId) {
 }
 builder.seen = {};
 builder.waiting = {};
+builder.disputed = {};
 
 async function reviewer(admin, key, done) {
   const me = admin.as(key);
   const seen = new Set();
+  const myId = (await me.me()).agent.id;
   while (!done.value) {
     const s = await me.state();
+    for (const t of (s.threads ?? []).filter((t) => t.kind === "dispute" && t.status === "open")) {
+      const terms = JSON.parse(t.terms);
+      if (!terms.parties.includes(myId) || terms.positions[myId]) continue;
+      await pause(2);
+      await me.req("POST", `/disputes/${t.id}/position`, { position: "A docs change shouldn't touch package.json: edits outside a change's declared intent need their own task, and version bumps happen at release time." });
+      log("rex", `stated a position in dispute #${t.id}`);
+    }
     for (const c of s.changes.filter((x) => x.status === "review")) {
       const k = `${c.id}:${c.head}`;
       if (seen.has(k)) continue;
@@ -273,11 +348,21 @@ async function reviewer(admin, key, done) {
   }
 }
 
-/** Agents accept proposals addressed to them (an LLM agent would weigh them). */
+/** Agents accept proposals and answer consults addressed to them (an LLM agent would think about them). */
 async function proposalDesk(admin, keys, done) {
   const byId = Object.fromEntries(Object.values(keys).map((k) => [k.id, k]));
   const answered = new Set();
   while (!done.value) {
+    const asks = await admin.req("GET", "/threads?kind=discussion&status=open");
+    for (const t of asks.filter((t) => t.title.startsWith("Consult:") && byId[t.to_agent])) {
+      if (answered.has(t.id) || t.posts.some((p) => p.author === t.to_agent)) continue;
+      answered.add(t.id);
+      const who = byId[t.to_agent];
+      const plan = [...PLANS, TEST_PLAN, FOLLOW_PLAN].find((p) => p.agent === who.name);
+      await pause(2);
+      await admin.as(who.key).req("POST", `/threads/${t.id}/posts`, { body: plan?.consultAnswer ?? "I don't remember more than what's in my change's context; go by that." });
+      log(who.name, `answered a consult from ${t.createdByName}`);
+    }
     const threads = await admin.req("GET", "/threads?kind=proposal&status=open");
     for (const t of threads) {
       if (answered.has(t.id) || !byId[t.to_agent]) continue;
@@ -317,6 +402,16 @@ async function human(admin, key, done) {
       await me.req("POST", `/threads/${t.id}/posts`, { body: "200 is right. Return the error message in the response body so the UI can show it." });
       log("jo", `answered ${t.created_by}'s question`);
     }
+    for (const t of (s.threads ?? []).filter((t) => t.kind === "dispute" && t.status === "open" && t.escalated)) {
+      if (handled.has(`d${t.id}`)) continue;
+      handled.add(`d${t.id}`);
+      const terms = JSON.parse(t.terms);
+      const reviewerSide = terms.parties.find((p) => s.agents.find((a) => a.id === p)?.role === "reviewer");
+      log("jo", `jev passed dispute #${t.id} on: ${t.escalated}`);
+      await pause(4);
+      await me.req("POST", `/disputes/${t.id}/rule`, { for: reviewerSide, note: "Versions change at release time, as decided earlier." });
+      log("jo", `ruled on dispute #${t.id}`);
+    }
     const escalated = new Set(s.events.filter((e) => e.type === "delegate.escalated" && e.change_id).map((e) => e.change_id));
     const needs = new Set(s.events.filter((e) => e.type === "approval.needs_human").map((e) => e.change_id));
     const touches = (c, p) => c.files.some((f) => f.path === p);
@@ -324,11 +419,16 @@ async function human(admin, key, done) {
       const k = `c${c.id}:${c.head}`;
       if (handled.has(k)) continue;
       if (touches(c, "package.json")) {
+        // rex and eli's dispute settles this; if the change still bumps the version after it, jo sends it back.
+        const ruled = (s.threads ?? []).some((t) => t.kind === "dispute" && t.change_id === c.id && t.status === "ruled");
+        if (!ruled && !escalated.has(c.id)) continue;
         handled.add(k);
         await pause(3);
         await me.review(c.id, "request_changes", "Version bumps happen at release time, not in feature changes. Please drop the package.json edit.", [{ path: "package.json", body: "revert this" }]);
         log("jo", `requested changes on #${c.id}: no version bumps in feature changes`);
-      } else if (escalated.has(c.id) && s.reviews.some((r) => r.change_id === c.id && r.verdict === "approve")) {
+        continue;
+      }
+      if (escalated.has(c.id) && s.reviews.some((r) => r.change_id === c.id && r.verdict === "approve")) {
         handled.add(k);
         await pause(3);
         await me.review(c.id, "approve", "Docs look good.");
@@ -346,18 +446,19 @@ async function main() {
   await pause(3);
 
   const keys = {};
-  for (const name of ["ada", "bex", "cyd", "dax", "eli"]) keys[name] = await admin.addAgent(name);
+  for (const name of ["ada", "bex", "cyd", "dax", "eli", "fen"]) keys[name] = await admin.addAgent(name);
   keys.rex = await admin.addAgent("rex", "reviewer");
   const jo = await admin.addAgent("jo", "human");
   const tasks = {};
   for (const p of PLANS) tasks[p.agent] = (await admin.createTask(p.task, p.intent)).id;
   tasks.dax = (await admin.createTask(TEST_PLAN.task, TEST_PLAN.intent, [tasks.bex])).id;
+  tasks.fen = (await admin.createTask(FOLLOW_PLAN.task, FOLLOW_PLAN.intent, [tasks.ada])).id;
 
   const done = { value: false };
   const rev = reviewer(admin, keys.rex.key, done);
   const lead = human(admin, jo.key, done);
   const desk = proposalDesk(admin, keys, done);
-  await Promise.all([...PLANS, TEST_PLAN].map((p) => builder(admin, keys, p, tasks[p.agent])));
+  await Promise.all([...PLANS, TEST_PLAN, FOLLOW_PLAN].map((p) => builder(admin, keys, p, tasks[p.agent])));
   done.value = true;
   await Promise.all([rev, lead, desk]);
 

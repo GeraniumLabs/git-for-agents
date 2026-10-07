@@ -121,3 +121,11 @@ dialog#jev { width: min(560px, 94vw); }
 .jev-form input[type=range] { width: 100%; }
 .jev-form .row button { margin-top: 4px; }
 .agent.delegate .dot { outline: 2px dashed var(--accent); outline-offset: 1px; }
+.decisions { margin-top: 6px; max-height: 420px; overflow: auto; }
+.decision { font-size: 13px; }
+.decision .meta { font-size: 12px; margin-bottom: 2px; }
+#decision-add { padding: 8px; }
+#decision-add[hidden] { display: none; }
+.side { font-size: 13px; padding: 3px 0; }
+.side button.mini { margin-top: 0; margin-left: 4px; }
+.meta { color: var(--muted); }

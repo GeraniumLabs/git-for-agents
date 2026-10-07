@@ -45,7 +45,7 @@ const TOOLS: Tool[] = [
   {
     name: "create_task",
     description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Use dependsOn for ordering.",
-    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks") }, ["title"]),
+    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks"), related: { type: "array", items: { type: "number" }, description: "Earlier tasks whose history the agent taking this one should see" } }, ["title"]),
     run: (a, call) => call("POST", "/tasks", a),
   },
   {
@@ -56,7 +56,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "declare_intent",
-    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why. Loom tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too.",
+    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why. Loom tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too. It also returns memory: decisions the humans already made about these paths (follow them), earlier changes there with their reasons and objections, and which of those agents is still around to consult.",
     inputSchema: obj({ taskId: num("Your task"), paths: { type: "array", items: { type: "string" } }, description: str("What you are about to do in these paths") }, ["taskId", "paths"]),
     run: (a, call) => call("POST", "/intents", a),
   },
@@ -183,9 +183,33 @@ const TOOLS: Tool[] = [
   },
   {
     name: "task_context",
-    description: "Everything known about a task: intents, changes with their context and reviews, and the full event history. Use it to take over a task another agent started.",
+    description: "Everything known about a task: intents, changes with their context and reviews, the full event history, and memory (related earlier tasks, what they did, and decisions that apply). Use it to take over a task another agent started.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),
     run: (a, call) => call("GET", `/tasks/${a.taskId}/context`),
+  },
+  {
+    name: "recall_decisions",
+    description: "Look up what the humans (or rulings) already decided, by paths and/or keywords. Check before asking a human something that may already be settled.",
+    inputSchema: obj({ paths: { type: "array", items: { type: "string" } }, query: str("Keywords or the question you were about to ask") }),
+    run: (a, call) => call("GET", `/decisions?${new URLSearchParams({ paths: (a.paths ?? []).join(","), q: a.query ?? "" })}`),
+  },
+  {
+    name: "consult_agent",
+    description: "Ask an agent who worked on something before (declare_intent and task_context tell you who, and whether they're still around). Opens a thread anchored to the file or change; they're notified and reply there.",
+    inputSchema: obj({ agent: str("Agent id or name"), question: str("What you want to know, with enough context to answer"), path: str("File it's about"), changeId: num("Their earlier change"), taskId: num("Your task") }, ["agent", "question"]),
+    run: (a, call) => call("POST", "/consults", a),
+  },
+  {
+    name: "open_dispute",
+    description: "When you and another agent disagree and talking hasn't settled it (a review you think is wrong, a rejected proposal), open a dispute instead of arguing on. State the question and your position; they state theirs (state_position). The humans' delegate rules if their guidance settles it, a human otherwise. The ruling is binding and becomes a project decision; on a change, a ruling for the author dismisses the other side's request for changes.",
+    inputSchema: obj({ with: str("The other agent's id or name"), question: str("What you disagree about, neutrally worded"), position: str("Your position and why"), theirPosition: str("Their position as you understand it (they can restate it)"), taskId: num("Task"), changeId: num("Change it's about") }, ["with", "question", "position"]),
+    run: (a, call) => call("POST", "/disputes", a),
+  },
+  {
+    name: "state_position",
+    description: "State (or restate) your position in a dispute another agent opened with you. The ruling waits until both sides have stated theirs.",
+    inputSchema: obj({ disputeId: num("The dispute thread id"), position: str("Your position and why") }, ["disputeId", "position"]),
+    run: (a, call) => call("POST", `/disputes/${a.disputeId}/position`, { position: a.position }),
   },
 ];
 
@@ -209,7 +233,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviewers: get_change then review_change.",
+          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviewers: get_change then review_change.",
       });
     case "ping":
       return reply({});
