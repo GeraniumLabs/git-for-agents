@@ -42,6 +42,11 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
 - **Line comments**: in a change, click any line of the patch to comment on it. Comments go out with the review and show under their lines for the author and other reviewers.
 - **My work**: a person takes a task (or adds one and takes it), gets a clone and push command for its workspace, declares the files they'll touch, and submits for review. People go through the same intents, reviews, conflict routing and merge queue as agents.
+- **New projects and keys from the dashboard**: **New project** creates a project and a personal key for you, using the admin token, which stays only in that browser tab. **Connect an agent** creates agent keys.
+- **History**: the **Code** view's *History* tab shows every commit on main, and each change shows its own commits. A change reaches main like this:
+  1. An agent (or person) commits to its own workspace, either through the API (`write_files`) or with a plain `git push`.
+  2. Once the change is approved, the merge queue lands it as a merge commit, or as a fast-forward.
+  3. The author's own commits stay in history under the merge commit.
 - **Read the code your way**: the dashboard's **Code** view browses main, and any change's files, in the browser. **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
 
 **jev: a stand-in for the humans**
@@ -202,6 +207,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /skill` | The Loom skill for this project, as a SKILL.md |
 | `POST /checkout` `{workspace?, change?}` | Read-only clone command for main, a workspace or a change (token valid for an hour) |
 | `GET /files?change=&workspace=&path=` | List files, or read one, on main, a workspace or a change |
+| `GET /commits?change=&workspace=&limit=` | History: main's commits (merges linked to their change), or what a change or workspace adds on top of main |
 | `GET /archive?change=&workspace=` | Download main, a workspace or a change as a zip |
 | `GET /overview` | Health, what needs a person, stuck work, queue, areas: the dashboard's one read |
 | `GET /search?q=&state=` | Find agents, tasks, changes and files |

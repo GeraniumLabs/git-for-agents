@@ -324,6 +324,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
       if (a === "archive") return await this.archive(url.searchParams);
+      if (a === "commits") return json(await this.commits(url.searchParams));
       if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? ""), { headers: { "content-type": "text/markdown; charset=utf-8" } });
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
@@ -590,6 +591,49 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:loom-main && git diff loom-main...HEAD` } : {}),
       note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
     };
+  }
+
+  /**
+   * History. For main: every commit, with merges linked to the change they
+   * landed. For a change or workspace: the commits it adds on top of main,
+   * which is what its agent (or person) committed and pushed.
+   */
+  private async commits(q: URLSearchParams) {
+    let { repo } = this.repoFor({ workspace: q.get("workspace"), change: q.get("change") });
+    const limit = Math.min(200, Number(q.get("limit") ?? 50));
+    // A merged change: read it from main, from its landing commit down to main as it was.
+    const landedChange = q.get("change") ? this.change(Number(q.get("change"))) : null;
+    const merged = landedChange?.status === "merged" && landedChange.merged_commit ? landedChange : null;
+    if (merged) repo = this.mainRepo;
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+    let head = await w.head();
+    if (!head) return { repo, commits: [] };
+    let mainHead: string | null = null;
+    if (merged) {
+      head = merged.merged_commit as string;
+      const top = (await w.log(head, 1))[0];
+      mainHead = top.parents.length > 1 ? top.parents[0] : (merged.base as string);
+    } else if (repo !== this.mainRepo) mainHead = await w.fetchFrom("loom-main", await this.mainRemote("read"));
+    const byCommit = new Map(this.sql.exec("SELECT id, title, merged_commit FROM changes WHERE merged_commit IS NOT NULL").toArray().map((c) => [c.merged_commit as string, c]));
+    const agentByEmail = (email: string) => {
+      const m = /^(.+)@agents\.loom\.dev$/.exec(email);
+      return m ? m[1] : null;
+    };
+    const out = [];
+    for (const c of await w.log(head, limit)) {
+      if (mainHead && (await w.isAncestor(c.oid, mainHead))) break;
+      const parent = c.parents[0] ?? null;
+      const files = await w.changes(parent, c.oid);
+      const landed = byCommit.get(c.oid);
+      const agent = agentByEmail(c.author.email);
+      out.push({
+        oid: c.oid, message: c.message.trim(), at: c.author.at, parents: c.parents,
+        author: agent ? this.agentName(agent) ?? c.author.name : c.author.name, agent, merge: c.parents.length > 1,
+        change: landed ? { id: landed.id, title: landed.title } : null,
+        files: files.slice(0, 30), fileCount: files.length,
+      });
+    }
+    return { repo, head, base: mainHead, commits: out };
   }
 
   /** The files of main, a workspace or a change as a zip. */

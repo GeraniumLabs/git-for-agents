@@ -174,6 +174,17 @@ export class Workspace {
     if (!res.ok) throw new Error(`push rejected: ${JSON.stringify(res.refs)}`);
   }
 
+  /** Commits reachable from `ref`, newest first. */
+  async log(ref: string, depth = 50) {
+    const entries = await git.log({ fs: this.fs, dir: DIR, ref, depth });
+    return entries.map((e) => ({
+      oid: e.oid,
+      message: e.commit.message,
+      parents: e.commit.parent,
+      author: { name: e.commit.author.name, email: e.commit.author.email, at: e.commit.author.timestamp * 1000 },
+    }));
+  }
+
   async changes(from: string | null, to: string): Promise<FileChange[]> {
     return diffFlat(await this.flatten(from), await this.flatten(to));
   }

@@ -235,3 +235,18 @@ pre.copy { white-space: pre-wrap; overflow-wrap: anywhere; }
 .dc.request_changes { border-left-color: var(--bad); } .dc.approve { border-left-color: var(--ok); } .dc.pending { border-left-color: var(--accent); }
 .dc-new textarea { width: 100%; }
 .skill { max-height: 50vh; }
+
+/* history */
+.commits { display: flex; flex-direction: column; gap: 4px; margin-top: 8px; }
+details.commit { border: 1px solid var(--line); border-radius: 8px; background: var(--panel); padding: 6px 10px; }
+details.commit summary { display: flex; align-items: center; gap: 8px; cursor: pointer; list-style: none; min-width: 0; }
+details.commit summary::-webkit-details-marker { display: none; }
+.sha { color: var(--info); }
+pre.msg { margin: 6px 0; white-space: pre-wrap; color: var(--muted); font-size: 12.5px; }
+.commit .files { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 6px; }
+.fs.added { color: var(--ok); } .fs.deleted { color: var(--bad); } .fs.modified { color: var(--warn); }
+#detail-body label { display: block; margin: 6px 0; }
+#detail-body label input { width: 100%; }
+[hidden] { display: none !important; }
+#detail-body label.check { display: flex; align-items: center; gap: 6px; }
+#detail-body label.check input { width: auto; }

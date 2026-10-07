@@ -76,7 +76,8 @@ async function boot() {
   $("#project").innerHTML = projects.map((p) => `<option ${p.name === project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
-    $("main").innerHTML = `<p class="empty">No projects yet. Create one with <code>POST /api/projects</code> or run <code>npm run demo</code>.</p>`;
+    $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
+    $("#np-empty").onclick = () => showNewProject();
     return;
   }
   connect();
@@ -466,6 +467,27 @@ function wireGrid(el, data) {
   sc.scrollLeft = sc.scrollWidth;
 }
 
+// ── history: what was committed and pushed, and how it reached main ─────
+function historyHtml(h, isMain, landed = false) {
+  if (h.error) return `<p class="meta">${esc(h.error)}</p>`;
+  if (!h.commits.length) return `<p class="meta">${isMain ? "No commits yet." : "Nothing committed on top of main yet."}</p>`;
+  const row = (c) => {
+    const [subject, ...rest] = c.message.split("\n");
+    const by = c.agent ? `<a class="who" data-agent="${esc(c.agent)}" style="color:${color(c.agent)}">${esc(c.author)}</a>` : esc(c.author);
+    const kind = c.merge ? `<span class="pill merged">merge</span>` : c.change ? `<span class="pill merged">landed</span>` : "";
+    return `<details class="commit"><summary><span class="mono sha">${c.oid.slice(0, 7)}</span> ${kind} <span class="grow ellipsis">${esc(subject)}</span>
+        ${c.change ? `<a data-change="${c.change.id}">#${c.change.id}</a>` : ""} <span class="meta">${by} · ${ago(c.at)} ago · ${c.fileCount} file${c.fileCount === 1 ? "" : "s"}</span></summary>
+      ${rest.join("\n").trim() ? `<pre class="msg">${esc(rest.join("\n").trim())}</pre>` : ""}
+      <div class="files mono">${c.files.map((f) => `<span class="fs ${f.status}">${f.status === "added" ? "+" : f.status === "deleted" ? "−" : "~"} ${esc(f.path)}</span>`).join("")}${c.fileCount > c.files.length ? ` …` : ""}</div>
+      ${c.parents.length > 1 ? `<div class="meta">parents ${c.parents.map((p) => p.slice(0, 7)).join(" + ")}: main as it was, and the change's own commits</div>` : ""}</details>`;
+  };
+  return `<p class="meta">${isMain
+    ? "Main only moves through the merge queue. Each approved change lands as a merge commit (or a fast-forward), so the commits its author pushed stay in history underneath it."
+    : landed ? "How this change landed: the merge queue's commit on main, and underneath it the commits its author pushed to their workspace."
+    : "What was committed to this workspace on top of main: by API (write_files) or a plain git push. The merge queue lands these on main once the change is approved."}</p>
+    <div class="commits">${h.commits.map(row).join("")}</div>`;
+}
+
 // ── code: browse, download and check out, for people ──────────────────
 async function showClone(box, target) {
   if (!me) { box.innerHTML = `<p class="meta">Sign in to get a clone command; it carries a read-only token for an hour.</p>`; return; }
@@ -482,6 +504,8 @@ async function showCode(target = {}) {
     <h3>Code <small class="meta">${esc(target.label ?? `main · v${state.project.mainVersion}`)}</small></h3>
     <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}" download>Download zip</a><button class="ghost mini" id="code-clone">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
     <div id="code-clone-box"></div>
+    <span class="seg" role="tablist"><button id="tab-files" class="on" role="tab">Files</button><button id="tab-history" role="tab">History</button></span>
+    <div id="history" hidden></div>
     <div class="code-view">
       <div class="tree"><input id="tree-filter" placeholder="Filter ${list.files.length} files"><ol id="tree"></ol></div>
       <pre id="file" class="diff"><span class="meta">Pick a file.</span></pre>
@@ -496,6 +520,13 @@ async function showCode(target = {}) {
     a.classList.add("on");
     const f = await api(`/files?${q}&path=${encodeURIComponent(a.dataset.path)}`);
     $("#file").textContent = f.error ?? f.content;
+  };
+  $("#tab-files").onclick = () => { $("#tab-files").className = "on"; $("#tab-history").className = ""; $("#history").hidden = true; $(".code-view").hidden = false; };
+  $("#tab-history").onclick = async () => {
+    $("#tab-history").className = "on"; $("#tab-files").className = ""; $(".code-view").hidden = true; $("#history").hidden = false;
+    $("#history").innerHTML = `<p class="meta">Reading history…</p>`;
+    $("#history").innerHTML = historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace);
+    wire($("#history"));
   };
   $("#code-clone").onclick = () => showClone($("#code-clone-box"), target.change ? { change: target.change } : target.workspace ? { workspace: target.workspace } : {});
   wire($("#detail-body"));
@@ -512,12 +543,76 @@ async function showSkill() {
     <p class="meta">Give an agent this skill and a key in <span class="mono">LOOM_KEY</span>. It covers how to work here and how to check back for new work, which matters because agents come and go. Keys come from the project admin (<span class="mono">POST /api/projects/${esc(project)}/agents</span>); only their hash is stored.</p>
     <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
+    <h2>Create a key</h2>
+    <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option><option value="human">person</option></select>
+      <input id="mk-admin" type="password" placeholder="Admin token" autocomplete="off"><button class="ghost" id="mk-go">Create</button></div>
+    <div id="mk-out"></div>
+    <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
+  $("#mk-admin").value = adminToken.get();
+  $("#mk-go").onclick = async () => {
+    const n = $("#mk-name").value.trim();
+    if (!n) return;
+    adminToken.set($("#mk-admin").value.trim());
+    try {
+      const k = await adminCall("POST", `/api/projects/${project}/agents`, { name: n, role: $("#mk-role").value });
+      $("#mk-out").innerHTML = keyBox(k, project);
+      wireCopy($("#mk-out"));
+    } catch (e) { toast(e.message); }
+  };
   $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
   $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#skill-open").onclick = () => showSkill();
+
+// ── admin: new projects and member keys ─────────────────────────────────
+// The admin token is the LOOM_ADMIN_TOKEN secret set at deploy. It stays in
+// this tab only (sessionStorage), never in the page or localStorage.
+const adminToken = {
+  get: () => { try { return sessionStorage.getItem("loom-admin") ?? ""; } catch { return ""; } },
+  set: (v) => { try { sessionStorage.setItem("loom-admin", v); } catch {} },
+};
+async function adminCall(method, url, body) {
+  const res = await fetch(url, { method, headers: { authorization: `Bearer ${adminToken.get()}`, "content-type": "application/json" }, body: JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
+  return data;
+}
+const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
+  <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
+  <p class="meta">Shown once: Loom keeps only its hash. ${k.role === "human" ? "It's saved in this browser as your sign-in for this project." : `Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}.`}</p>
+  <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
+function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
+
+function showNewProject() {
+  $("#detail-body").innerHTML = `
+    <h3>New project</h3>
+    <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. Creating one needs the admin token (the <span class="mono">LOOM_ADMIN_TOKEN</span> secret set at deploy).</p>
+    <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
+    <label>Description <input id="np-desc" placeholder="What is being built"></label>
+    <label>Your name <input id="np-me" placeholder="e.g. jonathan"></label>
+    <label>Admin token <input id="np-admin" type="password" autocomplete="off"></label>
+    <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
+    <div class="row"><button id="np-create">Create project</button></div>
+    <div id="np-out"></div>`;
+  $("#np-admin").value = adminToken.get();
+  $("#np-create").onclick = async () => {
+    const name = $("#np-name").value.trim(), who = $("#np-me").value.trim() || "admin";
+    if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
+    adminToken.set($("#np-admin").value.trim());
+    try {
+      await adminCall("POST", "/api/projects", { name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0 });
+      const k = await adminCall("POST", `/api/projects/${name}/agents`, { name: who, role: "human" });
+      store.set(`loom-key:${name}`, k.key);
+      $("#np-out").innerHTML = `<p><b>${esc(name)}</b> is ready. Main starts with a README; add agents from <b>Connect an agent</b>, or bring code in with <b>My work</b> (take a task, push your files, submit).</p>${keyBox(k, name)}<div class="row"><button id="np-go">Open ${esc(name)}</button></div>`;
+      wireCopy($("#np-out"));
+      $("#np-go").onclick = () => (location.search = `?project=${name}`);
+    } catch (e) { toast(e.message); }
+  };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#np-open").onclick = () => showNewProject();
 
 // ── my work: people claim tasks, push with git, and submit like agents ───
 async function showWork(note = "") {
@@ -734,6 +829,7 @@ async function showChange(id) {
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
     ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
     ${reviewers}
+    <h2>Commits</h2><div id="change-commits"><p class="meta">Reading history…</p></div>
     <h2>Patch ${canReview ? `<small>click a line to comment on it</small>` : ""}</h2>${patch}
     ${canReview ? `<h2>Your review <small id="rv-pending"></small></h2><textarea id="rv-body" rows="3" placeholder="Summary (optional)"></textarea>
       <div class="row"><button data-verdict="approve">Approve</button><button data-verdict="request_changes" class="ghost">Request changes</button><button data-verdict="comment" class="ghost">Comment</button></div>` : ""}`;
@@ -762,6 +858,11 @@ async function showChange(id) {
     $("#detail").close();
   };
   wire($("#detail-body"));
+  api(`/commits?change=${c.id}`).then((h) => {
+    if (!$("#change-commits")) return;
+    $("#change-commits").innerHTML = historyHtml(h, false, c.status === "merged");
+    wire($("#change-commits"));
+  });
   $("#detail-body").querySelector("[data-browse]").onclick = () => showCode({ change: c.id, label: `change #${c.id} (${c.agentName}'s workspace)` });
   $("#detail-body").querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of $("#detail-body").querySelectorAll("[data-ask]")) b.onclick = async () => { await act("POST", `/changes/${id}/reviewers`, { reviewers: [b.dataset.ask] }); showChange(id); };
