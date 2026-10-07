@@ -503,6 +503,22 @@ async function showCode(target = {}) {
 }
 $("#code-open").onclick = () => showCode();
 
+// ── connect an agent: the Loom skill, ready to copy ──────────────────────
+async function showSkill() {
+  const text = await fetch(`/api/projects/${project}/skill`).then((r) => r.text());
+  const save = `mkdir -p .claude/skills/loom-${project} && curl -s ${location.origin}/api/projects/${project}/skill > .claude/skills/loom-${project}/SKILL.md`;
+  $("#detail-body").innerHTML = `
+    <h3>Connect an agent</h3>
+    <p class="meta">Give an agent this skill and a key in <span class="mono">LOOM_KEY</span>. It covers how to work here and how to check back for new work, which matters because agents come and go. Keys come from the project admin (<span class="mono">POST /api/projects/${esc(project)}/agents</span>); only their hash is stored.</p>
+    <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
+    <pre class="diff copy">${esc(save)}</pre>
+    <pre class="diff copy skill">${esc(text)}</pre>`;
+  $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
+  $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#skill-open").onclick = () => showSkill();
+
 // ── my work: people claim tasks, push with git, and submit like agents ───
 async function showWork(note = "") {
   if (!me) return toast("Sign in first");
@@ -613,6 +629,9 @@ function describe(e) {
     case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}`];
     case "change.updated": return ["review", `Change #${e.change_id} updated${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "review.assigned": return ["review", `${who} asked ${to} to review #${e.change_id}${d.reason ? ` (${esc(d.reason)})` : ""}${d.note ? `: “${esc(d.note.slice(0, 140))}”` : ""}`];
+    case "review.accepted": return ["review", `${who} accepted the review of #${e.change_id}`];
+    case "review.declined": return ["review", `${who} declined to review #${e.change_id}${d.reason ? `: “${esc(d.reason)}”` : ""}`];
+    case "review.rerouted": return ["review", `Review of #${e.change_id} rerouted: ${esc(d.why)}${d.toName ? `; asked ${esc(d.toName)}` : "; nobody else knows this code, so it waits for the reviewer pool"}`];
     case "review.requested": return ["review", `Review requested on #${e.change_id}`];
     case "review.submitted": return ["review", `${who} ${d.verdict === "approve" ? "approved" : d.verdict === "request_changes" ? "requested changes on" : "commented on"} #${e.change_id}${d.body ? `: “${esc(d.body.slice(0, 140))}”` : ""}`];
     case "change.queued": return ["", `#${e.change_id} entered the merge queue (position ${d.position})`];
@@ -661,6 +680,19 @@ function describe(e) {
 
 
 
+// Where a review request stands: did the reviewer get it, agree, and deliver?
+function requestState(r) {
+  const due = r.deadline ? ` · rerouted in ${Math.max(1, Math.ceil((r.deadline - Date.now()) / 60_000))}m` : "";
+  const [label, cls] = {
+    open: [r.seen_at ? `seen, no answer${due}` : `not picked up yet${due}`, "review"],
+    accepted: [`accepted, reviewing${due}`, "queued"],
+    declined: ["declined", "abandoned"],
+    expired: ["no answer, asked someone else", "conflict"],
+    done: ["reviewed", "merged"],
+  }[r.status] ?? [r.status, ""];
+  return `<span class="pill ${cls}">${label}</span>`;
+}
+
 /** A patch as rows with new-file line numbers, review comments under their lines. */
 function diffView(patchText, comments, clickable) {
   let path = null, line = 0;
@@ -688,7 +720,7 @@ async function showChange(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
   const inReview = ["review", "changes_requested"].includes(c.status);
   const asked = new Set(rv.requested.filter((r) => r.status === "open").map((r) => r.reviewer));
-  const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${r.reason?.startsWith("asked by") ? esc(r.reason) : `${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}`}</span><span class="pill ${r.status === "open" ? "review" : "merged"}">${r.status === "open" ? "waiting" : "done"}</span></div>`).join("")}` : ""}
+  const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${r.reason?.startsWith("asked by") ? esc(r.reason) : `${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}`}</span>${requestState(r)}</div>`).join("")}` : ""}
     ${inReview && rv.candidates.length ? `<h2>Who knows this code</h2>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="role">${k.role}</span> <span class="grow meta ellipsis">${k.reasons.map(esc).join(" · ")}${k.openReviews ? ` · ${k.openReviews} open` : ""}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}`;
   const canReview = me && !["merged", "abandoned"].includes(c.status) && me.id !== c.agent_id;
   const patch = diffView(c.patch, c.reviews.flatMap((r) => r.comments.map((x) => ({ ...x, reviewer: r.reviewer, verdict: r.verdict }))), canReview);

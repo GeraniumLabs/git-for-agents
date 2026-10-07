@@ -234,3 +234,4 @@ pre.copy { white-space: pre-wrap; overflow-wrap: anywhere; }
 .dc, .dc-new { margin: 4px 12px 6px 54px; padding: 6px 10px; border: 1px solid var(--line); border-left: 3px solid var(--info); border-radius: 6px; background: var(--panel); font: 13px/1.45 ui-sans-serif, system-ui, sans-serif; white-space: normal; }
 .dc.request_changes { border-left-color: var(--bad); } .dc.approve { border-left-color: var(--ok); } .dc.pending { border-left-color: var(--accent); }
 .dc-new textarea { width: 100%; }
+.skill { max-height: 50vh; }

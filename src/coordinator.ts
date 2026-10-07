@@ -12,6 +12,7 @@ import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normal
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
+import { skill } from "./skill";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
@@ -25,6 +26,9 @@ const NOTABLE = ["change.conflict", "dispute.opened", "dispute.ruled", "delegate
 /** Most queued changes merged together in one pass of the queue. */
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const CHATTER_LIMIT = 20;
+const since = (ms: number) => (ms < 3600_000 ? `${Math.max(1, Math.round(ms / 60_000))}m` : ms < 86400_000 ? `${Math.round(ms / 3600_000)}h` : `${Math.round(ms / 86400_000)}d`);
+const ACCEPT_MS = 5 * 60_000; // to accept or decline a review request
+const REVIEW_MS = 30 * 60_000; // to deliver an accepted review
 const MERGE_BATCH = 8;
 
 export type Role = "builder" | "reviewer" | "human";
@@ -90,6 +94,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN options TEXT",
       "ALTER TABLE tasks ADD COLUMN related TEXT",
       "ALTER TABLE changes ADD COLUMN symbols TEXT",
+      "ALTER TABLE review_requests ADD COLUMN seen_at INTEGER",
+      "ALTER TABLE review_requests ADD COLUMN answered_at INTEGER",
+      "ALTER TABLE review_requests ADD COLUMN deadline INTEGER",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -287,7 +294,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async route(req: Request): Promise<Response> {
     const url = new URL(req.url);
     const parts = url.pathname.split("/").filter(Boolean); // after /api/projects/:name
-    const [a, b, c] = parts;
+    const [a, b, c, d] = parts;
     const m = req.method;
     const body = m === "POST" || m === "PUT" ? await req.json<any>().catch(() => ({})) : {};
 
@@ -317,6 +324,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
       if (a === "archive") return await this.archive(url.searchParams);
+      if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? ""), { headers: { "content-type": "text/markdown; charset=utf-8" } });
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
@@ -338,7 +346,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
-    if (a === "me") return json({ agent: actor, mainFrozen: this.meta("frozen"), inbox: this.inbox(actor.id) });
+    if (a === "me") return json(this.me(actor));
 
     // Human controls. Humans (and the admin) steer; agents can't.
     const ruling = a === "disputes" && c === "rule";
@@ -367,6 +375,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "intents" && b && m === "DELETE") return json(this.releaseIntent(actor, Number(b)));
     if (a === "workspaces" && b && c === "commit") return json(await this.commitToWorkspace(actor, b, body));
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
+    if (a === "changes" && b && c === "reviewers" && d === "respond" && m === "POST") return json(this.respondToReview(actor, Number(b), body));
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
@@ -728,7 +737,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       id, actor.id, body.verdict, body.body ?? "", JSON.stringify(body.comments ?? []), ch.head, Date.now());
     this.emit("review.submitted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { verdict: body.verdict, body: body.body ?? "", comments: body.comments ?? [] } });
-    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND reviewer = ? AND status = 'open'", Date.now(), id, actor.id);
+    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND reviewer = ? AND status IN ('open','accepted')", Date.now(), id, actor.id);
     if (body.verdict !== "comment") this.learn(actor.id, "reviewed", ch.files, ch.symbols);
     if (body.verdict === "request_changes") {
       this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
@@ -762,6 +771,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
+    const nextDeadline = this.sweepReviewRequests();
+    if (nextDeadline) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     if (this.merging || this.meta("frozen")) return;
     this.merging = true;
     try {
@@ -779,7 +790,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     // Retries wait a little; make sure someone comes back for them.
     const retry = this.sql.exec("SELECT MIN(updated_at) AS t FROM changes WHERE status = 'queued'").one().t as number | null;
-    if (retry) await this.ctx.storage.setAlarm(Math.max(retry, Date.now() + 100));
+    const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
+    const next = Math.min(retry ?? Infinity, deadline ?? Infinity);
+    if (next < Infinity) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 100));
   }
 
   /**
@@ -850,7 +863,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.setMeta("main_head", commit);
       this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, batch: landed.length } });
       this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
-      this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status = 'open'", Date.now(), ch.id);
+      this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", Date.now(), ch.id);
       this.adviseStale(ch.id, files.map((f) => f.path));
       for (const r of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ?", ch.task_id).toArray()) {
         this.emit("task.unblocked", { task: r.id as number, data: { after: ch.task_id } });
@@ -1280,7 +1293,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Reviews an agent asked a person for.
     for (const r of this.sql.exec(`SELECT r.change_id, r.reviewer, r.requested_by, r.reason, r.created_at, c.title FROM review_requests r
                                    JOIN changes c ON c.id = r.change_id JOIN agents a ON a.id = r.reviewer
-                                   WHERE r.status = 'open' AND a.role = 'human' AND c.status IN ('review','changes_requested') LIMIT 50`).toArray()) {
+                                   WHERE r.status IN ('open','accepted') AND a.role = 'human' AND c.status IN ('review','changes_requested') LIMIT 50`).toArray()) {
       items.push({ kind: "review", change: r.change_id, title: r.title, agent: r.requested_by, reviewer: r.reviewer, reason: r.reason, since: r.created_at });
     }
     // Stuck: nobody asked for a person, but work isn't moving.
@@ -1291,7 +1304,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
     }
     // A change waiting on review that nobody has reviewed: say who was asked, if anyone.
-    for (const c of this.sql.exec(`SELECT c.id, c.title, c.agent_id, c.updated_at, (SELECT GROUP_CONCAT(reviewer) FROM review_requests r WHERE r.change_id = c.id AND r.status = 'open') AS asked
+    for (const c of this.sql.exec(`SELECT c.id, c.title, c.agent_id, c.updated_at, (SELECT GROUP_CONCAT(reviewer) FROM review_requests r WHERE r.change_id = c.id AND r.status IN ('open','accepted')) AS asked
                                    FROM changes c WHERE c.status = 'review' AND c.updated_at < ? AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = c.id AND v.head = c.head) LIMIT 50`, now - 10 * 60_000).toArray()) {
       const asked = c.asked ? (c.asked as string).split(",").map((r) => this.agentName(r)).join(", ") : null;
       items.push({ kind: "stuck", reason: asked ? `review requested from ${asked}, no answer` : "waiting for review, nobody asked", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
@@ -1378,6 +1391,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const symbols: Record<string, string[]> = ch.symbols ?? {};
     const folders = [...new Set(files.map(folderOf).filter(Boolean))];
     const reviewed = new Set(this.sql.exec("SELECT reviewer FROM reviews WHERE change_id = ? AND head = ?", id, ch.head).toArray().map((r) => r.reviewer as string));
+    // Someone who declined or let a request lapse isn't asked again for this change.
+    for (const r of this.sql.exec("SELECT reviewer FROM review_requests WHERE change_id = ? AND status IN ('declined','expired')", id).toArray()) reviewed.add(r.reviewer as string);
     const now = Date.now();
     const scores = new Map<string, { score: number; reasons: { w: number; text: string }[] }>();
     const add = (agent: string, w: number, text: string) => {
@@ -1401,7 +1416,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         add(r.agent_id as string, (wrote ? 0.6 : 0.4) * n, `${wrote ? "worked" : "reviewed"} in ${folder}/`);
       }
     }
-    const load = new Map(this.sql.exec("SELECT reviewer, COUNT(*) AS n FROM review_requests WHERE status = 'open' GROUP BY reviewer").toArray().map((r) => [r.reviewer as string, r.n as number]));
+    const load = new Map(this.sql.exec("SELECT reviewer, COUNT(*) AS n FROM review_requests WHERE status IN ('open','accepted') GROUP BY reviewer").toArray().map((r) => [r.reviewer as string, r.n as number]));
     const people = new Map(this.sql.exec("SELECT id, name, role, paused, last_seen FROM agents").toArray().map((a) => [a.id as string, a]));
     const present = (a: any) => a && now - ((a.last_seen as number) ?? 0) < PRESENT_MS;
     const out: Candidate[] = [];
@@ -1411,7 +1426,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const open = load.get(agent) ?? 0;
       // Fold a folder's many small reasons into one line.
       const reasons = [...new Map(s.reasons.sort((x, y) => y.w - x.w).map((r) => [r.text, r])).values()].slice(0, 3).map((r) => r.text);
-      out.push({ agent, name: a.name as string, role: a.role as string, score: Math.round((s.score * (present(a) ? 1.3 : 1)) / (1 + 0.5 * open) * 100) / 100, reasons, openReviews: open, present: present(a) });
+      // Agents come and go: knowledge counts for less when its owner isn't around to use it.
+      if (!present(a)) reasons.push(`last seen ${since(now - ((a.last_seen as number) ?? 0))} ago`);
+      out.push({ agent, name: a.name as string, role: a.role as string, score: Math.round((s.score * (present(a) ? 1 : 0.35)) / (1 + 0.5 * open) * 100) / 100, reasons, openReviews: open, present: present(a) });
     }
     out.sort((x, y) => y.score - x.score);
     if (out.length < limit) {
@@ -1420,7 +1437,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const open = load.get(a.id as string) ?? 0;
         out.push({ agent: a.id as string, name: a.name as string, role: "reviewer", score: 0, reasons: [`on the reviewer rota, ${open} open review${open === 1 ? "" : "s"}`], openReviews: open, present: present(a) });
       }
-      out.sort((x, y) => y.score - x.score || x.openReviews - y.openReviews || Number(y.present) - Number(x.present));
+      out.sort((x, y) => y.score - x.score || Number(y.present) - Number(x.present) || x.openReviews - y.openReviews);
     }
     return out.slice(0, limit);
   }
@@ -1446,7 +1463,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       });
     } else {
       const want = Math.max(1, Math.min(5, body.count ?? Math.max(1, this.requiredApprovals)));
-      const open = new Set(this.reviewRequests(id).filter((r) => r.status === "open").map((r) => r.reviewer as string));
+      const open = new Set(this.reviewRequests(id).map((r) => r.reviewer as string));
       picked = this.reviewerCandidates(id, want + open.size).filter((c) => !open.has(c.agent)).slice(0, want).map((c) => ({ agent: c.agent, reason: c.reasons[0] }));
     }
     for (const p of picked) this.assignReviewer(id, p.agent, actor.id, p.reason, body.note);
@@ -1455,10 +1472,75 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private assignReviewer(id: number, reviewer: string, by: string, reason: string, note?: string) {
     const ch = this.change(id);
-    const fresh = this.sql.exec(`INSERT INTO review_requests (change_id, reviewer, requested_by, reason, status, created_at) VALUES (?, ?, ?, ?, 'open', ?)
-                   ON CONFLICT (change_id, reviewer) DO UPDATE SET status = 'open', reason = excluded.reason, created_at = excluded.created_at WHERE status != 'open'
-                   RETURNING change_id`, id, reviewer, by, reason, Date.now()).toArray().length;
-    if (fresh) this.emit("review.assigned", { actor: by, change: id, task: ch.task_id, to: reviewer, data: { title: ch.title, reason, note: note ?? "", files: (ch.files as FileChange[]).map((f) => f.path) } });
+    const now = Date.now();
+    // People answer from the dashboard on their own time: no deadline for them.
+    const human = this.sql.exec("SELECT role FROM agents WHERE id = ?", reviewer).toArray()[0]?.role === "human";
+    const deadline = human ? null : now + ACCEPT_MS;
+    const fresh = this.sql.exec(`INSERT INTO review_requests (change_id, reviewer, requested_by, reason, status, created_at, deadline) VALUES (?, ?, ?, ?, 'open', ?, ?)
+                   ON CONFLICT (change_id, reviewer) DO UPDATE SET status = 'open', reason = excluded.reason, created_at = excluded.created_at, deadline = excluded.deadline,
+                     seen_at = NULL, answered_at = NULL WHERE status NOT IN ('open','accepted')
+                   RETURNING change_id`, id, reviewer, by, reason, now, deadline).toArray().length;
+    if (!fresh) return;
+    this.emit("review.assigned", { actor: by, change: id, task: ch.task_id, to: reviewer, data: {
+      title: ch.title, reason, note: note ?? "", files: (ch.files as FileChange[]).map((f) => f.path),
+      respond: human ? "" : `Accept or decline within ${ACCEPT_MS / 60_000} minutes (respond_to_review_request). If you don't answer, someone else is asked.`,
+    } });
+    if (deadline) void this.armAlarm(deadline);
+  }
+
+  /** Wake for whichever comes first: a queued merge retry or a review request deadline. */
+  private async armAlarm(at: number) {
+    const current = await this.ctx.storage.getAlarm();
+    if (!current || current > at) await this.ctx.storage.setAlarm(at);
+  }
+
+  /** A reviewer says yes (and has REVIEW_MS to deliver) or no (and someone else is asked). */
+  private respondToReview(actor: Agent, id: number, body: { accept: boolean; reason?: string }) {
+    const r = this.sql.exec("SELECT * FROM review_requests WHERE change_id = ? AND reviewer = ?", id, actor.id).toArray()[0];
+    if (!r) throw new HttpError(404, `you weren't asked to review change ${id}`);
+    if (!["open", "accepted"].includes(r.status as string)) throw new HttpError(409, `this request is ${r.status}`);
+    const ch = this.change(id);
+    const now = Date.now();
+    if (body.accept) {
+      this.sql.exec("UPDATE review_requests SET status = 'accepted', answered_at = ?, seen_at = COALESCE(seen_at, ?), deadline = ? WHERE change_id = ? AND reviewer = ?", now, now, now + REVIEW_MS, id, actor.id);
+      this.emit("review.accepted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { note: body.reason ?? "" } });
+      void this.armAlarm(now + REVIEW_MS);
+    } else {
+      this.sql.exec("UPDATE review_requests SET status = 'declined', answered_at = ?, seen_at = COALESCE(seen_at, ?) WHERE change_id = ? AND reviewer = ?", now, now, id, actor.id);
+      this.emit("review.declined", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { reason: body.reason ?? "" } });
+      this.reroute(id, `${actor.name} declined${body.reason ? `: ${body.reason}` : ""}`);
+    }
+    return { requested: this.reviewRequests(id) };
+  }
+
+  /** Ask the next best-placed agent, preferring ones who are around now. */
+  private reroute(id: number, why: string) {
+    const ch = this.change(id);
+    if (!["review", "changes_requested"].includes(ch.status)) return;
+    const asked = new Set(this.reviewRequests(id).map((r) => r.reviewer as string));
+    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent)).sort((x, y) => Number(y.present) - Number(x.present) || y.score - x.score)[0];
+    this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: next?.agent ?? null, toName: next?.name ?? null } });
+    if (next) this.assignReviewer(id, next.agent, "loom", `${next.reasons[0]} (${why})`);
+  }
+
+  /** Requests nobody accepted in time, or accepted and never delivered, go to someone else. */
+  private sweepReviewRequests() {
+    const now = Date.now();
+    for (const r of this.sql.exec("SELECT * FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL AND deadline <= ?", now).toArray()) {
+      this.sql.exec("UPDATE review_requests SET status = 'expired' WHERE change_id = ? AND reviewer = ?", r.change_id, r.reviewer);
+      const who = this.agentName(r.reviewer as string);
+      this.reroute(r.change_id as number, r.status === "open" ? `${who} didn't answer` : `${who} accepted but didn't review in time`);
+    }
+    return this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
+  }
+
+  /** Mark review requests delivered once the reviewer has actually received them. */
+  private markSeen(agent: string, events: LoomEvent[]) {
+    for (const e of events) {
+      if (e.type === "review.assigned" && e.to_agent === agent && e.change_id) {
+        this.sql.exec("UPDATE review_requests SET seen_at = COALESCE(seen_at, ?) WHERE change_id = ? AND reviewer = ?", Date.now(), e.change_id, agent);
+      }
+    }
   }
 
   // ── contribution activity, for the grids ───────────────────────────────
@@ -1529,7 +1611,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       changes: this.sql.exec("SELECT id, title, status, files, updated_at FROM changes WHERE agent_id = ? ORDER BY id DESC LIMIT 20", a.id).toArray().map((c) => ({ ...c, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path) })),
       threads: this.sql.exec("SELECT id FROM threads WHERE created_by = ? OR to_agent = ? ORDER BY updated_at DESC LIMIT 10", a.id, a.id).toArray().map((r) => this.thread(r.id as number)),
       events: this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE actor = ? OR to_agent = ? ORDER BY seq DESC LIMIT 60", a.id, a.id).toArray()),
-      reviewQueue: this.sql.exec("SELECT r.change_id, r.reason, r.created_at, r.requested_by, c.title, c.status FROM review_requests r JOIN changes c ON c.id = r.change_id WHERE r.reviewer = ? AND r.status = 'open' ORDER BY r.created_at LIMIT 20", a.id).toArray()
+      reviewQueue: this.sql.exec("SELECT r.change_id, r.reason, r.created_at, r.requested_by, c.title, c.status FROM review_requests r JOIN changes c ON c.id = r.change_id WHERE r.reviewer = ? AND r.status IN ('open','accepted') ORDER BY r.created_at LIMIT 20", a.id).toArray()
         .map((r) => ({ ...r, requestedByName: this.agentName(r.requested_by as string) })),
       reviewStats: this.reviewStats(a.id),
       knows: this.knows(a.id),
@@ -1877,6 +1959,30 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { seq: e.seq };
   }
 
+  /**
+   * Everything waiting for an agent, for one that checks back after hours away:
+   * review requests, its tasks and changes, and what was addressed to it.
+   */
+  private me(actor: Agent) {
+    const reviewRequests = this.sql.exec(`SELECT r.change_id, r.status, r.reason, r.created_at, r.deadline, c.title FROM review_requests r JOIN changes c ON c.id = r.change_id
+                                          WHERE r.reviewer = ? AND r.status IN ('open','accepted') ORDER BY r.created_at`, actor.id).toArray();
+    const now = Date.now();
+    for (const r of reviewRequests) this.sql.exec("UPDATE review_requests SET seen_at = COALESCE(seen_at, ?) WHERE change_id = ? AND reviewer = ?", now, r.change_id, actor.id);
+    const tasks = this.sql.exec("SELECT id, title, status FROM tasks WHERE assignee = ? AND status NOT IN ('merged','abandoned')", actor.id).toArray();
+    const changes = this.sql.exec("SELECT id, task_id, title, status FROM changes WHERE agent_id = ? AND status NOT IN ('merged','abandoned') ORDER BY id DESC LIMIT 20", actor.id).toArray();
+    const submitted = new Set(changes.map((c) => c.task_id));
+    const todo = [
+      ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
+      ...changes.filter((c) => ["conflict", "changes_requested"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
+      ...tasks.filter((t) => !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
+    ];
+    return {
+      agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, tasks, changes,
+      openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open'").one().n,
+      inbox: this.inbox(actor.id),
+    };
+  }
+
   private inbox(agentId: string) {
     return this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE to_agent = ? ORDER BY seq DESC LIMIT 20", agentId).toArray());
   }
@@ -1904,6 +2010,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return { events: out.slice(0, 200), cursor: out.length > 200 ? out[199].seq : cursor };
     };
     let res = read();
+    if (agent) this.markSeen(agent, res.events);
     if (!res.events.length && wait > 0) {
       await new Promise<void>((done) => {
         const w = { wants, wake: () => { clearTimeout(t); done(); } };
@@ -1911,6 +2018,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.waiters.add(w);
       });
       res = read();
+      if (agent) this.markSeen(agent, res.events);
     }
     return res;
   }
@@ -1922,7 +2030,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const tasks = new Set(this.sql.exec("SELECT id FROM tasks WHERE assignee = ?", agent).toArray().map((r) => r.id as number));
     const changes = new Set(this.sql.exec("SELECT id FROM changes WHERE agent_id = ?", agent).toArray().map((r) => r.id as number));
     // Changes this agent was asked to review: it hears when they're updated or merged.
-    for (const r of this.sql.exec("SELECT change_id FROM review_requests WHERE reviewer = ? AND status = 'open'", agent).toArray()) changes.add(r.change_id as number);
+    for (const r of this.sql.exec("SELECT change_id FROM review_requests WHERE reviewer = ? AND status IN ('open','accepted')", agent).toArray()) changes.add(r.change_id as number);
     return (e) => {
       if (e.to_agent) return e.to_agent === agent;
       if (STEERING.has(e.type)) return true;

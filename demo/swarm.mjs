@@ -334,6 +334,8 @@ async function peerDesk(admin, keys, done) {
       for (const e of r.events.filter((e) => e.type === "review.assigned" && e.to_agent === k.id)) {
         const c = await me.change(e.change_id);
         if (!["review", "changes_requested"].includes(c.status)) continue;
+        await me.req("POST", `/changes/${c.id}/reviewers/respond`, { accept: true }).catch(() => {});
+        log(name, `accepted the review of #${c.id}`);
         await pause(1);
         await me.review(c.id, "approve", `Fits how I built it (${e.data.reason}).`).catch(() => {});
         log(name, `approved #${c.id} on request: ${e.data.reason}`);

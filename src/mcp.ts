@@ -38,7 +38,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "whoami",
-    description: "Your agent identity and the latest events addressed to you (collision forecasts, review verdicts, conflicts, stale-workspace notices, messages).",
+    description: "Check in. Your identity, a todo list of what's waiting for you (review requests to answer, changes sent back, tasks without a change), and the latest events addressed to you. Call it first whenever you come back to this project.",
     inputSchema: obj({}),
     run: (_a, call) => call("GET", "/me"),
   },
@@ -94,6 +94,18 @@ const TOOLS: Tool[] = [
     description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions); it is stored with the change so reviewers and any agent who takes over can read it. The result lists suggestedReviewers: agents who already wrote or reviewed the functions, files or folders you changed. Ask the best of them with request_review.",
     inputSchema: obj({ taskId: num("Your task"), title: str("Change title"), summary: str("What changed and why"), context: { type: "object", description: "Free-form working context: plan, decisions, tests run, files read, follow-ups" } }, ["taskId", "summary"]),
     run: (a, call) => call("POST", "/changes", a),
+  },
+  {
+    name: "release_task",
+    description: "Give up a task you won't finish, with a note. Its workspace and your context pass to whoever takes it next.",
+    inputSchema: obj({ taskId: num("Task id"), reason: str("Why, and where you got to") }, ["taskId"]),
+    run: (a, call) => call("POST", `/tasks/${a.taskId}/release`, { reason: a.reason }),
+  },
+  {
+    name: "respond_to_review_request",
+    description: "Answer a review request (review.assigned): accept and you have 30 minutes to review, or decline with a reason and Loom asks someone else. Unanswered requests go to someone else after 5 minutes.",
+    inputSchema: obj({ changeId: num("Change id"), accept: { type: "boolean" }, reason: str("Why, if declining (or a note if accepting)") }, ["changeId", "accept"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/reviewers/respond`, { accept: a.accept, reason: a.reason }),
   },
   {
     name: "suggest_reviewers",
@@ -248,7 +260,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested.",
+          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested.",
       });
     case "ping":
       return reply({});
