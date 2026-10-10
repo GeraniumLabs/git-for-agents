@@ -250,3 +250,4 @@ pre.msg { margin: 6px 0; white-space: pre-wrap; color: var(--muted); font-size: 
 [hidden] { display: none !important; }
 #detail-body label.check { display: flex; align-items: center; gap: 6px; }
 #detail-body label.check input { width: auto; }
+.key-card .row { margin-top: 6px; } .key-card input { flex: 1; }

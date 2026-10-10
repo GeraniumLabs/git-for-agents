@@ -312,7 +312,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
@@ -647,6 +647,40 @@ function showNewProject() {
 }
 $("#np-open").onclick = () => showNewProject();
 
+// ── settings: keys people bring for this project ────────────────────────
+async function showSettings() {
+  if (!isHuman()) return showSignIn("Settings hold this project's keys, so only people signed in to it can see them.");
+  let s;
+  try { s = await act("GET", "/settings/keys"); } catch { return; }
+  const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+  $("#detail-body").innerHTML = `
+    <h3>Settings · ${esc(project)}</h3>
+    <h2>Keys</h2>
+    <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `Jev judges with <b>${esc(s.jevUses)}</b>.` : "Jev has no key yet, so it applies only house rules and earlier decisions."}</p>
+    ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
+    ${s.keys.map((k) => `<div class="card key-card">
+      <div class="row"><b class="grow">${esc(k.label)}</b>${k.saved ? `<span class="pill mono">…${esc(k.saved.last4)}</span>` : k.serverKey ? `<span class="pill">server key</span>` : `<span class="pill">not set</span>`}</div>
+      <div class="meta">${esc(k.uses)}${k.saved ? ` Saved by ${esc(k.saved.setByName)} on ${when(k.saved.setAt)}.` : k.serverKey ? " The server has one; a project key takes its place." : ""}</div>
+      ${k.saved && !k.saved.readable ? `<div class="warn">The secret that sealed this key is gone, so it can't be read. Save it again.</div>` : ""}
+      <div class="row"><input type="password" autocomplete="off" data-key-input="${k.kind}" placeholder="${esc(k.hint)}"><button data-key-save="${k.kind}" ${s.canSave ? "" : "disabled"}>${k.saved ? "Replace" : "Save"}</button>${k.saved ? `<button class="ghost" data-key-remove="${k.kind}">Remove</button>` : ""}</div>
+    </div>`).join("")}`;
+  for (const b of $("#detail-body").querySelectorAll("[data-key-save]")) b.onclick = async () => {
+    const input = $(`[data-key-input="${b.dataset.keySave}"]`);
+    if (!input.value.trim()) return;
+    try { await act("PUT", `/settings/keys/${b.dataset.keySave}`, { value: input.value.trim() }); } catch { return; }
+    toast("Key saved");
+    showSettings();
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-key-remove]")) b.onclick = async () => {
+    if (!confirm("Remove this key? Jev falls back to the server's key, or to house rules only.")) return;
+    try { await act("DELETE", `/settings/keys/${b.dataset.keyRemove}`); } catch { return; }
+    toast("Key removed");
+    showSettings();
+  };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#settings-open").onclick = () => showSettings();
+
 // ── my work: people claim tasks, push with git, and submit like agents ───
 async function showWork(note = "") {
   if (!me) return toast("Sign in first");
@@ -790,6 +824,8 @@ function describe(e) {
     case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
     case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
+    case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
+    case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];
     case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : d.kind === "dispute" ? `settled dispute #${d.thread}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : d.via === "precedent" ? `earlier decision${d.precedent ? ` #${d.precedent}` : ""}` : "house rule"}): “${esc(d.decision)}”`];
     case "decision.recorded": return ["directive", `Decision #${d.decision} recorded (${esc(d.kind)}, by ${who})${d.paths.length ? ` for <span class="mono">${d.paths.map(esc).join(", ")}</span>` : ""}: “${esc(d.text.slice(0, 140))}”`];
@@ -909,7 +945,7 @@ const listOf = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
 function fillJev() {
   const d = state.delegate;
   $("#jev-title").textContent = d.name;
-  $("#jev-status").textContent = d.jevConnected ? "Jev is connected." : "Jev isn't connected (no TYPESAFE_API_KEY), so only house rules apply.";
+  $("#jev-status").textContent = d.jevConnected ? `Jev judges with ${d.jevUses}.` : "Jev has no key yet, so only house rules and earlier decisions apply. Add one in Settings.";
   field("enabled").checked = d.enabled;
   field("name").value = d.name;
   field("guidance").value = d.guidance;

@@ -8,6 +8,7 @@
 // People decide what jev may handle (its scopes, thresholds, house rules and
 // guidance). Code owns the workflow; Jev answers narrow questions inside it.
 
+import Anthropic from "@anthropic-ai/sdk";
 import { matches } from "./paths";
 import { sameQuestion, type Decision } from "./memory";
 
@@ -54,6 +55,8 @@ export const DEFAULT_DELEGATE: DelegateConfig = {
 export interface Judge {
   apiKey?: string;
   url?: string;
+  /** Whose judge Jev uses: TypeSafe's System One, or Claude with the same questions. */
+  provider?: "typesafe" | "anthropic";
 }
 
 export type Verdict =
@@ -97,7 +100,7 @@ export async function decideQuestion(
   if (same) return { act: true, answer: cite(same), via: "precedent", decision: same.id };
 
   if (!judge.apiKey) {
-    return { act: false, reason: q.options ? "no house rule or earlier decision covers it (Jev isn't connected: set TYPESAFE_API_KEY)" : "no house rule or earlier decision covers it" };
+    return { act: false, reason: q.options ? "no house rule or earlier decision covers it (Jev isn't connected: add a key in Settings)" : "no house rule or earlier decision covers it" };
   }
   const precedents = q.precedents.slice(0, 12);
   if (!q.options && !precedents.length) return { act: false, reason: `no house rule or earlier decision covers it, and the question offers no options for ${cfg.name} to pick from` };
@@ -177,7 +180,7 @@ export async function decideDispute(
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
   if (!cfg.disputes.enabled) return { act: false, reason: `${cfg.name} isn't allowed to settle disputes` };
-  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (set TYPESAFE_API_KEY), so a person has to rule" };
+  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (add a key in Settings), so a person has to rule" };
   if (!cfg.guidance.trim() && !d.precedents.length) return { act: false, reason: `the humans haven't written guidance for ${cfg.name}, and nothing earlier was decided here` };
   const min = cfg.disputes.minConfidence;
   const res = await systemOne(judge, {
@@ -225,7 +228,7 @@ export async function decideApproval(
   const outside = c.guarded.filter((f) => !cfg.approvals.paths.some((p) => matches(p, f)));
   if (outside.length) return { act: false, reason: `${outside.join(", ")} is outside the paths ${cfg.name} may approve` };
   if (c.undeclared.length) return { act: false, reason: `the change touches files outside its declared intent (${c.undeclared.join(", ")})` };
-  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (set TYPESAFE_API_KEY), so a person has to look" };
+  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (add a key in Settings), so a person has to look" };
 
   const min = cfg.approvals.minConfidence;
   const res = await systemOne(judge, {
@@ -279,6 +282,7 @@ async function systemOne<Q extends Record<string, Question>>(
   state: unknown,
   questions: Q,
 ): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
+  if (judge.provider === "anthropic") return claudeOne(judge, state, questions);
   const url = judge.url ?? "https://api.typesafe.ai/v1/systemone";
   for (let attempt = 0; ; attempt++) {
     try {
@@ -299,5 +303,62 @@ async function systemOne<Q extends Record<string, Question>>(
       if (attempt < 2) continue;
       return { ok: false, reason: `Jev unavailable (${String(e?.message ?? e).slice(0, 80)})` };
     }
+  }
+}
+
+// ── the same questions, judged by Claude ─────────────────────────────────
+// For a project that brings an Anthropic key instead of a TypeSafe one.
+// Each yes/no question comes back as the probability its "true" criterion
+// holds; each choice as one option key with a confidence. Structured
+// output keeps the reply to exactly that shape.
+
+const JUDGE_MODEL = "claude-opus-5-5";
+const JUDGE_SYSTEM = `You are Jev, judging on behalf of a software project's human leads so their agents don't wait on them for routine calls.
+You get the situation as JSON and a set of questions about it. Answer every question.
+- For a yes/no question, give the probability (0 to 1) that its "true" criterion holds.
+- For a choice question, give the key of the option you pick and your confidence (0 to 1) that the leads would pick it.
+Be calibrated. Low numbers are useful: the leads would rather be asked than have you guess.`;
+
+async function claudeOne<Q extends Record<string, Question>>(
+  judge: Judge,
+  state: unknown,
+  questions: Q,
+): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
+  const properties: Record<string, unknown> = {};
+  for (const [k, q] of Object.entries(questions)) {
+    properties[k] = q.type === "noul"
+      ? { type: "object", properties: { probability: { type: "number" } }, required: ["probability"], additionalProperties: false }
+      : { type: "object", properties: { choice: { type: "string", enum: Object.keys(q.criteria) }, confidence: { type: "number" } }, required: ["choice", "confidence"], additionalProperties: false };
+  }
+  const client = new Anthropic({ apiKey: judge.apiKey });
+  try {
+    const res = await client.beta.messages.create({
+      model: JUDGE_MODEL,
+      max_tokens: 16000,
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
+      system: JUDGE_SYSTEM,
+      output_config: { format: { type: "json_schema", schema: { type: "object", properties, required: Object.keys(questions), additionalProperties: false } } },
+      messages: [{ role: "user", content: `Situation:\n${JSON.stringify(state, null, 2)}\n\nQuestions:\n${JSON.stringify(questions, null, 2)}` }],
+    });
+    if (res.stop_reason === "refusal") return { ok: false, reason: "Claude declined to judge this" };
+    const text = res.content.find((b) => b.type === "text");
+    if (!text || text.type !== "text") return { ok: false, reason: "Jev returned no answer" };
+    const raw = JSON.parse(text.text) as Record<string, any>;
+    const answers: Record<string, Answer> = {};
+    const clamp = (n: unknown) => Math.max(0, Math.min(1, Number(n) || 0));
+    for (const [k, q] of Object.entries(questions)) {
+      const a = raw[k];
+      if (!a) return { ok: false, reason: "Jev returned an incomplete answer" };
+      answers[k] = q.type === "noul"
+        ? { type: "noul", noul: clamp(a.probability) }
+        : { type: "choice", choice: String(a.choice), confidence: clamp(a.confidence), probabilities: { [String(a.choice)]: clamp(a.confidence) } };
+    }
+    return { ok: true, answers: answers as Answers<Q> };
+  } catch (e) {
+    if (e instanceof Anthropic.AuthenticationError) return { ok: false, reason: "Jev unavailable: the Anthropic key in Settings was rejected" };
+    if (e instanceof Anthropic.RateLimitError) return { ok: false, reason: "Jev unavailable: Claude is rate limited" };
+    if (e instanceof Anthropic.APIError) return { ok: false, reason: `Jev unavailable (Claude HTTP ${e.status})` };
+    return { ok: false, reason: `Jev unavailable (${String((e as any)?.message ?? e).slice(0, 80)})` };
   }
 }

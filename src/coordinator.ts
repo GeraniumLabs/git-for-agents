@@ -8,11 +8,12 @@ import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, t
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
-import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig } from "./delegate";
+import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig, type Judge } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
 import { skill } from "./skill";
+import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
@@ -150,6 +151,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS review_requests (
         change_id INTEGER, reviewer TEXT, requested_by TEXT, reason TEXT, status TEXT, created_at INTEGER, done_at INTEGER,
         PRIMARY KEY (change_id, reviewer));
+      CREATE TABLE IF NOT EXISTS project_keys (
+        kind TEXT PRIMARY KEY, ct TEXT NOT NULL, iv TEXT NOT NULL, sealed_by TEXT NOT NULL,
+        last4 TEXT, set_by TEXT, set_at INTEGER);
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
       CREATE INDEX IF NOT EXISTS events_actor ON events (actor, ts);
       CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
@@ -339,6 +343,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "agents" && !b && m === "POST") {
       if (who !== "admin") throw new HttpError(403, "only an admin can add agents");
       return json(await this.addAgent(body.name, body.role ?? "builder"));
+    }
+    if (a === "settings" && b === "keys") {
+      if (actor.role !== "human") throw new HttpError(403, "only people can manage the project's keys");
+      if (m === "GET" && !c) return json(this.keySettings());
+      if (!c || !isKeyKind(c)) throw new HttpError(404, `no key kind ${c ?? ""}; use ${Object.keys(KEY_KINDS).join(" or ")}`);
+      if (m === "PUT") return json(await this.saveKey(actor, c, body.value));
+      if (m === "DELETE") return json(this.removeKey(actor, c));
     }
     if (a === "settings" && m === "POST") {
       if (who !== "admin") throw new HttpError(403, "only an admin can change settings");
@@ -1103,7 +1114,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         options: t.options,
         task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
         precedents: this.relevantDecisions(this.threadPaths(t), e.data.body),
-      }, this.judge);
+      }, await this.judge());
       if (this.thread(t.id).status !== "open") return; // a human got there first
       if (v.act) {
         // House rules and precedents are already on record; a fresh pick by Jev becomes a decision.
@@ -1129,7 +1140,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         positions: Object.fromEntries(Object.entries(names).map(([n, id]) => [n, terms.positions[id]])),
         task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
         precedents: this.relevantDecisions(this.threadPaths(t), terms.question),
-      }, this.judge);
+      }, await this.judge());
       if (this.thread(t.id).status !== "open") return;
       if (v.act && v.option && names[v.option]) {
         this.ruleDispute(jev, t.id, names[v.option], v.answer);
@@ -1155,7 +1166,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       title: ch.title, summary: ch.summary ?? "",
       intent: detail.intents.map((i: any) => `${i.description} (${i.paths.join(", ")})`).join("; "),
       patch: detail.patch,
-    }, this.judge);
+    }, await this.judge());
     if (this.change(changeId).head !== ch.head || this.change(changeId).status !== "review") return; // moved on meanwhile
     if (v.act) {
       await this.review(jev, changeId, { verdict: "approve", body: v.answer });
@@ -1166,8 +1177,70 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private escalated = new Set<string>();
-  private get judge() {
-    return { apiKey: this.env.TYPESAFE_API_KEY, url: this.env.TYPESAFE_URL };
+  // ── keys people bring: Jev's judge, by the project's key or the server's ──
+
+  private keyCache = new Map<KeyKind, string | null>();
+  private async projectKey(kind: KeyKind): Promise<string | null> {
+    if (this.keyCache.has(kind)) return this.keyCache.get(kind)!;
+    const row = this.sql.exec("SELECT ct, iv, sealed_by FROM project_keys WHERE kind = ?", kind).toArray()[0] as any;
+    const key = row ? await unseal(this.env, this.project, row) : null;
+    this.keyCache.set(kind, key);
+    return key;
+  }
+
+  /** Jev's judge: the project's own keys first, then the server's; TypeSafe before Claude. */
+  private async judge(): Promise<Judge> {
+    const jev = (await this.projectKey("jev")) ?? this.env.TYPESAFE_API_KEY;
+    if (jev) return { provider: "typesafe", apiKey: jev, url: this.env.TYPESAFE_URL };
+    const claude = (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY;
+    if (claude) return { provider: "anthropic", apiKey: claude };
+    return {};
+  }
+
+  /** Where Jev's judge comes from, without decrypting anything. */
+  private jevSource(): string | null {
+    const saved = new Set(this.sql.exec("SELECT kind FROM project_keys").toArray().map((r) => r.kind as string));
+    if (saved.has("jev")) return "the project's TypeSafe key";
+    if (this.env.TYPESAFE_API_KEY) return "the server's TypeSafe key";
+    if (saved.has("anthropic")) return "Claude, with the project's Anthropic key";
+    if (this.env.ANTHROPIC_API_KEY) return "Claude, with the server's Anthropic key";
+    return null;
+  }
+
+  private keySettings() {
+    const rows = new Map(this.sql.exec("SELECT kind, last4, set_by, set_at, sealed_by FROM project_keys").toArray().map((r) => [r.kind as string, r]));
+    const server = { jev: !!this.env.TYPESAFE_API_KEY, anthropic: !!this.env.ANTHROPIC_API_KEY };
+    return {
+      canSave: !!sealer(this.env),
+      jevUses: this.jevSource(),
+      keys: (Object.keys(KEY_KINDS) as KeyKind[]).map((kind) => {
+        const r = rows.get(kind);
+        return {
+          kind, ...KEY_KINDS[kind],
+          saved: r ? { last4: r.last4, setBy: r.set_by, setByName: this.agentName(r.set_by as string) ?? r.set_by, setAt: r.set_at, readable: !!this.env[r.sealed_by === "secret" ? "LOOM_SECRET_KEY" : "LOOM_ADMIN_TOKEN"] } : null,
+          serverKey: server[kind],
+        };
+      }),
+    };
+  }
+
+  private async saveKey(actor: Agent, kind: KeyKind, value: unknown) {
+    const key = typeof value === "string" ? value.trim() : "";
+    if (key.length < 8 || /\s/.test(key)) throw new HttpError(400, "paste the whole key");
+    let sealed;
+    try { sealed = await seal(this.env, this.project, key); } catch (e: any) { throw new HttpError(503, e.message); }
+    this.sql.exec(`INSERT OR REPLACE INTO project_keys (kind, ct, iv, sealed_by, last4, set_by, set_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      kind, sealed.ct, sealed.iv, sealed.by, key.slice(-4), actor.id, Date.now());
+    this.keyCache.delete(kind);
+    this.emit("settings.key_saved", { actor: actor.id, data: { kind, label: KEY_KINDS[kind].label, last4: key.slice(-4) } });
+    return this.keySettings();
+  }
+
+  private removeKey(actor: Agent, kind: KeyKind) {
+    this.sql.exec("DELETE FROM project_keys WHERE kind = ?", kind);
+    this.keyCache.delete(kind);
+    this.emit("settings.key_removed", { actor: actor.id, data: { kind, label: KEY_KINDS[kind].label } });
+    return this.keySettings();
   }
 
   private escalate(threadId: number | null, changeId: number | null, taskId: number | null, reason: string, scores?: Record<string, number>) {
@@ -1283,7 +1356,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     return {
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals },
-      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.env.TYPESAFE_API_KEY },
+      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
         tasks: taskCounts, changes: changeCounts,
@@ -2102,7 +2175,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const reviews = this.sql.exec("SELECT id, change_id, reviewer, verdict, body, created_at FROM reviews ORDER BY id").toArray();
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
-      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.env.TYPESAFE_API_KEY },
+      delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),

@@ -59,6 +59,10 @@ People can't answer every question a swarm asks. jev is a delegate they brief to
 
 The humans set what jev may handle in the dashboard (**Delegate…**): whether it answers questions, which topics, house rules (`pattern => answer`) that apply first, which protected paths it may approve, and how confident Jev must be for each. Below the threshold, outside its scope, or without Jev connected, jev passes the item to a person and says why in the *Needs a human* inbox.
 
+**Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so jev judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude.
+
+![bring your own keys](docs/settings.png)
+
 ![a human steering the swarm](docs/human-in-the-loop.png)
 
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
@@ -154,7 +158,9 @@ Requires a Workers Paid plan (Artifacts is in beta there).
 ```sh
 npx wrangler r2 bucket create loom-context
 npx wrangler secret put LOOM_ADMIN_TOKEN
-npx wrangler secret put TYPESAFE_API_KEY   # optional: lets jev use Jev
+npx wrangler secret put LOOM_SECRET_KEY    # recommended: seals the keys people save in Settings
+npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key
+npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for jev
 npx wrangler deploy
 ```
 
@@ -227,6 +233,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
+| `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
 | `GET /decisions?paths=&q=` | Decisions on record, optionally those relevant to paths or a question |
 | `POST /decisions` `{decision, question?, paths}`, `POST /decisions/:id/retire` | *Human:* record a decision, or retire one |

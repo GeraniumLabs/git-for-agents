@@ -15,12 +15,12 @@
     "demo:claude": "node demo/claude-swarm.mjs"
   },
   "dependencies": {
+    "@anthropic-ai/sdk": "^0.131.0",
     "hono": "^4.13.13",
     "isomorphic-git": "^1.43.0",
     "node-diff3": "^3.2.1"
   },
   "devDependencies": {
-    "@anthropic-ai/sdk": "^0.131.0",
     "@cloudflare/workers-types": "^5.20261006.1",
     "typescript": "^7.0.2",
     "wrangler": "^4.147.0"
