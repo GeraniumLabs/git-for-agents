@@ -8,6 +8,15 @@ export interface Env {
   LOOM_SECRET_KEY?: string;
   /** A server-wide Claude key for Jev, used when a project has none of its own. */
   ANTHROPIC_API_KEY?: string;
+  /** GitHub OAuth app for people signing in. */
+  GITHUB_CLIENT_ID?: string;
+  GITHUB_CLIENT_SECRET?: string;
+  /** GitHub logins (comma-separated) who own every project. */
+  LOOM_OWNERS?: string;
+  /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
+  LOOM_CREATORS?: string;
+  /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
+  LOOM_DEV_LOGIN?: string;
   TYPESAFE_API_KEY?: string;
   TYPESAFE_URL?: string;
   PROJECT: DurableObjectNamespace<ProjectCoordinator>;

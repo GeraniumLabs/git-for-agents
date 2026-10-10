@@ -251,3 +251,6 @@ pre.msg { margin: 6px 0; white-space: pre-wrap; color: var(--muted); font-size: 
 #detail-body label.check { display: flex; align-items: center; gap: 6px; }
 #detail-body label.check input { width: auto; }
 .key-card .row { margin-top: 6px; } .key-card input { flex: 1; }
+.avatar { width: 20px; height: 20px; border-radius: 50%; vertical-align: middle; margin-right: 6px; }
+details.alt { margin-top: 14px; }
+details.alt summary { cursor: pointer; color: var(--muted, #888); font-size: 13px; }

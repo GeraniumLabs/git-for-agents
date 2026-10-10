@@ -6,7 +6,7 @@ compatibility_flags = ["nodejs_compat"]
 [assets]
 directory = "public"
 binding = "ASSETS"
-run_worker_first = ["/api/*", "/mcp", "/mcp/*"]
+run_worker_first = ["/api/*", "/mcp", "/mcp/*", "/auth/*"]
 
 [[artifacts]]
 binding = "ARTIFACTS"
@@ -27,7 +27,7 @@ bucket_name = "loom-context"
 # Local development: no Artifacts binding. The Worker talks to the
 # Artifacts shim (shim/artifacts-shim.mjs), which serves real git over HTTP.
 [env.local]
-vars = { ARTIFACTS_SHIM_URL = "http://127.0.0.1:8790", LOOM_ADMIN_TOKEN = "dev-admin" }
+vars = { ARTIFACTS_SHIM_URL = "http://127.0.0.1:8790", LOOM_ADMIN_TOKEN = "dev-admin", LOOM_DEV_LOGIN = "1", LOOM_OWNERS = "jonathanherr" }
 
 [[env.local.durable_objects.bindings]]
 name = "PROJECT"

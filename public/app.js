@@ -37,7 +37,7 @@ const keyName = () => `loom-key:${project}`;
 async function act(method, path, body) {
   const res = await fetch(`/api/projects/${project}${path}`, {
     method,
-    headers: { authorization: `Bearer ${store.get(keyName())}`, "content-type": "application/json" },
+    headers: { ...(store.get(keyName()) ? { authorization: `Bearer ${store.get(keyName())}` } : {}), "content-type": "application/json" },
     body: body === undefined ? undefined : JSON.stringify(body),
   });
   const data = await res.json().catch(() => ({}));
@@ -51,55 +51,69 @@ function toast(msg) {
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 4000);
 }
+// People sign in with GitHub (a session cookie). A pasted key still works,
+// for agents' keys and for scripts.
+let user = null, auth = { github: false, dev: false }, notMember = false;
+async function loadUser() {
+  try { auth = await fetch("/auth/me").then((r) => r.json()); user = auth.user; } catch { user = null; }
+}
 async function signIn(key) {
   if (key) store.set(keyName(), key);
-  if (!store.get(keyName())) { me = null; renderMe(); return; }
-  try { me = (await act("GET", "/me")).agent; } catch { me = null; store.set(keyName(), null); }
+  notMember = false;
+  me = null;
+  if (store.get(keyName()) || user) {
+    const res = await fetch(`/api/projects/${project}/me`, { headers: store.get(keyName()) ? { authorization: `Bearer ${store.get(keyName())}` } : {} });
+    if (res.ok) me = (await res.json()).agent;
+    else if (store.get(keyName())) store.set(keyName(), null);
+    else notMember = res.status === 403;
+  }
   renderMe();
   if (state) render();
 }
 const isHuman = () => me?.role === "human";
+const isOwner = () => !!me?.owner;
+const githubUrl = () => `/auth/github?return=${encodeURIComponent(location.pathname + location.search)}`;
 function renderMe() {
+  const face = user?.avatar ? `<img class="avatar" src="${esc(user.avatar)}" alt="">` : "";
   $("#me").innerHTML = me
-    ? `<span class="who-me">${esc(me.name)} <span class="role">${me.role}</span></span><button id="signout" class="ghost">Sign out</button>`
-    : `<button id="signin">Sign in</button>`;
-  if (me) $("#signout").onclick = () => { store.set(keyName(), null); signIn(); };
+    ? `<span class="who-me">${face}${esc(me.name)} <span class="role">${me.owner ? "owner" : me.role === "human" ? "member" : me.role}</span></span><button id="signout" class="ghost">Sign out</button>`
+    : user
+      ? `<span class="who-me">${face}${esc(user.login)} <span class="role">not a member</span></span><button id="signout" class="ghost">Sign out</button>`
+      : `<button id="signin">Sign in</button>`;
+  if ($("#signout")) $("#signout").onclick = async () => {
+    store.set(keyName(), null);
+    if (user) await fetch("/auth/logout", { method: "POST" });
+    user = null;
+    signIn();
+  };
   else $("#signin").onclick = () => showSignIn();
   $("#controls").hidden = !isHuman();
   $("#work-open").hidden = !me;
 }
 
-/** Sign in with a key, or (as the admin) make yourself a person key for this project. */
-function showSignIn(why = "") {
+/** Sign in with GitHub; or, if already signed in but not a member, say who can add you. */
+async function showSignIn(why = "") {
+  const ghButton = auth.github ? `<a class="button" href="${githubUrl()}">Sign in with GitHub</a>` : `<p class="meta">GitHub sign-in isn't set up on this server yet.</p>`;
+  const dev = auth.dev ? `<div class="row"><input id="si-dev" placeholder="Any GitHub login (local development)"><button class="ghost" id="si-dev-go">Sign in locally</button></div>` : "";
+  const owners = user && notMember ? (await api("/members").catch(() => [])).filter((p) => p.owner).map((p) => p.login) : [];
   $("#detail-body").innerHTML = `
     <h3>Sign in to ${esc(project)}</h3>
     ${why ? `<p>${esc(why)}</p>` : ""}
-    <h2>I have a key</h2>
-    <div class="row"><input id="si-key" type="password" placeholder="Your Loom key for this project" autocomplete="off"><button id="si-go">Sign in</button></div>
-    <h2>I'm the admin</h2>
-    <p class="meta">Use the admin token (the <span class="mono">LOOM_ADMIN_TOKEN</span> secret set at deploy) to make yourself a person key for this project. Your answers and reviews are then signed with your name.</p>
-    <div class="row"><input id="si-name" placeholder="Your name, e.g. jonathan"><input id="si-admin" type="password" placeholder="Admin token" autocomplete="off"><button class="ghost" id="si-make">Create key and sign in</button></div>
-    <div id="si-out"></div>`;
-  $("#si-admin").value = adminToken.get();
+    ${user && notMember
+      ? `<p>You're signed in as <b>${esc(user.login)}</b>, but you aren't a member of ${esc(project)} yet. ${owners.length ? `Ask ${owners.map(esc).join(" or ")} to add you in Settings.` : "Ask one of its owners to add you in Settings."}</p>`
+      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}
+    <details class="alt"><summary>Use a key instead</summary>
+      <p class="meta">For a Loom key someone made for you. Agents use these.</p>
+      <div class="row"><input id="si-key" type="password" placeholder="Loom key for this project" autocomplete="off"><button class="ghost" id="si-go">Sign in</button></div>
+    </details>`;
   const done = async () => { await signIn(); if (me) { $("#detail").close(); toast(`Signed in as ${me.name}`); } else toast("That key didn't work for this project"); };
   $("#si-go").onclick = () => { const k = $("#si-key").value.trim(); if (k) { store.set(keyName(), k); done(); } };
-  $("#si-make").onclick = async () => {
-    const n = $("#si-name").value.trim();
-    if (!n) return toast("Add your name");
-    adminToken.set($("#si-admin").value.trim());
-    try {
-      const k = await adminCall("POST", `/api/projects/${project}/agents`, { name: n, role: "human" });
-      store.set(keyName(), k.key);
-      await signIn();
-      $("#si-out").innerHTML = keyBox(k, project);
-      wireCopy($("#si-out"));
-      toast(`Signed in as ${k.name}`);
-    } catch (e) { toast(e.message); }
-  };
+  if ($("#si-dev-go")) $("#si-dev-go").onclick = () => { const l = $("#si-dev").value.trim(); if (l) location.href = `/auth/dev?login=${encodeURIComponent(l)}&return=${encodeURIComponent(location.pathname + location.search)}`; };
   if (!$("#detail").open) $("#detail").showModal();
 }
 
 async function boot() {
+  await loadUser();
   const projects = await fetch("/api/projects").then((r) => r.json());
   if (!project) project = projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
@@ -108,6 +122,7 @@ async function boot() {
   if (!project) {
     $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
     $("#np-empty").onclick = () => showNewProject();
+    renderMe();
     return;
   }
   connect();
@@ -312,7 +327,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
@@ -576,22 +591,18 @@ async function showSkill() {
     <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
     <h2>Create a key</h2>
-    <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option><option value="human">person</option></select>
-      <input id="mk-admin" type="password" placeholder="Admin token" autocomplete="off"><button class="ghost" id="mk-go">Create</button></div>
-    <div id="mk-out"></div>
+    ${isOwner() ? `<div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
+    <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
     <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
-  $("#mk-admin").value = adminToken.get();
-  $("#mk-go").onclick = async () => {
+  if ($("#mk-go")) $("#mk-go").onclick = async () => {
     const n = $("#mk-name").value.trim();
     if (!n) return;
-    adminToken.set($("#mk-admin").value.trim());
     try {
-      const k = await adminCall("POST", `/api/projects/${project}/agents`, { name: n, role: $("#mk-role").value });
-      if (k.role === "human") { store.set(keyName(), k.key); await signIn(); }
+      const k = await act("POST", "/agents", { name: n, role: $("#mk-role").value });
       $("#mk-out").innerHTML = keyBox(k, project);
       wireCopy($("#mk-out"));
-    } catch (e) { toast(e.message); }
+    } catch {}
   };
   $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
   $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
@@ -599,49 +610,29 @@ async function showSkill() {
 }
 $("#skill-open").onclick = () => showSkill();
 
-// ── admin: new projects and member keys ─────────────────────────────────
-// The admin token is the LOOM_ADMIN_TOKEN secret set at deploy. It stays in
-// this tab only (sessionStorage), never in the page or localStorage.
-const adminToken = {
-  get: () => { try { return sessionStorage.getItem("loom-admin") ?? ""; } catch { return ""; } },
-  set: (v) => { try { sessionStorage.setItem("loom-admin", v); } catch {} },
-};
-async function adminCall(method, url, body) {
-  const res = await fetch(url, { method, headers: { authorization: `Bearer ${adminToken.get()}`, "content-type": "application/json" }, body: JSON.stringify(body) });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`);
-  return data;
-}
+// ── new projects ────────────────────────────────────────────────────────
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
   <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
-  <p class="meta">Shown once: Loom keeps only its hash. ${k.role === "human" ? "It's saved in this browser as your sign-in for this project." : `Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}.`}</p>
+  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}.</p>
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
 function showNewProject() {
+  if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
   $("#detail-body").innerHTML = `
     <h3>New project</h3>
-    <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. Creating one needs the admin token (the <span class="mono">LOOM_ADMIN_TOKEN</span> secret set at deploy).</p>
+    <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. You'll be its owner, signed in as <b>${esc(user.login)}</b>.</p>
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
-    <label>Your name <input id="np-me" placeholder="e.g. jonathan"></label>
-    <label>Admin token <input id="np-admin" type="password" autocomplete="off"></label>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
-    <div class="row"><button id="np-create">Create project</button></div>
-    <div id="np-out"></div>`;
-  $("#np-admin").value = adminToken.get();
+    <div class="row"><button id="np-create">Create project</button></div>`;
   $("#np-create").onclick = async () => {
-    const name = $("#np-name").value.trim(), who = $("#np-me").value.trim() || "admin";
+    const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
-    adminToken.set($("#np-admin").value.trim());
-    try {
-      await adminCall("POST", "/api/projects", { name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0 });
-      const k = await adminCall("POST", `/api/projects/${name}/agents`, { name: who, role: "human" });
-      store.set(`loom-key:${name}`, k.key);
-      $("#np-out").innerHTML = `<p><b>${esc(name)}</b> is ready. Main starts with a README; add agents from <b>Connect an agent</b>, or bring code in with <b>My work</b> (take a task, push your files, submit).</p>${keyBox(k, name)}<div class="row"><button id="np-go">Open ${esc(name)}</button></div>`;
-      wireCopy($("#np-out"));
-      $("#np-go").onclick = () => (location.search = `?project=${name}`);
-    } catch (e) { toast(e.message); }
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0 }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
+    location.search = `?project=${name}`;
   };
   if (!$("#detail").open) $("#detail").showModal();
 }
@@ -649,12 +640,16 @@ $("#np-open").onclick = () => showNewProject();
 
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
-  if (!isHuman()) return showSignIn("Settings hold this project's keys, so only people signed in to it can see them.");
-  let s;
-  try { s = await act("GET", "/settings/keys"); } catch { return; }
+  if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
+  let s, people;
+  try { [s, people] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members")]); } catch { return; }
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
     <h3>Settings · ${esc(project)}</h3>
+    <h2>People</h2>
+    <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
+    ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
+    ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
     <h2>Keys</h2>
     <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `Jev judges with <b>${esc(s.jevUses)}</b>.` : "Jev has no key yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
@@ -669,6 +664,18 @@ async function showSettings() {
     if (!input.value.trim()) return;
     try { await act("PUT", `/settings/keys/${b.dataset.keySave}`, { value: input.value.trim() }); } catch { return; }
     toast("Key saved");
+    showSettings();
+  };
+  if ($("#mem-add")) $("#mem-add").onclick = async () => {
+    const login = $("#mem-login").value.trim();
+    if (!login) return;
+    try { await act("POST", "/members", { login, owner: $("#mem-owner").checked }); } catch { return; }
+    toast(`Added ${login}. They sign in with GitHub.`);
+    showSettings();
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-member-remove]")) b.onclick = async () => {
+    if (!confirm("Remove this person from the project?")) return;
+    try { await act("DELETE", `/members/${b.dataset.memberRemove}`); } catch { return; }
     showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-key-remove]")) b.onclick = async () => {
@@ -824,6 +831,8 @@ function describe(e) {
     case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
     case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
+    case "member.added": return ["directive", `${who} added ${esc(d.login)} to the project${d.owner ? " as an owner" : ""}`];
+    case "member.removed": return ["directive", `${who} removed ${esc(d.login)} from the project`];
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
     case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];

@@ -13,6 +13,7 @@ import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
 import { skill } from "./skill";
+import { USER_HEADER, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 
 const TOKEN_TTL = 6 * 3600;
@@ -39,6 +40,9 @@ export interface Agent {
   name: string;
   role: Role;
   paused?: string | null;
+  /** People only: "github:<login>", and whether they own the project. */
+  identity?: string | null;
+  owner?: boolean;
 }
 
 export interface LoomEvent {
@@ -98,6 +102,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE review_requests ADD COLUMN seen_at INTEGER",
       "ALTER TABLE review_requests ADD COLUMN answered_at INTEGER",
       "ALTER TABLE review_requests ADD COLUMN deadline INTEGER",
+      "ALTER TABLE agents ADD COLUMN identity TEXT",
+      "ALTER TABLE agents ADD COLUMN owner INTEGER DEFAULT 0",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -226,16 +232,37 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return r ? (r.name as string) : id;
   }
 
+  /** Server-wide owners (LOOM_OWNERS, GitHub logins) own every project. */
+  private siteOwner(identity: string): boolean {
+    return (this.env.LOOM_OWNERS ?? "").split(",").map((l) => `github:${l.trim().toLowerCase()}`).includes(identity);
+  }
+
+  /** A person signed in with GitHub, by their membership in this project. */
+  private async member(user: User): Promise<Agent> {
+    let row = this.sql.exec("SELECT id, name, role, paused, identity, owner FROM agents WHERE identity = ?", user.id).toArray()[0];
+    if (!row && this.siteOwner(user.id)) {
+      await this.addPerson(user.login, user.id, true, null);
+      row = this.sql.exec("SELECT id, name, role, paused, identity, owner FROM agents WHERE identity = ?", user.id).toArray()[0];
+    }
+    if (!row) throw new HttpError(403, `${user.login} isn't a member of ${this.project}; ask one of its owners to add you`);
+    this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
+    return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: null, identity: user.id, owner: !!row.owner || this.siteOwner(user.id) };
+  }
+
   private async authenticate(req: Request): Promise<Agent | "admin"> {
     const header = req.headers.get("authorization") ?? "";
     const key = header.replace(/^Bearer\s+/i, "");
-    if (!key) throw new HttpError(401, "missing bearer token");
+    if (!key) {
+      const user = req.headers.get(USER_HEADER);
+      if (user) return this.member(JSON.parse(user));
+      throw new HttpError(401, "sign in, or send an agent key as a bearer token");
+    }
     if (this.env.LOOM_ADMIN_TOKEN && key === this.env.LOOM_ADMIN_TOKEN) return "admin";
     const hash = await sha256(key);
-    const row = this.sql.exec("SELECT id, name, role, paused FROM agents WHERE key_hash = ?", hash).toArray()[0];
+    const row = this.sql.exec("SELECT id, name, role, paused, identity, owner FROM agents WHERE key_hash = ?", hash).toArray()[0];
     if (!row) throw new HttpError(401, "unknown agent key");
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
-    return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused as string | null) ?? null };
+    return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused as string | null) ?? null, identity: (row.identity as string | null) ?? null, owner: !!row.owner };
   }
 
   private remote(repo: string, token: string): Remote {
@@ -331,6 +358,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "commits") return json(await this.commits(url.searchParams));
       if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? ""), { headers: { "content-type": "text/markdown; charset=utf-8" } });
       if (a === "delegate") return json(this.delegateConfig);
+      if (a === "members") return json(this.members());
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
       if (a === "decisions") return json(this.listDecisions(url.searchParams));
@@ -338,11 +366,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
 
     const who = await this.authenticate(req);
-    const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human" } : who;
+    const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human", owner: true } : who;
+    const ownerOnly = (what: string) => { if (!actor.owner) throw new HttpError(403, `only the project's owners can ${what}`); };
 
     if (a === "agents" && !b && m === "POST") {
-      if (who !== "admin") throw new HttpError(403, "only an admin can add agents");
-      return json(await this.addAgent(body.name, body.role ?? "builder"));
+      ownerOnly("add agents");
+      if (body.role === "human" && who !== "admin") throw new HttpError(400, "add people by their GitHub login under members");
+      return json(await this.addAgent(body.name, body.role ?? "builder", actor.id === "admin" ? null : actor.id));
+    }
+    if (a === "members") {
+      ownerOnly("change who's in the project");
+      if (m === "POST") return json(await this.addMember(actor, body.login, !!body.owner));
+      if (m === "DELETE" && b) return json(this.removeMember(actor, b));
     }
     if (a === "settings" && b === "keys") {
       if (actor.role !== "human") throw new HttpError(403, "only people can manage the project's keys");
@@ -352,7 +387,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (m === "DELETE") return json(this.removeKey(actor, c));
     }
     if (a === "settings" && m === "POST") {
-      if (who !== "admin") throw new HttpError(403, "only an admin can change settings");
+      ownerOnly("change settings");
       if (body.requiredApprovals !== undefined) this.setMeta("required_approvals", String(body.requiredApprovals));
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
       return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths });
@@ -414,7 +449,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number }) {
+  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     const repo = `${name}`;
@@ -430,16 +465,53 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
     await w.push({ url: created.remote, token: created.token }, commit);
     this.setMeta("main_head", commit);
-    this.emit("project.created", { data: { name, commit } });
+    this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null } });
+    if (body.owner) await this.addPerson(body.owner.login, body.owner.id, true, null);
     return { name, remote: created.remote, head: commit };
   }
 
-  private async addAgent(name: string, role: Role) {
+  private async addAgent(name: string, role: Role, by: string | null = null) {
+    if (!name?.trim()) throw new HttpError(400, "name is required");
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
     const key = `loom_${randomId(20)}`;
     this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", id, name, role, await sha256(key), Date.now(), Date.now());
-    this.emit("agent.joined", { actor: id, data: { name, role } });
+    this.emit("agent.joined", { actor: id, data: { name, role, by } });
     return { id, name, role, key };
+  }
+
+  // ── people: GitHub sign-in, owners and members ───────────────────────────
+
+  /** A person's row. They sign in with GitHub, so the key is random and never handed out. */
+  private async addPerson(login: string, identity: string, owner: boolean, by: string | null) {
+    const id = `${login.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
+    this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen, identity, owner) VALUES (?, ?, 'human', ?, ?, ?, ?, ?)",
+      id, login, await sha256(`person_${randomId(20)}`), Date.now(), 0, identity, owner ? 1 : 0);
+    this.emit("member.added", { actor: by ?? id, to: id, data: { login, owner } });
+    return id;
+  }
+
+  private members() {
+    return this.sql.exec("SELECT id, name, identity, owner, last_seen FROM agents WHERE role = 'human' AND identity IS NOT NULL ORDER BY owner DESC, name").toArray()
+      .map((r) => ({ id: r.id, login: r.name, owner: !!r.owner, lastSeen: r.last_seen || null }));
+  }
+
+  private async addMember(actor: Agent, login: unknown, owner: boolean) {
+    const l = String(login ?? "").trim().replace(/^@/, "");
+    if (!/^[a-z0-9](?:[a-z0-9-]{0,38})$/i.test(l)) throw new HttpError(400, "give a GitHub login, e.g. octocat");
+    const identity = `github:${l.toLowerCase()}`;
+    const row = this.sql.exec("SELECT id FROM agents WHERE identity = ?", identity).toArray()[0];
+    if (row) this.sql.exec("UPDATE agents SET owner = ? WHERE id = ?", owner ? 1 : 0, row.id);
+    else await this.addPerson(l, identity, owner, actor.id);
+    return this.members();
+  }
+
+  private removeMember(actor: Agent, id: string) {
+    const row = this.sql.exec("SELECT id, name, owner FROM agents WHERE id = ? AND identity IS NOT NULL", id).toArray()[0];
+    if (!row) throw new HttpError(404, `no member ${id}`);
+    if (row.owner && (this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE owner = 1").one().n as number) <= 1) throw new HttpError(409, "a project needs at least one owner");
+    this.sql.exec("UPDATE agents SET identity = NULL, owner = 0, paused = 'removed from the project' WHERE id = ?", id);
+    this.emit("member.removed", { actor: actor.id, to: id, data: { login: row.name } });
+    return this.members();
   }
 
   // ── tasks and workspaces ─────────────────────────────────────────────────

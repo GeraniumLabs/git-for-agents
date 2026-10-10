@@ -42,7 +42,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
 - **Line comments**: in a change, click any line of the patch to comment on it. Comments go out with the review and show under their lines for the author and other reviewers.
 - **My work**: a person takes a task (or adds one and takes it), gets a clone and push command for its workspace, declares the files they'll touch, and submits for review. People go through the same intents, reviews, conflict routing and merge queue as agents.
-- **New projects and keys from the dashboard**: **New project** creates a project and a personal key for you, using the admin token, which stays only in that browser tab. **Connect an agent** creates agent keys.
+- **People sign in with GitHub; agents use keys**: whoever creates a project owns it and adds people by GitHub login in **Settings**. Members answer agents, review, steer and manage keys; owners also add people and create agent keys under **Connect an agent**. Logins listed in `LOOM_OWNERS` own every project. The admin token remains only for scripts.
 - **History**: the **Code** view's *History* tab shows every commit on main, and each change shows its own commits. A change reaches main like this:
   1. An agent (or person) commits to its own workspace, either through the API (`write_files`) or with a plain `git push`.
   2. Once the change is approved, the merge queue lands it as a merge commit, or as a fast-forward.
@@ -140,7 +140,7 @@ Open http://127.0.0.1:8787 and watch. In about a minute six builders, a reviewer
 - fen starting on files ada changed, getting ada's decisions and reasons from memory, and consulting ada, who is still around;
 - the docs change approved by jev (or by jo when Jev isn't connected).
 
-All six changes land on main. Without a TypeSafe key, jev uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, create a human key (`POST /api/projects/<p>/agents {"name":"you","role":"human"}` with the admin token) and click **Sign in** on the dashboard. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
+All six changes land on main. Without a TypeSafe key, jev uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, click **Sign in**: locally you can sign in as any GitHub login without a GitHub app (`LOOM_DEV_LOGIN=1` in `wrangler.toml`), and `jonathanherr` is set as a site owner there. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
 
 ### Real Claude agents
 
@@ -157,14 +157,19 @@ Requires a Workers Paid plan (Artifacts is in beta there).
 
 ```sh
 npx wrangler r2 bucket create loom-context
-npx wrangler secret put LOOM_ADMIN_TOKEN
-npx wrangler secret put LOOM_SECRET_KEY    # recommended: seals the keys people save in Settings
+npx wrangler secret put LOOM_ADMIN_TOKEN   # for scripts only
+npx wrangler secret put LOOM_SECRET_KEY    # signs sessions and seals the keys people save in Settings
+npx wrangler secret put GITHUB_CLIENT_ID   # from a GitHub OAuth app (below)
+npx wrangler secret put GITHUB_CLIENT_SECRET
+npx wrangler secret put LOOM_OWNERS        # optional: GitHub logins who own every project, comma-separated
 npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key
 npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for jev
 npx wrangler deploy
 ```
 
-Then create a project and agents:
+For GitHub sign-in, register an OAuth app at github.com/settings/developers (**New OAuth App**): homepage `https://<worker>`, callback `https://<worker>/auth/github/callback`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
+
+Then sign in on the dashboard and use **New project**, or script it:
 
 ```sh
 curl -X POST https://<worker>/api/projects -H "authorization: Bearer $LOOM_ADMIN_TOKEN" \
