@@ -64,9 +64,39 @@ function renderMe() {
     ? `<span class="who-me">${esc(me.name)} <span class="role">${me.role}</span></span><button id="signout" class="ghost">Sign out</button>`
     : `<button id="signin">Sign in</button>`;
   if (me) $("#signout").onclick = () => { store.set(keyName(), null); signIn(); };
-  else $("#signin").onclick = () => { const k = prompt("Your Loom key for this project (humans get one from the project admin):"); if (k) signIn(k.trim()); };
+  else $("#signin").onclick = () => showSignIn();
   $("#controls").hidden = !isHuman();
   $("#work-open").hidden = !me;
+}
+
+/** Sign in with a key, or (as the admin) make yourself a person key for this project. */
+function showSignIn(why = "") {
+  $("#detail-body").innerHTML = `
+    <h3>Sign in to ${esc(project)}</h3>
+    ${why ? `<p>${esc(why)}</p>` : ""}
+    <h2>I have a key</h2>
+    <div class="row"><input id="si-key" type="password" placeholder="Your Loom key for this project" autocomplete="off"><button id="si-go">Sign in</button></div>
+    <h2>I'm the admin</h2>
+    <p class="meta">Use the admin token (the <span class="mono">LOOM_ADMIN_TOKEN</span> secret set at deploy) to make yourself a person key for this project. Your answers and reviews are then signed with your name.</p>
+    <div class="row"><input id="si-name" placeholder="Your name, e.g. jonathan"><input id="si-admin" type="password" placeholder="Admin token" autocomplete="off"><button class="ghost" id="si-make">Create key and sign in</button></div>
+    <div id="si-out"></div>`;
+  $("#si-admin").value = adminToken.get();
+  const done = async () => { await signIn(); if (me) { $("#detail").close(); toast(`Signed in as ${me.name}`); } else toast("That key didn't work for this project"); };
+  $("#si-go").onclick = () => { const k = $("#si-key").value.trim(); if (k) { store.set(keyName(), k); done(); } };
+  $("#si-make").onclick = async () => {
+    const n = $("#si-name").value.trim();
+    if (!n) return toast("Add your name");
+    adminToken.set($("#si-admin").value.trim());
+    try {
+      const k = await adminCall("POST", `/api/projects/${project}/agents`, { name: n, role: "human" });
+      store.set(keyName(), k.key);
+      await signIn();
+      $("#si-out").innerHTML = keyBox(k, project);
+      wireCopy($("#si-out"));
+      toast(`Signed in as ${k.name}`);
+    } catch (e) { toast(e.message); }
+  };
+  if (!$("#detail").open) $("#detail").showModal();
 }
 
 async function boot() {
@@ -157,6 +187,7 @@ function renderHealth() {
 }
 
 // ── what needs a person ─────────────────────────────────────────────────
+const signInToAct = (verb) => `<div class="row"><button class="ghost mini" data-signin>Sign in to ${verb}</button></div>`;
 const escalation = (reason) => reason && state.delegate?.enabled ? `<div class="warn">${esc(state.delegate.name)} passed this to you: ${esc(reason)}</div>` : "";
 function renderAttention() {
   const items = state.attention.filter((i) => i.kind !== "stuck");
@@ -169,16 +200,16 @@ function renderAttention() {
       const opts = it.options ? `<div class="opts">${Object.entries(it.options).map(([k, v]) => me ? `<button class="ghost mini" data-answer="${it.threads.join(",")}" data-opt="${esc(k)}" title="${esc(v)}">${esc(k)}</button>` : `<span class="pill" title="${esc(v)}">${esc(k)}</span>`).join("")}</div>` : "";
       return box(`<div class="kicker">Question · asked by ${many ? `${it.threads.length} agents` : "1 agent"}${it.blocking ? ` · ${it.blocking} blocked` : ""} · ${ago(it.since)}</div>
         <div class="q">${esc(it.question)}</div><div class="meta">${askers}</div>${opts}${escalation(it.escalated)}
-        ${me ? `<div class="row"><input data-answer-text="${it.threads.join(",")}" placeholder="Answer${many ? ` all ${it.threads.length}` : ""}…"><button data-answer-send="${it.threads.join(",")}">Send</button></div>` : ""}`, "q");
+        ${me ? `<div class="row"><input data-answer-text="${it.threads.join(",")}" placeholder="Answer${many ? ` all ${it.threads.length}` : ""}…"><button data-answer-send="${it.threads.join(",")}">Send</button></div>` : signInToAct("answer")}`, "q");
     }
     if (it.kind === "dispute") {
       const sides = it.parties.map((p) => `<div class="side">${who(p)} ${it.positions[p] ? esc(it.positions[p]) : `<i class="meta">hasn't stated a position yet</i>`}${me && it.positions[p] ? ` <button class="mini" data-rule="${it.thread}" data-for="${esc(p)}">Rule for ${esc(name(p))}</button>` : ""}</div>`).join("");
-      return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}`, "q");
+      return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}${me ? "" : signInToAct("rule on it")}`, "q");
     }
     if (it.kind === "review") {
-      return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : ""}`, "q");
+      return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
-    return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : ""}`, "q");
+    return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("approve")}`, "q");
   }).join("") || `<p class="empty">Nothing needs a person right now.</p>`;
   wire($("#attention"));
 }
@@ -195,13 +226,14 @@ function renderStuck() {
 function renderDiscussions() {
   const posts = (t) => t.posts.slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("");
   $("#discussions").innerHTML = state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
-    ${me ? `<div class="row"><input data-reply="${t.id}" placeholder="Reply…"><button data-send="${t.id}">Send</button></div>` : ""}</div>`).join("")
+    ${me ? `<div class="row"><input data-reply="${t.id}" placeholder="Reply…"><button data-send="${t.id}">Send</button></div>` : signInToAct("reply")}</div>`).join("")
     || `<p class="empty">No open discussions.</p>`;
   wire($("#discussions"));
 }
 
 // One place to hook up links and buttons inside rendered HTML.
 function wire(root) {
+  for (const b of root.querySelectorAll("[data-signin]")) b.onclick = () => showSignIn("Answering, reviewing and replying are signed with your name, so sign in first.");
   for (const a of root.querySelectorAll("[data-agent]")) a.onclick = (e) => { e.preventDefault(); showAgent(a.dataset.agent); };
   for (const a of root.querySelectorAll("[data-change]")) a.onclick = (e) => { e.preventDefault(); showChange(Number(a.dataset.change)); };
   for (const b of root.querySelectorAll("[data-send]")) b.onclick = async () => {
@@ -556,6 +588,7 @@ async function showSkill() {
     adminToken.set($("#mk-admin").value.trim());
     try {
       const k = await adminCall("POST", `/api/projects/${project}/agents`, { name: n, role: $("#mk-role").value });
+      if (k.role === "human") { store.set(keyName(), k.key); await signIn(); }
       $("#mk-out").innerHTML = keyBox(k, project);
       wireCopy($("#mk-out"));
     } catch (e) { toast(e.message); }
