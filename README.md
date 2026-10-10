@@ -159,15 +159,13 @@ Requires a Workers Paid plan (Artifacts is in beta there).
 npx wrangler r2 bucket create loom-context
 npx wrangler secret put LOOM_ADMIN_TOKEN   # for scripts only
 npx wrangler secret put LOOM_SECRET_KEY    # signs sessions and seals the keys people save in Settings
-npx wrangler secret put GITHUB_CLIENT_ID   # from a GitHub OAuth app (below)
-npx wrangler secret put GITHUB_CLIENT_SECRET
 npx wrangler secret put LOOM_OWNERS        # optional: GitHub logins who own every project, comma-separated
 npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key
 npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for jev
 npx wrangler deploy
 ```
 
-For GitHub sign-in, register an OAuth app at github.com/settings/developers (**New OAuth App**): homepage `https://<worker>`, callback `https://<worker>/auth/github/callback`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
+For GitHub sign-in, open `https://<worker>/auth/setup`, enter the admin token once and click **Create Loom's GitHub app**: Loom asks GitHub to create a GitHub app for it (the manifest flow, no repository access), you approve it on GitHub, and Loom keeps the app's credentials sealed like project keys. Or register an OAuth app yourself (callback `https://<worker>/auth/github/callback`) and set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
 
 Then sign in on the dashboard and use **New project**, or script it:
 

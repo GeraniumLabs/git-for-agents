@@ -330,6 +330,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const body = m === "POST" || m === "PUT" ? await req.json<any>().catch(() => ({})) : {};
 
     // Registry (singleton instance)
+    if (a === "registry" && b === "github") {
+      // The GitHub app Loom created for itself (sign-in), sealed like project keys.
+      if (m === "GET") {
+        const row = this.meta("github_app");
+        const plain = row ? await unseal(this.env, "__github", JSON.parse(row)) : null;
+        return json(plain ? JSON.parse(plain) : null);
+      }
+      const sealed = await seal(this.env, "__github", JSON.stringify(body));
+      this.setMeta("github_app", JSON.stringify({ ct: sealed.ct, iv: sealed.iv, sealed_by: sealed.by }));
+      return json({ ok: true });
+    }
     if (a === "registry") {
       if (m === "GET") return json(this.sql.exec("SELECT * FROM projects ORDER BY created_at").toArray());
       this.sql.exec("INSERT OR REPLACE INTO projects VALUES (?, ?, ?)", body.name, body.description ?? "", Date.now());

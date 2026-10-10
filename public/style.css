@@ -254,3 +254,7 @@ pre.msg { margin: 6px 0; white-space: pre-wrap; color: var(--muted); font-size: 
 .avatar { width: 20px; height: 20px; border-radius: 50%; vertical-align: middle; margin-right: 6px; }
 details.alt { margin-top: 14px; }
 details.alt summary { cursor: pointer; color: var(--muted, #888); font-size: 13px; }
+body.setup { display: grid; place-items: start center; padding: 10vh 16px; }
+.setup-card { max-width: 520px; width: 100%; background: var(--card, #fff); border: 1px solid var(--line, #ddd); border-radius: 12px; padding: 24px; }
+.setup-card label { display: block; margin: 12px 0; }
+.setup-card input { width: 100%; }

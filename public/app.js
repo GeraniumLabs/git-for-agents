@@ -93,7 +93,7 @@ function renderMe() {
 
 /** Sign in with GitHub; or, if already signed in but not a member, say who can add you. */
 async function showSignIn(why = "") {
-  const ghButton = auth.github ? `<a class="button" href="${githubUrl()}">Sign in with GitHub</a>` : `<p class="meta">GitHub sign-in isn't set up on this server yet.</p>`;
+  const ghButton = auth.github ? `<a class="button" href="${githubUrl()}">Sign in with GitHub</a>` : `<p class="meta">GitHub sign-in isn't set up on this server yet. <a href="/auth/setup">Set it up</a> (one click, needs the admin token once).</p>`;
   const dev = auth.dev ? `<div class="row"><input id="si-dev" placeholder="Any GitHub login (local development)"><button class="ghost" id="si-dev-go">Sign in locally</button></div>` : "";
   const owners = user && notMember ? (await api("/members").catch(() => [])).filter((p) => p.owner).map((p) => p.login) : [];
   $("#detail-body").innerHTML = `

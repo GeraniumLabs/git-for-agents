@@ -67,7 +67,24 @@ export async function sessionUser(env: Env, req: Request): Promise<User | null> 
   return s ? { id: s.id, login: s.login, name: s.name, avatar: s.avatar } : null;
 }
 
-const githubReady = (env: Env) => !!(env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET);
+/** Loom's own registry, where the GitHub app it created for itself is kept. */
+export type Registry = (path: string, init?: RequestInit) => Promise<Response>;
+
+interface GitHubApp { client_id: string; client_secret: string; slug?: string; html_url?: string }
+let cachedApp: GitHubApp | null = null;
+
+/** GitHub sign-in credentials: from Worker secrets, or from the app Loom created for itself. */
+async function githubApp(env: Env, registry: Registry): Promise<GitHubApp | null> {
+  if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) return { client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET };
+  if (cachedApp) return cachedApp;
+  const app = await registry("/registry/github").then((r) => r.json<GitHubApp | null>()).catch(() => null);
+  if (app?.client_id) cachedApp = app;
+  return cachedApp;
+}
+
+const page = (title: string, body: string) => new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+<link rel="stylesheet" href="/style.css"><body class="setup"><main class="setup-card"><h3>${title}</h3>${body}</main></body>`, { headers: { "content-type": "text/html; charset=utf-8" } });
+const escHtml = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 const devLogin = (env: Env) => env.LOOM_DEV_LOGIN === "1";
 
 const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
@@ -81,13 +98,13 @@ async function startSession(env: Env, req: Request, user: User, to: string): Pro
 }
 
 /** /auth/* routes, or null when the path isn't one. */
-export async function handleAuth(env: Env, req: Request): Promise<Response | null> {
+export async function handleAuth(env: Env, req: Request, registry: Registry): Promise<Response | null> {
   const url = new URL(req.url);
   const path = url.pathname;
   if (!path.startsWith("/auth/")) return null;
 
   if (path === "/auth/me") {
-    return Response.json({ user: await sessionUser(env, req), github: githubReady(env), dev: devLogin(env) });
+    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env) });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {
@@ -103,12 +120,56 @@ export async function handleAuth(env: Env, req: Request): Promise<Response | nul
     return startSession(env, req, { id: `github:${login}`, login, name: login, avatar: "" }, safeReturn(url.searchParams.get("return")));
   }
 
+  // One-click setup: Loom asks GitHub to create a GitHub app for it (the
+  // manifest flow), then keeps the app's client ID and secret itself. Needs
+  // the admin token once, so nobody else can claim sign-in for this server.
+  if (path === "/auth/setup") {
+    const existing = await githubApp(env, registry);
+    if (existing) return page("GitHub sign-in is set up", `<p>Loom signs people in with ${existing.html_url ? `<a href="${escHtml(existing.html_url)}">its GitHub app</a>` : "GitHub"}.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
+    if (req.method !== "POST") {
+      return page("Set up GitHub sign-in", `<p>Loom will ask GitHub to create a small GitHub app for this server. It requests no access to your repositories; it only lets people sign in. You'll approve it on GitHub, and that's it.</p>
+<form method="post"><label>Admin token (one last time) <input name="token" type="password" autocomplete="off" required></label>
+<label>Create it under a GitHub organization (optional) <input name="org" placeholder="e.g. GeraniumLabs"></label>
+<p><button>Create Loom's GitHub app</button></p></form>`);
+    }
+    const form = await req.formData();
+    if (!env.LOOM_ADMIN_TOKEN || form.get("token") !== env.LOOM_ADMIN_TOKEN) return page("That isn't the admin token", `<p><a href="/auth/setup">Try again</a></p>`);
+    const org = String(form.get("org") ?? "").trim().replace(/[^A-Za-z0-9-]/g, "");
+    const state = await signed(env, { setup: true, exp: Date.now() + 30 * 60_000 });
+    const host = url.hostname.split(".");
+    const manifest = {
+      name: `Loom ${host.length > 2 ? host[1] : host[0]}`.slice(0, 34),
+      url: url.origin,
+      redirect_url: `${url.origin}/auth/github/setup-done`,
+      callback_urls: [`${url.origin}/auth/github/callback`],
+      public: true,
+      default_permissions: {},
+    };
+    const target = org ? `https://github.com/organizations/${org}/settings/apps/new` : "https://github.com/settings/apps/new";
+    return page("Opening GitHub…", `<form id="go" method="post" action="${target}?state=${encodeURIComponent(state)}"><input type="hidden" name="manifest" value="${escHtml(JSON.stringify(manifest))}"><button>Continue to GitHub</button></form><script>document.getElementById("go").submit()</script>`);
+  }
+
+  if (path === "/auth/github/setup-done") {
+    const ok = await verified<{ setup: boolean }>(env, url.searchParams.get("state") ?? undefined);
+    const code = url.searchParams.get("code");
+    if (!ok?.setup || !code) return page("Setup expired", `<p><a href="/auth/setup">Start again</a></p>`);
+    const res = await fetch(`https://api.github.com/app-manifests/${encodeURIComponent(code)}/conversions`, {
+      method: "POST", headers: { accept: "application/vnd.github+json", "user-agent": "loom" },
+    });
+    const app = await res.json<any>();
+    if (!res.ok || !app.client_id || !app.client_secret) return page("GitHub didn't finish creating the app", `<p>${escHtml(app.message ?? `HTTP ${res.status}`)}</p><p><a href="/auth/setup">Try again</a></p>`);
+    await registry("/registry/github", { method: "PUT", body: JSON.stringify({ client_id: app.client_id, client_secret: app.client_secret, slug: app.slug, html_url: app.html_url }) });
+    cachedApp = null;
+    return page("GitHub sign-in is ready", `<p>Loom created <b>${escHtml(app.name ?? "its GitHub app")}</b>. People can now sign in with GitHub.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
+  }
+
   if (path === "/auth/github") {
-    if (!githubReady(env)) return Response.json({ error: "GitHub sign-in isn't set up: set GITHUB_CLIENT_ID and GITHUB_CLIENT_SECRET" }, { status: 503 });
+    const gh = await githubApp(env, registry);
+    if (!gh) return page("GitHub sign-in isn't set up yet", `<p><a class="button" href="/auth/setup">Set it up</a></p>`);
     const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
     const state = await signed(env, { nonce, to: safeReturn(url.searchParams.get("return")), exp: Date.now() + 10 * 60_000 });
     const go = new URL("https://github.com/login/oauth/authorize");
-    go.searchParams.set("client_id", env.GITHUB_CLIENT_ID!);
+    go.searchParams.set("client_id", gh.client_id);
     go.searchParams.set("redirect_uri", `${url.origin}/auth/github/callback`);
     go.searchParams.set("scope", "read:user");
     go.searchParams.set("state", nonce);
@@ -117,21 +178,23 @@ export async function handleAuth(env: Env, req: Request): Promise<Response | nul
   }
 
   if (path === "/auth/github/callback") {
+    const gh = await githubApp(env, registry);
+    if (!gh) return page("GitHub sign-in isn't set up yet", `<p><a class="button" href="/auth/setup">Set it up</a></p>`);
     const state = await verified<{ nonce: string; to: string }>(env, cookie(req, STATE));
     const code = url.searchParams.get("code");
     if (!state || !code || url.searchParams.get("state") !== state.nonce) return Response.json({ error: "sign-in expired or was tampered with; try again" }, { status: 400 });
     const tok = await fetch("https://github.com/login/oauth/access_token", {
       method: "POST",
       headers: { accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET, code, redirect_uri: `${url.origin}/auth/github/callback` }),
+      body: JSON.stringify({ client_id: gh.client_id, client_secret: gh.client_secret, code, redirect_uri: `${url.origin}/auth/github/callback` }),
     }).then((r) => r.json<any>());
     if (!tok.access_token) return Response.json({ error: `GitHub refused the sign-in (${tok.error ?? "no token"})` }, { status: 400 });
-    const gh = await fetch("https://api.github.com/user", {
+    const profile = await fetch("https://api.github.com/user", {
       headers: { authorization: `Bearer ${tok.access_token}`, accept: "application/vnd.github+json", "user-agent": "loom" },
     }).then((r) => r.json<any>());
-    if (!gh.login) return Response.json({ error: "couldn't read your GitHub profile" }, { status: 400 });
-    const login = String(gh.login).toLowerCase();
-    return startSession(env, req, { id: `github:${login}`, login: gh.login, name: gh.name || gh.login, avatar: gh.avatar_url ?? "" }, state.to);
+    if (!profile.login) return Response.json({ error: "couldn't read your GitHub profile" }, { status: 400 });
+    const login = String(profile.login).toLowerCase();
+    return startSession(env, req, { id: `github:${login}`, login: profile.login, name: profile.name || profile.login, avatar: profile.avatar_url ?? "" }, state.to);
   }
 
   return Response.json({ error: "not found" }, { status: 404 });

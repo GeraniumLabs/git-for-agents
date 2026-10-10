@@ -40,7 +40,7 @@ export default {
       return coordinator(env, "__registry").fetch("https://do/registry");
     }
 
-    const auth = await handleAuth(env, req);
+    const auth = await handleAuth(env, req, (p, init) => coordinator(env, "__registry").fetch(`https://do${p}`, init));
     if (auth) return auth;
 
     if (path === "/api/projects" && req.method === "POST") {
