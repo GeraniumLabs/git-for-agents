@@ -12,6 +12,7 @@ import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normal
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
+import { runCheck, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
 import { USER_HEADER, sameSecret, type User } from "./auth";
@@ -114,6 +115,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE tasks ADD COLUMN winner INTEGER",
       "ALTER TABLE tasks ADD COLUMN contest_status TEXT",
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
+      "ALTER TABLE changes ADD COLUMN checks TEXT",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -241,6 +243,23 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.emit("project.visibility", { actor: actor.id, data: { visibility } });
   }
 
+  /** The project's check command (e.g. `npm ci && npm test`), run before anything lands. Empty: no checks. */
+  private get checks(): { command: string; timeoutSec: number } | null {
+    const command = this.meta("checks_command");
+    return command ? { command, timeoutSec: Number(this.meta("checks_timeout") ?? "600") } : null;
+  }
+
+  private setChecks(body: { command?: string | null; timeoutSec?: number } | null) {
+    const command = body?.command?.trim() ?? "";
+    if (command.length > 2000) throw new HttpError(400, "checks.command is too long");
+    this.setMeta("checks_command", command);
+    if (body?.timeoutSec !== undefined) {
+      const t = Number(body.timeoutSec);
+      if (!(t >= 10 && t <= 1800)) throw new HttpError(400, "checks.timeoutSec is between 10 and 1800");
+      this.setMeta("checks_timeout", String(t));
+    }
+  }
+
   private get requiredApprovals(): number {
     return Number(this.meta("required_approvals") ?? "1");
   }
@@ -346,6 +365,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       undeclared: JSON.parse(c.undeclared as string),
       conflicts: c.conflicts ? JSON.parse(c.conflicts as string) : null,
       symbols: c.symbols ? JSON.parse(c.symbols as string) : {},
+      checks: c.checks ? JSON.parse(c.checks as string) : null,
     } as any;
   }
   private activeIntents(excludeAgent?: string) {
@@ -462,11 +482,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.requiredApprovals !== undefined) this.setMeta("required_approvals", String(body.requiredApprovals));
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
+      if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
@@ -505,6 +526,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
+    if (a === "tasks" && b && c === "checks" && m === "POST") return json(await this.checkWorkspace(actor, Number(b)));
     if (a === "tasks" && b && c === "sync") return json(await this.sync(actor, { taskId: Number(b) }, body.resolutions));
     if (a === "messages" && m === "POST") return json(this.message(actor, body));
     if (a === "threads" && !b && m === "POST") {
@@ -531,7 +553,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User; visibility?: string }) {
+  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number } }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     const repo = `${name}`;
@@ -543,6 +565,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta("main_version", "0");
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
     this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
+    if (body.checks) this.setChecks(body.checks);
     const files = body.files ?? { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
     const w = await Workspace.open({ url: created.remote, token: created.token });
     const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
@@ -720,7 +743,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       });
     }
     // In-flight changes that already touch these paths are also worth knowing about.
-    const pending = this.sql.exec("SELECT id, agent_id, title, files FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested')").toArray()
+    const pending = this.sql.exec("SELECT id, agent_id, title, files FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested','checks_failed')").toArray()
       .map((c) => ({ change: c.id, agent: c.agent_id, title: c.title, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path).filter((f) => paths.some((p) => matches(p, f))) }))
       .filter((c) => c.files.length && c.agent !== actor.id && !siblings.has(this.change(c.change as number).task_id));
     const memory = await this.recall(actor, paths, body.taskId ?? null, body.description ?? "");
@@ -1332,7 +1355,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE changes SET status = 'merging', updated_at = ? WHERE id = ?", now(), id);
       this.emit("merge.started", { change: id, task: this.change(id).task_id, data: { batch: ids.length } });
     }
-    const landed: { ch: any; before: string; commit: string }[] = [];
+    let landed: { ch: any; before: string; commit: string }[] = [];
     let w: Workspace, mainW: Remote, main: string;
     try {
       mainW = await this.mainRemote("write");
@@ -1359,7 +1382,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         else {
           const result = await w.merge(tip, head);
           if (!result.tree) { this.recordConflict(ch, result.conflicts); continue; }
-          commit = await w.commit(result.tree, [tip, head], `Merge change #${id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim(), MERGE_IDENTITY);
+          commit = await w.commit(result.tree, [tip, head], this.mergeMessage(ch), MERGE_IDENTITY);
         }
         landed.push({ ch, before: tip, commit });
         tip = commit;
@@ -1368,6 +1391,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }
     }
     if (!landed.length) return;
+    if (this.checks && tip !== main) {
+      try {
+        ({ landed, tip } = await this.checkBatch(w, main, landed));
+      } catch (e: any) {
+        // The runner itself failed (not the tests): try again shortly.
+        return this.retryMerge(landed.map((l) => l.ch.id), e);
+      }
+      if (!landed.length) return;
+    }
     try {
       if (tip !== main) await w.push(mainW, tip);
     } catch (e: any) {
@@ -1401,6 +1433,96 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private notesChain: Promise<void> = Promise.resolve();
+
+  private mergeMessage(ch: any) {
+    return `Merge change #${ch.id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim();
+  }
+
+  // ── checks: the project's tests run on what would land, before main moves ──
+
+  private async checkCommit(w: Workspace, commit: string): Promise<CheckResult> {
+    const flat = await w.flatten(commit);
+    const files = new Map<string, { bytes: Uint8Array; mode: string }>();
+    for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
+    const { command, timeoutSec } = this.checks!;
+    return runCheck(this.env, this.project, files, command, timeoutSec);
+  }
+
+  /**
+   * Run the checks on the whole batch as it would land. If they pass, it all
+   * lands. If not, go one change at a time on top of what already passed, so
+   * a change that breaks main only together with another is caught, and the
+   * rest still land.
+   */
+  private async checkBatch(w: Workspace, main: string, landed: { ch: any; before: string; commit: string }[]) {
+    const ids = landed.map((l) => l.ch.id as number);
+    this.emit("checks.started", { data: { changes: ids, command: this.checks!.command } });
+    const whole = await this.checkCommit(w, landed[landed.length - 1].commit);
+    if (whole.ok) {
+      for (const l of landed) this.recordChecks(l.ch, whole, l.commit);
+      return { landed, tip: landed[landed.length - 1].commit };
+    }
+    if (landed.length === 1) {
+      this.checksFailed(landed[0].ch, whole);
+      return { landed: [], tip: main };
+    }
+    const kept: typeof landed = [];
+    let tip = main;
+    for (const { ch } of landed) {
+      let commit: string;
+      if (await w.isAncestor(ch.head, tip)) commit = tip;
+      else if (await w.isAncestor(tip, ch.head)) commit = ch.head;
+      else {
+        const result = await w.merge(tip, ch.head);
+        if (!result.tree) { this.recordConflict(ch, result.conflicts); continue; }
+        commit = await w.commit(result.tree, [tip, ch.head], this.mergeMessage(ch), MERGE_IDENTITY);
+      }
+      const r = await this.checkCommit(w, commit);
+      if (!r.ok) { this.checksFailed(ch, r, kept.map((k) => k.ch.id as number)); continue; }
+      this.recordChecks(ch, r, commit);
+      kept.push({ ch, before: tip, commit });
+      tip = commit;
+    }
+    return { landed: kept, tip };
+  }
+
+  private recordChecks(ch: any, r: CheckResult, commit: string) {
+    this.sql.exec("UPDATE changes SET checks = ? WHERE id = ?", JSON.stringify({ ...r, commit, at: Date.now() }), ch.id);
+    this.emit("checks.passed", { change: ch.id, task: ch.task_id, data: { command: r.command, ms: r.ms } });
+  }
+
+  /** The tests failed with this change on main: back to its author, like a conflict. */
+  private checksFailed(ch: any, r: CheckResult, alongside: number[] = []) {
+    this.sql.exec("UPDATE changes SET status = 'checks_failed', checks = ?, updated_at = ? WHERE id = ?", JSON.stringify({ ...r, at: Date.now(), alongside }), Date.now(), ch.id);
+    this.emit("checks.failed", {
+      change: ch.id, task: ch.task_id, to: ch.agent_id,
+      data: {
+        command: r.command, exitCode: r.exitCode, output: r.output.slice(-1500),
+        alongside: alongside.length ? alongside.map((id) => `#${id} ${this.change(id).title}`) : undefined,
+        advice: `The project's checks fail with your change on main${alongside.length ? ` (after ${alongside.map((id) => `#${id}`).join(", ")}, which land first)` : ""}. sync_workspace, fix it, run_checks to see it pass, then update_change.`,
+      },
+    });
+  }
+
+  /** Run the checks on what would land from a task's workspace: main with the workspace merged in. */
+  private async checkWorkspace(actor: Agent, taskId: number) {
+    const task = this.task(taskId);
+    if (task.assignee !== actor.id && actor.id !== "admin") throw new HttpError(403, `task ${taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name})`);
+    if (!this.checks) throw new HttpError(409, "this project has no check command; an owner sets one in Settings");
+    if (!task.workspace) throw new HttpError(409, `task ${taskId} has no workspace yet; claim it first`);
+    const w = await Workspace.open(await this.mainRemote("read"));
+    const main = (await w.head())!;
+    const head = await w.fetchFrom("ws", this.remote(task.workspace as string, await this.token(task.workspace as string, "read")));
+    const merged = await w.isAncestor(main, head) ? null : await w.merge(main, head);
+    let commit = head, note = "Ran on your workspace, which already includes main.";
+    if (merged?.tree) {
+      commit = await w.commit(merged.tree, [main, head], "checks", MERGE_IDENTITY);
+      note = "Ran on main with your workspace merged in: what would land.";
+    } else if (merged) note = "Your workspace conflicts with main, so this ran on your workspace alone; sync_workspace before you submit.";
+    const r = await this.checkCommit(w, commit);
+    this.emit("checks.ran", { actor: actor.id, task: taskId, data: { ok: r.ok, command: r.command, ms: r.ms } });
+    return { ...r, note };
+  }
 
   /** The record of a landed change, as a git note: what, why, who reviewed it, and what was decided. */
   private async gitNote(id: number): Promise<string> {
@@ -1888,7 +2010,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, checks: this.checks, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -1985,7 +2107,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return areas.get(k)!;
     };
     for (const i of this.activeIntents()) for (const p of new Set((i.paths as string[]).map(folder))) { const a = get(p, true); a.intents++; a.agents.add(i.agent_id); }
-    for (const c of this.sql.exec("SELECT files, agent_id FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested')").toArray()) {
+    for (const c of this.sql.exec("SELECT files, agent_id FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested','checks_failed')").toArray()) {
       for (const f of new Set((JSON.parse(c.files as string) as FileChange[]).map((f) => f.path))) { const a = get(f); a.inFlight++; a.agents.add(c.agent_id as string); }
     }
     for (const r of this.sql.exec("SELECT type, data FROM events WHERE ts > ? AND type IN ('change.merged','change.conflict')", now - 3600_000).toArray()) {
@@ -2743,7 +2865,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const submitted = new Set(changes.map((c) => c.task_id));
     const todo = [
       ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
-      ...changes.filter((c) => ["conflict", "changes_requested"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
+      ...changes.filter((c) => ["conflict", "changes_requested", "checks_failed"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
       ...tasks.filter((t) => !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
       ...this.contestsToVote(actor).map((c) => `Contest #${c.id} "${c.title}" has ${c.ready} attempts in: compare_attempts, then vote`),
     ];
@@ -2834,7 +2956,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, visibility: this.isPrivate ? "private" : "public", remote: this.remoteUrl(this.mainRepo) },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),

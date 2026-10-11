@@ -43,3 +43,10 @@ test("updating a change without new context keeps the context it was submitted w
   detail = await ada.change(ch.id);
   assert.deepEqual(detail.context.context, { plan: ["trim in db.js"], tested: ["v2 by hand"] });
 });
+
+test("the merge queue runs the project's tests: two clean merges that break main together are caught", { skip: !url, timeout: 300_000 }, async () => {
+  const { stdout } = await run("node", ["demo/checks.mjs", project("e2e-checks")], { env, maxBuffer: 1 << 24 });
+  assert.match(stdout, /fails the tests on main/);
+  assert.match(stdout, /does not provide an export named 'greet'/);
+  assert.match(stdout, /Done\. main is v2/);
+});

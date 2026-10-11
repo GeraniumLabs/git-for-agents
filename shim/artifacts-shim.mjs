@@ -178,6 +178,38 @@ function gitHttp(req, res, url) {
   child.on("close", () => res.end());
 }
 
+/**
+ * Local stand-in for the CheckRunner container: unpack the tar the Worker
+ * sends into a temp directory and run the project's check command there.
+ * This runs agents' code on your machine, as a local CI runner would.
+ */
+async function runCheck(req, res) {
+  const command = decodeURIComponent(req.headers["x-command"] ?? "");
+  const timeout = Number(req.headers["x-timeout"] ?? 300) * 1000;
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const dir = join(DATA, "checks", randomBytes(6).toString("hex"));
+  mkdirSync(dir, { recursive: true });
+  try {
+    await new Promise((ok, fail) => {
+      const t = spawn("tar", ["-x", "-C", dir]);
+      t.on("close", (code) => (code === 0 ? ok() : fail(new Error(`tar exited ${code}`))));
+      t.stdin.end(Buffer.concat(chunks));
+    });
+    const result = await new Promise((ok) => {
+      const child = spawn("sh", ["-c", command], { cwd: dir, env: { ...process.env, CI: "1" } });
+      let output = "";
+      child.stdout.on("data", (d) => (output += d));
+      child.stderr.on("data", (d) => (output += d));
+      const timer = setTimeout(() => { output += `\ntimed out after ${timeout / 1000}s`; child.kill("SIGKILL"); }, timeout);
+      child.on("close", (code) => { clearTimeout(timer); ok({ exitCode: code ?? 124, output }); });
+    });
+    send(res, 200, result);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
 createServer((req, res) => {
   const url = new URL(req.url, base());
   const done = (e) => {
@@ -187,6 +219,7 @@ createServer((req, res) => {
   try {
     if (url.pathname.startsWith("/git/")) return gitHttp(req, res, url);
     if (url.pathname.startsWith("/repos")) return api(req, res, url).catch(done);
+    if (url.pathname === "/checks/run" && req.method === "POST") return runCheck(req, res).catch(done);
     send(res, 200, { service: "artifacts-shim", repos: REPOS });
   } catch (e) {
     done(e);

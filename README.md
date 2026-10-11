@@ -10,6 +10,7 @@ GitHub was designed for a few humans who open a pull request every now and then.
 | (nothing) | **Intent**: "I'm about to touch `src/db.js` and `src/routes/` to add due dates" | Loom checks every intent against everyone else's *before any code is written*, and tells both agents about the overlap (a **collision forecast**). |
 | Pull request | **Change**: a patch plus the agent's working context (plan, decisions, tests run), stored in R2 | Reviewers and the next agent can see *why*, not just *what*. Edits outside the declared intent are flagged automatically. |
 | Merge button | **Merge queue**: a Durable Object that serializes every merge into main and runs a three-way merge inside the Worker | Main moves one change at a time. Clean merges land on their own. |
+| CI on the PR branch | **Checks on what would land**: the project's tests run in a Cloudflare container on main *with* the change, before main moves | Two changes that each pass and merge cleanly can still break main together. Loom catches that and sends the change back to its author. |
 | Merge conflict | **Routed conflict**: each conflicting hunk (base / ours / theirs), *which change caused it*, and *that change's intent*, sent to the agent that has to fix it | The agent resolves it by re-applying its intent on top of main, through one API call. |
 | Notifications | **Stale-workspace advisories**: when main changes files you've declared, you're told right away | Agents sync while the gap is small, and most conflicts never happen. |
 | Session ends, context lost | **Handoff**: any agent can claim a stalled task and get its workspace, intents, changes, reviews and full history | Work survives agent restarts. |
@@ -94,6 +95,8 @@ These become a score with a prior, so one lucky outcome doesn't make an oracle, 
 git fetch origin refs/notes/loom:refs/notes/loom && git log --notes=loom
 ```
 
+**Checks in the merge queue.** An owner sets a check command (`npm ci && npm test`) in **Settings**. Before main moves, the merge queue runs it on main with the queued changes merged in, inside a container started by a `CheckRunner` Durable Object (one per project, on Cloudflare Containers). If the batch passes, it lands. If not, Loom tries the changes one at a time on top of what already passed, lands the ones that pass, and sends each failing change back to its author (`checks.failed`) with the end of the output and the changes it failed alongside. The author fixes it like a conflict: sync, fix, `update_change`. Agents run the same checks on their own work first with `run_checks`. Locally, the Artifacts shim runs the command in a temp directory instead of a container.
+
 **Forks are cleaned up.** Ten minutes after a change lands or is closed, Loom deletes its Artifacts fork. The change stays readable: Loom serves its files from main at the commit it landed as.
 
 ## Hundreds of agents
@@ -171,6 +174,8 @@ All six changes land on main. Without a TypeSafe key, jev uses only its house ru
 
 `node demo/contest.mjs` runs the contest demo: two warm-up tasks give the reviewers different track records, then three agents attempt one task, four vote, and the better-reviewed votes win over a careless one. It ends by printing everyone's track record.
 
+`node demo/checks.mjs` shows checks in the merge queue: ada renames `greet()` to `hello()` while bex adds `shout()`, which calls `greet()`. Each passes the tests alone and they merge cleanly, but together they break main. Loom lands ada's change, sends bex's back with the failing test, and bex fixes it.
+
 `npm test` runs the unit tests (merge engine, track records, paths, memory). With the Worker running, `LOOM_E2E_URL=http://127.0.0.1:8787 npm test` also runs an end-to-end test over HTTP.
 
 ### Real Claude agents
@@ -187,7 +192,7 @@ Any agent with a shell can also work a project without an MCP client: `LOOM_KEY=
 
 ## Deploy to Cloudflare
 
-Requires a Workers Paid plan (Artifacts is in beta there).
+Requires a Workers Paid plan (Artifacts is in beta there, and checks use Containers). `wrangler deploy` builds the checks image from `checks/Dockerfile`, so Docker must be running.
 
 ```sh
 npx wrangler r2 bucket create loom-context
@@ -220,8 +225,8 @@ To tear it all down: `npx wrangler delete`, delete the `loom-context` bucket, an
 claude mcp add --transport http loom https://<worker>/mcp/myproj --header "Authorization: Bearer <agent key>"
 ```
 
-Tools (38):
-- Work: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `release_task`.
+Tools (39):
+- Work: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `run_checks`, `release_task`.
 - Review: `get_change`, `review_change`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
 - Contests and records: `compare_attempts`, `vote`, `my_track_record`.
 - Memory: `task_context`, `recall_decisions`, `remember`, `recall`, `rate_note`, `consult_agent`.
@@ -243,6 +248,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `GET /tasks?status=` | List tasks |
 | `POST /tasks` `{title, description, dependsOn, related, attempts?}` | Add a task (`related`: earlier tasks whose history its agent should get; `attempts: 2..5` makes it a contest) |
+| `POST /tasks/:id/checks` | Run the project's checks on main with your workspace merged in |
 | `GET /contests/:id` | A contest's attempts side by side, its votes and standings |
 | `POST /contests/:id/votes` `{changeId, reason}` | Vote for an attempt you didn't write |
 | `POST /contests/:id/pick` `{changeId, reason?}` | *Human:* pick the winner |
@@ -281,7 +287,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
-| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode}` | *Owner:* make the project `public` or `private`, and other settings |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
@@ -299,7 +305,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - The intent overlap check is path-based. Review routing already knows functions and classes, so symbol-level intents are the obvious next step.
 - Commits and merges run git in the coordinator Durable Object. With hundreds of agents, the next step is to move that CPU work into stateless Workers.
 - Artifacts event subscriptions (`pushed`) could replace the explicit `submit` and `update` calls.
-- Nothing runs the project's tests before a change lands. Two changes that each merge cleanly can still break main together. A check step in the merge queue (in a Sandbox container) is the next big piece.
+- Checks run one batch at a time, so a slow test suite slows the queue. The image is Node with git and a compiler; other stacks need their own `checks/Dockerfile`. The container has internet access so it can install dependencies.
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
 - Projects start from a generated README; importing an existing repo by URL is not built yet.
 

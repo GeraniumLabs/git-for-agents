@@ -400,7 +400,7 @@ $("#decision-save").onclick = async () => {
 };
 
 // ── activity: notable by default, everything on request ────────────────
-const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
@@ -731,6 +731,9 @@ async function showSettings() {
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
+    <h2>Checks</h2>
+    <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
+    ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -760,6 +763,11 @@ async function showSettings() {
   };
   if ($("#mode-toggle")) $("#mode-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { approvalMode: state.project.approvalMode === "count" ? "weighted" : "count" }); state.project.approvalMode = r.approvalMode; } catch { return; }
+    showSettings();
+  };
+  if ($("#checks-save")) $("#checks-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }
+    toast(state.project.checks ? "Checks saved" : "Checks turned off");
     showSettings();
   };
   if ($("#mem-add")) $("#mem-add").onclick = async () => {
@@ -904,6 +912,10 @@ function describe(e) {
     case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})`];
     case "workspace.conflict": return ["conflict", `Syncing ${to}'s workspace hit a conflict in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Hunks sent back for resolution.`];
     case "merge.retry": return ["stale", `Merge of #${e.change_id} will retry: ${esc(d.error)}`];
+    case "checks.started": return ["", `Running the checks on main with ${d.changes.map((x) => `#${x}`).join(", ")}: <span class="mono">${esc(d.command)}</span>`];
+    case "checks.passed": return ["merged", `Checks passed with #${e.change_id} (${Math.round(d.ms / 100) / 10}s)`];
+    case "checks.failed": return ["conflict", `#${e.change_id} fails the checks on main${d.alongside ? ` after ${esc(d.alongside.join(", "))}` : ""} (exit ${d.exitCode}). Sent back to ${to}.`];
+    case "checks.ran": return ["", `${who} ran the checks on task #${e.task_id}: ${d.ok ? "pass" : "fail"}`];
     case "change.conflict": return ["conflict", `#${e.change_id} conflicts in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Routed to ${to}.`];
     case "workspace.stale": return ["stale", `Main moved under ${to}: <span class="mono">${d.paths.map(esc).join(", ")}</span> changed. Told to sync now.`];
     case "workspace.synced": return ["merged", `${who} synced main into their workspace${d.resolved?.length ? `, resolving ${d.resolved.map(esc).join(", ")}` : ""}`];
@@ -1009,6 +1021,7 @@ async function showChange(id) {
     <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
     <div id="clone-box"></div>
     ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
+    ${c.checks ? `<h2>Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></h2><p class="meta"><span class="mono">${esc(c.checks.command)}</span> on main with this change${c.checks.alongside?.length ? ` after ${c.checks.alongside.map((x) => `#${x}`).join(", ")}` : ""}, ${Math.round(c.checks.ms / 100) / 10}s in ${c.checks.runner === "container" ? "a container" : "the local runner"}.</p>${c.checks.ok ? "" : `<pre class="diff">${esc(c.checks.output.slice(-3000))}</pre>`}` : ""}
     ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
     ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
