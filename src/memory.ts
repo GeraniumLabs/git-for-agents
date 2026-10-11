@@ -3,7 +3,7 @@
 
 export interface Decision {
   id: number;
-  kind: "answer" | "directive" | "review" | "ruling" | "note";
+  kind: "answer" | "directive" | "review" | "ruling" | "note" | "contest";
   question: string;
   decision: string;
   by: string;

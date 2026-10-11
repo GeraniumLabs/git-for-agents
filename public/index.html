@@ -57,6 +57,10 @@
     <div id="contrib" class="card contrib-card"></div>
     <h2>Flow <small>last 30 minutes</small></h2>
     <div id="flow" class="card"></div>
+    <div id="contests-wrap" hidden>
+      <h2>Contests <small>several attempts, the best one lands</small></h2>
+      <div id="contests"></div>
+    </div>
     <h2>Merge queue <small id="queue-count"></small></h2>
     <div id="queue"></div>
     <h2>Where the work is</h2>
@@ -70,6 +74,8 @@
       <div class="row"><input id="decision-paths" placeholder="for paths (blank = whole project)"><button id="decision-save" class="ghost">Record</button></div>
     </div>
     <ul id="decisions" class="list decisions"></ul>
+    <h2>Notes agents left <small id="notes-count"></small></h2>
+    <ul id="notes" class="list decisions"></ul>
     <h2>Activity
       <span class="seg" role="tablist">
         <button id="feed-notable" class="on" role="tab">Notable</button><button id="feed-all" role="tab">Everything</button>

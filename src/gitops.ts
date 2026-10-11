@@ -174,6 +174,28 @@ export class Workspace {
     if (!res.ok) throw new Error(`push rejected: ${JSON.stringify(res.refs)}`);
   }
 
+  /**
+   * Attach notes to commits under `refs/notes/<name>` and push that ref, so a
+   * plain clone can read them: \`git fetch origin refs/notes/loom:refs/notes/loom
+   * && git log --notes=loom\`. Fetches the remote's notes first and adds to them.
+   */
+  async addNotes(remote: Remote, notes: { oid: string; text: string }[], author: Identity, name = "loom"): Promise<void> {
+    const ref = `refs/notes/${name}`;
+    try {
+      await git.addRemote({ fs: this.fs, dir: DIR, remote: "loom-notes", url: remote.url, force: true });
+      const r = await git.fetch({ fs: this.fs, http, dir: DIR, remote: "loom-notes", ref, singleBranch: true, tags: false, onAuth: auth(remote.token) });
+      if (r.fetchHead) await git.writeRef({ fs: this.fs, dir: DIR, ref, value: r.fetchHead, force: true });
+    } catch (e: any) {
+      // No notes on the remote yet.
+      if (!/Could not find|NotFoundError|empty|404/i.test(String(e?.message ?? e))) throw e;
+    }
+    for (const n of notes) {
+      await git.addNote({ fs: this.fs, dir: DIR, ref, oid: n.oid, note: n.text, force: true, author: { name: author.name, email: author.email } });
+    }
+    const res = await git.push({ fs: this.fs, http, dir: DIR, url: remote.url, ref, remoteRef: ref, onAuth: auth(remote.token) });
+    if (!res.ok) throw new Error(`notes push rejected: ${JSON.stringify(res.refs)}`);
+  }
+
   /** Commits reachable from `ref`, newest first. */
   async log(ref: string, depth = 50) {
     const entries = await git.log({ fs: this.fs, dir: DIR, ref, depth });
