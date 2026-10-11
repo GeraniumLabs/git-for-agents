@@ -60,7 +60,7 @@ h2 small { text-transform: none; letter-spacing: 0; font-weight: 400; }
 .change:hover { border-color: var(--accent); }
 .change .top { display: flex; justify-content: space-between; gap: 10px; align-items: baseline; }
 .pill { font-size: 11px; padding: 1px 8px; border-radius: 99px; background: var(--chip); white-space: nowrap; }
-.pill.merged { color: var(--ok); } .pill.conflict, .pill.changes_requested { color: var(--bad); }
+.pill.merged { color: var(--ok); } .pill.conflict, .pill.changes_requested, .pill.checks_failed { color: var(--bad); }
 .pill.queued, .pill.merging { color: var(--info); } .pill.review { color: var(--warn); }
 .files { color: var(--muted); font-size: 12px; margin-top: 3px; }
 .why { margin-top: 6px; font-size: 12.5px; border-left: 3px solid var(--bad); padding-left: 8px; }

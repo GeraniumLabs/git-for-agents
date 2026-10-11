@@ -1,4 +1,5 @@
 import type { ProjectCoordinator } from "./coordinator";
+import type { CheckRunner } from "./checks";
 
 export interface Env {
   ARTIFACTS?: Artifacts;
@@ -20,6 +21,8 @@ export interface Env {
   TYPESAFE_API_KEY?: string;
   TYPESAFE_URL?: string;
   PROJECT: DurableObjectNamespace<ProjectCoordinator>;
+  /** Containers that run each project's checks. Absent in local development, where the shim runs them. */
+  CHECKS?: DurableObjectNamespace<CheckRunner>;
   CONTEXT: R2Bucket;
   ASSETS: Fetcher;
 }

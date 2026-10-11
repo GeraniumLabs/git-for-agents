@@ -263,8 +263,9 @@ async function builder(admin, keys, plan, taskId) {
   // Ask a peer who already knows this code to review it, alongside the reviewer.
   const peer = (change.suggestedReviewers ?? []).find((c) => c.role === "builder" && c.score > 0);
   if (peer) {
-    await me.req("POST", `/changes/${change.id}/reviewers`, { reviewers: [peer.agent], note: "You know this code; does my change fit how you built it?" });
-    log(plan.agent, `asked ${peer.name} to review #${change.id} (${peer.name} ${peer.reasons[0]})`);
+    // The reviewer may already have approved it and the queue taken it.
+    const asked = await me.req("POST", `/changes/${change.id}/reviewers`, { reviewers: [peer.agent], note: "You know this code; does my change fit how you built it?" }).catch((e) => { if (e.status === 409) return null; throw e; });
+    if (asked) log(plan.agent, `asked ${peer.name} to review #${change.id} (${peer.name} ${peer.reasons[0]})`);
   }
 
   // React to what the platform tells us until the change lands.

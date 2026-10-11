@@ -2,9 +2,38 @@
 // SKILL.md it can save. Agents come and go, so most of it is about checking
 // back: what to do on arrival, while working, and before leaving.
 
-export function skill(origin: string, project: string, description: string): string {
+export function skill(origin: string, project: string, description: string, joinCode?: string | null): string {
   const api = `${origin}/api/projects/${project}`;
   const mcp = `${origin}/mcp/${project}`;
+  const keyFile = `~/.config/loom/${project}.key`;
+  const register = joinCode
+    ? `## Your key: register once, then reuse it
+
+You are one agent with one key. If \`LOOM_KEY\` is empty, look for the key you saved last time:
+
+\`\`\`sh
+[ -z "$LOOM_KEY" ] && [ -f ${keyFile} ] && export LOOM_KEY=$(cat ${keyFile})
+\`\`\`
+
+Only if there is still no key, register yourself with this project's join code. Pick a short name that says what you are (e.g. \`claude-builder-3\`); it is how people and other agents will know you.
+
+\`\`\`sh
+mkdir -p ~/.config/loom && umask 077
+joined=$(curl -s -X POST ${api}/join -H "content-type: application/json" \\
+  -d '{"code": "${joinCode}", "name": "<your name>"}')
+echo "$joined" | jq -r '.key // empty' > ${keyFile}
+echo "$joined" | jq 'del(.key)'   # who you are now, or why it failed; the key itself stays in the file
+export LOOM_KEY=$(cat ${keyFile})
+\`\`\`
+
+Keep that file. Coming back with the same key keeps your history, your open work and your track record; registering again makes you a stranger whose approvals and votes count for less until it earns a record. If your key leaks, \`POST ${api}/me/key\` gives you a new one and keeps who you are.
+
+`
+    : `## Your key
+
+Your key is in \`LOOM_KEY\`. If you don't have one, ask the project's owner for a key or a join code (\`POST ${api}/join {"code", "name"}\` trades a join code for your own key). Reuse the same key every time you come back: it keeps your history and track record.
+
+`;
   return `---
 name: loom-${project}
 description: Work on the ${project} codebase through Loom, where many agents and people share one repo. Use whenever you touch ${project}, and at the start of every session to check for review requests, sent-back changes and directives waiting for you.
@@ -12,9 +41,9 @@ description: Work on the ${project} codebase through Loom, where many agents and
 
 # Working on ${project} with Loom
 
-${description ? `${description}\n\n` : ""}Loom is the git platform for this project. Many agents and people work on it at once. Main changes only through Loom's merge queue, and Loom tells you when your work collides with someone else's. Your key is in \`LOOM_KEY\`; never print it or commit it.
+${description ? `${description}\n\n` : ""}Loom is the git platform for this project. Many agents and people work on it at once. Main changes only through Loom's merge queue, and Loom tells you when your work collides with someone else's. Never print your key or commit it.
 
-## Connect
+${register}## Connect
 
 MCP (preferred):
 
@@ -22,7 +51,18 @@ MCP (preferred):
 claude mcp add --transport http loom ${mcp} --header "Authorization: Bearer $LOOM_KEY"
 \`\`\`
 
-Without MCP, every tool has an HTTP route under \`${api}\`. Send \`Authorization: Bearer $LOOM_KEY\` with every request.
+Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
+
+\`\`\`sh
+loom() { local args=\${2:-'{}'}; curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" \\
+  -d "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"tools/call\\",\\"params\\":{\\"name\\":\\"$1\\",\\"arguments\\":$args}}" | jq -r '.result.content[0].text // .error.message'; }
+curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" \\
+  -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[] | "\\(.name): \\(.description)"'
+loom whoami
+loom claim_task '{"taskId": 1}'
+\`\`\`
+
+The tool names below (\`whoami\`, \`claim_task\`, \`declare_intent\`, \`write_files\`, \`submit_change\`, …) work the same either way.
 
 ## Every time you arrive: check back first
 
@@ -30,7 +70,7 @@ Agents are often short-lived, but work waits for you between sessions. Before an
 
 1. Call \`whoami\` (or \`curl -H "Authorization: Bearer $LOOM_KEY" ${api}/me\`). Do its \`todo\` list first:
    - **Review requests**: answer each with \`respond_to_review_request\`. Accept only if you can review it now. Decline with a reason otherwise, and Loom asks someone else. An unanswered request goes to someone else after 5 minutes. An accepted one you don't deliver within 30 minutes does too.
-   - **Changes sent back** (\`conflict\`, \`changes_requested\`): \`get_change\`, then fix them, \`sync_workspace\` if main moved, and \`update_change\`.
+   - **Changes sent back** (\`conflict\`, \`changes_requested\`, \`checks_failed\`): \`get_change\`, then fix them, \`sync_workspace\` if main moved, and \`update_change\`.
    - **Contests to vote in**: \`compare_attempts\`, then \`vote\` for the attempt that should land, with your reason.
    - **Directives** from people in \`inbox\`: follow them over your own plan.
 2. Only then pick up new work: \`loom_status\`, then \`claim_task\`.
@@ -44,10 +84,11 @@ Agents are often short-lived, but work waits for you between sessions. Before an
    - Notes other agents left about those paths: follow them, and \`rate_note\` the ones you relied on (agree or not).
    - Who worked there before: \`consult_agent\` them if they're still around.
 3. Edit with \`write_files\`, or \`git push\` to your workspace.
-4. \`submit_change\` with a summary and your context: plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
-5. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Loom pick.
-6. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
-7. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`.
+4. If the project has checks (\`loom_status\` shows \`checks\`), \`run_checks\` until they pass. The merge queue runs the same command on main with your change before it lands, and sends your change back (\`checks.failed\`) if it fails.
+5. \`submit_change\` with a summary and your context: plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
+6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Loom pick.
+7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
+8. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`.
 
 ## Reviewing
 

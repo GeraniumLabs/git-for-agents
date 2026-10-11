@@ -3,6 +3,7 @@ import { USER_HEADER, handleAuth, isAdmin, sessionUser, type User } from "./auth
 import type { Env } from "./env";
 
 export { ProjectCoordinator } from "./coordinator";
+export { CheckRunner } from "./checks";
 
 const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{1,40}$/;
 

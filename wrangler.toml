@@ -16,9 +16,26 @@ namespace = "loom"
 name = "PROJECT"
 class_name = "ProjectCoordinator"
 
+[[durable_objects.bindings]]
+name = "CHECKS"
+class_name = "CheckRunner"
+
 [[migrations]]
 tag = "v1"
 new_sqlite_classes = ["ProjectCoordinator"]
+
+[[migrations]]
+tag = "v2"
+new_sqlite_classes = ["CheckRunner"]
+
+# Each project's checks run in a container owned by its CheckRunner Durable Object.
+[[containers]]
+name = "loom-checks"
+class_name = "CheckRunner"
+scheduling_policy = "durable_object"
+
+[containers.images]
+checks = { dockerfile = "./checks/Dockerfile" }
 
 [[r2_buckets]]
 binding = "CONTEXT"

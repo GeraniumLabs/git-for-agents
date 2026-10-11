@@ -400,7 +400,7 @@ $("#decision-save").onclick = async () => {
 };
 
 // ── activity: notable by default, everything on request ────────────────
-const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
@@ -658,14 +658,19 @@ async function showCode(target = {}) {
 $("#code-open").onclick = () => showCode();
 
 // ── connect an agent: the Loom skill, ready to copy ──────────────────────
-async function showSkill() {
-  const text = await fetch(`/api/projects/${project}/skill`, { headers: keyHeader() }).then((r) => r.text());
-  const save = `mkdir -p .claude/skills/loom-${project} && curl -s ${location.origin}/api/projects/${project}/skill > .claude/skills/loom-${project}/SKILL.md`;
+async function showSkill(joinCode) {
+  const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
+  const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
+  const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
-    <p class="meta">Give an agent this skill and a key in <span class="mono">LOOM_KEY</span>. It covers how to work here and how to check back for new work, which matters because agents come and go. Keys come from the project admin (<span class="mono">POST /api/projects/${esc(project)}/agents</span>); only their hash is stored.</p>
+    ${joinCode ? `<div class="card"><b>This skill carries a join code</b> <span class="role">${esc(joinCode.role)}</span><p class="meta">Any agent you give it registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
+      : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${isOwner() ? "To let agents register themselves, create a join code: the skill then carries it, and each agent trades it for its own key." : "Each agent needs its own key or a join code from an owner."}</p>`}
     <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
+    ${isOwner() ? `<h2>Let agents register themselves</h2>
+    <div class="row"><select id="jc-role"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
+    ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
     <h2>Create a key</h2>
     ${isOwner() ? `<div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
     <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
@@ -679,6 +684,17 @@ async function showSkill() {
       $("#mk-out").innerHTML = keyBox(k, project);
       wireCopy($("#mk-out"));
     } catch {}
+  };
+  if ($("#jc-go")) $("#jc-go").onclick = async () => {
+    try {
+      const code = await act("POST", "/join-codes", { role: $("#jc-role").value, maxUses: Number($("#jc-max").value), expiresInHours: Number($("#jc-hours").value) });
+      showSkill(code);
+    } catch {}
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-jc-revoke]")) b.onclick = async () => {
+    if (!confirm("Revoke this join code? Agents that already joined keep their keys.")) return;
+    try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
+    showSkill(joinCode);
   };
   $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
   $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
@@ -731,6 +747,9 @@ async function showSettings() {
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
+    <h2>Checks</h2>
+    <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
+    ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -760,6 +779,11 @@ async function showSettings() {
   };
   if ($("#mode-toggle")) $("#mode-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { approvalMode: state.project.approvalMode === "count" ? "weighted" : "count" }); state.project.approvalMode = r.approvalMode; } catch { return; }
+    showSettings();
+  };
+  if ($("#checks-save")) $("#checks-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }
+    toast(state.project.checks ? "Checks saved" : "Checks turned off");
     showSettings();
   };
   if ($("#mem-add")) $("#mem-add").onclick = async () => {
@@ -904,6 +928,10 @@ function describe(e) {
     case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})`];
     case "workspace.conflict": return ["conflict", `Syncing ${to}'s workspace hit a conflict in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Hunks sent back for resolution.`];
     case "merge.retry": return ["stale", `Merge of #${e.change_id} will retry: ${esc(d.error)}`];
+    case "checks.started": return ["", `Running the checks on main with ${d.changes.map((x) => `#${x}`).join(", ")}: <span class="mono">${esc(d.command)}</span>`];
+    case "checks.passed": return ["merged", `Checks passed with #${e.change_id} (${Math.round(d.ms / 100) / 10}s)`];
+    case "checks.failed": return ["conflict", `#${e.change_id} fails the checks on main${d.alongside ? ` after ${esc(d.alongside.join(", "))}` : ""} (exit ${d.exitCode}). Sent back to ${to}.`];
+    case "checks.ran": return ["", `${who} ran the checks on task #${e.task_id}: ${d.ok ? "pass" : "fail"}`];
     case "change.conflict": return ["conflict", `#${e.change_id} conflicts in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Routed to ${to}.`];
     case "workspace.stale": return ["stale", `Main moved under ${to}: <span class="mono">${d.paths.map(esc).join(", ")}</span> changed. Told to sync now.`];
     case "workspace.synced": return ["merged", `${who} synced main into their workspace${d.resolved?.length ? `, resolving ${d.resolved.map(esc).join(", ")}` : ""}`];
@@ -1009,6 +1037,7 @@ async function showChange(id) {
     <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
     <div id="clone-box"></div>
     ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
+    ${c.checks ? `<h2>Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></h2><p class="meta"><span class="mono">${esc(c.checks.command)}</span> on main with this change${c.checks.alongside?.length ? ` after ${c.checks.alongside.map((x) => `#${x}`).join(", ")}` : ""}, ${Math.round(c.checks.ms / 100) / 10}s in ${c.checks.runner === "container" ? "a container" : "the local runner"}.</p>${c.checks.ok ? "" : `<pre class="diff">${esc(c.checks.output.slice(-3000))}</pre>`}` : ""}
     ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
     ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
     ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
