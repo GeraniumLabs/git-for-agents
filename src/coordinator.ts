@@ -1133,6 +1133,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .map((v) => ({ voter: v.voter as string, voterName: this.agentName(v.voter as string), change: v.change_id as number, reason: v.reason as string, weight: this.weightOf(v.voter as string), at: v.created_at }));
     const live = new Set(entries.filter((e) => e.change && e.change.status !== "closed").map((e) => e.change!.id as number));
     const standings = tally(votes.filter((v) => live.has(v.change)).map((v) => ({ candidate: v.change, weight: v.weight })));
+    const everyVote = tally(votes.map((v) => ({ candidate: v.change, weight: v.weight })));
     const attempts = await Promise.all(entries.map(async (e) => {
       const ch = e.change;
       let detail: any = null;
@@ -1146,7 +1147,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         detail = {
           id: ch.id, status: ch.status, title: ch.title, summary: ch.summary, files: (ch.files as FileChange[]).map((f) => f.path), undeclared: ch.undeclared,
           ...this.patchStats(text), patch: text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated; get_change for all of it)` : text,
-          context: saved?.context ?? null, reviews, votes: standings.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
+          context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
         };
       }
       return { task: e.task.id, title: e.task.title, status: e.task.status, agent: e.task.assignee ?? ch?.agent_id ?? null, agentName: this.agentName((e.task.assignee ?? ch?.agent_id ?? null) as string | null), change: detail };
@@ -1159,6 +1160,22 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** Vote weight the leading attempt needs: two ordinary votes, or more if the project asks for more approvals. */
+  /** Open contests, and ones decided in the last hour, for the dashboard. */
+  private contestSummaries() {
+    const rows = this.sql.exec("SELECT id FROM tasks WHERE attempts IS NOT NULL AND (contest_status = 'open' OR updated_at > ?) ORDER BY id DESC LIMIT 6", Date.now() - 3600_000).toArray();
+    return rows.map((r) => {
+      const t = this.task(r.id as number);
+      const entries = this.contestEntries(t.id);
+      const votes = this.sql.exec("SELECT voter, change_id FROM contest_votes WHERE contest = ?", t.id).toArray();
+      const standings = tally(votes.map((v) => ({ candidate: v.change_id as number, weight: this.weightOf(v.voter as string) })));
+      return {
+        id: t.id, title: t.title, status: t.contest_status, winner: t.winner ?? null, quorum: this.contestQuorum,
+        attempts: entries.map((e) => ({ task: e.task.id, agent: (e.task.assignee ?? e.change?.agent_id ?? null) as string | null, change: e.change?.id ?? null, status: e.change?.status ?? e.task.status, weight: standings.find((s) => s.candidate === e.change?.id)?.weight ?? 0 })),
+        votes: votes.length,
+      };
+    });
+  }
+
   private get contestQuorum(): number {
     return Math.max(2, this.requiredApprovals);
   }
@@ -1850,7 +1867,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -1866,6 +1883,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       recentlyMerged: this.sql.exec("SELECT id, title, agent_id, merged_version, updated_at FROM changes WHERE status = 'merged' ORDER BY updated_at DESC LIMIT 8").toArray()
         .map((c) => ({ id: c.id, title: c.title, agent: c.agent_id, agentName: this.agentName(c.agent_id as string), version: c.merged_version, at: c.updated_at })),
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 30"),
+      contests: this.contestSummaries(),
+      notes: this.noteRows("retired_at IS NULL ORDER BY id DESC LIMIT 12"),
       discussions: this.sql.exec("SELECT id FROM threads WHERE kind IN ('discussion','contract') AND status = 'open' ORDER BY updated_at DESC LIMIT 6").toArray().map((r) => this.thread(r.id as number)),
       notable: this.notable(agents.length),
       names: Object.fromEntries(this.sql.exec("SELECT id, name FROM agents WHERE id IN (SELECT DISTINCT actor FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events) UNION SELECT DISTINCT to_agent FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events)) OR role = 'human'").toArray().map((r) => [r.id, r.name])),

@@ -178,9 +178,11 @@ function render() {
   renderStuck();
   renderDiscussions();
   renderFlow();
+  renderContests();
   renderQueue();
   renderAreas();
   renderDecisions();
+  renderNotes();
   renderFeed();
 }
 
@@ -262,6 +264,7 @@ function wire(root) {
   for (const b of root.querySelectorAll("[data-signin]")) b.onclick = () => showSignIn("Answering, reviewing and replying are signed with your name, so sign in first.");
   for (const a of root.querySelectorAll("[data-agent]")) a.onclick = (e) => { e.preventDefault(); showAgent(a.dataset.agent); };
   for (const a of root.querySelectorAll("[data-change]")) a.onclick = (e) => { e.preventDefault(); showChange(Number(a.dataset.change)); };
+  for (const a of root.querySelectorAll("[data-contest]")) a.onclick = (e) => { e.preventDefault(); showContest(Number(a.dataset.contest)); };
   for (const b of root.querySelectorAll("[data-send]")) b.onclick = async () => {
     const input = root.querySelector(`[data-reply="${b.dataset.send}"]`);
     if (!input.value.trim()) return;
@@ -318,8 +321,68 @@ function renderAreas() {
   for (const a of $("#areas").querySelectorAll("[data-find]")) a.onclick = () => { $("#search").value = a.dataset.find; runSearch(); $("#search").focus(); };
 }
 
+// ── contests: several attempts at one task, weighted votes pick one ─────
+function renderContests() {
+  const list = state.contests ?? [];
+  $("#contests-wrap").hidden = !list.length;
+  $("#contests").innerHTML = list.map((c) => `<div class="card contest">
+    <div class="qrow"><b class="grow ellipsis">#${c.id} ${esc(c.title)}</b><span class="pill ${c.status === "open" ? "review" : "merged"}">${c.status === "open" ? plural(c.votes, ["vote", "votes"]) : "decided"}</span></div>
+    ${c.attempts.map((a) => `<div class="qrow">${a.agent ? who(a.agent) : `<span class="meta">unclaimed</span>`} <span class="grow">${a.change ? `<a data-change="${a.change}">#${a.change}</a> <span class="meta">${esc(a.status)}</span>` : `<span class="meta">${a.agent ? "working…" : ""}</span>`}</span>
+      ${a.change ? `<span class="votebar" title="${a.weight} of ${c.quorum} vote weight needed"><span style="width:${Math.min(100, (a.weight / c.quorum) * 100)}%"></span></span><span class="meta">${a.weight}</span>` : ""}${c.winner && a.change === c.winner ? ` <span class="pill merged">won</span>` : ""}</div>`).join("")}
+    <div class="row"><button class="ghost mini" data-contest="${c.id}">Compare attempts</button></div></div>`).join("");
+  wire($("#contests"));
+}
+
+async function showContest(id) {
+  const v = await api(`/contests/${id}`);
+  if (v.error) return toast(v.error);
+  const k = v.contest, open = k.status === "open";
+  const col = (a) => {
+    const c = a.change;
+    const tested = c?.context?.tested ? [].concat(c.context.tested).join("; ") : "";
+    return `<div class="card attempt${c && c.id === k.winner ? " won" : ""}${c?.status === "closed" ? " lost" : ""}">
+      <div class="kicker">${a.agent ? who(a.agent) : "unclaimed"} · ${c ? `<a data-change="${c.id}">#${c.id}</a> <span class="pill ${c.status}">${c.id === k.winner ? "won" : c.status}</span>` : esc(a.status)}</div>
+      ${c ? `<p>${esc(c.summary)}</p>
+        <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> · ${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div>
+        ${tested ? `<div class="meta">Tested: ${esc(tested)}</div>` : ""}
+        ${c.undeclared?.length ? `<div class="warn">Touches ${c.undeclared.map(esc).join(", ")} outside its declared intent</div>` : ""}
+        <div class="votes"><b>${c.votes.weight}</b> vote weight · ${plural(c.votes.votes, ["vote", "votes"])}</div>
+        ${isHuman() && open ? `<div class="row"><button class="mini" data-pick="${c.id}">Pick this one</button></div>` : ""}
+        <details><summary>Patch</summary>${diffView(c.patch, [], false)}</details>` : `<p class="meta">${a.agent ? "Still working on it." : "Nobody has claimed this attempt."}</p>`}
+    </div>`;
+  };
+  $("#detail-body").innerHTML = `
+    <h3>Contest #${k.id}: ${esc(k.title)} <span class="pill ${open ? "review" : "merged"}">${open ? "voting" : "decided"}</span></h3>
+    ${k.description ? `<p class="meta">${esc(k.description)}</p>` : ""}
+    <p>${open ? `${k.attempts} agents attempt this task independently. The others compare the attempts and vote; each vote counts by the voter's track record. An attempt wins with ${k.quorum} vote weight and a clear lead${isHuman() ? ", or when you pick it" : ""}.` : `Decided: <a data-change="${k.winner}">#${k.winner}</a> lands. The other attempts were closed; their context is kept, and why the winner won is on record as a decision.`}</p>
+    <div class="attempts">${v.attempts.map(col).join("")}</div>
+    <h2>Votes</h2>
+    ${v.votes.map((x) => `<div class="qrow">${who(x.voter)} <span class="pill" title="what this agent's vote counts for, from its track record">${x.weight}×</span> for <a data-change="${x.change}">#${x.change}</a> <span class="grow">“${esc(x.reason)}”</span></div>`).join("") || `<p class="empty">No votes yet.</p>`}`;
+  wire($("#detail-body"));
+  for (const b of $("#detail-body").querySelectorAll("[data-pick]")) b.onclick = async () => {
+    const note = prompt("Why this one? The agents will see it, and it goes on record. (optional)");
+    if (note === null) return;
+    await act("POST", `/contests/${id}/pick`, { changeId: Number(b.dataset.pick), note: note.trim() || undefined });
+    showContest(id);
+  };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
+// ── notes: what agents learned, for the agents after them ──────────────
+function renderNotes() {
+  const list = state.notes ?? [];
+  $("#notes-count").textContent = list.length ? `${list.length} recent` : "";
+  $("#notes").innerHTML = list.map((n) => `<li class="card decision"><div class="kicker">${esc(n.kind)} #${n.id} · ${who(n.by)}${n.paths.length ? ` · <span class="mono">${n.paths.map(esc).join(", ")}</span>` : " · whole project"}${n.change ? ` · from <a data-change="${n.change}">#${n.change}</a>` : ""}</div>
+    <div>${esc(n.text)}</div>
+    <div class="meta">${n.confirmed ? `confirmed by ${n.confirmed}` : "not confirmed yet"}${n.disputed ? ` · disputed by ${n.disputed}${n.disputes.length ? `: ${n.disputes.map((d) => `${esc(d.by)}: “${esc(d.comment)}”`).join("; ")}` : ""}` : ""}</div>
+    ${isHuman() ? `<button class="ghost mini" data-note-retire="${n.id}">Retire</button>` : ""}</li>`).join("")
+    || `<li class="empty">Agents leave notes (remember, or notes in a change's context) about what they learned. The next agent on those files gets them.</li>`;
+  wire($("#notes"));
+  for (const b of document.querySelectorAll("[data-note-retire]")) b.onclick = () => act("POST", `/notes/${b.dataset.noteRetire}/retire`, {});
+}
+
 // ── decisions ───────────────────────────────────────────────────────────
-const KIND = { answer: "Answer", directive: "Directive", review: "Review", ruling: "Ruling", note: "Note" };
+const KIND = { answer: "Answer", directive: "Directive", review: "Review", ruling: "Ruling", note: "Note", contest: "Contest" };
 function renderDecisions() {
   const list = state.decisions ?? [];
   $("#decisions-count").textContent = list.length ? `${list.length} on record` : "";
@@ -339,7 +402,8 @@ $("#decision-save").onclick = async () => {
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
-  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"]);
+  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
+  "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const isNotable = (e) => NOTABLE.has(e.type) && !(CHATTER.has(e.type) && (state.health?.agents.total ?? 0) > 20);
@@ -415,6 +479,7 @@ async function showAgent(id) {
   $("#detail-body").innerHTML = `
     <h3><span class="dot ${a.state}"></span> ${esc(a.name)} <span class="role">${a.role}</span> <span class="pill">${a.state}</span></h3>
     <p class="meta">Last active ${ago(a.lastSeen)} ago${a.task ? ` · working on #${a.task.id} ${esc(a.task.title)} (${a.task.status})` : ""}</p>
+    ${p.trust ? `<div class="card"><div class="qrow"><b class="grow">Track record</b><span class="pill" title="what this agent's approvals and contest votes count for">${p.trust.weight}× vote</span></div><div class="meta">${esc(p.trust.summary)}</div></div>` : ""}
     ${ctl}
     <div id="agent-grid" class="card contrib-card"></div>
     ${p.knows.length ? `<h2>Knows</h2><div class="knows">${p.knows.map((k) => `<div><span class="mono">${esc(k.path)}</span> <span class="meta">${[k.wrote && `wrote ×${k.wrote}`, k.reviewed && `reviewed ×${k.reviewed}`].filter(Boolean).join(", ")}${k.symbols.length ? ` · ${k.symbols.slice(0, 6).map(esc).join(", ")}${k.symbols.length > 6 ? "…" : ""}` : ""}</span></div>`).join("")}</div>` : ""}
@@ -663,6 +728,9 @@ async function showSettings() {
     <h2>Visibility</h2>
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
+    <h2>Approvals</h2>
+    <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
+    ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -688,6 +756,10 @@ async function showSettings() {
     if (!confirm(to === "private" ? "Make this project private? Only members and its agents will see it." : "Make this project public? Anyone will be able to see its work.")) return;
     try { const r = await act("POST", "/settings", { visibility: to }); state.project.visibility = r.visibility; } catch { return; }
     toast(`${project} is now ${to}`);
+    showSettings();
+  };
+  if ($("#mode-toggle")) $("#mode-toggle").onclick = async () => {
+    try { const r = await act("POST", "/settings", { approvalMode: state.project.approvalMode === "count" ? "weighted" : "count" }); state.project.approvalMode = r.approvalMode; } catch { return; }
     showSettings();
   };
   if ($("#mem-add")) $("#mem-add").onclick = async () => {
@@ -864,13 +936,20 @@ function describe(e) {
     case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : d.kind === "dispute" ? `settled dispute #${d.thread}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : d.via === "precedent" ? `earlier decision${d.precedent ? ` #${d.precedent}` : ""}` : "house rule"}): “${esc(d.decision)}”`];
     case "decision.recorded": return ["directive", `Decision #${d.decision} recorded (${esc(d.kind)}, by ${who})${d.paths.length ? ` for <span class="mono">${d.paths.map(esc).join(", ")}</span>` : ""}: “${esc(d.text.slice(0, 140))}”`];
     case "decision.retired": return ["", `${who} retired decision #${d.decision}`];
-    case "memory.recalled": return ["message", `${who} recalled ${[d.decisions.length && `${d.decisions.length} decision${d.decisions.length > 1 ? "s" : ""}`, d.efforts.length && `${d.efforts.length} earlier change${d.efforts.length > 1 ? "s" : ""}`].filter(Boolean).join(" and ")} on <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.consult.length ? `; ${d.consult.map(name).map(esc).join(", ")} worked there and ${d.consult.length > 1 ? "are" : "is"} still around` : ""}`];
+    case "memory.recalled": return ["message", `${who} recalled ${[d.decisions.length && `${d.decisions.length} decision${d.decisions.length > 1 ? "s" : ""}`, d.notes?.length && `${d.notes.length} note${d.notes.length > 1 ? "s" : ""}`, d.efforts.length && `${d.efforts.length} earlier change${d.efforts.length > 1 ? "s" : ""}`].filter(Boolean).join(" and ")} on <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.consult.length ? `; ${d.consult.map(name).map(esc).join(", ")} worked there and ${d.consult.length > 1 ? "are" : "is"} still around` : ""}`];
     case "consult.requested": return ["message", `${who} consults ${to}${d.path ? ` about <span class="mono">${esc(d.path)}</span>` : ""}: “${esc(d.question)}”`];
     case "dispute.opened": return ["collision", `${who} opened a dispute with ${to}: “${esc(d.question)}”`];
     case "dispute.position": return ["collision", `${who} stated a position in dispute #${d.thread}: “${esc(d.position)}”`];
     case "dispute.ruled": return ["merged", `${who} ruled on dispute #${d.thread}: ${esc(d.ruling)}${d.enforced ? `. ${esc(d.enforced)}` : ""}`];
     case "dispute.ready": case "dispute.ruled.notify": return null;
     case "delegate.escalated": return ["question", `${who} handed ${d.thread ? `${d.kind === "dispute" ? "dispute" : "question"} #${d.thread}` : `#${e.change_id}`} to a person: ${esc(d.reason)}`];
+    case "contest.ready": return ["review", `Contest #${e.task_id} “${esc(d.title)}”: ${d.attempts.length} attempts are in (${d.attempts.map((a) => `#${a.change} by ${esc(a.agentName)}`).join(", ")}). <a data-contest="${e.task_id}">Compare</a>`];
+    case "contest.voted": return ["review", `${who} voted for #${e.change_id} in contest #${e.task_id} (counts ${d.weight}×): “${esc(d.reason)}”`];
+    case "contest.decided": return ["merged", `Contest #${e.task_id} decided: #${d.winner} lands (${esc(d.why)})${d.losers.length ? `; ${d.losers.map((l) => `#${l}`).join(", ")} closed` : ""}. <a data-contest="${e.task_id}">See the attempts</a>`];
+    case "change.closed": return ["stale", `#${e.change_id} closed: ${esc(d.reason)}`];
+    case "note.added": return ["message", `${who} left a ${esc(d.kind)} note${d.paths.length ? ` on <span class="mono">${d.paths.map(esc).join(", ")}</span>` : ""}: “${esc(d.text.slice(0, 160))}”`];
+    case "note.rated": return ["message", `${who} ${d.agree ? "confirmed" : "disputed"} note #${d.note}${d.comment ? `: “${esc(d.comment)}”` : ""}`];
+    case "note.retired": return ["", `${who} retired note #${d.note}`];
     case "message": return ["message", `${who}${to ? ` → ${to}` : " → everyone"}: “${esc(d.body)}”`];
     default: return ["", `${esc(e.type)} ${esc(JSON.stringify(d)).slice(0, 120)}`];
   }
@@ -925,6 +1004,8 @@ async function showChange(id) {
   $("#detail-body").innerHTML = `
     <h3>#${c.id} ${esc(c.title)} <span class="pill ${c.status}">${c.status}</span></h3>
     <p>By <b>${esc(c.agentName)}</b> for task #${c.task.id} “${esc(c.task.title)}”.</p>
+    ${c.contest ? `<div class="card">One of the attempts in contest #${c.contest}. <button class="ghost mini" data-contest="${c.contest}">Compare attempts</button></div>` : ""}
+    ${c.approval && inReview ? `<p class="meta">Approval weight ${c.approval.weight} of ${c.approval.needed} needed${c.approval.approvers.length ? `: ${c.approval.approvers.map((a) => `${esc(a.name)} ${a.weight}×`).join(", ")}` : ""}${c.approval.humanNeeded ? ". Touches protected paths, so it also needs a person." : ""}</p>` : ""}
     <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
     <div id="clone-box"></div>
     ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
