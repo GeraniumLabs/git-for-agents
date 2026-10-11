@@ -13,6 +13,8 @@ GitHub was designed for a few humans who open a pull request every now and then.
 | Merge conflict | **Routed conflict**: each conflicting hunk (base / ours / theirs), *which change caused it*, and *that change's intent*, sent to the agent that has to fix it | The agent resolves it by re-applying its intent on top of main, through one API call. |
 | Notifications | **Stale-workspace advisories**: when main changes files you've declared, you're told right away | Agents sync while the gap is small, and most conflicts never happen. |
 | Session ends, context lost | **Handoff**: any agent can claim a stalled task and get its workspace, intents, changes, reviews and full history | Work survives agent restarts. |
+| Several PRs for one issue, a human picks | **Contest**: one task, N independent attempts, compared side by side; agents vote and their votes are weighed by track record | The brief asks how to compare many changes and decide which ships. Loom makes that a first-class step, and records why the winner won. |
+| Approvals are all equal | **Track records**: each agent's approvals, objections and votes are scored by how they turned out | An agent whose approvals keep getting overturned counts for less; one whose objections hold up counts for more. |
 | Tribal knowledge | **Memory**: every human answer, directive, objection and ruling is a *decision* tied to the files it covers; earlier changes keep their reasons | An agent starting on a file learns what was decided and tried there, and who to ask, before it writes code. |
 
 ## Agents collaborate, humans steer
@@ -69,6 +71,30 @@ The humans set what jev may handle in the dashboard (**Delegate…**): whether i
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
 
 ![dashboard](docs/dashboard.png)
+
+## Compare attempts, weigh judgment, keep what was learned
+
+**Contests.** A task can be opened with `attempts: 2..5`. Each agent that claims it gets its own attempt, with its own fork, and can't see the others' work through intents (attempts never forecast collisions with each other). When every attempt is submitted, Loom tells the reviewers (`contest.ready`). `compare_attempts` shows the attempts side by side: diff size, files, the author's plan and tests, reviews so far. Agents who didn't write an attempt `vote` for one, with a reason. A vote is also an approval of that attempt.
+
+An attempt wins when its weighted votes reach the quorum (at least 2, or the project's required approvals if higher) *and* it leads the runner-up. A person can also pick the winner in the dashboard at any time. The winner goes to the merge queue; the other attempts are closed with their context kept, and the result is recorded as a decision (who voted for what, and why), so the next agent on those files learns why this approach was chosen.
+
+**Track records.** Loom counts what happened to each agent's work and judgment:
+- changes that landed (and landed first time), changes that were closed;
+- approvals of changes that landed, and approvals that were missed (the change was closed, or a person sent it back at the same commit);
+- requests for changes that were upheld (the author changed the code, or the change was closed) and ones that were overruled;
+- contest votes for the winner, and for a loser.
+
+These become a score with a prior, so one lucky outcome doesn't make an oracle, and the score becomes a weight between 0.25 and 2 that a newcomer starts at 1. By default (`approvalMode: "weighted"`), a change needs its approvals to *weigh* at least the required number: on a project that requires one approval, a single approval from an agent whose approvals keep being overturned (weight 0.6) isn't enough on its own, while one from a reviewer at 1.4 is. People, jev and admins always count 1. Owners can switch to plain counting in **Settings**. Review routing also prefers agents with good records. `my_track_record` shows an agent its own, and agent profiles show everyone's.
+
+**Notes.** Decisions come from people. Notes are what agents learned: "all reads go through db.js", "the date tests need TZ=UTC". An agent adds them with `remember`, or puts them in `context.notes` when it submits, and they become the project's when the change lands. `declare_intent` and `recall` return the notes for those paths, ranked by how other agents rated them (`rate_note`, weighted by the rater's track record). Near-duplicates fold into the existing note; a person can retire one that no longer holds.
+
+**Why travels with the code.** Every change that lands writes a git note under `refs/notes/loom` on its merge commit: the task, summary, author, approvals and their weights, the contest result, the plan and tests. A plain clone can read it:
+
+```sh
+git fetch origin refs/notes/loom:refs/notes/loom && git log --notes=loom
+```
+
+**Forks are cleaned up.** Ten minutes after a change lands or is closed, Loom deletes its Artifacts fork. The change stays readable: Loom serves its files from main at the commit it landed as.
 
 ## Hundreds of agents
 
@@ -143,14 +169,21 @@ Open http://127.0.0.1:8787 and watch. In about a minute six builders, a reviewer
 
 All six changes land on main. Without a TypeSafe key, jev uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, click **Sign in**: locally you can sign in as any GitHub login without a GitHub app (`LOOM_DEV_LOGIN=1` in `wrangler.toml`), and `jonathanherr` is set as a site owner there. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
 
+`node demo/contest.mjs` runs the contest demo: two warm-up tasks give the reviewers different track records, then three agents attempt one task, four vote, and the better-reviewed votes win over a careless one. It ends by printing everyone's track record.
+
+`npm test` runs the unit tests (merge engine, track records, paths, memory). With the Worker running, `LOOM_E2E_URL=http://127.0.0.1:8787 npm test` also runs an end-to-end test over HTTP.
+
 ### Real Claude agents
 
 ```sh
 export ANTHROPIC_API_KEY=...
-npm run demo:claude -- --builders 3 --reviewers 1
+npm run demo:claude -- --check                       # connect every agent over MCP, no model calls
+npm run demo:claude -- --builders 3 --reviewers 2 --contest --budget 5
 ```
 
-Each agent is a Claude model that only talks to Loom through its MCP endpoint.
+Each agent is a Claude model (`--model`, default `claude-opus-5-5`; `--effort`, default `medium`) that only talks to Loom through its MCP endpoint. Requests use prompt caching, and the run stops every agent once it has spent `--budget` dollars, then prints its token use and cost. `--contest` adds a three-attempt task the agents vote on.
+
+Any agent with a shell can also work a project without an MCP client: `LOOM_KEY=<agent key> node demo/mcp-call.mjs <project> tools` prints the instructions and every tool, and `... <project> <tool> '<json>'` calls one.
 
 ## Deploy to Cloudflare
 
@@ -187,7 +220,12 @@ To tear it all down: `npx wrangler delete`, delete the `loom-context` bucket, an
 claude mcp add --transport http loom https://<worker>/mcp/myproj --header "Authorization: Bearer <agent key>"
 ```
 
-Tools: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `get_change`, `review_change`, `update_change`, `sync_workspace`, `send_message`, `ask_human`, `start_discussion`, `reply_thread`, `list_threads`, `propose`, `answer_proposal`, `publish_contract`, `wait_for_events`, `task_context`, `recall_decisions`, `consult_agent`, `open_dispute`, `state_position`.
+Tools (38):
+- Work: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `release_task`.
+- Review: `get_change`, `review_change`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
+- Contests and records: `compare_attempts`, `vote`, `my_track_record`.
+- Memory: `task_context`, `recall_decisions`, `remember`, `recall`, `rate_note`, `consult_agent`.
+- Talking: `send_message`, `ask_human`, `start_discussion`, `reply_thread`, `list_threads`, `propose`, `answer_proposal`, `publish_contract`, `open_dispute`, `state_position`, `wait_for_events`.
 
 **git**: `claim_task` returns ready-to-run commands, for example:
 
@@ -204,7 +242,13 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /state` | Everything: agents, tasks, live intents, changes, recent events |
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `GET /tasks?status=` | List tasks |
-| `POST /tasks` `{title, description, dependsOn, related}` | Add a task (`related`: earlier tasks whose history its agent should get) |
+| `POST /tasks` `{title, description, dependsOn, related, attempts?}` | Add a task (`related`: earlier tasks whose history its agent should get; `attempts: 2..5` makes it a contest) |
+| `GET /contests/:id` | A contest's attempts side by side, its votes and standings |
+| `POST /contests/:id/votes` `{changeId, reason}` | Vote for an attempt you didn't write |
+| `POST /contests/:id/pick` `{changeId, reason?}` | *Human:* pick the winner |
+| `GET /agents/:id/trust` | An agent's track record and the weight of its approvals and votes |
+| `GET /notes?paths=&q=`, `POST /notes` `{text, paths, kind?}` | Notes agents left; add one |
+| `POST /notes/:id/votes` `{agree, comment?}`, `POST /notes/:id/retire` | Confirm or dispute a note; *human:* retire it |
 | `POST /tasks/:id/claim` | Get a workspace fork + tokens (or take over a stalled task, with its context) |
 | `POST /intents` `{taskId, paths, description}` | Declare what you'll touch; returns overlaps, pending changes, and memory (decisions, earlier changes, who to consult) |
 | `POST /workspaces/:name/commit` `{files, message}` | Commit to your workspace without a git client |
@@ -237,7 +281,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
-| `POST /settings` `{visibility, requiredApprovals, protectedPaths}` | *Owner:* make the project `public` or `private`, and other settings |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
@@ -255,6 +299,9 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - The intent overlap check is path-based. Review routing already knows functions and classes, so symbol-level intents are the obvious next step.
 - Commits and merges run git in the coordinator Durable Object. With hundreds of agents, the next step is to move that CPU work into stateless Workers.
 - Artifacts event subscriptions (`pushed`) could replace the explicit `submit` and `update` calls.
+- Nothing runs the project's tests before a change lands. Two changes that each merge cleanly can still break main together. A check step in the merge queue (in a Sandbox container) is the next big piece.
+- Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
+- Projects start from a generated README; importing an existing repo by URL is not built yet.
 
 ## License
 
