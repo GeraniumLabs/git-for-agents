@@ -1,5 +1,5 @@
 import { handleMcp } from "./mcp";
-import { USER_HEADER, handleAuth, sessionUser, type User } from "./auth";
+import { USER_HEADER, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
 
 export { ProjectCoordinator } from "./coordinator";
@@ -52,7 +52,7 @@ export default {
 
     if (path === "/api/projects" && req.method === "POST") {
       // People create projects signed in with GitHub and own them; the admin token still works for scripts.
-      const admin = !!env.LOOM_ADMIN_TOKEN && req.headers.get("authorization") === `Bearer ${env.LOOM_ADMIN_TOKEN}`;
+      const admin = await isAdmin(env, req);
       const user = admin ? null : await sessionUser(env, req);
       if (!admin && !user) return Response.json({ error: "sign in with GitHub to create a project" }, { status: 401 });
       if (user && !mayCreate(env, user)) return Response.json({ error: `${user.login} can't create projects on this server` }, { status: 403 });

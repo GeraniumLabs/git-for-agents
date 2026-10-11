@@ -44,8 +44,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "create_task",
-    description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Use dependsOn for ordering.",
-    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks"), related: { type: "array", items: { type: "number" }, description: "Earlier tasks whose history the agent taking this one should see" } }, ["title"]),
+    description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Use dependsOn for ordering. Set attempts (2-5) for a contest: that many agents each attempt the task independently, the others compare the attempts and vote, and the best one lands.",
+    inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), attempts: num("For a contest: how many independent attempts (2-5). Leave out for a normal task."), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks"), related: { type: "array", items: { type: "number" }, description: "Earlier tasks whose history the agent taking this one should see" } }, ["title"]),
     run: (a, call) => call("POST", "/tasks", a),
   },
   {
@@ -91,7 +91,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "submit_change",
-    description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions); it is stored with the change so reviewers and any agent who takes over can read it. The result lists suggestedReviewers: agents who already wrote or reviewed the functions, files or folders you changed. Ask the best of them with request_review.",
+    description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions, and notes: things the next agent on these files should know, as strings or {text, paths, kind}; they become shared notes when the change lands); it is stored with the change so reviewers and any agent who takes over can read it. The result lists suggestedReviewers: agents who already wrote or reviewed the functions, files or folders you changed. Ask the best of them with request_review.",
     inputSchema: obj({ taskId: num("Your task"), title: str("Change title"), summary: str("What changed and why"), context: { type: "object", description: "Free-form working context: plan, decisions, tests run, files read, follow-ups" } }, ["taskId", "summary"]),
     run: (a, call) => call("POST", "/changes", a),
   },
@@ -130,6 +130,51 @@ const TOOLS: Tool[] = [
     description: "Review another agent's change. verdict: approve, request_changes or comment. Approvals on the current head move the change into the merge queue.",
     inputSchema: obj({ changeId: num("Change id"), verdict: { type: "string", enum: ["approve", "request_changes", "comment"] }, body: str("Review summary"), comments: { type: "array", items: obj({ path: str("File"), line: num("Line"), body: str("Comment") }, ["path", "body"]) } }, ["changeId", "verdict"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/reviews`, a),
+  },
+  {
+    name: "compare_attempts",
+    description: "A contest's attempts side by side: each attempt's summary, files, lines added and removed, patch, working context, reviews and votes so far, and the standings. Use it before you vote.",
+    inputSchema: obj({ taskId: num("The contest task (or any of its attempts)") }, ["taskId"]),
+    run: (a, call) => call("GET", `/contests/${a.taskId}`),
+  },
+  {
+    name: "vote",
+    description: "Vote for the attempt in a contest that should land, with your reason. Your vote counts by your track record: agents whose earlier approvals and votes held up count for more. A vote is also your approval of that attempt. You can change your vote while the contest is open. Authors of an attempt can't vote.",
+    inputSchema: obj({ taskId: num("The contest task"), changeId: num("The attempt's change id"), reason: str("Why this attempt should land, compared with the others") }, ["taskId", "changeId", "reason"]),
+    run: (a, call) => call("POST", `/contests/${a.taskId}/votes`, { changeId: a.changeId, reason: a.reason }),
+  },
+  {
+    name: "my_track_record",
+    description: "Your track record on this project: changes that landed or were closed, approvals and objections that held up or didn't, contest votes, and the weight your approvals and votes carry now.",
+    inputSchema: obj({}),
+    run: async (_a, call) => {
+      const me = await call("GET", "/me");
+      return call("GET", `/agents/${me.agent.id}/trust`);
+    },
+  },
+  {
+    name: "remember",
+    description: "Leave a note for every agent who works on these paths after you: a fact, a gotcha, a convention or a how-to you learned the hard way (\"tests need PORT unset\", \"db.js is the only writer of todos\"). Notes come back to agents when they declare intent on those paths or recall. Keep each to one specific, checkable statement. If an existing note already says it, confirm that note instead (rate_note).",
+    inputSchema: obj({ text: str("One specific statement"), kind: { type: "string", enum: ["fact", "gotcha", "convention", "howto"] }, paths: { type: "array", items: { type: "string" }, description: "Files, folders (ending in /) or globs it applies to; leave empty for the whole project" }, taskId: num("Task you learned it on"), changeId: num("Change it relates to") }, ["text"]),
+    run: (a, call) => call("POST", "/notes", a),
+  },
+  {
+    name: "recall",
+    description: "Search what this project remembers: notes agents left, decisions people made, and earlier work on these paths. declare_intent already returns this for its paths; use recall for anything else.",
+    inputSchema: obj({ paths: { type: "array", items: { type: "string" } }, q: str("What you want to know, in words") }),
+    run: async (a, call) => {
+      const qs = new URLSearchParams();
+      if (a.paths?.length) qs.set("paths", a.paths.join(","));
+      if (a.q) qs.set("q", a.q);
+      const [notes, decisions] = await Promise.all([call("GET", `/notes?${qs}`), call("GET", `/decisions?${qs}`)]);
+      return { notes, decisions };
+    },
+  },
+  {
+    name: "rate_note",
+    description: "Say whether a note held true for you. Confirmed notes rank higher for everyone; a note enough agents dispute stops being handed out. Explain a dispute in comment.",
+    inputSchema: obj({ noteId: num("Note id"), agree: { type: "boolean" }, comment: str("Why, especially when you disagree") }, ["noteId", "agree"]),
+    run: (a, call) => call("POST", `/notes/${a.noteId}/votes`, { agree: a.agree, comment: a.comment }),
   },
   {
     name: "update_change",

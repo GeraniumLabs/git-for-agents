@@ -23,6 +23,18 @@ const enc = new TextEncoder();
 const b64url = (u: Uint8Array) => btoa(String.fromCharCode(...u)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const unb64url = (s: string) => Uint8Array.from(atob(s.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));
 
+/** Whether a presented secret equals the expected one, in time that doesn't depend on where they differ. */
+export async function sameSecret(given: string | null | undefined, expected: string | null | undefined): Promise<boolean> {
+  if (!given || !expected) return false;
+  const [a, b] = await Promise.all([given, expected].map((x) => crypto.subtle.digest("SHA-256", enc.encode(x))));
+  return crypto.subtle.timingSafeEqual(a, b);
+}
+
+/** Whether a request carries the admin token as its bearer token. */
+export async function isAdmin(env: Env, req: Request): Promise<boolean> {
+  return sameSecret((req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), env.LOOM_ADMIN_TOKEN);
+}
+
 function signingSecret(env: Env): string | undefined {
   return env.LOOM_SECRET_KEY ?? env.LOOM_ADMIN_TOKEN;
 }
@@ -137,7 +149,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
 <p><button>Create Loom's GitHub app</button></p></form>`);
     }
     const form = await req.formData();
-    if (!env.LOOM_ADMIN_TOKEN || form.get("token") !== env.LOOM_ADMIN_TOKEN) return page("That isn't the admin token", `<p><a href="/auth/setup">Try again</a></p>`);
+    if (!(await sameSecret(form.get("token") as string | null, env.LOOM_ADMIN_TOKEN))) return page("That isn't the admin token", `<p><a href="/auth/setup">Try again</a></p>`);
     const org = String(form.get("org") ?? "").trim().replace(/[^A-Za-z0-9-]/g, "");
     const state = await signed(env, { setup: true, exp: Date.now() + 30 * 60_000 });
     const host = url.hostname.split(".");
