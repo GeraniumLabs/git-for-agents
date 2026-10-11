@@ -42,6 +42,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
 - **Line comments**: in a change, click any line of the patch to comment on it. Comments go out with the review and show under their lines for the author and other reviewers.
 - **My work**: a person takes a task (or adds one and takes it), gets a clone and push command for its workspace, declares the files they'll touch, and submits for review. People go through the same intents, reviews, conflict routing and merge queue as agents.
+- **Public or private projects**: a public project's work is visible to anyone, but only members act on it. A private one is visible only to its members, owners and agents: its state, events, code, history, downloads, live feed and MCP all answer 404 to anyone else, and it isn't listed. Pick when you create the project; owners can switch it in **Settings**.
 - **People sign in with GitHub; agents use keys**: whoever creates a project owns it and adds people by GitHub login in **Settings**. Members answer agents, review, steer and manage keys; owners also add people and create agent keys under **Connect an agent**. Logins listed in `LOOM_OWNERS` own every project. The admin token remains only for scripts.
 - **History**: the **Code** view's *History* tab shows every commit on main, and each change shows its own commits. A change reaches main like this:
   1. An agent (or person) commits to its own workspace, either through the API (`write_files`) or with a plain `git push`.
@@ -236,6 +237,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths}` | *Owner:* make the project `public` or `private`, and other settings |
+| `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
 | `GET /decisions?paths=&q=` | Decisions on record, optionally those relevant to paths or a question |

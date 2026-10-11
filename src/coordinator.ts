@@ -104,6 +104,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE review_requests ADD COLUMN deadline INTEGER",
       "ALTER TABLE agents ADD COLUMN identity TEXT",
       "ALTER TABLE agents ADD COLUMN owner INTEGER DEFAULT 0",
+      "ALTER TABLE projects ADD COLUMN private INTEGER DEFAULT 0",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -196,6 +197,32 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private get protectedPaths(): string[] {
     return JSON.parse(this.meta("protected_paths") ?? "[]");
   }
+  private get isPrivate(): boolean {
+    return this.meta("visibility") === "private";
+  }
+
+  /** Whether this request may read the project: always for a public one; for a private one, members, owners and agents. */
+  private async canRead(req: Request): Promise<boolean> {
+    if (!this.isPrivate) return true;
+    // Browsers can't set headers on a WebSocket, so the dashboard passes a pasted key as ?key=.
+    const key = new URL(req.url).searchParams.get("key");
+    const probe = key && !req.headers.get("authorization") ? new Request(req.url, { headers: { ...Object.fromEntries(req.headers), authorization: `Bearer ${key}` } }) : req;
+    try {
+      await this.authenticate(probe);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private async setVisibility(actor: Agent, visibility: string) {
+    if (visibility !== "public" && visibility !== "private") throw new HttpError(400, "visibility is public or private");
+    if (visibility === (this.isPrivate ? "private" : "public")) return;
+    this.setMeta("visibility", visibility);
+    await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch("https://do/registry/visibility", { method: "PUT", body: JSON.stringify({ name: this.project, private: visibility === "private" }) });
+    this.emit("project.visibility", { actor: actor.id, data: { visibility } });
+  }
+
   private get requiredApprovals(): number {
     return Number(this.meta("required_approvals") ?? "1");
   }
@@ -342,12 +369,23 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return json({ ok: true });
     }
     if (a === "registry") {
-      if (m === "GET") return json(this.sql.exec("SELECT * FROM projects ORDER BY created_at").toArray());
-      this.sql.exec("INSERT OR REPLACE INTO projects VALUES (?, ?, ?)", body.name, body.description ?? "", Date.now());
+      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private })));
+      if (b === "visibility") {
+        this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
+        return json({ ok: true });
+      }
+      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private) VALUES (?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0);
       return json({ ok: true });
     }
 
     if (a === "init" && m === "POST") return json(await this.init(body));
+
+    // A private project shows nothing, not even that it exists, to anyone
+    // who isn't a member, an owner or one of its agents.
+    if (a === "visible") return json({ visible: await this.canRead(req) });
+    if (this.isPrivate && (a === "ws" || m === "GET") && !(await this.canRead(req))) {
+      throw new HttpError(404, `no project ${this.project ?? ""}; if it's private, sign in as one of its members`);
+    }
     if (a === "ws") return this.acceptSocket(req);
 
     // Reads are open so the dashboard can render without a key.
@@ -401,7 +439,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ownerOnly("change settings");
       if (body.requiredApprovals !== undefined) this.setMeta("required_approvals", String(body.requiredApprovals));
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths });
+      if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public" });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
@@ -460,7 +499,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User }) {
+  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User; visibility?: string }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     const repo = `${name}`;
@@ -471,6 +510,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta(`remote:${repo}`, created.remote);
     this.setMeta("main_version", "0");
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
+    this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
     const files = body.files ?? { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
     const w = await Workspace.open({ url: created.remote, token: created.token });
     const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
@@ -1438,7 +1478,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -2259,7 +2299,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, remote: this.remoteUrl(this.mainRepo) },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, visibility: this.isPrivate ? "private" : "public", remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),

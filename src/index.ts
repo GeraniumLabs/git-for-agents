@@ -37,7 +37,14 @@ export default {
     const path = url.pathname;
 
     if (path === "/api/projects" && req.method === "GET") {
-      return coordinator(env, "__registry").fetch("https://do/registry");
+      // Private projects are listed only to people (or keys) who can read them.
+      const all = await coordinator(env, "__registry").fetch("https://do/registry").then((r) => r.json<{ name: string; private: boolean }[]>());
+      const user = await sessionUser(env, req);
+      const headers: Record<string, string> = {};
+      if (req.headers.get("authorization")) headers.authorization = req.headers.get("authorization")!;
+      if (user) headers[USER_HEADER] = JSON.stringify(user);
+      const seen = await Promise.all(all.map(async (p) => !p.private || (await coordinator(env, p.name).fetch("https://do/visible", { headers }).then((r) => r.json<{ visible: boolean }>()).catch(() => ({ visible: false }))).visible));
+      return Response.json(all.filter((_, i) => seen[i]));
     }
 
     const auth = await handleAuth(env, req, (p, init) => coordinator(env, "__registry").fetch(`https://do${p}`, init));
@@ -53,13 +60,13 @@ export default {
       if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
       const res = await coordinator(env, body.name).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, owner: user ?? undefined }) });
       if (res.ok) {
-        await coordinator(env, "__registry").fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description }) });
+        await coordinator(env, "__registry").fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private" }) });
       }
       return res;
     }
 
     let m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(.*)$/);
-    if (m && /^(init|registry)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
+    if (m && /^(init|registry|visible)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
     if (m) return forward(env, req, m[1], m[2]);
 
     m = path.match(/^\/mcp\/([a-z0-9-]+)$/);

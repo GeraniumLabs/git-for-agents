@@ -25,7 +25,9 @@ const ago = (ts) => {
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
 };
 const dur = (ms) => (ms < 1000 ? "now" : ago(Date.now() - ms));
-const api = (p) => fetch(`/api/projects/${project}${p}`).then((r) => r.json());
+const keyQuery = () => { const k = store.get(keyName()); return k ? `&key=${encodeURIComponent(k)}` : ""; };
+const keyHeader = () => { const k = store.get(keyName()); return k ? { authorization: `Bearer ${k}` } : {}; };
+const api = (p) => fetch(`/api/projects/${project}${p}`, { headers: keyHeader() }).then((r) => r.json());
 
 // ── signing in as a human ────────────────────────────────────────────────
 let me = null;
@@ -117,11 +119,19 @@ async function boot() {
   const projects = await fetch("/api/projects").then((r) => r.json());
   if (!project) project = projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
-  $("#project").innerHTML = projects.map((p) => `<option ${p.name === project ? "selected" : ""}>${esc(p.name)}</option>`).join("");
+  $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
     $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
     $("#np-empty").onclick = () => showNewProject();
+    renderMe();
+    return;
+  }
+  // A private project answers 404 to anyone who can't read it.
+  const probe = await fetch(`/api/projects/${project}/delegate`, { headers: keyHeader() });
+  if (probe.status === 404) {
+    $("main").innerHTML = `<p class="empty">${esc(project)} doesn't exist, or it's private. ${user ? "Ask one of its owners to add you." : `<button id="private-signin">Sign in</button>`}</p>`;
+    if ($("#private-signin")) $("#private-signin").onclick = () => showSignIn("Private projects are visible only to their members.");
     renderMe();
     return;
   }
@@ -130,7 +140,8 @@ async function boot() {
 }
 
 function connect() {
-  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/projects/${project}/ws`);
+  const key = store.get(keyName());
+  const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/api/projects/${project}/ws${key ? `?key=${encodeURIComponent(key)}` : ""}`);
   ws.onopen = () => { $("#live").className = "live on"; $("#live").textContent = "live"; ws.send("overview"); };
   ws.onclose = () => { $("#live").className = "live off"; $("#live").textContent = "reconnecting"; setTimeout(connect, 1500); };
   ws.onmessage = (m) => {
@@ -327,7 +338,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
@@ -549,7 +560,7 @@ async function showCode(target = {}) {
   if (list.error) return toast(list.error);
   $("#detail-body").innerHTML = `
     <h3>Code <small class="meta">${esc(target.label ?? `main · v${state.project.mainVersion}`)}</small></h3>
-    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}" download>Download zip</a><button class="ghost mini" id="code-clone">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
+    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}${keyQuery()}" download>Download zip</a><button class="ghost mini" id="code-clone">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
     <div id="code-clone-box"></div>
     <span class="seg" role="tablist"><button id="tab-files" class="on" role="tab">Files</button><button id="tab-history" role="tab">History</button></span>
     <div id="history" hidden></div>
@@ -583,7 +594,7 @@ $("#code-open").onclick = () => showCode();
 
 // ── connect an agent: the Loom skill, ready to copy ──────────────────────
 async function showSkill() {
-  const text = await fetch(`/api/projects/${project}/skill`).then((r) => r.text());
+  const text = await fetch(`/api/projects/${project}/skill`, { headers: keyHeader() }).then((r) => r.text());
   const save = `mkdir -p .claude/skills/loom-${project} && curl -s ${location.origin}/api/projects/${project}/skill > .claude/skills/loom-${project}/SKILL.md`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
@@ -625,11 +636,13 @@ function showNewProject() {
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
+    <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
+    <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
     <div class="row"><button id="np-create">Create project</button></div>`;
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0 }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
     location.search = `?project=${name}`;
@@ -643,9 +656,13 @@ async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people;
   try { [s, people] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members")]); } catch { return; }
+  const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
     <h3>Settings · ${esc(project)}</h3>
+    <h2>Visibility</h2>
+    <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
+    ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -664,6 +681,13 @@ async function showSettings() {
     if (!input.value.trim()) return;
     try { await act("PUT", `/settings/keys/${b.dataset.keySave}`, { value: input.value.trim() }); } catch { return; }
     toast("Key saved");
+    showSettings();
+  };
+  if ($("#vis-toggle")) $("#vis-toggle").onclick = async () => {
+    const to = vis === "private" ? "public" : "private";
+    if (!confirm(to === "private" ? "Make this project private? Only members and its agents will see it." : "Make this project public? Anyone will be able to see its work.")) return;
+    try { const r = await act("POST", "/settings", { visibility: to }); state.project.visibility = r.visibility; } catch { return; }
+    toast(`${project} is now ${to}`);
     showSettings();
   };
   if ($("#mem-add")) $("#mem-add").onclick = async () => {
@@ -831,6 +855,7 @@ function describe(e) {
     case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
     case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
+    case "project.visibility": return ["directive", `${who} made the project ${esc(d.visibility)}`];
     case "member.added": return ["directive", `${who} added ${esc(d.login)} to the project${d.owner ? " as an owner" : ""}`];
     case "member.removed": return ["directive", `${who} removed ${esc(d.login)} from the project`];
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
@@ -900,7 +925,7 @@ async function showChange(id) {
   $("#detail-body").innerHTML = `
     <h3>#${c.id} ${esc(c.title)} <span class="pill ${c.status}">${c.status}</span></h3>
     <p>By <b>${esc(c.agentName)}</b> for task #${c.task.id} “${esc(c.task.title)}”.</p>
-    <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
+    <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
     <div id="clone-box"></div>
     ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
     ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
