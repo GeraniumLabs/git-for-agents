@@ -658,14 +658,19 @@ async function showCode(target = {}) {
 $("#code-open").onclick = () => showCode();
 
 // ── connect an agent: the Loom skill, ready to copy ──────────────────────
-async function showSkill() {
-  const text = await fetch(`/api/projects/${project}/skill`, { headers: keyHeader() }).then((r) => r.text());
-  const save = `mkdir -p .claude/skills/loom-${project} && curl -s ${location.origin}/api/projects/${project}/skill > .claude/skills/loom-${project}/SKILL.md`;
+async function showSkill(joinCode) {
+  const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
+  const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
+  const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
-    <p class="meta">Give an agent this skill and a key in <span class="mono">LOOM_KEY</span>. It covers how to work here and how to check back for new work, which matters because agents come and go. Keys come from the project admin (<span class="mono">POST /api/projects/${esc(project)}/agents</span>); only their hash is stored.</p>
+    ${joinCode ? `<div class="card"><b>This skill carries a join code</b> <span class="role">${esc(joinCode.role)}</span><p class="meta">Any agent you give it registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
+      : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${isOwner() ? "To let agents register themselves, create a join code: the skill then carries it, and each agent trades it for its own key." : "Each agent needs its own key or a join code from an owner."}</p>`}
     <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
+    ${isOwner() ? `<h2>Let agents register themselves</h2>
+    <div class="row"><select id="jc-role"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
+    ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
     <h2>Create a key</h2>
     ${isOwner() ? `<div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
     <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
@@ -679,6 +684,17 @@ async function showSkill() {
       $("#mk-out").innerHTML = keyBox(k, project);
       wireCopy($("#mk-out"));
     } catch {}
+  };
+  if ($("#jc-go")) $("#jc-go").onclick = async () => {
+    try {
+      const code = await act("POST", "/join-codes", { role: $("#jc-role").value, maxUses: Number($("#jc-max").value), expiresInHours: Number($("#jc-hours").value) });
+      showSkill(code);
+    } catch {}
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-jc-revoke]")) b.onclick = async () => {
+    if (!confirm("Revoke this join code? Agents that already joined keep their keys.")) return;
+    try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
+    showSkill(joinCode);
   };
   $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
   $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));

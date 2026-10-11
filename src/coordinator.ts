@@ -116,6 +116,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE tasks ADD COLUMN contest_status TEXT",
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
       "ALTER TABLE changes ADD COLUMN checks TEXT",
+      "ALTER TABLE agents ADD COLUMN joined_via INTEGER",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -175,6 +176,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT, by TEXT, kind TEXT NOT NULL DEFAULT 'fact', text TEXT NOT NULL,
         paths TEXT DEFAULT '[]', task_id INTEGER, change_id INTEGER, created_at INTEGER, retired_at INTEGER, retired_by TEXT);
+      CREATE TABLE IF NOT EXISTS join_codes (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, code_hash TEXT NOT NULL UNIQUE, label TEXT, role TEXT NOT NULL,
+        max_uses INTEGER, uses INTEGER DEFAULT 0, expires_at INTEGER, created_by TEXT, created_at INTEGER, revoked_at INTEGER);
       CREATE TABLE IF NOT EXISTS note_votes (
         note_id INTEGER, agent TEXT, agree INTEGER, comment TEXT, created_at INTEGER,
         PRIMARY KEY (note_id, agent));
@@ -445,7 +449,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "files") return json(await this.readFiles(url.searchParams));
       if (a === "archive") return await this.archive(url.searchParams);
       if (a === "commits") return json(await this.commits(url.searchParams));
-      if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? ""), { headers: { "content-type": "text/markdown; charset=utf-8" } });
+      if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? "", await this.liveJoinCode(url.searchParams.get("code"))), { headers: { "content-type": "text/markdown; charset=utf-8" } });
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "members") return json(this.members());
       if (a === "threads" && b) return json(this.thread(Number(b)));
@@ -456,10 +460,25 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "notes" && !b) return json(this.listNotes(url.searchParams));
     }
 
+    // Agents register themselves with a join code an owner shared.
+    if (a === "join" && m === "POST") return json(await this.join(body, url.origin));
+
     const who = await this.authenticate(req);
     const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human", owner: true } : who;
     const ownerOnly = (what: string) => { if (!actor.owner) throw new HttpError(403, `only the project's owners can ${what}`); };
 
+    if (a === "join-codes") {
+      ownerOnly("manage join codes");
+      if (m === "GET") return json(this.joinCodes());
+      if (m === "POST") return json(await this.createJoinCode(actor, body));
+      if (m === "DELETE" && b) return json(this.revokeJoinCode(actor, Number(b)));
+    }
+    // A new key for the same agent: its id, history and track record stay.
+    if (a === "me" && b === "key" && m === "POST") return json(await this.rotateKey(actor, actor.id));
+    if (a === "agents" && b && c === "key" && m === "POST") {
+      ownerOnly("replace another agent's key");
+      return json(await this.rotateKey(actor, this.profile(b).agent.id));
+    }
     if (a === "agents" && !b && m === "POST") {
       ownerOnly("add agents");
       if (body.role === "human" && who !== "admin") throw new HttpError(400, "add people by their GitHub login under members");
@@ -583,6 +602,74 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", id, name, role, await sha256(key), Date.now(), Date.now());
     this.emit("agent.joined", { actor: id, data: { name, role, by } });
     return { id, name, role, key };
+  }
+
+  // ── join codes: agents register themselves ──────────────────────────────
+
+  private async createJoinCode(actor: Agent, body: { label?: string; role?: string; maxUses?: number; expiresInHours?: number }) {
+    const role = body.role ?? "builder";
+    if (!["builder", "reviewer"].includes(role)) throw new HttpError(400, "role is builder or reviewer");
+    const maxUses = body.maxUses === undefined ? 50 : Number(body.maxUses);
+    if (!(maxUses >= 1 && maxUses <= 10_000)) throw new HttpError(400, "maxUses is between 1 and 10000");
+    const hours = body.expiresInHours === undefined ? 72 : Number(body.expiresInHours);
+    if (!(hours > 0 && hours <= 24 * 90)) throw new HttpError(400, "expiresInHours is between 0 and 2160 (90 days)");
+    const code = `loomjoin_${randomId(16)}`;
+    const expiresAt = Date.now() + hours * 3_600_000;
+    const r = this.sql.exec("INSERT INTO join_codes (code_hash, label, role, max_uses, expires_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      await sha256(code), body.label?.trim() || null, role, maxUses, expiresAt, actor.id, Date.now()).one();
+    this.emit("join_code.created", { actor: actor.id, data: { id: r.id, label: body.label ?? null, role, maxUses, expiresAt } });
+    return { id: r.id, code, label: body.label ?? null, role, maxUses, expiresAt, howToJoin: `POST /api/projects/${this.project}/join {"code": "<this code>", "name": "<agent name>"} returns the agent's own key. Shown once: Loom keeps only its hash.` };
+  }
+
+  /** The code itself if it is a live join code of this project, so the skill never carries anything else someone put in a link. */
+  private async liveJoinCode(code: string | null) {
+    if (!code || !/^loomjoin_[A-Za-z0-9_-]{8,64}$/.test(code)) return null;
+    const r = this.sql.exec("SELECT revoked_at, expires_at, uses, max_uses FROM join_codes WHERE code_hash = ?", await sha256(code)).toArray()[0];
+    return r && !r.revoked_at && (r.expires_at as number) > Date.now() && (r.uses as number) < (r.max_uses as number) ? code : null;
+  }
+
+  private joinCodes() {
+    return this.sql.exec("SELECT id, label, role, max_uses, uses, expires_at, created_by, created_at, revoked_at FROM join_codes ORDER BY id DESC").toArray()
+      .map((r) => ({ id: r.id, label: r.label, role: r.role, maxUses: r.max_uses, uses: r.uses, expiresAt: r.expires_at, createdBy: this.agentName(r.created_by as string), createdAt: r.created_at, revoked: !!r.revoked_at,
+        live: !r.revoked_at && (r.expires_at as number) > Date.now() && (r.uses as number) < (r.max_uses as number),
+        agents: this.sql.exec("SELECT id, name FROM agents WHERE joined_via = ? ORDER BY created_at", r.id).toArray() }));
+  }
+
+  private revokeJoinCode(actor: Agent, id: number) {
+    this.sql.exec("UPDATE join_codes SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL", Date.now(), id);
+    this.emit("join_code.revoked", { actor: actor.id, data: { id } });
+    return { id, revoked: true };
+  }
+
+  /** An agent trades a join code for its own key. Each agent that joins is a newcomer: its approvals and votes count 1 until it has a record. */
+  private async join(body: { code?: string; name?: string }, origin: string) {
+    if (!body.code || !body.name?.trim()) throw new HttpError(400, "send {code, name}: the join code an owner gave you, and a name for this agent");
+    if (body.name.length > 40) throw new HttpError(400, "name is 40 characters at most");
+    const row = this.sql.exec("SELECT * FROM join_codes WHERE code_hash = ?", await sha256(body.code)).toArray()[0];
+    // One message for every bad code, so a guesser learns nothing.
+    if (!row || row.revoked_at || (row.expires_at as number) <= Date.now() || (row.uses as number) >= (row.max_uses as number)) {
+      throw new HttpError(403, "this join code is not valid: it may have expired, been used up or revoked. Ask the project's owner for a new one");
+    }
+    this.sql.exec("UPDATE join_codes SET uses = uses + 1 WHERE id = ?", row.id);
+    const agent = await this.addAgent(body.name.trim(), row.role as Role, `join code #${row.id}`);
+    this.sql.exec("UPDATE agents SET joined_via = ? WHERE id = ?", row.id, agent.id);
+    return {
+      ...agent,
+      next: "Keep this key: it is shown once and it is this agent from now on. Reuse it whenever this agent comes back, so it keeps its history and track record.",
+      mcp: `${origin}/mcp/${this.project}`,
+      skill: `${origin}/api/projects/${this.project}/skill`,
+    };
+  }
+
+  /** Replace an agent's key, for a leak or a lost key. The agent keeps its id, history and track record; the old key stops working. */
+  private async rotateKey(actor: Agent, agentId: string) {
+    const row = this.sql.exec("SELECT id, name, role FROM agents WHERE id = ?", agentId).toArray()[0];
+    if (!row) throw new HttpError(404, `agent ${agentId} not found`);
+    if (row.role === "human") throw new HttpError(400, "people sign in with GitHub; they have no key");
+    const key = `loom_${randomId(20)}`;
+    this.sql.exec("UPDATE agents SET key_hash = ? WHERE id = ?", await sha256(key), agentId);
+    this.emit("agent.key_rotated", { actor: actor.id, to: agentId, data: { by: actor.name } });
+    return { id: row.id, name: row.name, role: row.role, key };
   }
 
   // ── people: GitHub sign-in, owners and members ───────────────────────────

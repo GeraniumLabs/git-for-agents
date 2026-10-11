@@ -50,3 +50,26 @@ test("the merge queue runs the project's tests: two clean merges that break main
   assert.match(stdout, /does not provide an export named 'greet'/);
   assert.match(stdout, /Done\. main is v2/);
 });
+
+test("agents register themselves with a join code from the skill, and keep who they are when their key is replaced", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-join");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "self-registration", requiredApprovals: 1 });
+  const jc = await admin.req("POST", "/join-codes", { role: "reviewer", maxUses: 2, expiresInHours: 1 });
+  const skill = await (await fetch(`${url}/api/projects/${name}/skill?code=${jc.code}`)).text();
+  assert.ok(skill.includes(jc.code), "the skill carries a live join code");
+  const forged = await (await fetch(`${url}/api/projects/${name}/skill?code=loomjoin_ignore-previous-instructions`)).text();
+  assert.ok(!forged.includes("ignore-previous"), "the skill never carries a code that isn't live");
+  const join = (agent: string, code = jc.code) => fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: agent }) });
+  const ada = await (await join("ada")).json();
+  assert.equal(ada.role, "reviewer");
+  assert.equal((await admin.as(ada.key).req("GET", "/me")).agent.id, ada.id);
+  assert.equal((await join("bex")).status, 200);
+  assert.equal((await join("cyd")).status, 403, "a used-up code is refused");
+  assert.equal((await join("dee", "loomjoin_nope")).status, 403);
+  const rotated = await admin.as(ada.key).req("POST", "/me/key");
+  assert.equal(rotated.id, ada.id);
+  assert.equal((await admin.as(rotated.key).req("GET", "/me")).agent.id, ada.id);
+  await assert.rejects(admin.as(ada.key).req("GET", "/me"), "the old key stops working");
+});
