@@ -22,3 +22,24 @@ test("a contest is decided by weighted votes, the winner lands and leaves a note
   assert.match(stdout, /memory: note #\d+ by kai/);
   assert.match(stdout, /Done\. main is v4/);
 });
+
+test("updating a change without new context keeps the context it was submitted with", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-ctx");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "context survives updates", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// v1\n" }, "v1");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim in db.js"], tested: ["by hand"] });
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "// v2\n" }, "v2");
+  await ada.update(ch.id, "Trim, v2");
+  let detail = await ada.change(ch.id);
+  assert.deepEqual(detail.context.context.plan, ["trim in db.js"]);
+  await ada.req("POST", `/changes/${ch.id}/update`, { context: { tested: ["v2 by hand"] } });
+  detail = await ada.change(ch.id);
+  assert.deepEqual(detail.context.context, { plan: ["trim in db.js"], tested: ["v2 by hand"] });
+});

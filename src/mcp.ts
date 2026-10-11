@@ -50,7 +50,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "claim_task",
-    description: "Claim a task. You get your own workspace (a fork of main) with a write token, plus a read token for main. If the task was started by another agent, you also get their full context so you can pick up where they left off.",
+    description: "Claim a task. You get your own workspace (a fork of main): pass its name (workspace.name) to read_file, list_files and write_files; the git commands and tokens are only for agents that use git directly. If the task was started by another agent, you also get their full context so you can pick up where they left off. Claiming a contest task gives you your own attempt (a separate task id); change ids and task ids are different numbers.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),
     run: (a, call) => call("POST", `/tasks/${a.taskId}/claim`),
   },
@@ -103,7 +103,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "respond_to_review_request",
-    description: "Answer a review request (review.assigned): accept and you have 30 minutes to review, or decline with a reason and Loom asks someone else. Unanswered requests go to someone else after 5 minutes.",
+    description: "Answer a review request (review.assigned): accept and you have 30 minutes to review, or decline with a reason and Loom asks someone else. Unanswered requests go to someone else after 5 minutes. You don't have to accept before reviewing: review_change answers the request too. For an attempt in a contest, compare_attempts and vote answer it.",
     inputSchema: obj({ changeId: num("Change id"), accept: { type: "boolean" }, reason: str("Why, if declining (or a note if accepting)") }, ["changeId", "accept"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/reviewers/respond`, { accept: a.accept, reason: a.reason }),
   },
@@ -246,11 +246,13 @@ const TOOLS: Tool[] = [
   },
   {
     name: "wait_for_events",
-    description: "Wait up to 25 seconds for new events after a cursor (0 for all). By default you get only what concerns you: events addressed to you, about your tasks and changes, and steering from humans. Pass all=true for every project event. Returns events and a new cursor.",
-    inputSchema: obj({ after: num("Cursor from the last call"), wait: num("Seconds to wait, max 25"), all: { type: "boolean" } }),
+    description: "Wait up to 25 seconds for events after a cursor. It returns as soon as there is at least one, so it can return at once. Always pass the cursor from your last call as `after`: with the same `after` you get the same events again (0 replays everything). By default you get only what concerns you: events addressed to you, about your tasks, changes, reviews and contests, and steering from humans; all=true gives every project event. Each event comes as one line; pass full=true for the raw payloads.",
+    inputSchema: obj({ after: num("The cursor from your last call (0 the first time)"), wait: num("Seconds to wait, max 25"), all: { type: "boolean" }, full: { type: "boolean", description: "Raw event payloads instead of one line each" } }),
     run: async (a, call) => {
       const me = (await call("GET", "/me")).agent;
-      return call("GET", `/events?after=${a.after ?? 0}&wait=${a.wait ?? 20}&agent=${encodeURIComponent(me.id)}${a.all ? "" : "&mine=1"}`);
+      const r = await call("GET", `/events?after=${a.after ?? 0}&wait=${Math.min(a.wait ?? 20, 25)}&agent=${encodeURIComponent(me.id)}${a.all ? "" : "&mine=1"}`);
+      if (a.full) return { ...r, next: `call again with after=${r.cursor}` };
+      return { events: r.events.map(brief), cursor: r.cursor, next: r.events.length ? `call again with after=${r.cursor}` : `nothing new; call again with after=${r.cursor} to keep waiting` };
     },
   },
   {
@@ -305,7 +307,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested.",
+          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
       });
     case "ping":
       return reply({});
@@ -324,4 +326,14 @@ async function handleOne(m: any, call: Call): Promise<any> {
     default:
       return { jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `method not found: ${m.method}` } };
   }
+}
+
+/** One line per event: who did what, to which task or change, and the gist. */
+function brief(e: { seq: number; type: string; actor: string | null; task_id: number | null; change_id: number | null; to_agent: string | null; data: any }) {
+  const d = e.data ?? {};
+  const gist = d.advice ?? d.reason ?? d.body ?? d.message ?? d.text ?? d.summary ?? d.question ?? d.why ?? d.title ?? "";
+  const extra = [d.verdict && `verdict ${d.verdict}`, d.winner && `winner #${d.winner}`, d.files && `${d.files.length} files`, d.paths && `paths ${[].concat(d.paths).slice(0, 4).join(", ")}`].filter(Boolean).join("; ");
+  const where = [e.task_id != null && `task #${e.task_id}`, e.change_id != null && `change #${e.change_id}`].filter(Boolean).join(", ");
+  const text = [extra, typeof gist === "string" ? gist : JSON.stringify(gist)].filter(Boolean).join(": ");
+  return `${e.seq} ${e.type}${where ? ` (${where})` : ""}${e.actor ? ` by ${d.actorName ?? e.actor}` : ""}${e.to_agent ? " to you" : ""}${text ? `: ${text.slice(0, 240)}` : ""}`;
 }

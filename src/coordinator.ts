@@ -744,7 +744,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private workspaceFor(actor: Agent, name: string) {
     const ws = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", name).toArray()[0];
     if (!ws) throw new HttpError(404, `workspace ${name} not found`);
-    if (ws.agent_id !== actor.id && actor.id !== "admin") throw new HttpError(403, "this workspace belongs to another agent");
+    if (ws.agent_id !== actor.id && actor.id !== "admin") throw new HttpError(403, `workspace ${ws.name} belongs to ${this.agentName(ws.agent_id as string)}; you are calling as ${actor.name} (check your key)`);
     return ws as any;
   }
 
@@ -889,7 +889,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any }) {
     const task = this.task(body.taskId);
-    if (task.assignee !== actor.id) throw new HttpError(403, `task ${body.taskId} is not assigned to you`);
+    if (task.assignee !== actor.id) throw new HttpError(403, `task ${body.taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name}); claim it first`);
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
@@ -921,7 +921,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }) {
     const ch = this.change(id);
-    if (ch.agent_id !== actor.id) throw new HttpError(403, "not your change");
+    if (ch.agent_id !== actor.id) throw new HttpError(403, `change ${id} is ${this.agentName(ch.agent_id as string)}'s, not yours (${actor.name})`);
     if (ch.status === "merged" || ch.status === "merging") throw new HttpError(409, `change ${id} is ${ch.status}`);
     const analysis = await this.analyze(ch.workspace);
     // The merge queue may have taken the change while we were analyzing.
@@ -929,7 +929,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) ? "review" : "queued";
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
-    await this.saveContext(id, actor, { ...body, summary: body.summary ?? ch.summary }, analysis.patch);
+    // An update (or a sync) without new context keeps what the author said
+    // at submit; new context is merged over it, key by key.
+    const prev = (await (await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
+    const context = body.context && typeof body.context === "object" ? { ...prev, ...body.context } : prev;
+    await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch);
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
@@ -1025,7 +1029,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     } else if (body.verdict === "approve" && ch.status === "review") {
       await this.maybeEnqueue(id);
     }
-    return this.change(id);
+    const now = this.change(id);
+    const approval = this.approval(id);
+    const next = now.status === "queued" || now.status === "merging" ? "In the merge queue; it lands on its own."
+      : now.status === "changes_requested" ? "Sent back to the author."
+      : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
+      : approval.humanNeeded ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).`
+      : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
+    return { recorded: { change: id, verdict: body.verdict, atHead: ch.head }, id, status: now.status, approval, next };
   }
 
   /** Queue a change once it has enough approval weight (a human's approval, if it touches protected paths). */
@@ -1150,7 +1161,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
           context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
         };
       }
-      return { task: e.task.id, title: e.task.title, status: e.task.status, agent: e.task.assignee ?? ch?.agent_id ?? null, agentName: this.agentName((e.task.assignee ?? ch?.agent_id ?? null) as string | null), change: detail };
+      const who = this.agentName((e.task.assignee ?? ch?.agent_id ?? null) as string | null);
+      return { attempt: ch ? `change #${ch.id} by ${who} (attempt task #${e.task.id})` : `attempt task #${e.task.id}: ${e.task.assignee ? `${who} is working on it` : "not claimed yet"}`, task: e.task.id, title: e.task.title, status: e.task.status, agent: e.task.assignee ?? ch?.agent_id ?? null, agentName: this.agentName((e.task.assignee ?? ch?.agent_id ?? null) as string | null), change: detail };
     }));
     return {
       contest: { id: task.id, title: task.title, description: task.description, status: task.contest_status, winner: task.winner ?? null, attempts: task.attempts, quorum: this.contestQuorum },
@@ -1195,9 +1207,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // A vote for an attempt is also an approval of it, at the commit the voter saw.
     this.sql.exec("DELETE FROM reviews WHERE vote = 1 AND reviewer = ? AND change_id IN (SELECT c.id FROM changes c JOIN tasks t ON t.id = c.task_id WHERE t.parent = ?)", actor.id, contestId);
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at, vote) VALUES (?, ?, 'approve', ?, '[]', ?, ?, 1)", ch.id, actor.id, `Voted for this attempt: ${body.reason}`, ch.head, Date.now());
+    // Comparing the attempts is the review: the voter's review requests on every attempt are answered.
+    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE reviewer = ? AND status IN ('open','accepted') AND change_id IN (SELECT c.id FROM changes c JOIN tasks t ON t.id = c.task_id WHERE t.parent = ?)", Date.now(), actor.id, contestId);
     this.emit("contest.voted", { actor: actor.id, task: contestId, change: ch.id, data: { change: ch.id, reason: body.reason, weight: this.weightOf(actor.id) } });
     await this.settleContest(contestId);
-    return this.contest(contestId);
+    // The vote's outcome, without every patch again (compare_attempts has those).
+    const view = await this.contest(contestId);
+    const decided = view.contest.status === "decided";
+    return {
+      voted: { change: ch.id, weight: this.weightOf(actor.id) },
+      contest: view.contest, standings: view.standings,
+      next: decided ? `Decided: change #${view.contest.winner} wins and goes to the merge queue.` : `Open: the leader needs ${view.contest.quorum} vote weight and a clear lead once every attempt is in. You can change your vote until then.`,
+    };
   }
 
   /** Decide a contest when the votes are in: every attempt being worked on has a change, and the leader has the quorum and a clear lead. */
@@ -2781,10 +2802,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const changes = new Set(this.sql.exec("SELECT id FROM changes WHERE agent_id = ?", agent).toArray().map((r) => r.id as number));
     // Changes this agent was asked to review: it hears when they're updated or merged.
     for (const r of this.sql.exec("SELECT change_id FROM review_requests WHERE reviewer = ? AND status IN ('open','accepted')", agent).toArray()) changes.add(r.change_id as number);
+    // Changes it reviewed: it hears whether they landed.
+    for (const r of this.sql.exec("SELECT DISTINCT change_id FROM reviews WHERE reviewer = ?", agent).toArray()) changes.add(r.change_id as number);
+    // Contests it has an attempt in or voted in: it hears the votes and the result.
+    for (const r of this.sql.exec("SELECT parent FROM tasks WHERE assignee = ? AND attempt = 1 UNION SELECT contest FROM contest_votes WHERE voter = ?", agent, agent).toArray()) tasks.add(r.parent as number);
     return (e) => {
       if (e.to_agent) return e.to_agent === agent;
       if (STEERING.has(e.type)) return true;
-      if (role === "reviewer" && (e.type === "review.requested" || e.type === "change.updated" || e.type === "contest.ready")) return true;
+      if (role === "reviewer" && (e.type === "review.requested" || e.type === "change.updated" || e.type === "contest.ready" || e.type === "contest.decided")) return true;
       return (e.task_id !== null && tasks.has(e.task_id)) || (e.change_id !== null && changes.has(e.change_id));
     };
   }
