@@ -104,11 +104,15 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (!path.startsWith("/auth/")) return null;
 
   if (path === "/auth/me") {
-    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env) });
+    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env) }, { headers: { "cache-control": "no-store" } });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {
-    return new Response(null, { status: 204, headers: { "set-cookie": setCookie(req, SESSION, "", 0) } });
+    // Expire the session cookie, and ask the browser to drop this site's cookies outright.
+    const headers = new Headers({ "cache-control": "no-store", "clear-site-data": '"cookies"' });
+    headers.append("set-cookie", setCookie(req, SESSION, "", 0));
+    headers.append("set-cookie", setCookie(req, STATE, "", 0));
+    return new Response(null, { status: 204, headers });
   }
 
   if (!signingSecret(env)) return Response.json({ error: "set LOOM_SECRET_KEY on the Worker first" }, { status: 503 });

@@ -57,7 +57,7 @@ function toast(msg) {
 // for agents' keys and for scripts.
 let user = null, auth = { github: false, dev: false }, notMember = false;
 async function loadUser() {
-  try { auth = await fetch("/auth/me").then((r) => r.json()); user = auth.user; } catch { user = null; }
+  try { auth = await fetch("/auth/me", { cache: "no-store" }).then((r) => r.json()); user = auth.user; } catch { user = null; }
 }
 async function signIn(key) {
   if (key) store.set(keyName(), key);
@@ -83,10 +83,10 @@ function renderMe() {
       ? `<span class="who-me">${face}${esc(user.login)} <span class="role">not a member</span></span><button id="signout" class="ghost">Sign out</button>`
       : `<button id="signin">Sign in</button>`;
   if ($("#signout")) $("#signout").onclick = async () => {
-    store.set(keyName(), null);
-    if (user) await fetch("/auth/logout", { method: "POST" });
-    user = null;
-    signIn();
+    // Sign out everywhere on this site: the GitHub session and any key pasted for any project.
+    try { for (const k of Object.keys(localStorage)) if (k.startsWith("loom-key:")) localStorage.removeItem(k); } catch {}
+    await fetch("/auth/logout", { method: "POST", cache: "no-store" }).catch(() => {});
+    location.reload();
   };
   else $("#signin").onclick = () => showSignIn();
   $("#controls").hidden = !isHuman();
