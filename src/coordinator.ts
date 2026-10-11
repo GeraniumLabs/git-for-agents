@@ -256,6 +256,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private setChecks(body: { command?: string | null; timeoutSec?: number } | null) {
     const command = body?.command?.trim() ?? "";
     if (command.length > 2000) throw new HttpError(400, "checks.command is too long");
+    if (command && !this.env.CHECKS && !this.env.ARTIFACTS_SHIM_URL) throw new HttpError(409, "this server has no check runner yet: it needs the CHECKS container binding");
     this.setMeta("checks_command", command);
     if (body?.timeoutSec !== undefined) {
       const t = Number(body.timeoutSec);
