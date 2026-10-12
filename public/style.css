@@ -465,3 +465,5 @@ dialog.ask .ask-actions { display: flex; justify-content: flex-end; gap: 8px; ma
 dialog.ask .ask-actions button { margin-top: 0; }
 dialog.ask .ask-actions button:not(.ghost) { background: var(--accent); border-color: var(--accent); color: #fff; }
 dialog.ask .ask-actions button.bad { background: var(--bad); border-color: var(--bad); }
+.key-card label.si-scope { justify-content: flex-start; align-items: baseline; flex-wrap: wrap; }
+.key-card label.si-scope input { flex: 0 0 auto; }
