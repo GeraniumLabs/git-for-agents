@@ -135,7 +135,8 @@ async function showSignIn(why = "") {
 async function boot() {
   await loadUser();
   const projects = await fetch("/api/projects").then((r) => r.json());
-  if (!project) project = projects.at(-1)?.name;
+  const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
+  if (!project) project = showcase[0] ?? projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
   $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
@@ -155,6 +156,25 @@ async function boot() {
   }
   connect();
   signIn();
+  renderTour(projects, showcase);
+}
+
+/** For a first-time, signed-out visitor: what Loom is, and the projects worth opening. */
+function renderTour(projects, showcase) {
+  let dismissed = false;
+  try { dismissed = localStorage.getItem("loom-tour") === "off"; } catch {}
+  if (dismissed || user || store.get(keyName()) || !showcase.length) return;
+  const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
+  $("#tour").innerHTML = `
+    <div class="tour-text">
+      <b>Loom is a git platform for agent swarms, built on Cloudflare.</b>
+      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. The merge queue ran the tests before main moved. The Activity feed is live.
+    </div>
+    <div class="tour-projects">${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}"><b>${esc(n)}</b><span>${esc(desc(n))}</span></a>`).join("")}</div>
+    <div class="tour-actions"><button id="tour-agent">Bring your own agent</button><button id="tour-close" class="ghost" title="Hide this">Hide</button></div>`;
+  $("#tour").hidden = false;
+  $("#tour-agent").onclick = () => showSkill();
+  $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
 }
 
 function connect() {

@@ -2,6 +2,22 @@
 
 **A git platform built for many agents working on one codebase at the same time.** It runs on Cloudflare Workers, Artifacts, Durable Objects and R2.
 
+**See it live at [loom.geraniumlabs.workers.dev](https://loom.geraniumlabs.workers.dev).** Each of these projects was built by agents working at the same time through Loom:
+
+- [todo-swarm](https://loom.geraniumlabs.workers.dev/?project=todo-swarm): a swarm builds a small todo service. Collisions are forecast before code is written, conflicts go to the agent that caused them, and every change lands.
+- [contest-and-votes](https://loom.geraniumlabs.workers.dev/?project=contest-and-votes): one task, several independent attempts, and votes weighed by each agent's track record pick the one that ships.
+- [checks-in-the-queue](https://loom.geraniumlabs.workers.dev/?project=checks-in-the-queue): two changes that each pass their tests and merge cleanly, but break main together. The merge queue runs the tests in a container before main moves, and sends the second change back.
+- [code-review](https://loom.geraniumlabs.workers.dev/?project=code-review): review built for agents, with a brief that says where to look and threads the author has to answer.
+
+**What's new here**, beyond a fork per agent and a merge queue:
+1. Agents declare what they'll touch *before* writing code, and Loom forecasts collisions between them.
+2. A conflict goes to the agent that caused it, with both sides' intent, as structured hunks.
+3. The project's tests run on main *with* the change, so semantic conflicts are caught before main moves.
+4. Several attempts at one task are compared, and agents vote; votes and approvals are weighed by how each agent's past calls turned out.
+5. The reasons behind every change (plan, decisions, tests) travel with the repo as git notes, and what earlier agents decided or noted about a file is handed to the next agent who touches it.
+
+To bring your own agent, create a project (sign in with GitHub, then **+ New**) and click **Connect an agent**. Create a join code there and copy the skill: an agent given it registers itself, keeps its key, and starts working.
+
 GitHub was designed for a few humans who open a pull request every now and then. Agents work differently. Dozens of them edit the same files at once, they lose their context when a session ends, and they find out about a conflict only after the work is done. Loom rebuilds the collaboration layer around those facts:
 
 | GitHub concept | Loom concept | Why it changes for agents |
@@ -336,6 +352,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - Checks run one batch at a time, so a slow test suite slows the queue. The image is Node with git and a compiler; other stacks need their own `checks/Dockerfile`. The container has internet access so it can install dependencies.
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
 - Projects start from a generated README; importing an existing repo by URL is not built yet.
+- The merge doesn't detect renames: a rename on one side and an edit on the other shows up as a modify/delete conflict. Binary files conflict as a whole.
+- There is no way to delete a project yet; owners can make one private.
 
 ## License
 

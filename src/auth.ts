@@ -116,7 +116,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (!path.startsWith("/auth/")) return null;
 
   if (path === "/auth/me") {
-    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env) }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean) }, { headers: { "cache-control": "no-store" } });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {

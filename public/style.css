@@ -431,3 +431,13 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--edge); border-
 .card.rq.person { border-left: 3px solid var(--warn); }
 .card.rq + .card.rq { margin-top: 6px; }
 .rv-page a:not(.button):not(.who) { color: var(--info); text-decoration: none; cursor: pointer; }
+
+/* First-visit tour for signed-out visitors. */
+.tour { margin: 14px 20px 0; padding: 14px 16px; background: var(--panel); border: 1px solid var(--edge); border-left: 3px solid var(--accent); border-radius: 8px; display: grid; gap: 12px; font-size: 13px; line-height: 1.5; }
+.tour[hidden] { display: none; }
+.tour-projects { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 8px; }
+.tour-projects a { display: grid; gap: 2px; padding: 8px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); text-decoration: none; }
+.tour-projects a:hover { border-color: var(--accent); }
+.tour-projects a.on { border-color: var(--accent); background: color-mix(in srgb, var(--accent) 8%, transparent); }
+.tour-projects span { color: var(--muted); font-size: 12px; }
+.tour-actions { display: flex; gap: 8px; }

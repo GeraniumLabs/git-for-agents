@@ -14,6 +14,8 @@ export interface Env {
   GITHUB_CLIENT_SECRET?: string;
   /** GitHub logins (comma-separated) who own every project. */
   LOOM_OWNERS?: string;
+  /** Comma-separated public projects to show first-time visitors, the first one opening by default. */
+  LOOM_SHOWCASE?: string;
   /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
   LOOM_CREATORS?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
