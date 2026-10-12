@@ -29,6 +29,8 @@ export interface BriefInput {
   sentBack: number;
   /** Open review threads that must be resolved before merge. */
   openThreads: number;
+  /** The decision model's judgment of whether the diff does what its intent declared, if the project asks for one. */
+  intentCheck?: { score: number; model: string } | null;
 }
 
 export interface BriefFile extends FileStat {
@@ -103,6 +105,12 @@ export function buildBrief(i: BriefInput): Brief {
   if (contested.length) reasons.push({ kind: "contested", text: "Other agents are working on the same files", files: contested });
   const unfamiliar = of("unfamiliar");
   if (unfamiliar.length) reasons.push({ kind: "unfamiliar", text: `The author is new to ${unfamiliar.length === 1 ? "this file" : "these files"}`, files: unfamiliar });
+  if (i.intentCheck) {
+    const p = Math.round(i.intentCheck.score * 100);
+    if (i.intentCheck.score < 0.5) { score += 3; reasons.push({ kind: "intent", text: `${i.intentCheck.model} doubts the diff does what its intent declared (${p}%)` }); }
+    else if (i.intentCheck.score < 0.85) { score += 1; reasons.push({ kind: "intent", text: `${i.intentCheck.model} isn't sure the diff sticks to its declared intent (${p}%)` }); }
+    else reasons.push({ kind: "ok", text: `${i.intentCheck.model} finds the diff matches its declared intent (${p}%)` });
+  }
   if (i.sentBack >= 2) { score += 1; reasons.push({ kind: "churn", text: `Sent back ${i.sentBack} times` }); }
   if (i.openThreads) reasons.push({ kind: "threads", text: `${i.openThreads} open thread${i.openThreads === 1 ? "" : "s"} must be resolved before it merges` });
 

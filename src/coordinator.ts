@@ -8,7 +8,7 @@ import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, t
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
-import { DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig, type Judge } from "./delegate";
+import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideQuestion, normalizeOptions, type DelegateConfig, type Judge } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
@@ -25,7 +25,7 @@ const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev"
 /** Project-wide events every agent hears about, whatever it is working on. */
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
-const NOTABLE = ["change.conflict", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"];
 /** Most queued changes merged together in one pass of the queue. */
@@ -133,6 +133,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN resolved_by TEXT",
       "ALTER TABLE threads ADD COLUMN default_answer TEXT",
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
+      "ALTER TABLE changes ADD COLUMN intent_check TEXT",
       "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
     ]) {
       try { this.sql.exec(ddl); } catch {}
@@ -283,6 +284,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** How much agents may ask of people: open questions per agent (0 = no limit), and how long a question with a default waits. */
+  /** Optional uses of the decision model beyond the deputy, each off by default. */
+  private get modelOptions(): { reviewers: boolean; intent: boolean } {
+    const o = JSON.parse(this.meta("model_options") ?? "{}");
+    return { reviewers: !!o.reviewers, intent: !!o.intent };
+  }
+
   private get questionRules(): { maxOpen: number; deadlineMinutes: number } {
     return { maxOpen: Number(this.meta("questions_max_open") ?? "3"), deadlineMinutes: Number(this.meta("questions_deadline_min") ?? "30") };
   }
@@ -411,6 +418,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       conflicts: c.conflicts ? JSON.parse(c.conflicts as string) : null,
       symbols: c.symbols ? JSON.parse(c.symbols as string) : {},
       checks: c.checks ? JSON.parse(c.checks as string) : null,
+      intent_check: c.intent_check ? JSON.parse(c.intent_check as string) : null,
     } as any;
   }
   private activeIntents(excludeAgent?: string) {
@@ -548,11 +556,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
+      if (body.model !== undefined) this.setMeta("model_options", JSON.stringify({ ...this.modelOptions, ...Object.fromEntries(Object.entries(body.model ?? {}).filter(([k]) => k === "reviewers" || k === "intent").map(([k, v]) => [k, !!v])) }));
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
@@ -588,7 +597,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
     if (a === "changes" && b && c === "reviewers" && d === "respond" && m === "POST") return json(this.respondToReview(actor, Number(b), body));
     if (a === "changes" && b && c === "reviewers" && d === "take" && m === "POST") return json(this.takeReview(actor, Number(b)));
-    if (a === "changes" && b && c === "reviewers" && m === "POST") return json(this.requestReviewers(actor, Number(b), body));
+    if (a === "changes" && b && c === "reviewers" && m === "POST") return json(await this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
@@ -1072,6 +1081,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .one();
     const id = row.id as number;
     await this.saveContext(id, actor, body, analysis.patch, analysis.head, analysis.snapshot);
+    await this.checkChangeIntent(id, analysis.patch);
     this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
     this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status } });
     if (status === "review") this.requestReview(id, actor.id);
@@ -1079,7 +1089,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const contest = this.openContest(body.taskId);
     if (contest) this.contestEntered(contest.id as number);
     // Who already knows this code, so the author can ask them to review it.
-    return { ...this.change(id), suggestedReviewers: status === "review" ? this.reviewerCandidates(id, 3) : [] };
+    return { ...this.change(id), suggestedReviewers: status === "review" ? await this.rankedCandidates(id, 3) : [] };
   }
 
   private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }) {
@@ -1097,6 +1107,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const prev = (await (await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
     const context = body.context && typeof body.context === "object" ? { ...prev, ...body.context } : prev;
     await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch, analysis.head, analysis.snapshot);
+    await this.checkChangeIntent(id, analysis.patch);
     const outdated = this.markOutdated(id, analysis.snapshot);
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
     if (status === "review") this.requestReview(id, actor.id);
@@ -1254,6 +1265,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
+      intentCheck: ch.intent_check?.head === ch.head ? ch.intent_check : null,
     });
   }
 
@@ -2308,7 +2320,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -2550,13 +2562,43 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return out.slice(0, limit);
   }
 
+  /**
+   * The best-placed reviewers. With the project's "model picks reviewers"
+   * option on, the decision model reorders the top few by who is best placed;
+   * otherwise (or if it fails) the familiarity score decides.
+   */
+  private async rankedCandidates(id: number, limit: number): Promise<Candidate[]> {
+    const pool = this.reviewerCandidates(id, Math.max(limit, 6));
+    if (!this.modelOptions.reviewers || pool.length < 2) return pool.slice(0, limit);
+    const ch = this.change(id);
+    const intent = this.sql.exec("SELECT description, paths FROM intents WHERE task_id = ?", ch.task_id).toArray().map((i) => `${i.description} (${JSON.parse(i.paths as string).join(", ")})`).join("; ");
+    const ranked = await rankReviewers(await this.judge(), { title: ch.title, summary: ch.summary ?? "", files: (ch.files as FileChange[]).map((f) => f.path), intent }, pool);
+    if (!ranked) return pool.slice(0, limit);
+    const p = ranked.probabilities;
+    return pool
+      .map((c) => ({ ...c, reasons: [...c.reasons, `${ranked.model} rates them ${Math.round((p[c.agent] ?? 0) * 100)}% best placed`] }))
+      .sort((x, y) => (p[y.agent] ?? 0) - (p[x.agent] ?? 0) || y.score - x.score)
+      .slice(0, limit);
+  }
+
+  /** With the project's "model checks intent" option on, judge whether the diff does what its task declared. */
+  private async checkChangeIntent(id: number, patch: string) {
+    if (!this.modelOptions.intent) return;
+    const ch = this.change(id);
+    const intent = this.sql.exec("SELECT description, paths FROM intents WHERE task_id = ?", ch.task_id).toArray().map((i) => `${i.description || "(no description)"} (${JSON.parse(i.paths as string).join(", ")})`).join("; ");
+    const v = await checkIntent(await this.judge(), { title: ch.title, summary: ch.summary ?? "", intent, patch }).catch(() => null);
+    if (!v) return;
+    this.sql.exec("UPDATE changes SET intent_check = ? WHERE id = ?", JSON.stringify({ ...v, head: ch.head, at: Date.now() }), id);
+    if (v.score < 0.5) this.emit("change.off_intent", { change: id, task: ch.task_id, to: ch.agent_id, data: { score: v.score, model: v.model, intent } });
+  }
+
   private reviewRequests(id: number): any[] {
     return this.sql.exec("SELECT * FROM review_requests WHERE change_id = ? ORDER BY created_at", id).toArray()
       .map((r) => ({ ...r, reviewerName: this.agentName(r.reviewer as string), requestedByName: this.agentName(r.requested_by as string) }));
   }
 
   /** Ask specific agents to review a change: named ones, or the best-placed few. */
-  private requestReviewers(actor: Agent, id: number, body: { reviewers?: string[]; count?: number; note?: string }) {
+  private async requestReviewers(actor: Agent, id: number, body: { reviewers?: string[]; count?: number; note?: string }) {
     const ch = this.change(id);
     if (ch.agent_id !== actor.id && actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "only the author or a human can request reviewers");
     if (!["review", "changes_requested"].includes(ch.status)) throw new HttpError(409, `change ${id} is ${ch.status}, not in review`);
@@ -2572,7 +2614,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     } else {
       const want = Math.max(1, Math.min(5, body.count ?? Math.max(1, this.requiredApprovals)));
       const open = new Set(this.reviewRequests(id).map((r) => r.reviewer as string));
-      picked = this.reviewerCandidates(id, want + open.size).filter((c) => !open.has(c.agent)).slice(0, want).map((c) => ({ agent: c.agent, reason: c.reasons[0] }));
+      picked = (await this.rankedCandidates(id, want + open.size)).filter((c) => !open.has(c.agent)).slice(0, want).map((c) => ({ agent: c.agent, reason: c.reasons[0] }));
     }
     for (const p of picked) this.assignReviewer(id, p.agent, actor.id, p.reason, body.note);
     return { requested: this.reviewRequests(id) };

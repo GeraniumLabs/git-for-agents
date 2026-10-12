@@ -181,3 +181,28 @@ test("questions for people: similar ones share a card, each agent has a limit, a
   assert.equal((await ada.req("GET", "/me")).questions.open, 1, "an answered question frees a slot");
   assert.ok((await admin.req("GET", "/overview")).health.people.defaultedLastHour >= 1);
 });
+
+test("decision model options: off by default, owners turn them on, and without a model reviews still route", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-model");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "model options", files: SEED, requiredApprovals: 1 });
+  assert.deepEqual((await admin.req("GET", "/overview")).project.model, { reviewers: false, intent: false });
+  const on = await admin.req("POST", "/settings", { model: { reviewers: true, intent: true, other: true } });
+  assert.deepEqual(on.model, { reviewers: true, intent: true });
+  assert.deepEqual((await admin.req("POST", "/settings", { model: { intent: false } })).model, { reviewers: true, intent: false });
+  await admin.req("POST", "/settings", { model: { intent: true } });
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  await admin.addAgent("rex", "reviewer");
+  const t = await ada.createTask("Comment db.js", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.req("POST", "/intents", { taskId: t.id, paths: ["src/db.js"], description: "add a comment" });
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// done\n" }, "c");
+  const ch = await ada.submit(t.id, t.title, "comment");
+  const asked = await ada.req("POST", `/changes/${ch.id}/reviewers`, { count: 1 });
+  assert.equal(asked.requested.length, 1, "the familiarity ranking still picks a reviewer");
+  const detail = await admin.req("GET", `/changes/${ch.id}`);
+  assert.equal(detail.intent_check, null, "no model here, so no intent judgment");
+});
