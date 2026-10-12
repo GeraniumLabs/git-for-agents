@@ -230,6 +230,15 @@ const STATES = [
   ["working", "working", "ok"], ["waiting", "waiting on a person", "warn"], ["conflict", "in conflict", "bad"],
   ["quiet", "quiet holding a task", "bad"], ["paused", "paused", "warn"], ["idle", "idle", ""], ["away", "away", ""],
 ];
+const STATE_HELP = {
+  working: "Holding a task and seen recently",
+  waiting: "Blocked on a question to a person",
+  conflict: "Its change hit a conflict it has to resolve",
+  quiet: "Holding a task but not seen for a while; listed under Stuck",
+  paused: "Paused by a person: it can still talk, but can't change code",
+  idle: "Around, with no task",
+  away: "Not seen recently, with no task",
+};
 function renderHealth() {
   const h = state.health;
   const t = h.tasks;
@@ -237,21 +246,21 @@ function renderHealth() {
   const total = open + active + review + merged || 1;
   const seg = (n, cls, label) => n ? `<span class="seg-${cls}" style="flex:${n}" title="${n} ${label}"></span>` : "";
   $("#health").innerHTML = `
-    <div class="tile wide">
+    <div class="tile wide" title="Agents in this project, by what they're doing now. Click a state to list those agents">
       <b>${h.agents.total}</b><span>agents</span>
-      <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
+      <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}" title="${STATE_HELP[k] ?? ""}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
     </div>
-    <div class="tile wide">
+    <div class="tile wide" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage">
       <b>${merged}<small>/${total === 1 && !merged ? 0 : total}</small></b><span>tasks landed</span>
       <div class="bar">${seg(merged, "ok", "landed")}${seg(review, "info", "in review or queued")}${seg(active, "warn", "in progress")}${seg(open, "muted", "open")}</div>
       <div class="meta">${open} open · ${active} in progress · ${review} in review or queued</div>
     </div>
-    <div class="tile"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
-    <div class="tile"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
-    <div class="tile"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
-    ${h.people ? `<div class="tile" title="${h.people.askedLastHour} asked this hour · ${h.people.answeredLastHour} answered by people · ${h.people.defaultedLastHour} went ahead on a default"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
-    <div class="tile"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
-    <div class="tile"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
+    <div class="tile" title="Changes waiting for review. Each is a task any agent can take (take_review); untaken ones are offered to agents who know the code"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
+    <div class="tile" title="Approved changes waiting to land on main. They land one batch at a time, after the project's checks pass"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
+    <div class="tile" title="Changes that landed on main in the last hour"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
+    ${h.people ? `<div class="tile" title="Questions agents asked people that are still open. This hour: ${h.people.askedLastHour} asked, ${h.people.answeredLastHour} answered by people, ${h.people.defaultedLastHour} went ahead on the agent's default. Limits are in Settings"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
+    <div class="tile" title="Share of merge attempts in the last hour that hit a conflict. Over 20% shows red: look at Where the work is"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
+    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
   for (const b of document.querySelectorAll("[data-state]")) b.onclick = () => showDirectory(b.dataset.state);
 }
 
@@ -638,9 +647,9 @@ async function showCode(target = {}) {
   if (list.error) return toast(list.error);
   $("#detail-body").innerHTML = `
     <h3>Code <small class="meta">${esc(target.label ?? `main · v${state.project.mainVersion}`)}</small></h3>
-    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}${keyQuery()}" download>Download zip</a><button class="ghost mini" id="code-clone">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
+    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}${keyQuery()}" download title="A snapshot of these files, without history">Download zip</a><button class="ghost mini" id="code-clone" title="A read-only git clone command with a token valid for an hour">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
     <div id="code-clone-box"></div>
-    <span class="seg" role="tablist"><button id="tab-files" class="on" role="tab">Files</button><button id="tab-history" role="tab">History</button></span>
+    <span class="seg" role="tablist"><button id="tab-files" class="on" role="tab" title="Browse the files">Files</button><button id="tab-history" role="tab" title="Every commit: merge commits for each landing, with the author's own commits under them">History</button></span>
     <div id="history" hidden></div>
     <div class="code-view">
       <div class="tree"><input id="tree-filter" placeholder="Filter ${list.files.length} files"><ol id="tree"></ol></div>
@@ -682,10 +691,12 @@ async function showSkill(joinCode) {
     <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
     ${isOwner() ? `<h2>Let agents register themselves</h2>
-    <div class="row"><select id="jc-role"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
+    <p class="meta">Best for a swarm. One join code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code. Limit how many agents may use it and for how long, and revoke it any time.</p>
+    <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
     ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
     <h2>Create a key</h2>
-    ${isOwner() ? `<div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
+    ${isOwner() ? `<p class="meta">For a single agent you set up yourself. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
+    <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
     <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
     <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
@@ -1147,7 +1158,7 @@ function drawReview() {
       <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
       <div class="meta">${who(c.agent_id)} wants to land this for task #${c.task.id} “${esc(c.task.title)}” · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
-      <div class="row"><button class="ghost mini" data-browse>Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone>Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
+      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
       <div id="clone-box"></div>
     </div>
     <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
@@ -1162,7 +1173,7 @@ function drawReview() {
       </aside>
       <section class="rv-diff">
         <div class="rv-tools">
-          <span class="seg"><button data-view="unified" class="${review.view === "unified" ? "on" : ""}">Unified</button><button data-view="split" class="${review.view === "split" ? "on" : ""}">Split</button></span>
+          <span class="seg"><button data-view="unified" class="${review.view === "unified" ? "on" : ""}" title="Old and new lines in one column">Unified</button><button data-view="split" class="${review.view === "split" ? "on" : ""}" title="Old on the left, new on the right">Split</button></span>
           ${review.lastMine ? `<span class="seg"><button data-since="0" class="${review.since ? "" : "on"}">All changes</button><button data-since="1" class="${review.since ? "on" : ""}">Since your review</button></span>` : ""}
           <span class="meta grow">${canReview ? "Click a line to comment on it." : !me ? "Sign in to review." : me.id === c.agent_id ? "Your own change: answer the threads on it." : ""}</span>
           ${open.length ? `<span class="pill changes_requested">${plural(open.length, ["open thread", "open threads"])}</span>` : ""}
@@ -1173,9 +1184,9 @@ function drawReview() {
         ${canReview ? `<div class="rv-submit panel">
           <textarea id="rv-body" rows="2" placeholder="Review summary (optional)"></textarea>
           <div class="row"><span class="meta grow" id="rv-pending"></span>
-            <button data-verdict="comment" class="ghost">Comment</button>
-            <button data-verdict="request_changes" class="ghost">Request changes</button>
-            <button data-verdict="approve">Approve</button></div>
+            <button data-verdict="comment" class="ghost" title="Send your line comments without a verdict">Comment</button>
+            <button data-verdict="request_changes" class="ghost" title="Send it back: the change can't merge until the author answers your threads and pushes again">Request changes</button>
+            <button data-verdict="approve" title="Count your approval toward the weight this change needs. A person's approval always counts one">Approve</button></div>
         </div>` : ""}
       </section>
       <aside class="rv-why">${whyPanel(c, rv)}</aside>
@@ -1201,7 +1212,7 @@ function fileBlock(f, i, b, threads, canReview) {
     <div class="rv-fhead"><b class="mono">${esc(f.path)}</b>${f.added ? ` <span class="pill merged">new</span>` : f.deleted ? ` <span class="pill conflict">deleted</span>` : ""}
       ${(b?.flags ?? []).map((x) => `<span class="flag ${x.kind}">${esc(x.text)}</span>`).join("")}
       <span class="grow"></span><span class="add">+${f.plus}</span> <span class="del">−${f.minus}</span>
-      ${f.deleted ? "" : `<button class="ghost mini" data-open="${esc(f.path)}">View file</button>`}</div>
+      ${f.deleted ? "" : `<button class="ghost mini" data-open="${esc(f.path)}" title="The whole file as this change leaves it">View file</button>`}</div>
     ${elsewhere.length ? `<div class="rv-orphans">${elsewhere.map((t) => threadHtml(t, true)).join("")}</div>` : ""}
     <div class="diffview rv-dv ${review.view}">${body}</div>
   </div>`;
@@ -1268,7 +1279,7 @@ function whyPanel(c, rv) {
   const asked = new Set(rv.requested.filter((r) => r.status === "open").map((r) => r.reviewer));
   const inReview = ["review", "changes_requested"].includes(c.status);
   return `
-    <section class="panel"><div class="panel-head"><h2>Approval</h2></div><div class="panel-body">${meter}</div></section>
+    <section class="panel"><div class="panel-head"><h2>Approval</h2><small title="${state?.project?.approvalMode === "count" ? "Every approval counts one (Settings)" : "Each agent's approval counts by its track record (Settings can make every approval count one). A person's approval always counts one"}">${state?.project?.approvalMode === "count" ? "every approval counts one" : "weighted by track record"}</small></div><div class="panel-body">${meter}</div></section>
     ${c.checks ? `<section class="panel"><div class="panel-head"><h2>Checks</h2><span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></div><div class="panel-body"><p class="meta"><span class="mono">${esc(c.checks.command)}</span> on main with this change${c.checks.alongside?.length ? ` after ${c.checks.alongside.map((x) => `#${x}`).join(", ")}` : ""}, ${Math.round(c.checks.ms / 100) / 10}s.</p>${c.checks.ok ? "" : `<pre class="diff">${esc(c.checks.output.slice(-3000))}</pre>`}</div></section>` : ""}
     <section class="panel"><div class="panel-head"><h2>Intent</h2><small>what it said it would touch</small></div><div class="panel-body">
       ${c.intents.length ? c.intents.map((i) => `<div>${esc(i.description)}</div><div class="mono meta">${i.paths.map(esc).join(", ")}</div>`).join("") : `<p class="meta">No intent was declared.</p>`}
@@ -1277,7 +1288,7 @@ function whyPanel(c, rv) {
     ${ctxHtml ? `<section class="panel"><div class="panel-head"><h2>What the agent says</h2><small>its plan and testing</small></div><div class="panel-body">${ctxHtml}</div></section>` : ""}
     <section class="panel"><div class="panel-head"><h2>Reviews</h2><small>${c.reviews.length ? "" : "none yet"}</small></div><div class="panel-body">${reviews || `<p class="meta">Nobody has reviewed it yet.</p>`}
       ${rv.requested.length ? `<h3>Asked to review</h3>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow"></span>${requestState(r)}</div>`).join("")}` : ""}
-      ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}
+      ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}" title="Send this agent a review request. If it doesn't answer in 5 minutes, Loom asks the next best agent">Ask</button>` : ""}</div>`).join("")}` : ""}
     </div></section>
     <section class="panel"><div class="panel-head"><h2>Commits</h2></div><div class="panel-body" id="change-commits"><p class="meta">Reading history…</p></div></section>`;
 }
@@ -1472,5 +1483,89 @@ $("#jev").onclose = async () => {
   });
   toast(`Saved ${field("name").value.trim() || "jev"}'s brief`);
 };
+
+// ── help: what each part of the page is for ─────────────────────────────
+const HELP = {
+  attention: "What only a person can settle: questions agents asked people, disputes jev couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
+  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a change nobody reviewed for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
+  discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
+  contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
+  flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",
+  contests: "A task with several independent attempts. Agents who didn't write one compare them and vote, and each vote is weighed by the voter's track record. The best-supported attempt lands and the others close with their context kept; a person can also pick.",
+  queue: "Approved changes wait here and land on main one batch at a time. If the project has checks, they run on main with the change before main moves, and a failure goes back to its author.",
+  areas: "Folders where agents are working now: agents with intents or changes there, changes in flight, and what landed or conflicted in the last hour. Many agents in one folder is where collisions come from. Click a folder to search it.",
+  decisions: "What people decided: answers to agents' questions, directives, rulings, requests for changes and rules recorded here. Each is tied to the files it covers, and agents get it when they declare an intent on those files. Retire one that no longer holds.",
+  notes: "What agents learned and left for the next agent on the same files, through remember or the notes in a change's context. Agents rate the notes they relied on.",
+  activity: "Everything happening, live. Notable shows what a person would want to see; Everything adds routine agent traffic. Filter by an agent, a file or #change.",
+};
+for (const h of document.querySelectorAll("h2[data-help]")) {
+  const text = HELP[h.dataset.help];
+  if (!text) continue;
+  const b = document.createElement("button");
+  b.className = "help-dot";
+  b.type = "button";
+  b.textContent = "?";
+  b.title = text;
+  b.setAttribute("aria-label", `About ${h.textContent}`);
+  b.onclick = () => {
+    const head = h.closest(".panel-head");
+    const open = head.nextElementSibling?.classList.contains("panel-help");
+    if (open) head.nextElementSibling.remove();
+    else head.insertAdjacentHTML("afterend", `<p class="panel-help">${esc(text)}</p>`);
+  };
+  h.after(b);
+}
+
+// Status words carry their meaning on hover, wherever they appear.
+const STATUS_HELP = {
+  open: "Nobody has claimed it yet", claimed: "An agent is working on it", blocked: "Waiting on an answer from a person",
+  review: "Submitted and waiting for review", "in review": "Submitted and waiting for review", in_review: "Submitted and waiting for review",
+  queued: "Approved; waiting in the merge queue", merging: "Landing on main now", merged: "Landed on main", landed: "Landed on main",
+  conflict: "Clashed with main; its author has to resolve it", "changes requested": "A reviewer asked for changes", changes_requested: "A reviewer asked for changes",
+  "checks failed": "The project's checks failed on main with this change; it went back to its author", checks_failed: "The project's checks failed on main with this change; it went back to its author",
+  closed: "Closed without landing; its context is kept", abandoned: "Given up; its context is kept", voting: "Agents are comparing attempts and voting",
+  decided: "The contest is decided", won: "This attempt won and landed", pending: "Not sent yet: submit your review to send it",
+  outdated: "The line changed since this comment", new: "A new file", deleted: "A deleted file",
+};
+const explain = (root) => {
+  for (const el of root.querySelectorAll?.(".pill:not([title])") ?? []) {
+    const t = STATUS_HELP[el.textContent.trim().toLowerCase()];
+    if (t) el.title = t;
+  }
+};
+new MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes) if (n.nodeType === 1) { if (n.matches?.(".pill")) explain(n.parentElement ?? n); else explain(n); } })
+  .observe(document.body, { childList: true, subtree: true });
+
+/** How Loom works, in one place: the ideas behind the page. */
+function showHelp() {
+  const item = (t, d) => `<div class="gl"><b>${t}</b><div>${d}</div></div>`;
+  $("#detail-body").innerHTML = `
+    <h3>How Loom works</h3>
+    <p class="meta">Loom is a git platform for many agents working on one codebase at the same time. People steer; agents do the work. Hover over anything on the page to see what it means, or click the <b>?</b> beside a panel's title.</p>
+    <h2>Agents' work</h2>
+    ${item("Task", "A unit of work. An agent claims it and gets its own <b>workspace</b>: a fork of main only it can write to.")}
+    ${item("Intent", "Before writing code, an agent declares the files it will touch. Loom checks that against everyone else's and warns both agents of a <b>collision</b> before either has written anything.")}
+    ${item("Proposal", "When a collision is forecast, one agent proposes a split (who keeps which files) or an order (who lands first). Loom enforces what the other accepts.")}
+    ${item("Change", "What an agent submits: its commits plus its context (plan, decisions, what it tested). Reviewers see why, not just what.")}
+    ${item("Conflict", "When a change clashes with main, the clashing hunks, the change that caused them and its intent go to the agent that has to fix it.")}
+    ${item("Merge queue", "Approved changes land on main one batch at a time. With <b>checks</b> set, the project's tests run on main with the change first, so two changes that each pass can't break main together.")}
+    ${item("Contest", "Several agents attempt one task independently. Others compare the attempts and vote, and the best-supported one lands.")}
+    <h2>Review and trust</h2>
+    ${item("Review", "Reviews are tasks agents take. Loom suggests reviewers who already know the functions that changed, and each change has a <b>brief</b> saying where to look and whether a person should.")}
+    ${item("Review thread", "A line comment the author has to answer or resolve before the change merges.")}
+    ${item("Track record", "Each agent's approvals and votes are weighed by how its earlier calls turned out. A newcomer counts as one; a person always does.")}
+    ${item("Protected paths", "Changes touching them need a person's approval, however many agents approve.")}
+    <h2>Memory</h2>
+    ${item("Decision", "Anything a person decided: answers, directives, rulings, rules recorded by hand. Tied to the files it covers and handed to agents who touch them.")}
+    ${item("Note", "Something an agent learned and left for the next agent on those files.")}
+    ${item("Git notes", "Each landing writes its reasons to <span class=\"mono\">refs/notes/loom</span>, so a plain clone of main carries why.")}
+    <h2>People</h2>
+    ${item("Needs a person", "The only things that wait for you. Agents can ask with a default and go ahead on it if nobody answers in time; each agent may have only a few questions open (Settings).")}
+    ${item("Directive", "An instruction to one agent or all of them, followed over their own plan and kept as a decision.")}
+    ${item("jev", "A stand-in you brief (Delegate…) to answer questions, approve protected changes or settle disputes within your guidance. It hands everything else to a person, with the reason.")}
+    ${item("Pause and freeze", "Pause an agent from its profile: it can still talk but not change code. Freeze main to stop anything landing.")}`;
+  if (!$("#detail").open) $("#detail").showModal();
+}
+$("#help-open").onclick = () => showHelp();
 
 boot();
