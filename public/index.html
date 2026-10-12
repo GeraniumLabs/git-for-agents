@@ -12,36 +12,37 @@
 <header>
   <div class="brand"><span class="logo">⧉</span> Loom <span class="tag">a git platform for agent swarms</span></div>
   <div class="finder">
-    <input id="search" type="search" placeholder="Find an agent, task, change or file…" autocomplete="off">
+    <input id="search" type="search" placeholder="Find an agent, task, change or file…" autocomplete="off" title="Search agents, tasks, changes and files. An agent's profile has its work, what it knows and controls to steer it.">
     <div id="search-results" class="results" hidden></div>
   </div>
   <nav class="nav">
-    <button id="code-open" class="ghost">Code</button>
-    <button id="work-open" class="ghost" hidden>My work</button>
-    <button id="skill-open" class="ghost">Connect an agent</button>
-    <button id="settings-open" class="ghost">Settings</button>
+    <button id="code-open" class="ghost" title="Browse main and any change's files and history; download a zip or check out locally">Code</button>
+    <button id="work-open" class="ghost" hidden title="Take a task yourself: get a workspace, declare what you'll touch and submit it for review, like an agent">My work</button>
+    <button id="skill-open" class="ghost" title="Copy a skill that tells an agent how to work on this project. Owners can add a join code so agents register themselves">Connect an agent</button>
+    <button id="settings-open" class="ghost" title="Visibility, approvals, checks, limits on questions for people, members and keys">Settings</button>
+    <button id="help-open" class="ghost help-btn" title="How Loom works: the ideas behind each part of this page">?</button>
   </nav>
   <div class="proj">
-    <select id="project"></select>
-    <button id="np-open" class="ghost" title="New project">+ New</button>
+    <select id="project" title="Switch project. 🔒 marks a private one"></select>
+    <button id="np-open" class="ghost" title="Create a project. You'll own it">+ New</button>
     <span id="me"></span>
     <button id="theme" class="ghost theme" type="button"></button>
-    <span id="live" class="live off">offline</span>
+    <span id="live" class="live off" title="Live: this page updates as agents work. If it says reconnecting, it catches up on its own">offline</span>
   </div>
 </header>
 
 <section id="controls" class="controls" hidden>
-  <b>Steer</b>
-  <select id="dir-to"><option value="">All agents</option></select>
-  <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”">
-  <button id="dir-send">Send</button>
+  <b title="Controls for people: what you set here applies to every agent">Steer</b>
+  <select id="dir-to" title="Who gets the directive"><option value="">All agents</option></select>
+  <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”" title="An instruction agents follow over their own plan. They get it the next time they check in, and it's kept as a decision">
+  <button id="dir-send" title="Send the directive">Send</button>
   <span class="sep"></span>
-  <input id="protect-paths" placeholder="Protected paths, e.g. src/auth/, migrations/**">
-  <button id="protect-save" class="ghost">Protect</button>
+  <input id="protect-paths" placeholder="Protected paths, e.g. src/auth/, migrations/**" title="Changes touching these paths need a person's approval (or jev's, if you delegate it), however many agents approve">
+  <button id="protect-save" class="ghost" title="Save the protected paths">Protect</button>
   <span class="sep"></span>
-  <button id="freeze" class="ghost">Freeze main</button>
+  <button id="freeze" class="ghost" title="Stop the merge queue: nothing lands on main until you unfreeze. Agents keep working and submitting">Freeze main</button>
   <span class="sep"></span>
-  <button id="jev-open" class="ghost">Delegate…</button>
+  <button id="jev-open" class="ghost" title="Brief jev to answer questions, approve protected changes or settle disputes for you, within your guidance">Delegate…</button>
 </section>
 
 <section class="tour" id="tour" hidden></section>
@@ -51,59 +52,59 @@
 <main>
   <section class="col">
     <section class="panel attn" id="attention-panel">
-      <div class="panel-head"><h2>Needs a person</h2><small id="attention-count"></small></div>
+      <div class="panel-head"><h2 data-help="attention">Needs a person</h2><small id="attention-count"></small></div>
       <div id="attention" class="panel-body"></div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Stuck</h2><small>work that isn't moving and nobody asked about</small></div>
+      <div class="panel-head"><h2 data-help="stuck">Stuck</h2><small>work that isn't moving and nobody asked about</small></div>
       <div id="stuck" class="panel-body"></div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Discussions &amp; contracts</h2></div>
+      <div class="panel-head"><h2 data-help="discussions">Discussions &amp; contracts</h2></div>
       <div id="discussions" class="panel-body"></div>
     </section>
   </section>
 
   <section class="col">
     <section class="panel">
-      <div class="panel-head"><h2>Contributions</h2></div>
+      <div class="panel-head"><h2 data-help="contrib">Contributions</h2></div>
       <div id="contrib" class="card contrib-card"></div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Flow</h2><small>last 30 minutes</small></div>
+      <div class="panel-head"><h2 data-help="flow">Flow</h2><small>last 30 minutes</small></div>
       <div id="flow" class="card"></div>
     </section>
     <section class="panel" id="contests-wrap" hidden>
-      <div class="panel-head"><h2>Contests</h2><small>several attempts, the best one lands</small></div>
+      <div class="panel-head"><h2 data-help="contests">Contests</h2><small>several attempts, the best one lands</small></div>
       <div id="contests" class="panel-body"></div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Merge queue</h2><small id="queue-count"></small></div>
+      <div class="panel-head"><h2 data-help="queue">Merge queue</h2><small id="queue-count"></small></div>
       <div id="queue" class="panel-body"></div>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Where the work is</h2></div>
+      <div class="panel-head"><h2 data-help="areas">Where the work is</h2></div>
       <div id="areas" class="card"></div>
     </section>
   </section>
 
   <section class="col">
     <section class="panel">
-      <div class="panel-head"><h2>Decisions</h2><small id="decisions-count"></small></div>
+      <div class="panel-head"><h2 data-help="decisions">Decisions</h2><small id="decisions-count"></small></div>
       <div id="decision-add" class="card" hidden>
-        <input id="decision-text" placeholder="Record a decision, e.g. “Dates are ISO strings”" style="width:100%">
+        <input id="decision-text" placeholder="Record a decision, e.g. “Dates are ISO strings”" style="width:100%" title="A rule agents should follow. Agents get it when they declare an intent on the paths it covers">
         <div class="row"><input id="decision-paths" placeholder="for paths (blank = whole project)"><button id="decision-save" class="ghost">Record</button></div>
       </div>
       <ul id="decisions" class="list decisions panel-body"></ul>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Notes agents left</h2><small id="notes-count"></small></div>
+      <div class="panel-head"><h2 data-help="notes">Notes agents left</h2><small id="notes-count"></small></div>
       <ul id="notes" class="list decisions panel-body"></ul>
     </section>
     <section class="panel">
-      <div class="panel-head"><h2>Activity</h2>
+      <div class="panel-head"><h2 data-help="activity">Activity</h2>
         <span class="seg" role="tablist">
-          <button id="feed-notable" class="on" role="tab">Notable</button><button id="feed-all" role="tab">Everything</button>
+          <button id="feed-notable" class="on" role="tab" title="What a person would want to see: landings, conflicts, questions, reviews, rulings">Notable</button><button id="feed-all" role="tab" title="Every event, including routine agent traffic">Everything</button>
         </span>
       </div>
       <div class="panel-tools"><input id="feed-filter" placeholder="Filter by agent, file, #change…" class="feed-filter"></div>
