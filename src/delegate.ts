@@ -1,12 +1,13 @@
-// jev: a stand-in for the project's humans, backed by TypeSafe's Jev model
-// (https://docs.typesafe.ai). Jev doesn't write text; it returns typed
-// judgments with probabilities. So jev never invents an answer: it picks one of
+// deputy: a stand-in for the project's humans, backed by a decision model:
+// Cloudflare's Clef on Workers AI, or TypeSafe's Jev (https://docs.typesafe.ai)
+// with a key. Neither writes text; they return typed judgments with
+// probabilities. So the deputy never invents an answer: it picks one of
 // the options an agent offered, or judges a protected change against the
-// humans' written guidance, and acts only when Jev is confident enough.
+// humans' written guidance, and acts only when the model is confident enough.
 // Everything else goes to a person, with the reason.
 //
-// People decide what jev may handle (its scopes, thresholds, house rules and
-// guidance). Code owns the workflow; Jev answers narrow questions inside it.
+// People decide what the deputy may handle (its scopes, thresholds, house rules and
+// guidance). Code owns the workflow; the model answers narrow questions inside it.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { matches } from "./paths";
@@ -15,27 +16,27 @@ import { sameQuestion, type Decision } from "./memory";
 export interface DelegateConfig {
   enabled: boolean;
   name: string;
-  /** Principles and preferences jev judges by, written by the humans. */
+  /** Principles and preferences the deputy judges by, written by the humans. */
   guidance: string;
   questions: {
     enabled: boolean;
     /** Only questions mentioning one of these words; empty means any topic. */
     topics: string[];
-    /** How sure Jev must be (0-1) before jev picks an option. */
+    /** How sure the model must be (0-1) before the deputy picks an option. */
     minConfidence: number;
   };
   approvals: {
     enabled: boolean;
-    /** Protected paths jev may approve on the humans' behalf. */
+    /** Protected paths the deputy may approve on the humans' behalf. */
     paths: string[];
     /** Also require at least one approving agent review first. */
     requireAgentReview: boolean;
-    /** How sure Jev must be (0-1) that the change follows the guidance. */
+    /** How sure the model must be (0-1) that the change follows the guidance. */
     minConfidence: number;
   };
   disputes: {
     enabled: boolean;
-    /** How sure Jev must be (0-1) before jev rules between two agents. */
+    /** How sure the model must be (0-1) before the deputy rules between two agents. */
     minConfidence: number;
   };
   /** Canned answers: when a question matches `pattern` (a regex), answer with `answer`. */
@@ -44,7 +45,7 @@ export interface DelegateConfig {
 
 export const DEFAULT_DELEGATE: DelegateConfig = {
   enabled: false,
-  name: "jev",
+  name: "deputy",
   guidance: "",
   questions: { enabled: true, topics: [], minConfidence: 0.85 },
   approvals: { enabled: false, paths: [], requireAgentReview: true, minConfidence: 0.9 },
@@ -55,12 +56,19 @@ export const DEFAULT_DELEGATE: DelegateConfig = {
 export interface Judge {
   apiKey?: string;
   url?: string;
-  /** Whose judge Jev uses: TypeSafe's System One, or Claude with the same questions. */
-  provider?: "typesafe" | "anthropic";
+  /** Workers AI, for Clef. */
+  ai?: Ai;
+  /** The deputy's judge: TypeSafe's System One, Cloudflare's Clef (same API, on Workers AI), or Claude with the same questions. */
+  provider?: "typesafe" | "clef" | "anthropic";
+}
+
+/** The model behind a judge, by the name people know it by. */
+export function judgeName(judge: Judge): string {
+  return judge.provider === "anthropic" ? "Claude" : judge.provider === "clef" ? "Clef" : "Jev";
 }
 
 export type Verdict =
-  | { act: true; answer: string; via: "rule" | "jev" | "precedent"; scores?: Record<string, number>; option?: string; decision?: number }
+  | { act: true; answer: string; via: "rule" | "model" | "precedent"; model?: string; scores?: Record<string, number>; option?: string; decision?: number }
   | { act: false; reason: string; scores?: Record<string, number> };
 
 /** Turn an agent's options (a list, or option → description) into Choice criteria. */
@@ -78,7 +86,7 @@ export function normalizeOptions(raw: unknown): Record<string, string> | null {
 
 const pct = (x: number) => `${Math.round(x * 100)}%`;
 
-/** Decide whether jev can settle a question, and how: house rules, then precedent, then Jev. */
+/** Decide whether the deputy can settle a question, and how: house rules, then precedent, then the model. */
 export async function decideQuestion(
   cfg: DelegateConfig,
   q: { question: string; options: Record<string, string> | null; task: string; precedents: Decision[] },
@@ -99,8 +107,8 @@ export async function decideQuestion(
   const same = q.precedents.find((d) => d.kind === "answer" && sameQuestion(d.question, q.question));
   if (same) return { act: true, answer: cite(same), via: "precedent", decision: same.id };
 
-  if (!judge.apiKey) {
-    return { act: false, reason: q.options ? "no house rule or earlier decision covers it (Jev isn't connected: add a key in Settings)" : "no house rule or earlier decision covers it" };
+  if (!judge.provider) {
+    return { act: false, reason: q.options ? "no house rule or earlier decision covers it (no decision model is connected: add a key in Settings)" : "no house rule or earlier decision covers it" };
   }
   const precedents = q.precedents.slice(0, 12);
   if (!q.options && !precedents.length) return { act: false, reason: `no house rule or earlier decision covers it, and the question offers no options for ${cfg.name} to pick from` };
@@ -142,29 +150,30 @@ export async function decideQuestion(
   }, questions);
   if (!res.ok) return { act: false, reason: res.reason };
   const a = res.answers as Record<string, any>;
+  const M = judgeName(judge);
   const stakes = a.high_stakes.noul as number;
   const scores: Record<string, number> = { highStakes: stakes };
-  if (stakes >= 0.5) return { act: false, reason: `Jev judges this high-stakes (${pct(stakes)})`, scores };
+  if (stakes >= 0.5) return { act: false, reason: `${M} judges this high-stakes (${pct(stakes)})`, scores };
 
   if (a.precedent) {
     scores.precedent = a.precedent.confidence;
     const d = precedents.find((p) => `d${p.id}` === a.precedent.choice);
     if (d && a.precedent.confidence >= min) {
-      return { act: true, answer: `${cite(d)} Jev is ${pct(a.precedent.confidence)} sure that decision covers this.`, via: "precedent", decision: d.id, scores };
+      return { act: true, answer: `${cite(d)} ${M} is ${pct(a.precedent.confidence)} sure that decision covers this.`, via: "precedent", model: M, decision: d.id, scores };
     }
   }
   if (!a.pick) {
-    return { act: false, reason: a.precedent?.choice !== "none" ? `Jev isn't sure an earlier decision covers this (${pct(a.precedent.confidence)}, needs ${pct(min)})` : "no earlier decision covers it, and the question offers no options to pick from", scores };
+    return { act: false, reason: a.precedent?.choice !== "none" ? `${M} isn't sure an earlier decision covers this (${pct(a.precedent.confidence)}, needs ${pct(min)})` : "no earlier decision covers it, and the question offers no options to pick from", scores };
   }
   const pick = a.pick, settled = a.settled.noul as number;
   Object.assign(scores, { confidence: pick.confidence, settled });
-  if (settled < min) return { act: false, reason: `Jev isn't sure the guidance covers this (${pct(settled)}, needs ${pct(min)})`, scores };
-  if (pick.confidence < min) return { act: false, reason: `Jev leans to “${pick.choice}” but is only ${pct(pick.confidence)} sure (needs ${pct(min)})`, scores };
+  if (settled < min) return { act: false, reason: `${M} isn't sure the guidance covers this (${pct(settled)}, needs ${pct(min)})`, scores };
+  if (pick.confidence < min) return { act: false, reason: `${M} leans to “${pick.choice}” but is only ${pct(pick.confidence)} sure (needs ${pct(min)})`, scores };
   const why = q.options![pick.choice] && q.options![pick.choice] !== pick.choice ? ` (${q.options![pick.choice]})` : "";
   return {
     act: true,
-    answer: `Go with “${pick.choice}”${why}. I picked it from your options going by the team's guidance; Jev is ${pct(pick.confidence)} sure. Ask again if it doesn't fit.`,
-    via: "jev",
+    answer: `Go with “${pick.choice}”${why}. I picked it from your options going by the team's guidance; ${M} is ${pct(pick.confidence)} sure. Ask again if it doesn't fit.`,
+    via: "model", model: M,
     option: pick.choice,
     scores,
   };
@@ -172,7 +181,7 @@ export async function decideQuestion(
 
 const cite = (d: Decision) => `Already decided (decision #${d.id}, by ${d.byName ?? d.by}): “${d.decision.replace(/[.\s]+$/, "")}.”`;
 
-/** Decide whether jev can rule between two agents' positions. */
+/** Decide whether the deputy can rule between two agents' positions. */
 export async function decideDispute(
   cfg: DelegateConfig,
   d: { question: string; positions: Record<string, string>; task: string; precedents: Decision[] },
@@ -180,7 +189,7 @@ export async function decideDispute(
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
   if (!cfg.disputes.enabled) return { act: false, reason: `${cfg.name} isn't allowed to settle disputes` };
-  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (add a key in Settings), so a person has to rule" };
+  if (!judge.provider) return { act: false, reason: "no decision model is connected (add a key in Settings), so a person has to rule" };
   if (!cfg.guidance.trim() && !d.precedents.length) return { act: false, reason: `the humans haven't written guidance for ${cfg.name}, and nothing earlier was decided here` };
   const min = cfg.disputes.minConfidence;
   const res = await systemOne(judge, {
@@ -207,15 +216,16 @@ export async function decideDispute(
     },
   });
   if (!res.ok) return { act: false, reason: res.reason };
+  const M = judgeName(judge);
   const ruling = res.answers.ruling, settled = res.answers.settled.noul, stakes = res.answers.high_stakes.noul;
   const scores = { confidence: ruling.confidence, settled, highStakes: stakes };
-  if (stakes >= 0.5) return { act: false, reason: `Jev judges this high-stakes (${pct(stakes)})`, scores };
-  if (settled < min) return { act: false, reason: `Jev isn't sure the guidance settles this (${pct(settled)}, needs ${pct(min)})`, scores };
-  if (ruling.confidence < min) return { act: false, reason: `Jev leans to ${ruling.choice} but is only ${pct(ruling.confidence)} sure (needs ${pct(min)})`, scores };
-  return { act: true, option: ruling.choice, answer: `The team's guidance supports ${ruling.choice}'s position; Jev is ${pct(ruling.confidence)} sure.`, via: "jev", scores };
+  if (stakes >= 0.5) return { act: false, reason: `${M} judges this high-stakes (${pct(stakes)})`, scores };
+  if (settled < min) return { act: false, reason: `${M} isn't sure the guidance settles this (${pct(settled)}, needs ${pct(min)})`, scores };
+  if (ruling.confidence < min) return { act: false, reason: `${M} leans to ${ruling.choice} but is only ${pct(ruling.confidence)} sure (needs ${pct(min)})`, scores };
+  return { act: true, option: ruling.choice, answer: `The team's guidance supports ${ruling.choice}'s position; ${M} is ${pct(ruling.confidence)} sure.`, via: "model", model: M, scores };
 }
 
-/** Decide whether jev can approve a change that touches protected paths. */
+/** Decide whether the deputy can approve a change that touches protected paths. */
 export async function decideApproval(
   cfg: DelegateConfig,
   c: { guarded: string[]; agentApprovals: number; undeclared: string[]; title: string; summary: string; intent: string; patch: string },
@@ -228,7 +238,7 @@ export async function decideApproval(
   const outside = c.guarded.filter((f) => !cfg.approvals.paths.some((p) => matches(p, f)));
   if (outside.length) return { act: false, reason: `${outside.join(", ")} is outside the paths ${cfg.name} may approve` };
   if (c.undeclared.length) return { act: false, reason: `the change touches files outside its declared intent (${c.undeclared.join(", ")})` };
-  if (!judge.apiKey) return { act: false, reason: "Jev isn't connected (add a key in Settings), so a person has to look" };
+  if (!judge.provider) return { act: false, reason: "no decision model is connected (add a key in Settings), so a person has to look" };
 
   const min = cfg.approvals.minConfidence;
   const res = await systemOne(judge, {
@@ -252,15 +262,16 @@ export async function decideApproval(
     },
   });
   if (!res.ok) return { act: false, reason: res.reason };
+  const M = judgeName(judge);
   const follows = res.answers.follows_guidance.noul, honest = res.answers.does_what_it_says.noul, risky = res.answers.risky.noul;
   const scores = { followsGuidance: follows, doesWhatItSays: honest, risky };
-  if (risky >= 1 - min) return { act: false, reason: `Jev flags the diff as risky (${pct(risky)})`, scores };
-  if (follows < min) return { act: false, reason: `Jev isn't sure it follows the guidance (${pct(follows)}, needs ${pct(min)})`, scores };
-  if (honest < min) return { act: false, reason: `Jev isn't sure the diff only does what it says (${pct(honest)}, needs ${pct(min)})`, scores };
+  if (risky >= 1 - min) return { act: false, reason: `${M} flags the diff as risky (${pct(risky)})`, scores };
+  if (follows < min) return { act: false, reason: `${M} isn't sure it follows the guidance (${pct(follows)}, needs ${pct(min)})`, scores };
+  if (honest < min) return { act: false, reason: `${M} isn't sure the diff only does what it says (${pct(honest)}, needs ${pct(min)})`, scores };
   return {
     act: true,
-    answer: `Approved for the humans: ${c.guarded.join(", ")} is in my scope, and Jev judges the diff consistent with the guidance (${pct(follows)}), true to its summary (${pct(honest)}) and low-risk (${pct(1 - risky)}).`,
-    via: "jev",
+    answer: `Approved for the humans: ${c.guarded.join(", ")} is in my scope, and ${M} judges the diff consistent with the guidance (${pct(follows)}), true to its summary (${pct(honest)}) and low-risk (${pct(1 - risky)}).`,
+    via: "model", model: M,
     scores,
   };
 }
@@ -283,6 +294,7 @@ async function systemOne<Q extends Record<string, Question>>(
   questions: Q,
 ): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
   if (judge.provider === "anthropic") return claudeOne(judge, state, questions);
+  if (judge.provider === "clef") return clefOne(judge, state, questions);
   const url = judge.url ?? "https://api.typesafe.ai/v1/systemone";
   for (let attempt = 0; ; attempt++) {
     try {
@@ -295,13 +307,40 @@ async function systemOne<Q extends Record<string, Question>>(
         await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
         continue;
       }
-      if (!res.ok) return { ok: false, reason: `Jev unavailable (HTTP ${res.status})` };
+      if (!res.ok) return { ok: false, reason: `Jev (TypeSafe) unavailable (HTTP ${res.status})` };
       const out = (await res.json()) as { answers?: Answers<Q> };
-      if (!out.answers || Object.keys(questions).some((k) => !(k in out.answers!))) return { ok: false, reason: "Jev returned an incomplete answer" };
+      if (!out.answers || Object.keys(questions).some((k) => !(k in out.answers!))) return { ok: false, reason: "Jev (TypeSafe) returned an incomplete answer" };
       return { ok: true, answers: out.answers };
     } catch (e: any) {
       if (attempt < 2) continue;
-      return { ok: false, reason: `Jev unavailable (${String(e?.message ?? e).slice(0, 80)})` };
+      return { ok: false, reason: `Jev (TypeSafe) unavailable (${String(e?.message ?? e).slice(0, 80)})` };
+    }
+  }
+}
+
+// ── the same questions, judged by Clef on Workers AI ─────────────────────
+// Cloudflare's decision model takes System One requests as they are and
+// answers with the same per-option probabilities, so no key is needed.
+
+const CLEF_MODEL = "@cf/cloudflare/clef";
+
+async function clefOne<Q extends Record<string, Question>>(
+  judge: Judge,
+  state: unknown,
+  questions: Q,
+): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const out = (await (judge.ai as any).run(CLEF_MODEL, { model: "clef", state, questions })) as { answers?: Answers<Q>; result?: { answers?: Answers<Q> } };
+      const answers = out?.answers ?? out?.result?.answers;
+      if (!answers || Object.keys(questions).some((k) => !(k in answers))) return { ok: false, reason: "Clef returned an incomplete answer" };
+      return { ok: true, answers };
+    } catch (e: any) {
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+        continue;
+      }
+      return { ok: false, reason: `Clef unavailable (${String(e?.message ?? e).slice(0, 80)})` };
     }
   }
 }
@@ -313,7 +352,7 @@ async function systemOne<Q extends Record<string, Question>>(
 // output keeps the reply to exactly that shape.
 
 const JUDGE_MODEL = "claude-opus-5-5";
-const JUDGE_SYSTEM = `You are Jev, judging on behalf of a software project's human leads so their agents don't wait on them for routine calls.
+const JUDGE_SYSTEM = `You are a decision model judging on behalf of a software project's human leads so their agents don't wait on them for routine calls.
 You get the situation as JSON and a set of questions about it. Answer every question.
 - For a yes/no question, give the probability (0 to 1) that its "true" criterion holds.
 - For a choice question, give the key of the option you pick and your confidence (0 to 1) that the leads would pick it.
@@ -343,22 +382,22 @@ async function claudeOne<Q extends Record<string, Question>>(
     });
     if (res.stop_reason === "refusal") return { ok: false, reason: "Claude declined to judge this" };
     const text = res.content.find((b) => b.type === "text");
-    if (!text || text.type !== "text") return { ok: false, reason: "Jev returned no answer" };
+    if (!text || text.type !== "text") return { ok: false, reason: "Claude returned no answer" };
     const raw = JSON.parse(text.text) as Record<string, any>;
     const answers: Record<string, Answer> = {};
     const clamp = (n: unknown) => Math.max(0, Math.min(1, Number(n) || 0));
     for (const [k, q] of Object.entries(questions)) {
       const a = raw[k];
-      if (!a) return { ok: false, reason: "Jev returned an incomplete answer" };
+      if (!a) return { ok: false, reason: "Claude returned an incomplete answer" };
       answers[k] = q.type === "noul"
         ? { type: "noul", noul: clamp(a.probability) }
         : { type: "choice", choice: String(a.choice), confidence: clamp(a.confidence), probabilities: { [String(a.choice)]: clamp(a.confidence) } };
     }
     return { ok: true, answers: answers as Answers<Q> };
   } catch (e) {
-    if (e instanceof Anthropic.AuthenticationError) return { ok: false, reason: "Jev unavailable: the Anthropic key in Settings was rejected" };
-    if (e instanceof Anthropic.RateLimitError) return { ok: false, reason: "Jev unavailable: Claude is rate limited" };
-    if (e instanceof Anthropic.APIError) return { ok: false, reason: `Jev unavailable (Claude HTTP ${e.status})` };
-    return { ok: false, reason: `Jev unavailable (${String((e as any)?.message ?? e).slice(0, 80)})` };
+    if (e instanceof Anthropic.AuthenticationError) return { ok: false, reason: "Claude unavailable: the Anthropic key in Settings was rejected" };
+    if (e instanceof Anthropic.RateLimitError) return { ok: false, reason: "Claude is rate limited" };
+    if (e instanceof Anthropic.APIError) return { ok: false, reason: `Claude unavailable (HTTP ${e.status})` };
+    return { ok: false, reason: `Claude unavailable (${String((e as any)?.message ?? e).slice(0, 80)})` };
   }
 }

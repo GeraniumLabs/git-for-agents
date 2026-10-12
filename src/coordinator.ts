@@ -133,6 +133,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN resolved_by TEXT",
       "ALTER TABLE threads ADD COLUMN default_answer TEXT",
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
+      "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -2018,12 +2019,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { protectedPaths: this.protectedPaths };
   }
 
-  // ── jev: the humans' delegate ────────────────────────────────────────────
+  // ── the deputy: the humans' delegate ────────────────────────────────────────────
 
   private get delegateConfig(): DelegateConfig {
     const raw = this.meta("delegate");
     if (!raw) return DEFAULT_DELEGATE;
     const cfg = JSON.parse(raw);
+    // Projects briefed before the rename still have the old default name.
+    if (cfg.name === "jev") cfg.name = DEFAULT_DELEGATE.name;
     return { ...DEFAULT_DELEGATE, ...cfg, questions: { ...DEFAULT_DELEGATE.questions, ...cfg.questions }, approvals: { ...DEFAULT_DELEGATE.approvals, ...cfg.approvals }, disputes: { ...DEFAULT_DELEGATE.disputes, ...cfg.disputes } };
   }
 
@@ -2038,7 +2041,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     cfg.approvals = { ...this.delegateConfig.approvals, ...(body.approvals ?? {}) };
     cfg.disputes = { ...this.delegateConfig.disputes, ...(body.disputes ?? {}) };
     this.setMeta("delegate", JSON.stringify(cfg));
-    // jev is a member like any other, so its decisions are attributed to it.
+    // The deputy is a member like any other, so its decisions are attributed to it.
     this.sql.exec("INSERT OR IGNORE INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, 'human', ?, ?, ?)",
       DELEGATE_ID, cfg.name, `delegate:${randomId(16)}`, Date.now(), Date.now());
     this.sql.exec("UPDATE agents SET name = ? WHERE id = ?", cfg.name, DELEGATE_ID);
@@ -2046,11 +2049,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return cfg;
   }
 
-  /** Let jev act on an event if its brief covers it; otherwise say why a human is needed. */
+  /** Let the deputy act on an event if its brief covers it; otherwise say why a human is needed. */
   private async delegateOn(e: LoomEvent) {
     const cfg = this.delegateConfig;
     if (!cfg.enabled) return;
-    const jev = this.delegateActor();
+    const deputy = this.delegateActor();
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), DELEGATE_ID);
 
     if (e.type === "question.asked" && e.data.audience === "humans") {
@@ -2065,14 +2068,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }, await this.judge());
       if (this.thread(t.id).status !== "open") return; // a human got there first
       if (v.act) {
-        // House rules and precedents are already on record; a fresh pick by Jev becomes a decision.
+        // House rules and precedents are already on record; a fresh pick by the model becomes a decision.
         this.citing = true;
-        try { this.post(jev, t.id, v.answer); } finally { this.citing = false; }
-        if (v.via === "jev" && v.option) {
+        try { this.post(deputy, t.id, v.answer); } finally { this.citing = false; }
+        if (v.via === "model" && v.option) {
           const meaning = t.options?.[v.option];
-          this.recordDecision("answer", jev, { question: e.data.body, decision: meaning && meaning !== v.option ? `${v.option}: ${meaning}` : v.option, paths: this.threadPaths(t), task: t.task_id, change: t.change_id, thread: t.id });
+          this.recordDecision("answer", deputy, { question: e.data.body, decision: meaning && meaning !== v.option ? `${v.option}: ${meaning}` : v.option, paths: this.threadPaths(t), task: t.task_id, change: t.change_id, thread: t.id });
         }
-        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, data: { thread: t.id, kind: "question", via: v.via, decision: v.answer, precedent: v.decision ?? null, scores: v.scores ?? null } });
+        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, data: { thread: t.id, kind: "question", via: v.via, model: v.act ? v.model ?? null : null, decision: v.answer, precedent: v.decision ?? null, scores: v.scores ?? null } });
       } else this.escalate(t.id, null, t.task_id, v.reason, v.scores);
       return;
     }
@@ -2091,9 +2094,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }, await this.judge());
       if (this.thread(t.id).status !== "open") return;
       if (v.act && v.option && names[v.option]) {
-        this.ruleDispute(jev, t.id, names[v.option], v.answer);
-        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, change: terms.changeId, data: { thread: t.id, kind: "dispute", via: v.via, decision: `Ruled for ${v.option}. ${v.answer}`, scores: v.scores ?? null } });
-      } else this.escalate(t.id, null, t.task_id, v.act ? "Jev's ruling didn't match either party" : v.reason, v.scores);
+        this.ruleDispute(deputy, t.id, names[v.option], v.answer);
+        this.emit("delegate.decided", { actor: DELEGATE_ID, task: t.task_id, change: terms.changeId, data: { thread: t.id, kind: "dispute", via: v.via, model: v.act ? v.model ?? null : null, decision: `Ruled for ${v.option}. ${v.answer}`, scores: v.scores ?? null } });
+      } else this.escalate(t.id, null, t.task_id, v.act ? "the model's ruling didn't match either party" : v.reason, v.scores);
       return;
     }
 
@@ -2117,15 +2120,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }, await this.judge());
     if (this.change(changeId).head !== ch.head || this.change(changeId).status !== "review") return; // moved on meanwhile
     if (v.act) {
-      await this.review(jev, changeId, { verdict: "approve", body: v.answer });
-      this.emit("delegate.decided", { actor: DELEGATE_ID, change: changeId, task: ch.task_id, data: { kind: "approval", via: v.via, decision: v.answer, scores: v.scores ?? null } });
+      await this.review(deputy, changeId, { verdict: "approve", body: v.answer });
+      this.emit("delegate.decided", { actor: DELEGATE_ID, change: changeId, task: ch.task_id, data: { kind: "approval", via: v.via, model: v.act ? v.model ?? null : null, decision: v.answer, scores: v.scores ?? null } });
     } else if (v.reason !== "waiting for an agent review first") {
       this.escalate(null, changeId, ch.task_id, v.reason, v.scores);
     }
   }
 
   private escalated = new Set<string>();
-  // ── keys people bring: Jev's judge, by the project's key or the server's ──
+  // ── keys people bring: the deputy's judge, by the project's key or the server's ──
 
   private keyCache = new Map<KeyKind, string | null>();
   private async projectKey(kind: KeyKind): Promise<string | null> {
@@ -2136,22 +2139,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return key;
   }
 
-  /** Jev's judge: the project's own keys first, then the server's; TypeSafe before Claude. */
+  /** The deputy's judge: the project's own keys first, then the server's; TypeSafe before Claude. With no key, Clef on Workers AI. */
   private async judge(): Promise<Judge> {
     const jev = (await this.projectKey("jev")) ?? this.env.TYPESAFE_API_KEY;
     if (jev) return { provider: "typesafe", apiKey: jev, url: this.env.TYPESAFE_URL };
     const claude = (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY;
     if (claude) return { provider: "anthropic", apiKey: claude };
+    if (this.env.AI) return { provider: "clef", ai: this.env.AI };
     return {};
   }
 
-  /** Where Jev's judge comes from, without decrypting anything. */
+  /** Where the deputy's judge comes from, without decrypting anything. */
   private jevSource(): string | null {
     const saved = new Set(this.sql.exec("SELECT kind FROM project_keys").toArray().map((r) => r.kind as string));
-    if (saved.has("jev")) return "the project's TypeSafe key";
-    if (this.env.TYPESAFE_API_KEY) return "the server's TypeSafe key";
+    if (saved.has("jev")) return "Jev, with the project's TypeSafe key";
+    if (this.env.TYPESAFE_API_KEY) return "Jev, with the server's TypeSafe key";
     if (saved.has("anthropic")) return "Claude, with the project's Anthropic key";
     if (this.env.ANTHROPIC_API_KEY) return "Claude, with the server's Anthropic key";
+    if (this.env.AI) return "Clef, Cloudflare's decision model on Workers AI (no key needed)";
     return null;
   }
 
@@ -2790,7 +2795,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── memory: what the humans decided, and what earlier agents tried ──────
 
-  /** Set while jev cites an earlier decision, so the citation isn't recorded as a new one. */
+  /** Set while the deputy cites an earlier decision, so the citation isn't recorded as a new one. */
   private citing = false;
 
   private decisionRows(where: string, ...args: SqlStorageValue[]): Decision[] {
@@ -3047,7 +3052,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   // ── disputes: when agents can't settle it themselves ───────────────────
 
   /**
-   * Open a dispute with another agent. Each side states a position; jev rules
+   * Open a dispute with another agent. Each side states a position; the deputy rules
    * if the humans' guidance and earlier decisions settle it, a person if not.
    * A ruling becomes a decision, and on a change it is enforced: a ruling for
    * the author dismisses the other side's request for changes.

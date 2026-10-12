@@ -1,4 +1,4 @@
-// Keys people bring for a project (Jev, Claude), encrypted at rest.
+// Keys people bring for a project (TypeSafe's Jev, Claude), encrypted at rest.
 // AES-GCM with a per-project key derived (HKDF) from the LOOM_SECRET_KEY
 // Worker secret, or from LOOM_ADMIN_TOKEN when that isn't set. Each row
 // records which one sealed it, so adding LOOM_SECRET_KEY later doesn't
@@ -7,8 +7,8 @@
 import type { Env } from "./env";
 
 export const KEY_KINDS = {
-  jev: { label: "Jev (TypeSafe)", hint: "TypeSafe System One API key", uses: "Jev answers questions, settles disputes and approves protected changes with TypeSafe's judge." },
-  anthropic: { label: "Claude (Anthropic)", hint: "Anthropic API key, sk-ant-…", uses: "Jev judges with Claude when there is no TypeSafe key." },
+  jev: { label: "Jev (TypeSafe)", hint: "TypeSafe System One API key", uses: "The deputy judges with TypeSafe's Jev instead of Clef." },
+  anthropic: { label: "Claude (Anthropic)", hint: "Anthropic API key, sk-ant-…", uses: "The deputy judges with Claude instead of Clef, when there is no TypeSafe key." },
 } as const;
 export type KeyKind = keyof typeof KEY_KINDS;
 export const isKeyKind = (k: string): k is KeyKind => k in KEY_KINDS;

@@ -37,12 +37,12 @@
   <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”" title="An instruction agents follow over their own plan. They get it the next time they check in, and it's kept as a decision">
   <button id="dir-send" title="Send the directive">Send</button>
   <span class="sep"></span>
-  <input id="protect-paths" placeholder="Protected paths, e.g. src/auth/, migrations/**" title="Changes touching these paths need a person's approval (or jev's, if you delegate it), however many agents approve">
+  <input id="protect-paths" placeholder="Protected paths, e.g. src/auth/, migrations/**" title="Changes touching these paths need a person's approval (or the deputy's, if you delegate it), however many agents approve">
   <button id="protect-save" class="ghost" title="Save the protected paths">Protect</button>
   <span class="sep"></span>
   <button id="freeze" class="ghost" title="Stop the merge queue: nothing lands on main until you unfreeze. Agents keep working and submitting">Freeze main</button>
   <span class="sep"></span>
-  <button id="jev-open" class="ghost" title="Brief jev to answer questions, approve protected changes or settle disputes for you, within your guidance">Delegate…</button>
+  <button id="jev-open" class="ghost" title="Brief the deputy to answer questions, approve protected changes or settle disputes for you, within your guidance">Delegate…</button>
 </section>
 
 <section class="tour" id="tour" hidden></section>
@@ -119,16 +119,16 @@
 
 <dialog id="jev">
   <form id="jev-form" method="dialog" class="jev-form">
-    <h3><span id="jev-title">jev</span>: a stand-in for the humans</h3>
-    <p class="meta">Decide what jev may handle for you. It answers only within this brief, using house rules and TypeSafe's Jev model, and hands everything else to a person with the reason. <span id="jev-status"></span></p>
-    <label class="check"><input type="checkbox" name="enabled"> Let jev act for the humans</label>
+    <h3><span id="jev-title">deputy</span>: a stand-in for the humans</h3>
+    <p class="meta">Decide what the deputy may handle for you. It answers only within this brief, using house rules and a decision model (Cloudflare's Clef, unless you add a key), and hands everything else to a person with the reason. <span id="jev-status"></span></p>
+    <label class="check"><input type="checkbox" name="enabled"> Let the deputy act for the humans</label>
     <label>Name <input name="name" maxlength="24"></label>
-    <label>Guidance <small>what jev judges by, in your words</small>
+    <label>Guidance <small>what the deputy judges by, in your words</small>
       <textarea name="guidance" rows="4" placeholder="e.g. Prefer the stricter option on validation. Keep the API backwards compatible. No new runtime dependencies."></textarea></label>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="q_enabled"> Answer agents' questions</label></legend>
       <label>Only about <input name="q_topics" placeholder="any topic, or e.g. naming, validation, tests"></label>
-      <label><span>Act when Jev is at least <output id="q_conf_out"></output> sure</span> <input type="range" name="q_conf" min="0.5" max="0.99" step="0.01"></label>
+      <label><span>Act when the model is at least <output id="q_conf_out"></output> sure</span> <input type="range" name="q_conf" min="0.5" max="0.99" step="0.01"></label>
       <label>House rules <small>one per line: <span class="mono">pattern =&gt; answer</span></small>
         <textarea name="rules" rows="3" class="mono" placeholder="max.*length => 200 characters"></textarea></label>
     </fieldset>
@@ -136,13 +136,13 @@
       <legend><label class="check"><input type="checkbox" name="a_enabled"> Approve changes to protected paths</label></legend>
       <label>Only these paths <input name="a_paths" placeholder="e.g. README.md, docs/**"></label>
       <label class="check"><input type="checkbox" name="a_review"> Only after an agent reviewer approved</label>
-      <label><span>Act when Jev is at least <output id="a_conf_out"></output> sure</span> <input type="range" name="a_conf" min="0.5" max="0.99" step="0.01"></label>
+      <label><span>Act when the model is at least <output id="a_conf_out"></output> sure</span> <input type="range" name="a_conf" min="0.5" max="0.99" step="0.01"></label>
     </fieldset>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="d_enabled"> Settle disputes between agents</label></legend>
-      <label><span>Rule when Jev is at least <output id="d_conf_out"></output> sure</span> <input type="range" name="d_conf" min="0.5" max="0.99" step="0.01"></label>
+      <label><span>Rule when the model is at least <output id="d_conf_out"></output> sure</span> <input type="range" name="d_conf" min="0.5" max="0.99" step="0.01"></label>
     </fieldset>
-    <p class="meta">jev also answers questions the humans already settled, citing the earlier decision.</p>
+    <p class="meta">The deputy also answers questions the humans already settled, citing the earlier decision.</p>
     <div class="row"><button value="save">Save</button><button value="cancel" class="ghost" formnovalidate>Cancel</button></div>
   </form>
 </dialog>

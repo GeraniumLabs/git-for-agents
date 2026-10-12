@@ -8,11 +8,11 @@
 // Set PACE=0 to run as fast as possible (for tests), PACE=1.5 to slow down.
 //
 // A human ("jo", scripted) takes part too: protects package.json and
-// README.md, sets a ground rule, and briefs jev, the humans' delegate, to
+// README.md, sets a ground rule, and briefs the deputy, the humans' delegate, to
 // answer questions, settle disputes and approve docs changes within that
-// brief. jev settles what its house rules, earlier decisions or TypeSafe's Jev
-// model (with TYPESAFE_API_KEY set on the Worker) can settle confidently; jo
-// gets the rest, with jev's reason.
+// brief. The deputy settles what its house rules, earlier decisions or its
+// decision model can settle confidently; jo
+// gets the rest, with the deputy's reason.
 //
 // Memory: every human answer, directive and ruling becomes a decision. dax
 // asks a question jo already answered and gets the earlier decision back; fen
@@ -407,7 +407,7 @@ async function proposalDesk(admin, keys, done) {
   }
 }
 
-/** A human tech lead: sets rules, briefs jev, and takes what jev hands back. */
+/** A human tech lead: sets rules, briefs the deputy, and takes what it hands back. */
 async function human(admin, key, done) {
   const me = admin.as(key);
   await me.req("POST", "/protect", { paths: ["package.json", "README.md"] });
@@ -421,15 +421,15 @@ async function human(admin, key, done) {
     approvals: { enabled: true, paths: ["README.md", "docs/**"], requireAgentReview: true, minConfidence: 0.9 },
     rules: [{ pattern: "test runner|node:test|vitest|jest", answer: "Use node:test. It's built in, and we don't add dependencies for tests." }],
   });
-  log("jo", "briefed jev: answer questions, approve README and docs changes, escalate the rest");
+  log("jo", "briefed the deputy: answer questions, approve README and docs changes, escalate the rest");
   const handled = new Set();
   while (!done.value) {
     const s = await me.state();
-    // jo only picks up what jev handed back.
+    // jo only picks up what the deputy handed back.
     for (const t of (s.threads ?? []).filter((t) => t.kind === "question" && t.status === "open" && t.to_agent === "humans" && t.escalated)) {
       if (handled.has(`q${t.id}`)) continue;
       handled.add(`q${t.id}`);
-      log("jo", `jev passed ${t.created_by}'s question on: ${t.escalated}`);
+      log("jo", `the deputy passed ${t.created_by}'s question on: ${t.escalated}`);
       await pause(4);
       await me.req("POST", `/threads/${t.id}/posts`, { body: "200 is right. Return the error message in the response body so the UI can show it." });
       log("jo", `answered ${t.created_by}'s question`);
@@ -439,7 +439,7 @@ async function human(admin, key, done) {
       handled.add(`d${t.id}`);
       const terms = JSON.parse(t.terms);
       const reviewerSide = terms.parties.find((p) => s.agents.find((a) => a.id === p)?.role === "reviewer");
-      log("jo", `jev passed dispute #${t.id} on: ${t.escalated}`);
+      log("jo", `the deputy passed dispute #${t.id} on: ${t.escalated}`);
       await pause(4);
       await me.req("POST", `/disputes/${t.id}/rule`, { for: reviewerSide, note: "Versions change at release time, as decided earlier." });
       log("jo", `ruled on dispute #${t.id}`);
@@ -464,7 +464,7 @@ async function human(admin, key, done) {
         handled.add(k);
         await pause(3);
         await me.review(c.id, "approve", "Docs look good.");
-        log("jo", `approved #${c.id} after jev passed it on`);
+        log("jo", `approved #${c.id} after the deputy passed it on`);
       }
     }
     await pause(1);
