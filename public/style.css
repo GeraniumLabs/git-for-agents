@@ -129,6 +129,14 @@ dialog#jev { width: min(560px, 94vw); }
 .jev-form legend { padding: 0 4px; }
 .jev-form legend label { margin: 0; font-weight: 600; }
 .jev-form input[type=range] { width: 100%; }
+.jev-form label.jev-master { flex-wrap: wrap; font-weight: 600; font-size: 14px; }
+.jev-form label.jev-master small { flex-basis: 100%; margin-left: 22px; }
+.jev-form fieldset .meta { margin: 2px 0 4px; font-size: 12px; }
+.jev-summary { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 12.5px; }
+.jev-summary ul { margin: 2px 0 6px; padding-left: 18px; }
+.jev-summary li { margin: 2px 0; }
+.jev-off { border-left: 3px solid var(--warn); padding: 6px 10px; margin: 8px 0; font-size: 13px; }
+.jev-form.off fieldset, .jev-form.off > label:not(.jev-master) { opacity: .5; }
 .jev-form .row button { margin-top: 4px; }
 .agent.delegate .dot { outline: 2px dashed var(--accent); outline-offset: 1px; }
 .decisions { margin-top: 6px; max-height: 420px; overflow: auto; }

@@ -312,7 +312,7 @@ function renderAttention() {
       return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}${me ? "" : signInToAct("rule on it")}`, "q");
     }
     if (it.kind === "brief") {
-      return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
+      return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
     if (it.kind === "review") {
       return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
@@ -1537,12 +1537,46 @@ function fillJev() {
   field("a_conf").value = d.approvals.minConfidence;
   field("d_enabled").checked = d.disputes.enabled;
   field("d_conf").value = d.disputes.minConfidence;
+  field("f_enabled").checked = d.flagged.enabled;
+  field("f_review").checked = d.flagged.requireAgentReview;
+  field("f_conf").value = d.flagged.minConfidence;
   showConf();
+}
+// What the deputy will and won't do with the brief as it stands in the form, in plain words.
+function jevSummary() {
+  const n = esc(field("name").value.trim() || "the deputy");
+  const pctOf = (k) => `${Math.round(field(k).value * 100)}%`;
+  if (!field("enabled").checked) {
+    return `<p class="jev-off"><b>${n} is off.</b> It won't do anything, whatever you set below: every question, approval and flagged change waits for a person. Tick “Let the deputy act for the humans” to turn it on.</p>`;
+  }
+  const guided = !!field("guidance").value.trim();
+  const model = !!state.delegate?.jevConnected;
+  const rules = field("rules").value.split("\n").filter((l) => l.includes("=>")).length;
+  const topics = listOf(field("q_topics").value), paths = listOf(field("a_paths").value);
+  const will = [], wont = [];
+  if (field("q_enabled").checked) {
+    will.push(`Answer questions agents ask the humans${topics.length ? ` that mention ${topics.map(esc).join(", ")}` : ", on any topic"}: ${rules ? `${rules} house rule${rules === 1 ? "" : "s"} first, then ` : ""}earlier decisions${guided && model ? `, then picking from the agent's options when the guidance covers it and the model is ${pctOf("q_conf")} sure` : ""}.`);
+  } else wont.push("Answer agents' questions.");
+  if (field("a_enabled").checked && paths.length && model) {
+    will.push(`Approve changes to protected paths under ${paths.map(esc).join(", ")}${field("a_review").checked ? ", after an agent reviewer approved" : ""}, when the model is ${pctOf("a_conf")} sure they follow the guidance. Never a change with files outside its declared intent.`);
+  } else wont.push(!field("a_enabled").checked ? "Approve changes to protected paths." : !paths.length ? "Approve protected changes: no paths are listed yet." : "Approve protected changes: that needs a decision model.");
+  if (field("f_enabled").checked && guided && model) {
+    will.push(`Clear changes flagged “Needs a person” (files outside the intent, no tests, new to the author…)${field("f_review").checked ? " after an agent reviewer approved" : ""}, when the model is ${pctOf("f_conf")} sure the guidance lets them through at this stage of the project. Never protected paths or failing checks.`);
+  } else wont.push(!field("f_enabled").checked ? "Clear changes flagged “Needs a person”." : !guided ? "Clear flagged changes: write guidance first; it's what the deputy judges them by." : "Clear flagged changes: that needs a decision model.");
+  if (field("d_enabled").checked && guided && model) will.push(`Settle disputes between two agents when the model is ${pctOf("d_conf")} sure the guidance favors one side.`);
+  else wont.push(!field("d_enabled").checked ? "Settle disputes between agents." : !guided ? "Settle disputes: write guidance first." : "Settle disputes: that needs a decision model.");
+  if (!guided) wont.push("Use your guidance: none is written, so only house rules and earlier decisions apply.");
+  if (!model) wont.push("Ask a decision model: none is connected (add a key in Settings), so only house rules and earlier decisions apply.");
+  wont.push("Anything the model judges high-stakes or risky. That always goes to a person, with the reason.");
+  return `<div class="jev-summary"><b>${n} will</b><ul>${will.map((x) => `<li>${x}</li>`).join("") || "<li>Nothing yet: tick a power below.</li>"}</ul><b>${n} won't</b><ul>${wont.map((x) => `<li>${x}</li>`).join("")}</ul></div>`;
 }
 function showConf() {
   $("#q_conf_out").textContent = `${Math.round(field("q_conf").value * 100)}%`;
   $("#a_conf_out").textContent = `${Math.round(field("a_conf").value * 100)}%`;
   $("#d_conf_out").textContent = `${Math.round(field("d_conf").value * 100)}%`;
+  $("#f_conf_out").textContent = `${Math.round(field("f_conf").value * 100)}%`;
+  jevForm.classList.toggle("off", !field("enabled").checked);
+  $("#jev-summary").innerHTML = jevSummary();
 }
 jevForm.oninput = showConf;
 $("#jev-open").onclick = () => { fillJev(); $("#jev").showModal(); };
@@ -1555,6 +1589,7 @@ $("#jev").onclose = async () => {
     questions: { enabled: field("q_enabled").checked, topics: listOf(field("q_topics").value), minConfidence: Number(field("q_conf").value) },
     approvals: { enabled: field("a_enabled").checked, paths: listOf(field("a_paths").value), requireAgentReview: field("a_review").checked, minConfidence: Number(field("a_conf").value) },
     disputes: { enabled: field("d_enabled").checked, minConfidence: Number(field("d_conf").value) },
+    flagged: { enabled: field("f_enabled").checked, requireAgentReview: field("f_review").checked, minConfidence: Number(field("f_conf").value) },
     rules: field("rules").value.split("\n").map((l) => l.split("=>")).filter((p) => p.length === 2 && p[0].trim() && p[1].trim()).map(([pattern, answer]) => ({ pattern: pattern.trim(), answer: answer.trim() })),
   });
   toast(`Saved ${field("name").value.trim() || "deputy"}'s brief`);

@@ -39,6 +39,14 @@ export interface DelegateConfig {
     /** How sure the model must be (0-1) before the deputy rules between two agents. */
     minConfidence: number;
   };
+  /** Changes whose review brief says "Needs a person" (files outside the intent, no tests, …), but no protected paths. */
+  flagged: {
+    enabled: boolean;
+    /** Also require at least one approving agent review first. */
+    requireAgentReview: boolean;
+    /** How sure the model must be (0-1) that the guidance lets this change go ahead without a person. */
+    minConfidence: number;
+  };
   /** Canned answers: when a question matches `pattern` (a regex), answer with `answer`. */
   rules: { pattern: string; answer: string }[];
 }
@@ -50,6 +58,7 @@ export const DEFAULT_DELEGATE: DelegateConfig = {
   questions: { enabled: true, topics: [], minConfidence: 0.85 },
   approvals: { enabled: false, paths: [], requireAgentReview: true, minConfidence: 0.9 },
   disputes: { enabled: true, minConfidence: 0.85 },
+  flagged: { enabled: false, requireAgentReview: true, minConfidence: 0.85 },
   rules: [],
 };
 
@@ -271,6 +280,66 @@ export async function decideApproval(
   return {
     act: true,
     answer: `Approved for the humans: ${c.guarded.join(", ")} is in my scope, and ${M} judges the diff consistent with the guidance (${pct(follows)}), true to its summary (${pct(honest)}) and low-risk (${pct(1 - risky)}).`,
+    via: "model", model: M,
+    scores,
+  };
+}
+
+/** How far along the project is, so guidance like "early on" or "during bootstrap" means something to the model. */
+export interface ProjectStage {
+  mergedChanges: number;
+  testFiles: number;
+  ageDays: number;
+}
+
+/**
+ * Decide whether the deputy can clear a change its review brief flagged for a
+ * person (files outside the declared intent, no tests, unfamiliar code…).
+ * Protected paths and failing checks are never cleared here.
+ */
+export async function decideFlagged(
+  cfg: DelegateConfig,
+  c: { reasons: string[]; agentApprovals: number; title: string; summary: string; intent: string; patch: string; stage: ProjectStage },
+  judge: Judge,
+): Promise<Verdict> {
+  if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
+  if (!cfg.flagged.enabled) return { act: false, reason: `${cfg.name} isn't allowed to clear changes flagged for a person` };
+  if (cfg.flagged.requireAgentReview && c.agentApprovals < 1) return { act: false, reason: "waiting for an agent review first" };
+  if (!cfg.guidance.trim()) return { act: false, reason: `the humans haven't written guidance for ${cfg.name} yet` };
+  if (!judge.provider) return { act: false, reason: "no decision model is connected (add a key in Settings), so a person has to look" };
+
+  const min = cfg.flagged.minConfidence;
+  const res = await systemOne(judge, {
+    guidance: cfg.guidance,
+    project: { merged_changes: c.stage.mergedChanges, test_files_on_main: c.stage.testFiles, age_days: c.stage.ageDays },
+    change: { title: c.title, summary: c.summary, intent: c.intent, flagged_because: c.reasons, diff: c.patch.slice(0, 12_000) },
+  }, {
+    allowed: {
+      type: "noul",
+      instructions: "Loom flagged `change` for a person to look at, for the reasons in `change.flagged_because`. Given the project's stage in `project`, does the human leads' `guidance` say they're fine letting a change like this go ahead without a person looking?",
+      criteria: { true: "The guidance clearly allows this kind of change, for these reasons, at this stage of the project", false: "The guidance is silent, ambiguous, or wants a person to look at this" },
+    },
+    risky: {
+      type: "noul",
+      instructions: "Does `change.diff` add risk to the project?",
+      criteria: { true: "Adds or upgrades dependencies, adds install or run scripts, weakens checks, touches secrets, or deletes data", false: "None of these" },
+    },
+    high_stakes: {
+      type: "noul",
+      instructions: "Is `change` a high-stakes change?",
+      criteria: { true: "Hard to undo, or about security, money, legal matters, user data, or the product's direction", false: "A routine, reversible engineering change" },
+    },
+  });
+  if (!res.ok) return { act: false, reason: res.reason };
+  const M = judgeName(judge);
+  const allowed = res.answers.allowed.noul, risky = res.answers.risky.noul, stakes = res.answers.high_stakes.noul;
+  const scores = { allowed, risky, highStakes: stakes };
+  if (stakes >= 0.5) return { act: false, reason: `${M} judges this high-stakes (${pct(stakes)})`, scores };
+  if (risky >= 1 - min) return { act: false, reason: `${M} flags the diff as risky (${pct(risky)})`, scores };
+  if (allowed < min) return { act: false, reason: `${M} isn't sure the guidance lets this through without a person (${pct(allowed)}, needs ${pct(min)})`, scores };
+  return {
+    act: true,
+    answer: `Cleared for the humans: it was flagged (${c.reasons.join("; ").toLowerCase()}), and ${M} is ${pct(allowed)} sure the team's guidance lets a change like this go ahead at this stage, and judges it low-risk (${pct(1 - risky)}).`,
     via: "model", model: M,
     scores,
   };
