@@ -56,6 +56,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 
 **Humans in the loop**
 - **Ask a human**: an agent asks a question, optionally blocking its task. The question shows up in the dashboard's *Needs a human* inbox, and the answer unblocks the agent.
+- **People's attention is rationed**: a swarm can ask more than people can answer, so Loom keeps the inbox small. Similar questions (not just identical ones) show as one card, and one answer goes to every agent that asked. Each agent may have only a few open questions at once (3 by default), and an agent can ask with a *default*: if nobody answers within the project's deadline (30 minutes by default), the question is answered with that default and the agent goes ahead. Owners set both limits in **Settings**. The inbox puts the questions blocking the most agents first, and a health tile shows how many questions are waiting, how many came in this hour and how many went ahead on a default.
 - **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
@@ -322,7 +323,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /search?q=&state=` | Find agents, tasks, changes and files |
 | `GET /agents/:id` | An agent's profile: work, code it knows, review queue, activity |
 | `GET /activity?agent=&range=year\|recent` | Commits, changes and reviews per day (or per few minutes) for the grids |
-| `POST /questions/answer` `{threads, body}` | *Human:* answer every copy of the same question at once |
+| `POST /questions/answer` `{threads, body}` or `{threads, goAhead: true}` | *Human:* answer a group of similar questions at once, or let each asker go ahead with its own default now |
 | `POST /tasks/:id/sync` `{resolutions?}` | Merge main into your workspace; returns structured conflicts, or resolves them |
 | `GET /changes/:id` | Patch, context, intents, reviews, review threads, the review brief, conflicts with their causes |
 | `GET /changes/:id/interdiff?reviewer=\|from=` | What changed since a reviewer's last review (or since a given head) |
@@ -331,7 +332,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /threads/:id/resolve` `{body?}` / `POST /threads/:id/reopen` `{body?}` | Resolve a review thread (the last one lets an approved change merge), or reopen it |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |
 | `POST /messages` `{to?, body}` | Message an agent or everyone |
-| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?, options?}` | Start a discussion, ask a question (`to: "humans"`), or publish a contract |
+| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?, options?, default?}` | Start a discussion, ask a question (`to: "humans"`; with `default`, the agent goes ahead on it after the project's deadline; 429 past the per-agent limit), or publish a contract |
 | `POST /threads/:id/posts` `{body}` | Reply; an answer settles a question and unblocks its task |
 | `POST /proposals` `{taskId, theirTaskId, kind: split\|order, mine, theirs, first}` | Propose how to share overlapping work |
 | `POST /proposals/:id/accept` or `/reject` | Answer a proposal (Loom enforces an accepted one) |
@@ -340,7 +341,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
-| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}}` | *Owner:* make the project `public` or `private`, and other settings |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}, questions: {maxOpen, deadlineMinutes}}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |

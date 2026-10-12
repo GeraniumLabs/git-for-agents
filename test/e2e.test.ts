@@ -146,3 +146,38 @@ test("reviews are agent tasks: an untaken review shows up in whoami and loom_sta
   await bex.review(ch.id, "approve", "ok");
   assert.equal((await bex.me()).reviewTasks.some((x: any) => x.change === ch.id), false, "done once reviewed");
 });
+
+test("questions for people: similar ones share a card, each agent has a limit, and a default wins when nobody answers in time", { skip: !url, timeout: 150_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-questions");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "questions for people", requiredApprovals: 1 });
+  const rules = await admin.req("POST", "/settings", { questions: { maxOpen: 2, deadlineMinutes: 1 } });
+  assert.deepEqual(rules.questions, { maxOpen: 2, deadlineMinutes: 1 });
+  await assert.rejects(admin.req("POST", "/settings", { questions: { deadlineMinutes: 0 } }));
+  const ada = admin.as((await admin.addAgent("ada")).key);
+  const bex = admin.as((await admin.addAgent("bex")).key);
+  const ask = (who: any, body: string, extra = {}) => who.req("POST", "/threads", { kind: "question", to: "humans", body, ...extra });
+
+  const q1 = await ask(ada, "Should we use SQLite or Postgres for the todo store?", { default: "Use SQLite" });
+  await ask(bex, "Which database should the todo store use: SQLite or Postgres?");
+  await ask(ada, "Can I add a dependency on lodash?");
+  await assert.rejects(ask(ada, "Can I add a dependency on dayjs?"), /open questions/, "a third open question is refused");
+  assert.equal((await ada.req("GET", "/me")).questions.open, 2);
+
+  const cards = (await admin.req("GET", "/overview")).attention.filter((i: any) => i.kind === "question");
+  assert.equal(cards.length, 2, "the two database questions share one card");
+  const db = cards.find((c: any) => c.threads.length === 2);
+  assert.ok(db, "one card answers both agents");
+  assert.equal(db.default, "Use SQLite");
+
+  // Nobody answers: after the deadline ada goes ahead with its default.
+  let t: any;
+  for (let i = 0; i < 100 && t?.status !== "answered"; i++) { await sleep(1000); t = await admin.req("GET", `/threads/${q1.id}`); }
+  assert.equal(t.status, "answered");
+  assert.match(t.posts.at(-1).body, /goes ahead with its default: Use SQLite/);
+  const answered = (await ada.req("GET", "/me")).inbox.find((e: any) => e.type === "question.answered");
+  assert.equal(answered.data.defaulted, true);
+  assert.equal((await ada.req("GET", "/me")).questions.open, 1, "an answered question frees a slot");
+  assert.ok((await admin.req("GET", "/overview")).health.people.defaultedLastHour >= 1);
+});
