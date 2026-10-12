@@ -76,6 +76,22 @@ export function judgeName(judge: Judge): string {
   return judge.provider === "anthropic" ? "Claude" : judge.provider === "clef" ? "Clef" : "Jev";
 }
 
+/**
+ * Where the project stands, given to the model with every decision so the
+ * humans' guidance can depend on it ("early on", "while it's just a few
+ * agents", "once there are tests"…).
+ */
+export interface ProjectContext {
+  /** What the project is for, in the humans' words. */
+  concept: string;
+  age_days: number;
+  agents: { total: number; working_now: number; people: number };
+  main: { merged_changes: number; version: number; test_files: number };
+  in_flight: { open_tasks: number; changes_in_review: number };
+  recently_merged: string[];
+  protected_paths: string[];
+}
+
 export type Verdict =
   | { act: true; answer: string; via: "rule" | "model" | "precedent"; model?: string; scores?: Record<string, number>; option?: string; decision?: number }
   | { act: false; reason: string; scores?: Record<string, number> };
@@ -98,7 +114,7 @@ const pct = (x: number) => `${Math.round(x * 100)}%`;
 /** Decide whether the deputy can settle a question, and how: house rules, then precedent, then the model. */
 export async function decideQuestion(
   cfg: DelegateConfig,
-  q: { question: string; options: Record<string, string> | null; task: string; precedents: Decision[] },
+  q: { question: string; options: Record<string, string> | null; task: string; precedents: Decision[]; project?: ProjectContext },
   judge: Judge,
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
@@ -146,12 +162,13 @@ export async function decideQuestion(
     };
     questions.settled = {
       type: "noul",
-      instructions: "Does `guidance` settle `question`, so the human leads wouldn't need to think about it?",
+      instructions: "Given where the project stands in `project`, does `guidance` settle `question`, so the human leads wouldn't need to think about it?",
       criteria: { true: "The guidance clearly covers this decision", false: "The guidance is silent, ambiguous or conflicting on this decision" },
     };
   }
   const res = await systemOne(judge, {
     guidance: cfg.guidance,
+    ...(q.project ? { project: q.project } : {}),
     task: q.task,
     question: q.question,
     ...(q.options ? { options: q.options } : {}),
@@ -193,7 +210,7 @@ const cite = (d: Decision) => `Already decided (decision #${d.id}, by ${d.byName
 /** Decide whether the deputy can rule between two agents' positions. */
 export async function decideDispute(
   cfg: DelegateConfig,
-  d: { question: string; positions: Record<string, string>; task: string; precedents: Decision[] },
+  d: { question: string; positions: Record<string, string>; task: string; precedents: Decision[]; project?: ProjectContext },
   judge: Judge,
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
@@ -203,6 +220,7 @@ export async function decideDispute(
   const min = cfg.disputes.minConfidence;
   const res = await systemOne(judge, {
     guidance: cfg.guidance || "(none written)",
+    ...(d.project ? { project: d.project } : {}),
     decisions: d.precedents.slice(0, 12).map((p) => ({ asked: p.question, decided: p.decision, by: p.byName })),
     task: d.task,
     dispute: d.question,
@@ -237,7 +255,7 @@ export async function decideDispute(
 /** Decide whether the deputy can approve a change that touches protected paths. */
 export async function decideApproval(
   cfg: DelegateConfig,
-  c: { guarded: string[]; agentApprovals: number; undeclared: string[]; title: string; summary: string; intent: string; patch: string },
+  c: { guarded: string[]; agentApprovals: number; undeclared: string[]; title: string; summary: string; intent: string; patch: string; project?: ProjectContext },
   judge: Judge,
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
@@ -252,11 +270,12 @@ export async function decideApproval(
   const min = cfg.approvals.minConfidence;
   const res = await systemOne(judge, {
     guidance: cfg.guidance || "(none written)",
+    ...(c.project ? { project: c.project } : {}),
     change: { title: c.title, summary: c.summary, intent: c.intent, protected_files: c.guarded, diff: protectedDiff(c.patch, c.guarded) },
   }, {
     follows_guidance: {
       type: "noul",
-      instructions: "Is `change.diff` consistent with the human leads' `guidance`?",
+      instructions: "Given where the project stands in `project`, is `change.diff` consistent with the human leads' `guidance`?",
       criteria: { true: "Nothing in the diff goes against the guidance", false: "Some part of the diff goes against the guidance, or the guidance would forbid it" },
     },
     does_what_it_says: {
@@ -285,12 +304,6 @@ export async function decideApproval(
   };
 }
 
-/** How far along the project is, so guidance like "early on" or "during bootstrap" means something to the model. */
-export interface ProjectStage {
-  mergedChanges: number;
-  testFiles: number;
-  ageDays: number;
-}
 
 /**
  * Decide whether the deputy can clear a change its review brief flagged for a
@@ -299,7 +312,7 @@ export interface ProjectStage {
  */
 export async function decideFlagged(
   cfg: DelegateConfig,
-  c: { reasons: string[]; agentApprovals: number; title: string; summary: string; intent: string; patch: string; stage: ProjectStage },
+  c: { reasons: string[]; agentApprovals: number; title: string; summary: string; intent: string; patch: string; project: ProjectContext },
   judge: Judge,
 ): Promise<Verdict> {
   if (!cfg.enabled) return { act: false, reason: `${cfg.name} is off` };
@@ -311,12 +324,12 @@ export async function decideFlagged(
   const min = cfg.flagged.minConfidence;
   const res = await systemOne(judge, {
     guidance: cfg.guidance,
-    project: { merged_changes: c.stage.mergedChanges, test_files_on_main: c.stage.testFiles, age_days: c.stage.ageDays },
+    project: c.project,
     change: { title: c.title, summary: c.summary, intent: c.intent, flagged_because: c.reasons, diff: c.patch.slice(0, 12_000) },
   }, {
     allowed: {
       type: "noul",
-      instructions: "Loom flagged `change` for a person to look at, for the reasons in `change.flagged_because`. Given the project's stage in `project`, does the human leads' `guidance` say they're fine letting a change like this go ahead without a person looking?",
+      instructions: "Loom flagged `change` for a person to look at, for the reasons in `change.flagged_because`. Given where the project stands in `project`, does the human leads' `guidance` say they're fine letting a change like this go ahead without a person looking?",
       criteria: { true: "The guidance clearly allows this kind of change, for these reasons, at this stage of the project", false: "The guidance is silent, ambiguous, or wants a person to look at this" },
     },
     risky: {

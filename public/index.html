@@ -123,6 +123,8 @@
     <p class="meta">Decide what the deputy may handle for you. It answers only within this brief, using house rules and a decision model (Cloudflare's Clef, unless you add a key), and hands everything else to a person with the reason. <span id="jev-status"></span></p>
     <label class="check jev-master"><input type="checkbox" name="enabled"> Let the deputy act for the humans <small>the master switch: while it's off, nothing below does anything</small></label>
     <div id="jev-summary" aria-live="polite"></div>
+    <details class="jev-context"><summary>What the deputy knows about the project</summary><div id="jev-context" class="meta">Loading…</div>
+      <p class="meta">It gets this with every decision, so your guidance can depend on it (“early on”, “while it's a few agents”, “once there are tests”). The concept is the project description in Settings.</p></details>
     <label>Name <input name="name" maxlength="24"></label>
     <label>Guidance <small>what the deputy judges by, in your words. It isn't a power itself: it only takes effect through the powers you tick below</small>
       <textarea name="guidance" rows="4" placeholder="e.g. Prefer the stricter option on validation. Keep the API backwards compatible. No new runtime dependencies."></textarea></label>
@@ -143,7 +145,7 @@
     </fieldset>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="f_enabled"> Clear changes flagged “Needs a person”</label></legend>
-      <p class="meta">A change's review brief flags it for a person when it touches files outside its declared intent, changes code without tests, or is new ground for its author. The deputy can approve it for the humans when your guidance allows it. It sees how far along the project is, so guidance like “during bootstrap” works. Never protected paths or failing checks.</p>
+      <p class="meta">A change's review brief flags it for a person when it touches files outside its declared intent, changes code without tests, or is new ground for its author. The deputy can approve it for the humans when your guidance allows it. It knows where the project stands, so guidance like “during bootstrap” works. Never protected paths or failing checks.</p>
       <label class="check"><input type="checkbox" name="f_review"> Only after an agent reviewer approved</label>
       <label><span>Act when the model is at least <output id="f_conf_out"></output> sure</span> <input type="range" name="f_conf" min="0.5" max="0.99" step="0.01"></label>
     </fieldset>

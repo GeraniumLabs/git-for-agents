@@ -1579,7 +1579,23 @@ function showConf() {
   $("#jev-summary").innerHTML = jevSummary();
 }
 jevForm.oninput = showConf;
-$("#jev-open").onclick = () => { fillJev(); $("#jev").showModal(); };
+async function fillJevContext() {
+  const box = $("#jev-context");
+  try {
+    const c = await api("/delegate/context");
+    const row = (k, v) => `<div><b>${k}</b> ${v}</div>`;
+    box.innerHTML = [
+      row("Concept", c.concept ? esc(c.concept) : "<i>none written: add a project description in Settings</i>"),
+      row("Age", `${c.age_days} day${c.age_days === 1 ? "" : "s"}`),
+      row("Agents", `${c.agents.total} agent${c.agents.total === 1 ? "" : "s"}, ${c.agents.working_now} working now; ${c.agents.people} ${c.agents.people === 1 ? "person" : "people"}`),
+      row("Main", `${c.main.merged_changes} change${c.main.merged_changes === 1 ? "" : "s"} merged, ${c.main.test_files} test file${c.main.test_files === 1 ? "" : "s"}`),
+      row("In flight", `${c.in_flight.open_tasks} open task${c.in_flight.open_tasks === 1 ? "" : "s"}, ${c.in_flight.changes_in_review} change${c.in_flight.changes_in_review === 1 ? "" : "s"} in review`),
+      c.recently_merged.length ? row("Recently merged", c.recently_merged.map(esc).join(" · ")) : "",
+      row("Protected paths", c.protected_paths.length ? c.protected_paths.map(esc).join(", ") : "none"),
+    ].join("");
+  } catch { box.textContent = "Couldn't load it right now."; }
+}
+$("#jev-open").onclick = () => { fillJev(); fillJevContext(); $("#jev").showModal(); };
 $("#jev").onclose = async () => {
   if ($("#jev").returnValue !== "save") return;
   await act("POST", "/delegate", {

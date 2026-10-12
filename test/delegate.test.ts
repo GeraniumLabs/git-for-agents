@@ -20,14 +20,18 @@ const cfg = (over: Partial<DelegateConfig["flagged"]> = {}, rest: Partial<Delega
 const change = {
   reasons: ["2 files outside the declared intent", "Changes code without changing any tests"],
   agentApprovals: 1, title: "Scaffold the CLI", summary: "", intent: "src/cli.ts", patch: "--- a/src/cli.ts\n+++ b/src/cli.ts\n+x\n",
-  stage: { mergedChanges: 3, testFiles: 0, ageDays: 0 },
+  project: {
+    concept: "A CLI for tidying photo libraries", age_days: 0, agents: { total: 4, working_now: 3, people: 1 },
+    main: { merged_changes: 3, version: 3, test_files: 0 }, in_flight: { open_tasks: 6, changes_in_review: 2 },
+    recently_merged: ["Scaffold the repo"], protected_paths: [],
+  },
 };
 
-test("the deputy clears a flagged change the guidance allows, and the model sees the project's stage", async () => {
+test("the deputy clears a flagged change the guidance allows, and the model sees where the project stands", async () => {
   const { judge, seen } = judgeSaying({ allowed: 0.95, risky: 0.02, high_stakes: 0.1 });
   const v = await decideFlagged(cfg(), change, judge);
   assert.equal(v.act, true);
-  assert.deepEqual(seen[0].state.project, { merged_changes: 3, test_files_on_main: 0, age_days: 0 });
+  assert.deepEqual(seen[0].state.project, change.project);
   assert.deepEqual(seen[0].state.change.flagged_because, change.reasons);
 });
 

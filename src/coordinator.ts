@@ -8,7 +8,7 @@ import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, t
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import type { Env } from "./env";
-import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge } from "./delegate";
+import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge, type ProjectContext } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
@@ -517,6 +517,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "archive") return await this.archive(url.searchParams);
       if (a === "commits") return json(await this.commits(url.searchParams));
       if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? "", await this.liveJoinCode(url.searchParams.get("code"))), { headers: { "content-type": "text/markdown; charset=utf-8" } });
+      if (a === "delegate" && b === "context") return json(this.projectContext());
       if (a === "delegate") return json(this.delegateConfig);
       if (a === "members") return json(this.members());
       if (a === "threads" && b) return json(this.thread(Number(b)));
@@ -2130,6 +2131,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         options: t.options,
         task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
         precedents: this.relevantDecisions(this.threadPaths(t), e.data.body),
+        project: this.projectContext(),
       }, await this.judge());
       if (this.thread(t.id).status !== "open") return; // a human got there first
       if (v.act) {
@@ -2156,6 +2158,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         positions: Object.fromEntries(Object.entries(names).map(([n, id]) => [n, terms.positions[id]])),
         task: task ? `#${task.id} ${task.title}: ${task.description ?? ""}` : "",
         precedents: this.relevantDecisions(this.threadPaths(t), terms.question),
+        project: this.projectContext(),
       }, await this.judge());
       if (this.thread(t.id).status !== "open") return;
       if (v.act && v.option && names[v.option]) {
@@ -2182,7 +2185,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       guarded, agentApprovals, undeclared: ch.undeclared,
       title: ch.title, summary: ch.summary ?? "",
       intent: detail.intents.map((i: any) => `${i.description} (${i.paths.join(", ")})`).join("; "),
-      patch: detail.patch,
+      patch: detail.patch, project: this.projectContext(),
     }, await this.judge());
     if (this.change(changeId).head !== ch.head || this.change(changeId).status !== "review") return; // moved on meanwhile
     if (v.act) {
@@ -2202,7 +2205,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       reasons: detail.brief.reasons.filter((x: any) => x.kind !== "ok" && x.kind !== "threads").map((x: any) => x.text),
       agentApprovals, title: ch.title, summary: ch.summary ?? "",
       intent: detail.intents.map((i: any) => `${i.description} (${i.paths.join(", ")})`).join("; "),
-      patch: detail.patch, stage: this.projectStage(),
+      patch: detail.patch, project: this.projectContext(),
     }, await this.judge());
     if (this.change(ch.id).head !== ch.head || this.change(ch.id).status !== "review") return; // moved on meanwhile
     if (v.act) {
@@ -2213,13 +2216,30 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** How far along the project is: what the deputy's model needs to read guidance like "early on". */
-  private projectStage() {
-    const merged = this.sql.exec("SELECT files FROM changes WHERE status = 'merged'").toArray();
+  /** Where the project stands, for the deputy's model: guidance like "early on" or "while it's a few agents" needs it. */
+  private projectContext(): ProjectContext {
+    const merged = this.sql.exec("SELECT title, files FROM changes WHERE status = 'merged' ORDER BY updated_at DESC LIMIT 500").toArray();
     const tests = new Set<string>();
     for (const r of merged) for (const f of JSON.parse(r.files as string) as FileChange[]) if (isTest(f.path)) tests.add(f.path);
     const first = this.sql.exec("SELECT MIN(ts) AS t FROM events").one().t as number | null;
-    return { mergedChanges: merged.length, testFiles: tests.size, ageDays: first ? Math.floor((Date.now() - first) / 86_400_000) : 0 };
+    const agents = this.agentStates().filter((a) => a.id !== DELEGATE_ID);
+    const n = (sql: string) => this.sql.exec(sql).one().n as number;
+    return {
+      concept: (this.meta("description") ?? "").slice(0, 1000),
+      age_days: first ? Math.floor((Date.now() - first) / 86_400_000) : 0,
+      agents: {
+        total: agents.filter((a) => a.role !== "human").length,
+        working_now: agents.filter((a) => a.state === "working" || a.state === "waiting" || a.state === "conflict").length,
+        people: agents.filter((a) => a.role === "human").length,
+      },
+      main: { merged_changes: n("SELECT COUNT(*) AS n FROM changes WHERE status = 'merged'"), version: this.mainVersion, test_files: tests.size },
+      in_flight: {
+        open_tasks: n("SELECT COUNT(*) AS n FROM tasks WHERE status NOT IN ('merged','closed','abandoned')"),
+        changes_in_review: n("SELECT COUNT(*) AS n FROM changes WHERE status IN ('review','changes_requested')"),
+      },
+      recently_merged: merged.slice(0, 8).map((r) => String(r.title ?? "")),
+      protected_paths: this.protectedPaths,
+    };
   }
 
   private escalated = new Set<string>();
