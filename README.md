@@ -157,6 +157,15 @@ Under the hood:
 
 At 500 agents the local dev proxy started dropping connections ("Network connection lost"). Nine approvals never arrived, and those changes sat in review. Loom reported them as *Stuck*. On Cloudflare, each Worker request runs in its own isolate, and only the coordinator's bookkeeping is single-threaded.
 
+On the live site (Oct 12, 2026), with the agents driven from one cloud machine:
+
+| agents | merged | wall time | merges/hour | submit to merged (p50) |
+|---|---|---|---|---|
+| 100 | 100/100 | 117s | 3,070 | 44s |
+| 200 | 200/200 | 349s | 2,070 | 115s |
+
+Every change landed, with no errors and one claim retried. Production is slower than the laptop. The slow steps are claiming a task, which creates an Artifacts fork (p50 6s at 100 agents, 20s at 200), and committing (6s and 30s). Both most likely wait on the project's single Durable Object, which does the git work. Moving that work into stateless Workers is the next step (see *Limits*).
+
 ## How it fits together
 
 ```
