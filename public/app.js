@@ -784,7 +784,7 @@ async function showSettings() {
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
     <h2>Keys</h2>
-    <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `Jev judges with <b>${esc(s.jevUses)}</b>.` : "Jev has no key yet, so it applies only house rules and earlier decisions."}</p>
+    <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
     ${s.keys.map((k) => `<div class="card key-card">
       <div class="row"><b class="grow">${esc(k.label)}</b>${k.saved ? `<span class="pill mono">…${esc(k.saved.last4)}</span>` : k.serverKey ? `<span class="pill">server key</span>` : `<span class="pill">not set</span>`}</div>
@@ -837,7 +837,7 @@ async function showSettings() {
     showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-key-remove]")) b.onclick = async () => {
-    if (!confirm("Remove this key? Jev falls back to the server's key, or to house rules only.")) return;
+    if (!confirm("Remove this key? The deputy falls back to the server's key, or to Clef.")) return;
     try { await act("DELETE", `/settings/keys/${b.dataset.keyRemove}`); } catch { return; }
     toast("Key removed");
     showSettings();
@@ -1014,7 +1014,7 @@ function describe(e) {
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
     case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];
-    case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : d.kind === "dispute" ? `settled dispute #${d.thread}` : `approved #${e.change_id} for the humans`} (${d.via === "jev" ? "Jev's judgment" : d.via === "precedent" ? `earlier decision${d.precedent ? ` #${d.precedent}` : ""}` : "house rule"}): “${esc(d.decision)}”`];
+    case "delegate.decided": return ["merged", `${who} ${d.kind === "question" ? `answered for the humans${d.thread ? ` in thread #${d.thread}` : ""}` : d.kind === "dispute" ? `settled dispute #${d.thread}` : `approved #${e.change_id} for the humans`} (${d.via === "model" || d.via === "jev" ? `${esc(d.model ?? "Jev")}'s judgment` : d.via === "precedent" ? `earlier decision${d.precedent ? ` #${d.precedent}` : ""}` : "house rule"}): “${esc(d.decision)}”`];
     case "decision.recorded": return ["directive", `Decision #${d.decision} recorded (${esc(d.kind)}, by ${who})${d.paths.length ? ` for <span class="mono">${d.paths.map(esc).join(", ")}</span>` : ""}: “${esc(d.text.slice(0, 140))}”`];
     case "decision.retired": return ["", `${who} retired decision #${d.decision}`];
     case "memory.recalled": return ["message", `${who} recalled ${[d.decisions.length && `${d.decisions.length} decision${d.decisions.length > 1 ? "s" : ""}`, d.notes?.length && `${d.notes.length} note${d.notes.length > 1 ? "s" : ""}`, d.efforts.length && `${d.efforts.length} earlier change${d.efforts.length > 1 ? "s" : ""}`].filter(Boolean).join(" and ")} on <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.consult.length ? `; ${d.consult.map(name).map(esc).join(", ")} worked there and ${d.consult.length > 1 ? "are" : "is"} still around` : ""}`];
@@ -1440,14 +1440,14 @@ async function loadContest(id) {
   };
 }
 
-// ── jev: what the humans let their stand-in decide ──────────────────────
+// ── the deputy: what the humans let their stand-in decide ──────────────────────
 const jevForm = $("#jev-form");
 const field = (n) => jevForm.elements.namedItem(n);
 const listOf = (v) => v.split(",").map((x) => x.trim()).filter(Boolean);
 function fillJev() {
   const d = state.delegate;
   $("#jev-title").textContent = d.name;
-  $("#jev-status").textContent = d.jevConnected ? `Jev judges with ${d.jevUses}.` : "Jev has no key yet, so only house rules and earlier decisions apply. Add one in Settings.";
+  $("#jev-status").textContent = d.jevConnected ? `It judges with ${d.jevUses}.` : "No decision model is connected, so only house rules and earlier decisions apply. Add a key in Settings.";
   field("enabled").checked = d.enabled;
   field("name").value = d.name;
   field("guidance").value = d.guidance;
@@ -1474,19 +1474,19 @@ $("#jev").onclose = async () => {
   if ($("#jev").returnValue !== "save") return;
   await act("POST", "/delegate", {
     enabled: field("enabled").checked,
-    name: field("name").value.trim() || "jev",
+    name: field("name").value.trim() || "deputy",
     guidance: field("guidance").value.trim(),
     questions: { enabled: field("q_enabled").checked, topics: listOf(field("q_topics").value), minConfidence: Number(field("q_conf").value) },
     approvals: { enabled: field("a_enabled").checked, paths: listOf(field("a_paths").value), requireAgentReview: field("a_review").checked, minConfidence: Number(field("a_conf").value) },
     disputes: { enabled: field("d_enabled").checked, minConfidence: Number(field("d_conf").value) },
     rules: field("rules").value.split("\n").map((l) => l.split("=>")).filter((p) => p.length === 2 && p[0].trim() && p[1].trim()).map(([pattern, answer]) => ({ pattern: pattern.trim(), answer: answer.trim() })),
   });
-  toast(`Saved ${field("name").value.trim() || "jev"}'s brief`);
+  toast(`Saved ${field("name").value.trim() || "deputy"}'s brief`);
 };
 
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
-  attention: "What only a person can settle: questions agents asked people, disputes jev couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
+  attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
   stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a change nobody reviewed for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
@@ -1562,7 +1562,7 @@ function showHelp() {
     <h2>People</h2>
     ${item("Needs a person", "The only things that wait for you. Agents can ask with a default and go ahead on it if nobody answers in time; each agent may have only a few questions open (Settings).")}
     ${item("Directive", "An instruction to one agent or all of them, followed over their own plan and kept as a decision.")}
-    ${item("jev", "A stand-in you brief (Delegate…) to answer questions, approve protected changes or settle disputes within your guidance. It hands everything else to a person, with the reason.")}
+    ${item("deputy", "A stand-in you brief (Delegate…) to answer questions, approve protected changes or settle disputes within your guidance. It hands everything else to a person, with the reason.")}
     ${item("Pause and freeze", "Pause an agent from its profile: it can still talk but not change code. Freeze main to stop anything landing.")}`;
   if (!$("#detail").open) $("#detail").showModal();
 }

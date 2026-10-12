@@ -46,13 +46,13 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 - **Consults**: when memory shows that an agent who worked on these files is still around, the newcomer can ask them in one call (`consult_agent`). Loom suggests a consult at most once per pair of agents per file, so memory doesn't turn into chatter. If the earlier agent is gone, its saved plan and decisions answer instead.
 - **Review routing**: Loom remembers which agent wrote or reviewed each file, and each function, class and export inside it (parsed from the diff for JS/TS, Python, Go and Rust). After submitting, an agent gets `suggestedReviewers`, ranked by how much of the change they already know: the same functions first, then the same files, then the same folder. Recent work counts more, as do agents who are around now, and agents who already have open reviews count less. The agent asks them with `request_review`, or omits names to let Loom pick. Reviewer agents are a class of their own. They still see every review request, and they fill in when no builder knows the code. Agents come and go, so a request has to be acknowledged. Loom marks it *seen* once it reaches the reviewer. The reviewer then accepts or declines it (`respond_to_review_request`). A request nobody answers within 5 minutes goes to the next best agent who is around, and so does one that was accepted and not delivered within 30 minutes, or that was declined. The change shows where each request stands. Requests to people have no deadline and wait under *Needs a person*.
 - **Checking back**: agents are often short-lived. `whoami` returns a `todo` list: review requests to answer, changes sent back, tasks with no change yet. The dashboard's **Connect an agent** button copies a ready-made skill (also at `GET /api/projects/<project>/skill`). It tells an agent how to work on the project, what to do whenever it arrives, what to tidy before it leaves, and how a scheduler can poll `/me` to bring an agent back when work is waiting.
-- **Disputes**: when two agents disagree and talking hasn't settled it (a review one thinks is wrong, a rejected proposal), either opens a dispute and each states a position. jev rules if the humans' guidance and earlier decisions settle it, a person if not. The ruling is binding and becomes a decision. On a change, a ruling for the author dismisses the other side's request for changes.
+- **Disputes**: when two agents disagree and talking hasn't settled it (a review one thinks is wrong, a rejected proposal), either opens a dispute and each states a position. The deputy rules if the humans' guidance and earlier decisions settle it, a person if not. The ruling is binding and becomes a decision. On a change, a ruling for the author dismisses the other side's request for changes.
 
 **Memory**
 - **Decisions**: human answers to agents' questions, broadcast directives, human requests for changes, dispute rulings and notes humans record directly all land in one log, tagged with the files they cover. Humans can retire a decision that no longer holds.
 - **Recall on intent**: `declare_intent` returns the decisions that apply to those paths, earlier finished changes there (summary, the author's recorded decisions, objections from reviews), and which of those authors is still around.
 - **Delegation with memory**: claiming or being handed a task returns related earlier tasks, either named by a human (`related`) or similar in wording, with what they did and the decisions along the way.
-- **Precedent**: asking the humans returns earlier decisions that may already answer the question. jev answers a repeated question by citing the earlier decision, so people decide once.
+- **Precedent**: asking the humans returns earlier decisions that may already answer the question. The deputy answers a repeated question by citing the earlier decision, so people decide once.
 
 **Humans in the loop**
 - **Ask a human**: an agent asks a question, optionally blocking its task. The question shows up in the dashboard's *Needs a human* inbox, and the answer unblocks the agent.
@@ -70,17 +70,17 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
   3. The author's own commits stay in history under the merge commit.
 - **Read the code your way**: the dashboard's **Code** view browses main, and any change's files, in the browser. **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
 
-**jev: a stand-in for the humans**
+**The deputy: a stand-in for the humans**
 
-People can't answer every question a swarm asks. jev is a delegate they brief to decide some things for them, backed by a decision model: Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) on Workers AI by default, or [TypeSafe](https://docs.typesafe.ai)'s Jev with a key. Neither writes text; they return typed judgments with probabilities, and Clef takes Jev's API as is. So jev never makes up an answer. It acts in only two ways:
-- **Questions**: when an agent asks the humans and lists its options, jev uses a Jev *Choice* to pick the option the humans' written guidance points to. Two Jev *Noul* checks run alongside it: does the guidance actually settle this, and is it high-stakes?
-- **Protected changes**: jev approves a change to paths it has been trusted with only after Jev's Noul checks pass. The diff must follow the guidance, do only what its summary says, and add no risk (dependencies, scripts, secrets, deleted data).
-- **Disputes**: jev uses a Jev Choice between the two positions, judged against the guidance and earlier decisions, with the same "settled?" and "high-stakes?" checks.
-- **Precedent**: a question asked before is answered with the earlier decision. A Jev Choice also matches new wording to earlier decisions.
+People can't answer every question a swarm asks. The deputy is a delegate they brief to decide some things for them, backed by a decision model: Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) on Workers AI by default, or [TypeSafe](https://docs.typesafe.ai)'s Jev with a key. Neither writes text; they return typed judgments with probabilities, and Clef takes Jev's API as is. So the deputy never makes up an answer. It acts in only two ways:
+- **Questions**: when an agent asks the humans and lists its options, the deputy uses a *Choice* to pick the option the humans' written guidance points to. Two *Noul* checks run alongside it: does the guidance actually settle this, and is it high-stakes?
+- **Protected changes**: the deputy approves a change to paths it has been trusted with only after the model's Noul checks pass. The diff must follow the guidance, do only what its summary says, and add no risk (dependencies, scripts, secrets, deleted data).
+- **Disputes**: the deputy uses a Choice between the two positions, judged against the guidance and earlier decisions, with the same "settled?" and "high-stakes?" checks.
+- **Precedent**: a question asked before is answered with the earlier decision. A Choice also matches new wording to earlier decisions.
 
-The humans set what jev may handle in the dashboard (**Delegate…**): whether it answers questions, which topics, house rules (`pattern => answer`) that apply first, which protected paths it may approve, and how confident Jev must be for each. Below the threshold, outside its scope, or without Jev connected, jev passes the item to a person and says why in the *Needs a human* inbox.
+The humans set what the deputy may handle in the dashboard (**Delegate…**): whether it answers questions, which topics, house rules (`pattern => answer`) that apply first, which protected paths it may approve, and how confident the model must be for each. Below the threshold, outside its scope, or without a decision model, the deputy passes the item to a person and says why in the *Needs a human* inbox.
 
-**Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so jev judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude. With no key at all, jev judges with Clef through the Worker's `AI` binding, so it works on every project out of the box.
+**Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so the deputy judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude. With no key at all, the deputy judges with Clef through the Worker's `AI` binding, so it works on every project out of the box.
 
 ![bring your own keys](docs/settings.png)
 
@@ -116,7 +116,7 @@ An attempt wins when its weighted votes reach the quorum (at least 2, or the pro
 - requests for changes that were upheld (the author changed the code, or the change was closed) and ones that were overruled;
 - contest votes for the winner, and for a loser.
 
-These become a score with a prior, so one lucky outcome doesn't make an oracle, and the score becomes a weight between 0.25 and 2 that a newcomer starts at 1. By default (`approvalMode: "weighted"`), a change needs its approvals to *weigh* at least the required number: on a project that requires one approval, a single approval from an agent whose approvals keep being overturned (weight 0.6) isn't enough on its own, while one from a reviewer at 1.4 is. People, jev and admins always count 1. Owners can switch to plain counting in **Settings**. Review routing also prefers agents with good records. `my_track_record` shows an agent its own, and agent profiles show everyone's.
+These become a score with a prior, so one lucky outcome doesn't make an oracle, and the score becomes a weight between 0.25 and 2 that a newcomer starts at 1. By default (`approvalMode: "weighted"`), a change needs its approvals to *weigh* at least the required number: on a project that requires one approval, a single approval from an agent whose approvals keep being overturned (weight 0.6) isn't enough on its own, while one from a reviewer at 1.4 is. People, the deputy and admins always count 1. Owners can switch to plain counting in **Settings**. Review routing also prefers agents with good records. `my_track_record` shows an agent its own, and agent profiles show everyone's.
 
 **Notes.** Decisions come from people. Notes are what agents learned: "all reads go through db.js", "the date tests need TZ=UTC". An agent adds them with `remember`, or puts them in `context.notes` when it submits, and they become the project's when the change lands. `declare_intent` and `recall` return the notes for those paths, ranked by how other agents rated them (`rate_note`, weighted by the rater's track record). Near-duplicates fold into the existing note; a person can retire one that no longer holds.
 
@@ -203,14 +203,14 @@ npm run demo          # terminal 3: six agents build a todo service together
 Open http://127.0.0.1:8787 and watch. In about a minute six builders, a reviewer and a scripted human lead (jo) build a todo service together. Along the way you'll see:
 - collision forecasts, and one agent proposing "you land first" to another;
 - a published contract;
-- jev answering agents' blocking questions within the brief jo gave it, and passing on what it can't settle;
+- the deputy answering agents' blocking questions within the brief jo gave it, and passing on what it can't settle;
 - a conflict routed to the right agent and resolved;
-- eli disputing rex's objection to a version bump, and the ruling (by jev, or jo when Jev isn't connected) enforced;
-- dax asking a question jo already answered, and jev answering with the earlier decision;
+- eli disputing rex's objection to a version bump, and the ruling (by the deputy, or by jo when no decision model is connected) enforced;
+- dax asking a question jo already answered, and the deputy answering with the earlier decision;
 - fen starting on files ada changed, getting ada's decisions and reasons from memory, and consulting ada, who is still around;
-- the docs change approved by jev (or by jo when Jev isn't connected).
+- the docs change approved by the deputy (or by jo when no decision model is connected).
 
-All six changes land on main. Without a TypeSafe key, jev uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, click **Sign in**: locally you can sign in as any GitHub login without a GitHub app (`LOOM_DEV_LOGIN=1` in `wrangler.toml`), and `jonathanherr` is set as a site owner there. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
+All six changes land on main. Local development has no Workers AI binding, so without a key the deputy uses only its house rules and passes the rest to jo. To use Jev, run the Worker with `npx wrangler dev --env local --var TYPESAFE_API_KEY:<key>`. To steer it yourself, click **Sign in**: locally you can sign in as any GitHub login without a GitHub app (`LOOM_DEV_LOGIN=1` in `wrangler.toml`), and `jonathanherr` is set as a site owner there. Set `PACE=2` to slow it down for a demo, or `PACE=0` to run it as a test.
 
 `node demo/contest.mjs` runs the contest demo: two warm-up tasks give the reviewers different track records, then three agents attempt one task, four vote, and the better-reviewed votes win over a careless one. It ends by printing everyone's track record.
 
@@ -239,8 +239,8 @@ npx wrangler r2 bucket create loom-context
 npx wrangler secret put LOOM_ADMIN_TOKEN   # for scripts only
 npx wrangler secret put LOOM_SECRET_KEY    # signs sessions and seals the keys people save in Settings
 npx wrangler secret put LOOM_OWNERS        # optional: GitHub logins who own every project, comma-separated
-npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key (without one, jev uses Clef on Workers AI)
-npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for jev
+npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key (without one, the deputy uses Clef on Workers AI)
+npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for the deputy
 npx wrangler deploy
 ```
 
@@ -344,14 +344,14 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}, questions: {maxOpen, deadlineMinutes}}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
-| `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
+| `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set the deputy's brief |
 | `GET /decisions?paths=&q=` | Decisions on record, optionally those relevant to paths or a question |
 | `POST /decisions` `{decision, question?, paths}`, `POST /decisions/:id/retire` | *Human:* record a decision, or retire one |
 | `GET /tasks/:id/memory` | Related earlier tasks and the decisions that apply |
 | `POST /consults` `{agent, question, path?, changeId?}` | Ask an agent who worked on something before |
 | `POST /disputes` `{with, question, position, changeId?, taskId?}` | Open a dispute with another agent |
 | `POST /disputes/:id/position` `{position}` | State your side |
-| `POST /disputes/:id/rule` `{for, note?}` | *Human:* rule (jev rules too, within its brief) |
+| `POST /disputes/:id/rule` `{for, note?}` | *Human:* rule (the deputy rules too, within its brief) |
 
 ## Limits and next steps
 

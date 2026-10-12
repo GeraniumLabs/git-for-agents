@@ -43,7 +43,7 @@ bucket_name = "loom-context"
 
 # Projects a first-time visitor sees first; the first one opens by default.
 # Leave empty to open the newest public project.
-# Workers AI: Clef judges for jev when a project brings no key of its own.
+# Workers AI: Clef judges for the deputy when a project brings no key of its own.
 [ai]
 binding = "AI"
 

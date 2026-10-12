@@ -7,7 +7,7 @@ export interface Env {
   LOOM_ADMIN_TOKEN?: string;
   /** Seals the keys people save in a project's Settings. Falls back to LOOM_ADMIN_TOKEN. */
   LOOM_SECRET_KEY?: string;
-  /** A server-wide Claude key for Jev, used when a project has none of its own. */
+  /** A server-wide Claude key for the deputy, used when a project has none of its own. */
   ANTHROPIC_API_KEY?: string;
   /** GitHub OAuth app for people signing in. */
   GITHUB_CLIENT_ID?: string;
@@ -20,7 +20,7 @@ export interface Env {
   LOOM_CREATORS?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
-  /** Workers AI, for Clef: jev's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
+  /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
   TYPESAFE_API_KEY?: string;
   TYPESAFE_URL?: string;
