@@ -713,20 +713,29 @@ function showNewJoinCode() {
   try { fresh = JSON.parse(sessionStorage.getItem("loom-new-join") ?? "null"); sessionStorage.removeItem("loom-new-join"); } catch {}
   if (fresh?.project === project && fresh.code) showSkill(fresh.code);
 }
+// Whether a skill without a join code was copied, so a code made afterwards says to copy again.
+let copiedPlainSkill = false;
 async function showSkill(joinCode) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
   const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
+  const owner = isOwner();
+  const codeRows = codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("");
+  // Owners go in order: make a join code, then copy the skill that carries it.
+  const step1 = joinCode
+    ? `<h2>1. Join code ready</h2><div class="card fresh"><b>Join code #${joinCode.id} is in the skill below</b> <span class="role">${esc(joinCode.role)}</span>
+        ${copiedPlainSkill ? `<p><b>Copy the skill again.</b> The one you copied earlier has no join code, so agents given it can't register.</p>` : ""}
+        <p class="meta">Any agent you give this skill registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. Sub-agents use that key with their own names. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
+    : `<h2>1. Let agents register themselves</h2>
+      <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
+      <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
-    ${joinCode ? `<div class="card"><b>This skill carries a join code</b> <span class="role">${esc(joinCode.role)}</span><p class="meta">Any agent you give it registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
-      : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${isOwner() ? "To let agents register themselves, create a join code: the skill then carries it, and each agent trades it for its own key." : "Each agent needs its own key or a join code from an owner."}</p>`}
-    <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
+    ${owner ? step1 : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${joinCode ? "It carries a join code: each agent trades it for its own key once." : "Each agent needs its own key or a join code from an owner."}</p>`}
+    ${owner ? `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "It has no join code yet: agents given it need a key you create for each one (below)."}</p>` : ""}
+    <div class="row code-row"><button id="skill-copy" class="${joinCode || !owner ? "" : "ghost"}">${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
-    ${isOwner() ? `<h2>Let agents register themselves</h2>
-    <p class="meta">Best for a swarm. One join code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code. Limit how many agents may use it and for how long, and revoke it any time.</p>
-    <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
-    ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
+    ${owner && codes.length ? `<h2>Join codes</h2>${codeRows}${joinCode ? `<div class="row"><button class="ghost mini" id="jc-another">Create another join code</button></div>` : ""}` : ""}
     <details class="mk-key"><summary><h2>Create a key for one agent</h2></summary>
     ${isOwner() ? `<p class="meta">For a single agent you set up yourself. Prefer a join code for anything that starts sub-agents or a swarm. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
     <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
@@ -746,7 +755,10 @@ async function showSkill(joinCode) {
   if ($("#jc-go")) $("#jc-go").onclick = async () => {
     try {
       const code = await act("POST", "/join-codes", { role: $("#jc-role").value, maxUses: Number($("#jc-max").value), expiresInHours: Number($("#jc-hours").value) });
-      showSkill(code);
+      await showSkill(code);
+      $("#detail-body").scrollTop = 0;
+      $("#detail-body").closest("dialog")?.scrollTo?.(0, 0);
+      toast(copiedPlainSkill ? "Join code created. Copy the skill again: it now carries the code" : "Join code created and added to the skill");
     } catch {}
   };
   for (const b of $("#detail-body").querySelectorAll("[data-jc-revoke]")) b.onclick = async () => {
@@ -754,8 +766,10 @@ async function showSkill(joinCode) {
     try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
     showSkill(joinCode);
   };
-  $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
-  $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
+  const copied = (what) => { copiedPlainSkill = !joinCode; toast(joinCode ? `${what} copied, with join code #${joinCode.id}` : `${what} copied${owner ? " (no join code in it)" : ""}`); };
+  $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => copied("Skill"));
+  $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => copied("Install command"));
+  if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#skill-open").onclick = () => showSkill();
