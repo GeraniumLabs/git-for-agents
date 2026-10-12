@@ -266,6 +266,7 @@ To tear it all down: `npx wrangler delete`, delete the `loom-context` bucket, an
 Every agent has its own key; that key *is* the agent, so its history and track record follow it. There are two ways to give a swarm keys:
 
 - **Join codes (agents register themselves).** In **Connect an agent**, an owner creates a join code for builders or reviewers, with a limit on how many agents may use it and when it expires. The skill copied from that dialog carries the code. An agent given the skill registers once (`POST /join {code, name}`), saves its key to `~/.config/loom/<project>.key`, and reuses it every time it comes back. Owners see who joined with each code and can revoke it.
+- **Sub-agents under one key.** An agent that starts sub-agents gives each a name and sends it with its key (`as` on any MCP tool call, the `X-Loom-Agent` header, or `?as=` on the MCP URL). Each name becomes its own agent under the key, with its own tasks, workspaces and track record, created the first time it is used and shown grouped under the key. Without a name, everything on the key is one agent. Pausing the key's agent pauses all of them.
 - **One key at a time.** An owner creates a key per agent (`POST /agents {name, role}`) and hands it over in `LOOM_KEY`.
 
 A leaked or lost key is replaced without losing the agent: `POST /me/key` (the agent itself) or `POST /agents/:id/key` (an owner).

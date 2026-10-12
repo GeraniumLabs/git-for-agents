@@ -494,7 +494,7 @@ async function runSearch() {
   for (const a of r.agents) names[a.id] = a.name;
   const section = (title, rows) => rows ? `<div class="kicker">${title}</div>${rows}` : "";
   $("#search-results").innerHTML =
-    section(`Agents${r.total > r.agents.length ? ` (${r.total}, showing ${r.agents.length})` : ""}`, r.agents.map((a) => `<a class="hit" data-agent="${esc(a.id)}"><span class="dot ${a.state}"></span><b>${esc(a.name)}</b> <span class="meta">${a.state}${a.task ? ` · #${a.task.id} ${esc(a.task.title)}` : ""}</span></a>`).join(""))
+    section(`Agents${r.total > r.agents.length ? ` (${r.total}, showing ${r.agents.length})` : ""}`, r.agents.map((a) => `<a class="hit" data-agent="${esc(a.id)}"><span class="dot ${a.state}"></span><b>${esc(a.name)}</b> <span class="meta">${a.under ? `under ${esc(a.under.name)} · ` : ""}${a.state}${a.task ? ` · #${a.task.id} ${esc(a.task.title)}` : ""}</span></a>`).join(""))
     + section("Tasks", r.tasks.map((t) => `<a class="hit" ${t.assignee ? `data-agent="${esc(t.assignee)}"` : ""}>#${t.id} ${esc(t.title)} <span class="meta">${t.status}${t.assigneeName ? ` · ${esc(t.assigneeName)}` : ""}</span></a>`).join(""))
     + section("Changes", r.changes.map((c) => `<a class="hit" data-change="${c.id}">#${c.id} ${esc(c.title)} <span class="meta">${c.status} · ${esc(c.agentName)}</span></a>`).join(""))
     || `<p class="empty">Nothing matches “${esc(q)}”.</p>`;
@@ -508,7 +508,7 @@ async function showDirectory(st) {
   for (const a of r.agents) names[a.id] = a.name;
   $("#detail-body").innerHTML = `<h3>${r.total} agent${r.total === 1 ? "" : "s"} ${esc((STATES.find(([k]) => k === st) ?? [, st])[1])}</h3>
     <table class="dir"><thead><tr><th>Agent</th><th>Task</th><th>Last seen</th></tr></thead><tbody>
-    ${r.agents.map((a) => `<tr><td>${who(a.id)}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
+    ${r.agents.map((a) => `<tr><td>${who(a.id)}${a.under ? ` <span class="meta">under ${esc(a.under.name)}</span>` : ""}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
     ${r.total > r.agents.length ? `<p class="meta">Showing ${r.agents.length} of ${r.total}. Search to narrow it down.</p>` : ""}`;
   wire($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
@@ -519,12 +519,14 @@ async function showAgent(id) {
   if (p.error) return toast(p.error);
   const a = p.agent;
   names[a.id] = a.name;
+  if (a.under) names[a.under.id] = a.under.name;
   const ctl = isHuman() && a.role !== "human" ? `<div class="row">
       <button data-op="${a.state === "paused" ? "resume" : "pause"}" class="${a.state === "paused" ? "" : "ghost"}">${a.state === "paused" ? "Resume" : "Pause"}</button>
       <input id="dm-body" placeholder="Directive to ${esc(a.name)} only"><button id="dm-send" class="ghost">Send</button></div>` : "";
   $("#detail-body").innerHTML = `
     <h3><span class="dot ${a.state}"></span> ${esc(a.name)} <span class="role">${a.role}</span> <span class="pill">${a.state}</span></h3>
-    <p class="meta">Last active ${ago(a.lastSeen)} ago${a.task ? ` · working on #${a.task.id} ${esc(a.task.title)} (${a.task.status})` : ""}</p>
+    <p class="meta">Last active ${ago(a.lastSeen)} ago${a.task ? ` · working on #${a.task.id} ${esc(a.task.title)} (${a.task.status})` : ""}${a.under ? ` · works under ${who(a.under.id)}'s key` : ""}</p>
+    ${p.underKey?.length ? `<h2>Agents under this key <small>${p.underKey.length}</small></h2>${p.underKey.map((u) => { names[u.id] = u.name; return `<div class="qrow"><span class="dot ${u.state}"></span>${who(u.id)} <span class="grow meta ellipsis">${u.state}${u.task ? ` · #${u.task.id} ${esc(u.task.title)}` : ""}</span></div>`; }).join("")}` : ""}
     ${p.trust ? `<div class="card"><div class="qrow"><b class="grow">Track record</b><span class="pill" title="what this agent's approvals and contest votes count for">${p.trust.weight}× vote</span></div><div class="meta">${esc(p.trust.summary)}</div></div>` : ""}
     ${ctl}
     <div id="agent-grid" class="card contrib-card"></div>
@@ -754,7 +756,7 @@ $("#skill-open").onclick = () => showSkill();
 // ── new projects ────────────────────────────────────────────────────────
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
   <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
-  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}.</p>
+  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Loom shows them as separate agents under ${esc(k.name)}.</p>
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
@@ -1032,7 +1034,7 @@ function describe(e) {
   const to = e.to_agent ? `<a class="who" data-agent="${esc(e.to_agent)}" style="color:${color(e.to_agent)}">${esc(name(e.to_agent))}</a>` : "";
   switch (e.type) {
     case "project.created": return ["", `Project created, main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>`];
-    case "agent.joined": return ["", `${who} joined as ${d.role}`];
+    case "agent.joined": return ["", `${who} joined as ${d.role}${d.via ? ` under ${esc(name(d.via))}'s key` : ""}`];
     case "task.created": return ["", `${who} created task #${e.task_id} “${esc(d.title)}”`];
     case "task.claimed": return ["", `${who} ${d.resumed ? "took over" : "claimed"} task #${e.task_id} in workspace <span class="mono">${esc(d.workspace)}</span>`];
     case "task.reassigned": return ["stale", `Task #${e.task_id} reassigned: ${esc(d.reason)}`];

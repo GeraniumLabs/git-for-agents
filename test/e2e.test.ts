@@ -74,6 +74,48 @@ test("agents register themselves with a join code from the skill, and keep who t
   await assert.rejects(admin.as(ada.key).req("GET", "/me"), "the old key stops working");
 });
 
+test("sub-agents sharing one key each get their own identity, grouped under the key", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-subagents");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "one key, many agents", requiredApprovals: 1 });
+  const key = await admin.addAgent("builders", "builder");
+  // Sub-agents share one MCP connection, so each names itself on every call.
+  const mcp = async (tool: string, args: Record<string, unknown> = {}, headers: Record<string, string> = {}) => {
+    const res = await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${key.key}`, "content-type": "application/json", ...headers },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }) });
+    const r = (await res.json()).result;
+    if (r.isError) throw new Error(r.content[0].text);
+    return JSON.parse(r.content[0].text);
+  };
+  const list = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${key.key}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }) })).json();
+  assert.ok(list.result.tools.every((t: any) => t.inputSchema.properties.as), "every tool takes as");
+
+  const lead = await mcp("whoami");
+  assert.equal(lead.agent.id, key.id, "without a name the key is its own agent");
+  const ui = await mcp("whoami", { as: "builder-ui" });
+  const api = await mcp("whoami", { as: "builder-api" });
+  assert.notEqual(ui.agent.id, key.id);
+  assert.notEqual(ui.agent.id, api.agent.id);
+  assert.equal(ui.agent.under.id, key.id);
+  assert.equal((await mcp("whoami", { as: "Builder-UI" })).agent.id, ui.agent.id, "the same name is the same agent");
+  assert.equal((await mcp("whoami", {}, { "x-loom-agent": "builder-api" })).agent.id, api.agent.id, "or name it once per connection");
+  assert.equal((await admin.as(key.key).req("GET", "/me", undefined)).agent.id, key.id);
+
+  const t1 = await mcp("create_task", { title: "Calendar view", as: "builder-ui" });
+  const t2 = await mcp("create_task", { title: "Events API", as: "builder-api" });
+  const ws1 = (await mcp("claim_task", { taskId: t1.id, as: "builder-ui" })).workspace.name;
+  await mcp("claim_task", { taskId: t2.id, as: "builder-api" });
+  await assert.rejects(mcp("write_files", { workspace: ws1, files: { "x.txt": "x" }, message: "x", as: "builder-api" }), /belongs to builder-ui/, "siblings don't share workspaces");
+
+  const profile = await admin.req("GET", `/agents/${key.id}`);
+  assert.deepEqual(profile.underKey.map((a: any) => a.name).sort(), ["builder-api", "builder-ui"]);
+  assert.equal((await admin.req("GET", "/search?state=working&limit=50")).agents.length, 2, "two agents at work, not one");
+
+  await admin.req("POST", `/agents/${key.id}/pause`, { reason: "hold on" });
+  await assert.rejects(mcp("create_task", { title: "more", as: "builder-ui" }), /paused/, "pausing the key pauses everyone under it");
+});
+
 test("review threads: the author must answer line comments before the change merges, and reviewers see what changed since", { skip: !url, timeout: 120_000 }, async () => {
   const { Loom } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");

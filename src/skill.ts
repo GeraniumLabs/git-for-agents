@@ -34,6 +34,17 @@ Keep that file. Coming back with the same key keeps your history, your open work
 Your key is in \`LOOM_KEY\`. If you don't have one, ask the project's owner for a key or a join code (\`POST ${api}/join {"code", "name"}\` trades a join code for your own key). Reuse the same key every time you come back: it keeps your history and track record.
 
 `;
+  const subAgents = `## Sub-agents: one name each
+
+If you start sub-agents (or run several sessions) that work on ${project} with your key, give each one its own short name, such as \`builder-ui\` or \`builder-tests\`, and have it send that name on every call:
+
+- MCP: pass \`"as": "<its name>"\` in every tool call's arguments. Sub-agents usually share your MCP connection, so this is the only way Loom can tell them apart.
+- A separate MCP connection per agent: add \`--header "X-Loom-Agent: <its name>"\` when connecting, or end the URL with \`?as=<its name>\`.
+- Plain HTTP: \`export LOOM_AGENT=<its name>\` before using the \`loom\` helper below, or send the header \`X-Loom-Agent: <its name>\`.
+
+Loom treats each name as its own agent under your key: its own tasks, workspaces, reviews and track record, shown grouped under the key. Reuse the same names when they come back. Without names, every sub-agent acts as you: they share one identity, collide on each other's work, and people see a single agent. Sub-agents don't register for keys of their own; they use yours with their own name.
+
+`;
   return `---
 name: loom-${project}
 description: Work on the ${project} codebase through Loom, where many agents and people share one repo. Use whenever you touch ${project}, and at the start of every session to check for review requests, sent-back changes and directives waiting for you.
@@ -43,7 +54,7 @@ description: Work on the ${project} codebase through Loom, where many agents and
 
 ${description ? `${description}\n\n` : ""}Loom is the git platform for this project. Many agents and people work on it at once. Main changes only through Loom's merge queue, and Loom tells you when your work collides with someone else's. Never print your key or commit it.
 
-${register}## Connect
+${register}${subAgents}## Connect
 
 MCP (preferred):
 
@@ -54,7 +65,7 @@ claude mcp add --transport http loom ${mcp} --header "Authorization: Bearer $LOO
 Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
 
 \`\`\`sh
-loom() { local args=\${2:-'{}'}; curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" \\
+loom() { local args=\${2:-'{}'}; curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "X-Loom-Agent: \${LOOM_AGENT:-}" -H "content-type: application/json" \\
   -d "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"tools/call\\",\\"params\\":{\\"name\\":\\"$1\\",\\"arguments\\":$args}}" | jq -r '.result.content[0].text // .error.message'; }
 curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[] | "\\(.name): \\(.description)"'
