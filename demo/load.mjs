@@ -5,7 +5,7 @@
 // and re-applying its edit when main moves under it. A pool of reviewers
 // approves whatever reaches review. Prints where time goes.
 //
-//   LOOM_URL=http://127.0.0.1:8787 node demo/load.mjs --agents 200 [--share 0.3] [--reviewers 5]
+//   LOOM_URL=http://127.0.0.1:8787 node demo/load.mjs --agents 200 [--share 0.3] [--reviewers 5] [--private]
 //
 // Numbers from `wrangler dev` are only indicative; production Durable Objects
 // and Artifacts behave differently.
@@ -150,7 +150,7 @@ async function reviewer(admin, key, stop, index) {
 async function main() {
   const admin = new Loom(BASE, PROJECT, ADMIN);
   console.log(`project ${PROJECT}: ${N} agents, ${REVIEWERS} reviewers, ${Math.round(SHARE * 100)}% on shared files. Watch: ${BASE}/?project=${PROJECT}`);
-  await admin.createProject({ name: PROJECT, description: `Load test with ${N} agents`, files: seed(), requiredApprovals: 1 });
+  await admin.createProject({ name: PROJECT, description: `Load test with ${N} agents`, files: seed(), requiredApprovals: 1, visibility: process.argv.includes("--private") ? "private" : "public" });
 
   const keys = [];
   for (let i = 0; i < N; i += 25) {
