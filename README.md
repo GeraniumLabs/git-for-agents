@@ -82,6 +82,8 @@ The humans set what the deputy may handle in the dashboard (**Delegate…**): wh
 
 **Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so the deputy judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude. With no key at all, the deputy judges with Clef through the Worker's `AI` binding, so it works on every project out of the box.
 
+**The model beyond the deputy.** Two project settings, both off by default, put the same decision model to work elsewhere. *Pick reviewers with the model* has it reorder the best-placed few reviewer candidates (still chosen by who wrote or reviewed the changed code) by who is best placed to review this change. *Check changes against their intent* has it judge, on each submit and update, whether the diff does what its task's declared intent says and nothing else: a doubtful score adds to the review brief's risk and tells the author (`change.off_intent`). If the model fails, Loom carries on as it would without it.
+
 ![bring your own keys](docs/settings.png)
 
 ![a human steering the swarm](docs/human-in-the-loop.png)
@@ -341,7 +343,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
-| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}, questions: {maxOpen, deadlineMinutes}}` | *Owner:* make the project `public` or `private`, and other settings |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}, questions: {maxOpen, deadlineMinutes}, model: {reviewers, intent}}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set the deputy's brief |

@@ -804,6 +804,11 @@ async function showSettings() {
     <h2>Questions for people</h2>
     <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
     ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
+    <h2>Decision model</h2>
+    <p class="meta">${s.jevUses ? `Loom can also use the deputy's decision model (<b>${esc(s.jevUses)}</b>) beyond the deputy. Both are off unless you turn them on, and if the model fails Loom does what it does without one.` : "No decision model is connected, so these options have no effect."}</p>
+    ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
+      return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
+        + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -846,6 +851,12 @@ async function showSettings() {
     toast(state.project.checks ? "Checks saved" : "Checks turned off");
     showSettings();
   };
+  for (const [id, key] of [["#model-reviewers", "reviewers"], ["#model-intent", "intent"]]) {
+    if ($(id) && isOwner()) $(id).onchange = async () => {
+      try { const r = await act("POST", "/settings", { model: { [key]: $(id).checked } }); state.project.model = r.model; } catch { $(id).checked = !$(id).checked; return; }
+      toast($(id).checked ? "Turned on" : "Turned off");
+    };
+  }
   if ($("#q-save")) $("#q-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { questions: { maxOpen: Number($("#q-max").value), deadlineMinutes: Number($("#q-deadline").value) } }); state.project.questions = r.questions; } catch { return; }
     toast("Saved");
@@ -998,6 +1009,7 @@ function describe(e) {
     case "collision.forecast": return ["collision", `Collision forecast: ${who} and ${to} both plan to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>. Both notified before any code was written.`];
     case "intent.released": return ["", `${who} released an intent`];
     case "workspace.committed": return ["", `${who} committed to their workspace: ${esc(d.message)}`];
+    case "change.off_intent": return ["conflict", `${esc(d.model)} doubts change #${e.change_id} does what its intent declared (${Math.round(d.score * 100)}%)`];
     case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}`];
     case "change.updated": return ["review", `Change #${e.change_id} updated${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "review.assigned": return ["review", `${who} asked ${to} to review #${e.change_id}${d.reason ? ` (${esc(d.reason)})` : ""}${d.note ? `: “${esc(d.note.slice(0, 140))}”` : ""}`];

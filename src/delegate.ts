@@ -282,6 +282,53 @@ function protectedDiff(patch: string, files: string[]): string {
   return (parts.join("") || patch).slice(0, 12_000);
 }
 
+// ── optional uses of the decision model outside the deputy ──────────────
+// Each is a project setting, off by default; any failure falls back to what
+// Loom does without a model.
+
+/** Rank reviewer candidates by how well placed each is to review a change. Probabilities by candidate id, or null. */
+export async function rankReviewers(
+  judge: Judge,
+  c: { title: string; summary: string; files: string[]; intent: string },
+  candidates: { agent: string; name: string; reasons: string[]; openReviews: number; present: boolean }[],
+): Promise<{ probabilities: Record<string, number>; model: string } | null> {
+  if (!judge.provider || candidates.length < 2) return null;
+  const keys = candidates.map((_, i) => `r${i}`);
+  const res = await systemOne(judge, {
+    change: { title: c.title, summary: c.summary, files: c.files.slice(0, 50), intent: c.intent },
+  }, {
+    best: {
+      type: "choice",
+      instructions: "Which reviewer is best placed to review `change`: the one who knows the code it touches and the reasoning behind it, and who can get to it soon?",
+      criteria: Object.fromEntries(candidates.map((x, i) => [keys[i], `${x.name}: ${x.reasons.join("; ") || "no history with these files"}; ${x.openReviews} open review${x.openReviews === 1 ? "" : "s"}; ${x.present ? "around now" : "not around now"}`])),
+    },
+  });
+  if (!res.ok) return null;
+  const a = res.answers.best;
+  // Jev and Clef give a probability per option; Claude gives only its pick.
+  const probs = a.probabilities && Object.keys(a.probabilities).length > 1 ? a.probabilities : { [a.choice]: a.confidence };
+  return { probabilities: Object.fromEntries(candidates.map((x, i) => [x.agent, Number(probs[keys[i]] ?? 0)])), model: judgeName(judge) };
+}
+
+/** How likely a change's diff does what its agent declared it would, and nothing else. */
+export async function checkIntent(
+  judge: Judge,
+  c: { title: string; summary: string; intent: string; patch: string },
+): Promise<{ score: number; model: string } | null> {
+  if (!judge.provider || !c.intent.trim()) return null;
+  const res = await systemOne(judge, {
+    change: { title: c.title, summary: c.summary, intent: c.intent, diff: c.patch.slice(0, 12_000) },
+  }, {
+    on_intent: {
+      type: "noul",
+      instructions: "Does `change.diff` do what the agent declared in `change.intent`, and nothing beyond it?",
+      criteria: { true: "Every edit serves the declared intent", false: "The diff does something the intent doesn't describe, or doesn't do what it declared" },
+    },
+  });
+  if (!res.ok) return null;
+  return { score: res.answers.on_intent.noul, model: judgeName(judge) };
+}
+
 // ── TypeSafe System One API ──────────────────────────────────────────────
 
 type Question = { type: "noul" | "choice"; instructions: string; criteria: Record<string, string> };
