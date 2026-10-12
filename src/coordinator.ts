@@ -12,6 +12,7 @@ import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDis
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
+import { FilesShapeError, normalizeFiles } from "./files";
 import { runCheck, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
@@ -676,7 +677,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: Record<string, string>; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number } }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number } }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     const repo = `${name}`;
@@ -689,7 +690,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
     this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
     if (body.checks) this.setChecks(body.checks);
-    const files = body.files ?? { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
+    const files = body.files != null ? this.fileWrites(body.files) : { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
     const w = await Workspace.open({ url: created.remote, token: created.token });
     const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
     await w.push({ url: created.remote, token: created.token }, commit);
@@ -963,16 +964,25 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return ws as any;
   }
 
-  private async commitToWorkspace(actor: Agent, name: string, body: { files: Record<string, string | null>; message: string }) {
+  private async commitToWorkspace(actor: Agent, name: string, body: { files: unknown; message: string }) {
     const ws = this.workspaceFor(actor, name);
-    if (!body.files || !Object.keys(body.files).length) throw new HttpError(400, "files is required");
+    const files = this.fileWrites(body.files);
     const remote = this.remote(name, await this.token(name, "write"));
     const w = await Workspace.open(remote);
     const parent = await w.head();
-    const commit = await w.commitFiles(parent, body.files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const commit = await w.commitFiles(parent, files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
     await w.push(remote, commit);
-    this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(body.files), message: body.message } });
-    return { commit, files: Object.keys(body.files) };
+    this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(files), message: body.message } });
+    return { commit, files: Object.keys(files) };
+  }
+
+  private fileWrites(input: unknown) {
+    try {
+      return normalizeFiles(input);
+    } catch (e) {
+      if (e instanceof FilesShapeError) throw new HttpError(400, e.message);
+      throw e;
+    }
   }
 
   /**
