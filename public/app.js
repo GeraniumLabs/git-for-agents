@@ -70,6 +70,31 @@ function toast(msg) {
   document.body.appendChild(t);
   setTimeout(() => t.remove(), 4000);
 }
+// Our own confirm/prompt: a small dialog that names the action on its button.
+// Resolves false/null on cancel; true (no input) or the trimmed text on OK.
+// Opens above whatever dialog is already up, since every showModal stacks.
+function ask({ title, body = "", ok = "OK", cancel = "Cancel", danger = false, input = null }) {
+  const d = document.createElement("dialog");
+  d.className = "ask";
+  d.innerHTML = `<form method="dialog">
+    <h3>${esc(title)}</h3>
+    ${body ? `<p class="meta">${esc(body)}</p>` : ""}
+    ${input ? `<label>${esc(input.label ?? "")}<textarea name="text" rows="${input.rows ?? 2}" placeholder="${esc(input.placeholder ?? "")}" ${input.required ? "required" : ""}></textarea></label>` : ""}
+    <div class="ask-actions"><button value="cancel" class="ghost" formnovalidate>${esc(cancel)}</button><button value="ok" class="${danger ? "bad" : ""}">${esc(ok)}</button></div>
+  </form>`;
+  document.body.appendChild(d);
+  const text = d.querySelector("textarea");
+  if (text) text.onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); d.querySelector("form").requestSubmit(d.querySelector('[value="ok"]')); } };
+  return new Promise((resolve) => {
+    d.onclose = () => {
+      const yes = d.returnValue === "ok";
+      d.remove();
+      resolve(input ? (yes ? text.value.trim() : null) : yes);
+    };
+    d.showModal();
+    (text ?? d.querySelector('[value="ok"]')).focus();
+  });
+}
 // People sign in with GitHub (a session cookie). A pasted key still works,
 // for agents' keys and for scripts.
 let user = null, auth = { github: false, dev: false }, notMember = false;
@@ -334,9 +359,9 @@ function wire(root) {
     if (input.value.trim()) await answer(b.dataset.answerSend, input.value.trim());
   };
   for (const b of root.querySelectorAll("[data-rule]")) b.onclick = async () => {
-    const note = prompt(`Ruling for ${name(b.dataset.for)}. Add a reason the agents will see (optional):`);
+    const note = await ask({ title: `Rule for ${name(b.dataset.for)}?`, body: "This settles the dispute. The agents will see your reason.", ok: "Rule", input: { label: "Reason (optional)", placeholder: "Why this side wins" } });
     if (note === null) return;
-    await act("POST", `/disputes/${b.dataset.rule}/rule`, { for: b.dataset.for, note: note.trim() || undefined });
+    await act("POST", `/disputes/${b.dataset.rule}/rule`, { for: b.dataset.for, note: note || undefined });
   };
 }
 
@@ -515,7 +540,7 @@ async function showAgent(id) {
   wire($("#detail-body"));
   renderGrid($("#agent-grid"), a.id);
   for (const b of $("#detail-body").querySelectorAll("[data-op]")) b.onclick = async () => {
-    const reason = b.dataset.op === "pause" ? prompt(`Why pause ${a.name}? (they will see this)`) : undefined;
+    const reason = b.dataset.op === "pause" ? await ask({ title: `Pause ${a.name}?`, body: "It stops taking work until you resume it. It will see your reason.", ok: "Pause", input: { label: "Reason", placeholder: "e.g. Waiting on the schema decision" } }) : undefined;
     if (b.dataset.op === "pause" && reason === null) return;
     await act("POST", `/agents/${a.id}/${b.dataset.op}`, { reason });
     showAgent(a.id);
@@ -527,7 +552,7 @@ async function showAgent(id) {
     toast(`Sent to ${a.name}`);
   };
   for (const b of $("#detail-body").querySelectorAll("[data-reassign]")) b.onclick = async () => {
-    const to = prompt("Hand this task, with its workspace and context, to which agent? (name or id; blank to put it back on the board)");
+    const to = await ask({ title: `Reassign task #${b.dataset.reassign}?`, body: "The new agent gets its workspace and context. Leave the name blank to put it back on the board.", ok: "Reassign", input: { label: "Agent", placeholder: "Name or id", rows: 1 } });
     if (to === null) return;
     let target = null;
     if (to.trim()) {
@@ -716,7 +741,7 @@ async function showSkill(joinCode) {
     } catch {}
   };
   for (const b of $("#detail-body").querySelectorAll("[data-jc-revoke]")) b.onclick = async () => {
-    if (!confirm("Revoke this join code? Agents that already joined keep their keys.")) return;
+    if (!await ask({ title: "Revoke this join code?", body: "No new agents can join with it. Agents that already joined keep their keys.", ok: "Revoke", danger: true })) return;
     try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
     showSkill(joinCode);
   };
@@ -801,7 +826,9 @@ async function showSettings() {
   };
   if ($("#vis-toggle")) $("#vis-toggle").onclick = async () => {
     const to = vis === "private" ? "public" : "private";
-    if (!confirm(to === "private" ? "Make this project private? Only members and its agents will see it." : "Make this project public? Anyone will be able to see its work.")) return;
+    if (!await ask(to === "private"
+      ? { title: "Make this project private?", body: "Only members and its agents will see it.", ok: "Make private" }
+      : { title: "Make this project public?", body: "Anyone will be able to see its work.", ok: "Make public", danger: true })) return;
     try { const r = await act("POST", "/settings", { visibility: to }); state.project.visibility = r.visibility; } catch { return; }
     toast(`${project} is now ${to}`);
     showSettings();
@@ -832,12 +859,12 @@ async function showSettings() {
     showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-member-remove]")) b.onclick = async () => {
-    if (!confirm("Remove this person from the project?")) return;
+    if (!await ask({ title: "Remove this person?", body: "They lose access to the project. You can invite them again later.", ok: "Remove", danger: true })) return;
     try { await act("DELETE", `/members/${b.dataset.memberRemove}`); } catch { return; }
     showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-key-remove]")) b.onclick = async () => {
-    if (!confirm("Remove this key? The deputy falls back to the server's key, or to Clef.")) return;
+    if (!await ask({ title: "Remove this key?", body: "The deputy falls back to the server's key, or to Clef.", ok: "Remove key", danger: true })) return;
     try { await act("DELETE", `/settings/keys/${b.dataset.keyRemove}`); } catch { return; }
     toast("Key removed");
     showSettings();
@@ -943,7 +970,10 @@ $("#dir-send").onclick = async () => {
 $("#dir-to").title = "Directives here go to every agent; open an agent (search) to send one to it alone.";
 $("#freeze").onclick = async () => {
   if (state.project.frozen) await act("POST", "/unfreeze", {});
-  else await act("POST", "/freeze", { reason: prompt("Why freeze main?") ?? "" });
+  else {
+    const reason = await ask({ title: "Freeze main?", body: "Nothing merges until you unfreeze. Agents will see your reason.", ok: "Freeze", danger: true, input: { label: "Reason", placeholder: "e.g. Cutting a release" } });
+    if (reason !== null) await act("POST", "/freeze", { reason });
+  }
 };
 $("#protect-save").onclick = async () => {
   await act("POST", "/protect", { paths: $("#protect-paths").value.split(",").map((p) => p.trim()).filter(Boolean) });
@@ -1433,9 +1463,9 @@ async function loadContest(id) {
     ${v.votes.map((x) => `<div class="qrow">${who(x.voter)} <span class="pill" title="what this agent's vote counts for, from its track record">${x.weight}×</span> for <a href="#change/${x.change}">#${x.change}</a> <span class="grow">“${esc(x.reason)}”</span></div>`).join("") || `<p class="empty">No votes yet.</p>`}</div></section>`;
   wire($("#review"));
   for (const b of $("#review").querySelectorAll("[data-pick]")) b.onclick = async () => {
-    const note = prompt("Why this one? The agents will see it, and it goes on record. (optional)");
+    const note = await ask({ title: `Pick change #${b.dataset.pick}?`, body: "This settles the contest. The agents will see your reason, and it goes on record.", ok: "Pick this one", input: { label: "Why this one? (optional)" } });
     if (note === null) return;
-    await act("POST", `/contests/${id}/pick`, { changeId: Number(b.dataset.pick), note: note.trim() || undefined });
+    await act("POST", `/contests/${id}/pick`, { changeId: Number(b.dataset.pick), note: note || undefined });
     loadContest(id);
   };
 }
