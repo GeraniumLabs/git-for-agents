@@ -1,3 +1,6 @@
+:root { color-scheme: light dark; }
+:root[data-theme="light"] { color-scheme: light; }
+:root[data-theme="dark"] { color-scheme: dark; }
 :root {
   --bg: #ecebe5; --panel: #ffffff; --head: #f7f6f2; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1d9; --edge: #d6d3c9;
   --shadow: 0 1px 2px rgb(30 28 20 / .06), 0 1px 1px rgb(30 28 20 / .03);
@@ -10,6 +13,11 @@
     --shadow: 0 1px 2px rgb(0 0 0 / .5);
     --ok: #4fbf84; --warn: #e0a640; --bad: #f06363; --info: #63a4f0; --chip: #262522; --code: #161614;
   }
+}
+:root[data-theme="dark"] {
+  --bg: #0d0d0c; --panel: #1b1b19; --head: #222220; --ink: #ecebe6; --muted: #9a988f; --line: #2c2b28; --edge: #34332f;
+  --shadow: 0 1px 2px rgb(0 0 0 / .5);
+  --ok: #4fbf84; --warn: #e0a640; --bad: #f06363; --info: #63a4f0; --chip: #262522; --code: #161614;
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--ink); font: 14px/1.45 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
@@ -193,6 +201,7 @@ table.areas td:not(:first-child), table.areas th:not(:first-child) { text-align:
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) { --h0: #262522; --h1: #1d4a31; --h2: #2a7147; --h3: #3f9e64; --h4: #74d39b; }
 }
+:root[data-theme="dark"] { --h0: #262522; --h1: #1d4a31; --h2: #2a7147; --h3: #3f9e64; --h4: #74d39b; }
 .contrib-card { padding: 10px 12px; }
 .grid-head { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; margin-bottom: 6px; }
 .grid-head .seg { margin-left: auto; }
@@ -327,3 +336,6 @@ dialog { padding: 22px 24px; border-color: var(--edge); box-shadow: 0 20px 60px 
 #detail-body h2 small { color: var(--muted); font-size: 12px; font-weight: 400; }
 #detail-body .card + .card { margin-top: 8px; }
 #detail-body .card { border-radius: 10px; }
+
+/* theme switch */
+button.theme { min-width: 34px; padding: 5px 8px; }
