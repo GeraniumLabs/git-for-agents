@@ -768,11 +768,12 @@ function showNewProject() {
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
+    ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div class="row"><button id="np-create">Create project</button></div>`;
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
     location.search = `?project=${name}`;
@@ -793,6 +794,8 @@ async function showSettings() {
     <h2>Visibility</h2>
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
+    <h2>Where the data lives</h2>
+    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
@@ -1040,9 +1043,10 @@ function describe(e) {
     case "collision.forecast": return ["collision", `Collision forecast: ${who} and ${to} both plan to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>. Both notified before any code was written.`];
     case "intent.released": return ["", `${who} released an intent`];
     case "workspace.committed": return ["", `${who} committed to their workspace: ${esc(d.message)}`];
+    case "workspace.pushed": return ["", `${who} pushed ${d.commits ? `${d.commits} commit${d.commits === 1 ? "" : "s"} ` : ""}to their workspace${d.head ? ` <span class="mono">${esc(d.head.slice(0, 7))}</span>` : ""}`];
     case "change.off_intent": return ["conflict", `${esc(d.model)} doubts change #${e.change_id} does what its intent declared (${Math.round(d.score * 100)}%)`];
     case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}`];
-    case "change.updated": return ["review", `Change #${e.change_id} updated${d.reason ? `: ${esc(d.reason)}` : ""}`];
+    case "change.updated": return ["review", `Change #${e.change_id} updated${d.via === "push" ? " from a git push" : ""}${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "review.assigned": return ["review", `${who} asked ${to} to review #${e.change_id}${d.reason ? ` (${esc(d.reason)})` : ""}${d.note ? `: “${esc(d.note.slice(0, 140))}”` : ""}`];
     case "review.accepted": return ["review", `${who} accepted the review of #${e.change_id}`];
     case "review.declined": return ["review", `${who} declined to review #${e.change_id}${d.reason ? `: “${esc(d.reason)}”` : ""}`];
