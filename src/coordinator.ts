@@ -2136,12 +2136,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return key;
   }
 
-  /** Jev's judge: the project's own keys first, then the server's; TypeSafe before Claude. */
+  /** Jev's judge: the project's own keys first, then the server's; TypeSafe before Claude. With no key, Clef on Workers AI. */
   private async judge(): Promise<Judge> {
     const jev = (await this.projectKey("jev")) ?? this.env.TYPESAFE_API_KEY;
     if (jev) return { provider: "typesafe", apiKey: jev, url: this.env.TYPESAFE_URL };
     const claude = (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY;
     if (claude) return { provider: "anthropic", apiKey: claude };
+    if (this.env.AI) return { provider: "clef", ai: this.env.AI };
     return {};
   }
 
@@ -2152,6 +2153,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (this.env.TYPESAFE_API_KEY) return "the server's TypeSafe key";
     if (saved.has("anthropic")) return "Claude, with the project's Anthropic key";
     if (this.env.ANTHROPIC_API_KEY) return "Claude, with the server's Anthropic key";
+    if (this.env.AI) return "Clef, Cloudflare's decision model on Workers AI (no key needed)";
     return null;
   }
 

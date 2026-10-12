@@ -55,8 +55,10 @@ export const DEFAULT_DELEGATE: DelegateConfig = {
 export interface Judge {
   apiKey?: string;
   url?: string;
-  /** Whose judge Jev uses: TypeSafe's System One, or Claude with the same questions. */
-  provider?: "typesafe" | "anthropic";
+  /** Workers AI, for Clef. */
+  ai?: Ai;
+  /** Whose judge Jev uses: TypeSafe's System One, Cloudflare's Clef (same API, on Workers AI), or Claude with the same questions. */
+  provider?: "typesafe" | "clef" | "anthropic";
 }
 
 export type Verdict =
@@ -283,6 +285,7 @@ async function systemOne<Q extends Record<string, Question>>(
   questions: Q,
 ): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
   if (judge.provider === "anthropic") return claudeOne(judge, state, questions);
+  if (judge.provider === "clef") return clefOne(judge, state, questions);
   const url = judge.url ?? "https://api.typesafe.ai/v1/systemone";
   for (let attempt = 0; ; attempt++) {
     try {
@@ -302,6 +305,33 @@ async function systemOne<Q extends Record<string, Question>>(
     } catch (e: any) {
       if (attempt < 2) continue;
       return { ok: false, reason: `Jev unavailable (${String(e?.message ?? e).slice(0, 80)})` };
+    }
+  }
+}
+
+// ── the same questions, judged by Clef on Workers AI ─────────────────────
+// Cloudflare's decision model takes System One requests as they are and
+// answers with the same per-option probabilities, so no key is needed.
+
+const CLEF_MODEL = "@cf/cloudflare/clef";
+
+async function clefOne<Q extends Record<string, Question>>(
+  judge: Judge,
+  state: unknown,
+  questions: Q,
+): Promise<{ ok: true; answers: Answers<Q> } | { ok: false; reason: string }> {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      const out = (await (judge.ai as any).run(CLEF_MODEL, { model: "clef", state, questions })) as { answers?: Answers<Q>; result?: { answers?: Answers<Q> } };
+      const answers = out?.answers ?? out?.result?.answers;
+      if (!answers || Object.keys(questions).some((k) => !(k in answers))) return { ok: false, reason: "Clef returned an incomplete answer" };
+      return { ok: true, answers };
+    } catch (e: any) {
+      if (attempt < 2) {
+        await new Promise((r) => setTimeout(r, 500 * 2 ** attempt));
+        continue;
+      }
+      return { ok: false, reason: `Clef unavailable (${String(e?.message ?? e).slice(0, 80)})` };
     }
   }
 }

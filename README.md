@@ -72,7 +72,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 
 **jev: a stand-in for the humans**
 
-People can't answer every question a swarm asks. jev is a delegate they brief to decide some things for them, backed by [TypeSafe](https://docs.typesafe.ai)'s Jev model. Jev doesn't write text; it returns typed judgments with probabilities. So jev never makes up an answer. It acts in only two ways:
+People can't answer every question a swarm asks. jev is a delegate they brief to decide some things for them, backed by a decision model: Cloudflare's [Clef](https://developers.cloudflare.com/workers-ai/models/clef/) on Workers AI by default, or [TypeSafe](https://docs.typesafe.ai)'s Jev with a key. Neither writes text; they return typed judgments with probabilities, and Clef takes Jev's API as is. So jev never makes up an answer. It acts in only two ways:
 - **Questions**: when an agent asks the humans and lists its options, jev uses a Jev *Choice* to pick the option the humans' written guidance points to. Two Jev *Noul* checks run alongside it: does the guidance actually settle this, and is it high-stakes?
 - **Protected changes**: jev approves a change to paths it has been trusted with only after Jev's Noul checks pass. The diff must follow the guidance, do only what its summary says, and add no risk (dependencies, scripts, secrets, deleted data).
 - **Disputes**: jev uses a Jev Choice between the two positions, judged against the guidance and earlier decisions, with the same "settled?" and "high-stakes?" checks.
@@ -80,7 +80,7 @@ People can't answer every question a swarm asks. jev is a delegate they brief to
 
 The humans set what jev may handle in the dashboard (**Delegate…**): whether it answers questions, which topics, house rules (`pattern => answer`) that apply first, which protected paths it may approve, and how confident Jev must be for each. Below the threshold, outside its scope, or without Jev connected, jev passes the item to a person and says why in the *Needs a human* inbox.
 
-**Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so jev judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude.
+**Bring your own keys.** People signed in to a project can add its own keys in **Settings**: a TypeSafe key for Jev, or an Anthropic key so jev judges with Claude (`claude-opus-5-5`, asked the same Choice and Noul questions and returning the same probabilities). Keys are encrypted with AES-GCM before they're stored, using a per-project key derived from the `LOOM_SECRET_KEY` Worker secret (or `LOOM_ADMIN_TOKEN` when that isn't set). Loom never returns them; Settings shows only the last four characters and who saved them. A project's key takes the place of the server's; TypeSafe is used before Claude. With no key at all, jev judges with Clef through the Worker's `AI` binding, so it works on every project out of the box.
 
 ![bring your own keys](docs/settings.png)
 
@@ -239,7 +239,7 @@ npx wrangler r2 bucket create loom-context
 npx wrangler secret put LOOM_ADMIN_TOKEN   # for scripts only
 npx wrangler secret put LOOM_SECRET_KEY    # signs sessions and seals the keys people save in Settings
 npx wrangler secret put LOOM_OWNERS        # optional: GitHub logins who own every project, comma-separated
-npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key
+npx wrangler secret put TYPESAFE_API_KEY   # optional: a server-wide Jev key (without one, jev uses Clef on Workers AI)
 npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key for jev
 npx wrangler deploy
 ```

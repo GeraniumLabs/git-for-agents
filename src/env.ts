@@ -20,6 +20,8 @@ export interface Env {
   LOOM_CREATORS?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
+  /** Workers AI, for Clef: jev's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
+  AI?: Ai;
   TYPESAFE_API_KEY?: string;
   TYPESAFE_URL?: string;
   PROJECT: DurableObjectNamespace<ProjectCoordinator>;
