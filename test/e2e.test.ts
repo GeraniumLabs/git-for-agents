@@ -206,3 +206,66 @@ test("decision model options: off by default, owners turn them on, and without a
   const detail = await admin.req("GET", `/changes/${ch.id}`);
   assert.equal(detail.intent_check, null, "no model here, so no intent judgment");
 });
+
+test("stand-ins: a person's own agent watches what needs them, hears by webhook, and acts only within the rights it was given", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { createServer } = await import("node:http");
+  const { createHmac } = await import("node:crypto");
+  const name = project("e2e-standin");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "stand-ins", requiredApprovals: 1 });
+  await admin.req("POST", "/members", { login: "jo" });
+
+  const got: { body: string; sig: string }[] = [];
+  const server = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { got.push({ body: b, sig: String(req.headers["x-loom-signature"] ?? "") }); res.end("ok"); }); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as any).port;
+  try {
+    await assert.rejects(admin.req("POST", "/standins", { for: "jo", name: "x", scopes: ["everything"] }), /unknown scope/);
+    const si = await admin.req("POST", "/standins", { for: "jo", name: "jo-assistant", scopes: ["answer"], webhook: `http://127.0.0.1:${port}/hook` });
+    assert.ok(si.key.startsWith("loomstand_") && si.webhookSecret, "key and secret are shown once");
+    const watcher = await admin.req("POST", "/standins", { for: "jo", name: "jo-pager", scopes: [] });
+    const helper = admin.as(si.key), pager = admin.as(watcher.key);
+
+    const info = await helper.req("GET", "/standins/me");
+    assert.equal(info.actsFor.name, "jo");
+    assert.deepEqual(Object.keys(info.can), ["answer"]);
+    const first = await pager.req("GET", "/attention");
+    assert.equal(first.items.length, 0);
+
+    // The feed holds until something needs a person.
+    const ada = admin.as((await admin.addAgent("ada")).key);
+    const waiting = pager.req("GET", `/attention?known=${first.known}&wait=20`);
+    await sleep(500);
+    const q = await ada.req("POST", "/threads", { kind: "question", to: "humans", body: "May I rename the todos table?", default: "Keep the name" });
+    const feed = await waiting;
+    const item = feed.items.find((i: any) => i.kind === "question");
+    assert.ok(item?.new, "the question arrives as new");
+    assert.match(item.text, /ada asks: May I rename the todos table\?/);
+    assert.deepEqual(item.youCan, { scope: "answer", allowed: false }, "the watch-only key can't answer");
+    assert.equal((await helper.req("GET", "/attention")).items[0].youCan.allowed, true);
+
+    // The webhook hears about it once, signed.
+    for (let i = 0; i < 40 && !got.length; i++) await sleep(250);
+    assert.equal(got.length, 1);
+    assert.equal(got[0].sig, `sha256=${createHmac("sha256", si.webhookSecret).update(got[0].body).digest("hex")}`);
+    assert.equal(JSON.parse(got[0].body).items[0].key, item.key);
+
+    // Rights: watching can't answer; answering can't review, freeze or touch settings.
+    await assert.rejects(pager.req("POST", "/questions/answer", { threads: [q.id], body: "no" }), /"answer" right/);
+    await assert.rejects(helper.req("POST", "/freeze", { reason: "x" }), /"freeze" right/);
+    await assert.rejects(helper.req("POST", "/settings", { requiredApprovals: 0 }), /stand-in key can't/);
+    await assert.rejects(helper.req("POST", "/standins", { name: "y", scopes: ["freeze"] }), /stand-in key can't/);
+    await helper.req("POST", "/questions/answer", { threads: [q.id], body: "Yes, rename it to tasks" });
+    const t = await admin.req("GET", `/threads/${q.id}`);
+    assert.equal(t.status, "answered");
+    const acted = (await admin.req("GET", "/events?after=0")).events.find((e: any) => e.type === "standin.acted");
+    assert.equal(acted.data.name, "jo-assistant");
+    assert.match(acted.data.action, /POST \/questions\/answer/);
+
+    await admin.req("DELETE", `/standins/${si.id}`);
+    await assert.rejects(helper.req("GET", "/attention"), /401/);
+  } finally {
+    server.close();
+  }
+});

@@ -18,6 +18,7 @@ import { skill } from "./skill";
 import { buildBrief, fileStats } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
+import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
 const DELEGATE_ID = "delegate";
@@ -27,7 +28,9 @@ const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.pr
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
-  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published"];
+  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted"];
+/** Events that can put something in front of a person; stand-in webhooks are checked after them. */
+const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made"]);
 /** Most queued changes merged together in one pass of the queue. */
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const CHATTER_LIMIT = 20;
@@ -54,6 +57,8 @@ export interface Agent {
   /** People only: "github:<login>", and whether they own the project. */
   identity?: string | null;
   owner?: boolean;
+  /** Set when a person's own agent is acting for them with a stand-in key. */
+  standin?: { id: string; name: string; scopes: Scope[] };
 }
 
 export interface LoomEvent {
@@ -203,6 +208,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS contest_votes (
         contest INTEGER, voter TEXT, change_id INTEGER, reason TEXT, created_at INTEGER,
         PRIMARY KEY (contest, voter));
+      CREATE TABLE IF NOT EXISTS standins (
+        id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
+        webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
       CREATE INDEX IF NOT EXISTS events_actor ON events (actor, ts);
       CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
@@ -333,8 +341,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (w.wants(event)) { this.waiters.delete(w); w.wake(); }
     }
     if (["question.asked", "approval.needs_human", "review.submitted", "dispute.ready"].includes(type) && e.actor !== DELEGATE_ID) {
-      this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)));
-    }
+      // Stand-ins hear about it after the deputy had its chance to handle it.
+      this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)).finally(() => NEEDS_PERSON.has(type) && this.notifySoon()));
+    } else if (NEEDS_PERSON.has(type)) this.notifySoon();
     return event;
   }
 
@@ -377,7 +386,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (await sameSecret(key, this.env.LOOM_ADMIN_TOKEN)) return "admin";
     const hash = await sha256(key);
     const row = this.sql.exec("SELECT id, name, role, paused, identity, owner FROM agents WHERE key_hash = ?", hash).toArray()[0];
-    if (!row) throw new HttpError(401, "unknown agent key");
+    if (!row) return this.standinFor(hash);
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
     return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused as string | null) ?? null, identity: (row.identity as string | null) ?? null, owner: !!row.owner };
   }
@@ -433,7 +442,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   async fetch(req: Request): Promise<Response> {
     try {
-      return await this.route(req);
+      const res = await this.route(req);
+      // What a stand-in did is on record as the person's, through it.
+      const acted = this.standinActs.get(req);
+      if (acted && res.ok) this.emit("standin.acted", { actor: acted.person, data: { standin: acted.id, name: acted.name, action: acted.action } });
+      return res;
     } catch (e: any) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       console.error(e);
@@ -447,6 +460,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const [a, b, c, d] = parts;
     const m = req.method;
     const body = m === "POST" || m === "PUT" ? await req.json<any>().catch(() => ({})) : {};
+    // Where links in webhooks point; the Durable Object only learns its origin from requests.
+    if (url.hostname !== "do" && this.meta("project") && this.meta("origin") !== url.origin) this.setMeta("origin", url.origin);
 
     // Registry (singleton instance)
     if (a === "registry" && b === "github") {
@@ -514,10 +529,37 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     // Agents register themselves with a join code an owner shared.
     if (a === "join" && m === "POST") return json(await this.join(body, url.origin));
+    if (a === "standin-skill" && m === "GET") {
+      // Fetched with a stand-in key, the skill names the person and the key's rights.
+      const by = req.headers.get("authorization") ? await this.authenticate(req).catch(() => null) : null;
+      const si = by && by !== "admin" && by.standin ? by : null;
+      return new Response(standinSkill(url.origin, this.project, si?.name ?? null, si?.standin?.scopes ?? null), { headers: { "content-type": "text/markdown; charset=utf-8" } });
+    }
 
     const who = await this.authenticate(req);
     const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human", owner: true } : who;
     const ownerOnly = (what: string) => { if (!actor.owner) throw new HttpError(403, `only the project's owners can ${what}`); };
+
+    // A stand-in reaches only what its person allowed, and never settings, people or keys.
+    if (actor.standin) {
+      const need = scopeFor(m, parts);
+      if (!need) throw new HttpError(403, `a stand-in key can't ${m} /${parts.join("/")}; ask ${actor.name} to do it in Loom`);
+      if (need !== "watch" && !actor.standin.scopes.includes(need)) throw new HttpError(403, `this stand-in key doesn't have the "${need}" right (${SCOPES[need].toLowerCase()}); ${actor.name} can grant it in Settings`);
+      if (need !== "watch") this.standinActs.set(req, { id: actor.standin.id, name: actor.standin.name, person: actor.id, action: `${m} /${parts.join("/")}` });
+    }
+    if (a === "attention" && m === "GET") return json(await this.attentionFeed(actor, url.searchParams.get("known"), Number(url.searchParams.get("wait") ?? 0), url.origin));
+    if (a === "standins") {
+      if (b === "me" && m === "GET") {
+        if (!actor.standin) throw new HttpError(400, "this isn't a stand-in key");
+        return json(this.standinInfo(actor, url.origin));
+      }
+      if (actor.role !== "human" || actor.standin) throw new HttpError(403, "only people make stand-ins, for themselves");
+      if (m === "GET" && !b) return json(this.standins(actor));
+      if (m === "POST" && !b) return json(await this.createStandin(actor, body, url.origin));
+      if (m === "POST" && b && c === "test") return json(await this.testStandin(actor, b, url.origin));
+      if (m === "POST" && b && !c) return json(await this.updateStandin(actor, b, body));
+      if (m === "DELETE" && b) return json(this.revokeStandin(actor, b));
+    }
 
     if (a === "join-codes") {
       ownerOnly("manage join codes");
@@ -765,6 +807,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!row) throw new HttpError(404, `no member ${id}`);
     if (row.owner && (this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE owner = 1").one().n as number) <= 1) throw new HttpError(409, "a project needs at least one owner");
     this.sql.exec("UPDATE agents SET identity = NULL, owner = 0, paused = 'removed from the project' WHERE id = ?", id);
+    this.sql.exec("UPDATE standins SET revoked_at = ? WHERE person = ? AND revoked_at IS NULL", Date.now(), id);
     this.emit("member.removed", { actor: actor.id, to: id, data: { login: row.name } });
     return this.members();
   }
@@ -1623,6 +1666,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
+    // Work that stopped moving needs no event to need a person.
+    this.notifySoon();
     if (this.merging || this.meta("frozen")) return;
     this.merging = true;
     try {
@@ -2214,6 +2259,222 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.escalated.add(key);
     if (threadId) this.sql.exec("UPDATE threads SET escalated = ? WHERE id = ?", reason, threadId);
     this.emit("delegate.escalated", { actor: DELEGATE_ID, task: taskId, change: changeId, data: { thread: threadId, kind: threadId ? this.thread(threadId).kind : "approval", reason, scores: scores ?? null } });
+  }
+
+  // ── stand-ins: a person's own agent, acting for them within limits ──────
+
+  /** Which agent action is a stand-in's, by request, so it can be put on record once it succeeds. */
+  private standinActs = new WeakMap<Request, { id: string; name: string; person: string; action: string }>();
+
+  private standinFor(hash: string): Agent {
+    const s = this.sql.exec("SELECT id, name, person, scopes FROM standins WHERE key_hash = ? AND revoked_at IS NULL", hash).toArray()[0];
+    if (!s) throw new HttpError(401, "unknown agent key");
+    this.sql.exec("UPDATE standins SET last_used = ? WHERE id = ?", Date.now(), s.id);
+    return this.standinActor(s);
+  }
+
+  /** The person a stand-in acts for, carrying the stand-in's rights. */
+  private standinActor(s: Record<string, SqlStorageValue>): Agent {
+    const p = this.sql.exec("SELECT id, name, role, paused, identity FROM agents WHERE id = ?", s.person).toArray()[0];
+    if (!p || p.role !== "human" || p.paused) throw new HttpError(401, "the person this stand-in acts for is no longer in the project");
+    return { id: p.id as string, name: p.name as string, role: "human", paused: null, identity: (p.identity as string | null) ?? null, owner: false, standin: { id: s.id as string, name: s.name as string, scopes: JSON.parse(s.scopes as string) } };
+  }
+
+  private parseScopes(x: unknown): Scope[] {
+    if (!Array.isArray(x)) throw new HttpError(400, `scopes is a list: any of ${Object.keys(SCOPES).join(", ")}, or [] to only watch`);
+    const bad = x.filter((s) => typeof s !== "string" || !isScope(s));
+    if (bad.length) throw new HttpError(400, `unknown scope ${bad.join(", ")}; use ${Object.keys(SCOPES).join(", ")}`);
+    return [...new Set(x as Scope[])];
+  }
+
+  private webhookUrl(x: unknown): string | null {
+    try { return validWebhook(x); } catch (e: any) { throw new HttpError(400, e.message); }
+  }
+
+  private async sealWebhookSecret(): Promise<{ secret: string; sealed: string }> {
+    if (!sealer(this.env)) throw new HttpError(503, "set LOOM_SECRET_KEY on the Worker before adding webhooks");
+    const secret = `whsec_${randomId(24)}`;
+    const s = await seal(this.env, this.project, secret);
+    return { secret, sealed: JSON.stringify({ ct: s.ct, iv: s.iv, sealed_by: s.by }) };
+  }
+
+  private standinRow(id: string, actor: Agent) {
+    const r = this.sql.exec("SELECT * FROM standins WHERE id = ?", id).toArray()[0];
+    if (!r) throw new HttpError(404, `no stand-in ${id}`);
+    if (r.person !== actor.id && !actor.owner) throw new HttpError(403, "that stand-in acts for someone else");
+    return r;
+  }
+
+  private standinView(r: Record<string, SqlStorageValue>) {
+    return { id: r.id, name: r.name, for: r.person, forName: this.agentName(r.person as string), scopes: JSON.parse(r.scopes as string), webhook: r.webhook ?? null,
+      lastDelivery: r.last_delivery ? JSON.parse(r.last_delivery as string) : null, createdAt: r.created_at, lastUsed: r.last_used, revoked: !!r.revoked_at };
+  }
+
+  private standins(actor: Agent) {
+    const rows = this.sql.exec(`SELECT * FROM standins WHERE (person = ? OR ?) ORDER BY revoked_at IS NOT NULL, created_at DESC`, actor.id, actor.owner ? 1 : 0).toArray();
+    return { scopes: SCOPES, standins: rows.map((r) => this.standinView(r)) };
+  }
+
+  private async createStandin(actor: Agent, body: { name?: string; scopes?: unknown; webhook?: unknown; for?: string }, origin: string) {
+    // People make stand-ins for themselves; the admin token (scripts) names the person.
+    let person = actor.id;
+    if (actor.id === "admin") {
+      if (!body.for) throw new HttpError(400, "with the admin token, say whom it acts for: for = a person's login or id");
+      person = this.resolveAgent(body.for);
+      if (this.sql.exec("SELECT role FROM agents WHERE id = ?", person).toArray()[0]?.role !== "human") throw new HttpError(400, `${body.for} isn't a person`);
+    }
+    const name = (body.name ?? "").trim().slice(0, 60);
+    if (!name) throw new HttpError(400, "name the agent that will hold it, e.g. my-assistant");
+    const scopes = this.parseScopes(body.scopes ?? []);
+    const live = this.sql.exec("SELECT COUNT(*) AS n FROM standins WHERE person = ? AND revoked_at IS NULL", person).one().n as number;
+    if (live >= 10) throw new HttpError(409, "10 live stand-ins already; revoke one first");
+    const webhook = this.webhookUrl(body.webhook ?? null);
+    const hook = webhook ? await this.sealWebhookSecret() : null;
+    const id = `si_${randomId(6)}`;
+    const key = `loomstand_${randomId(24)}`;
+    // Items already waiting count as seen, so a new webhook doesn't start with a flood.
+    const seen = webhook ? this.attention(this.agentStates()).map((i) => shortKey(itemKey(i))) : [];
+    this.sql.exec("INSERT INTO standins (id, name, person, key_hash, scopes, webhook, webhook_secret, seen, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, name, person, await sha256(key), JSON.stringify(scopes), webhook, hook?.sealed ?? null, JSON.stringify(seen), actor.id, Date.now());
+    this.emit("standin.created", { actor: actor.id, to: person, data: { standin: id, name, scopes, webhook: !!webhook } });
+    return {
+      ...this.standinView(this.sql.exec("SELECT * FROM standins WHERE id = ?", id).one()),
+      key, webhookSecret: hook?.secret ?? null,
+      skill: `${origin}/api/projects/${this.project}/standin-skill`,
+      howTo: `Give your agent the skill and this key as LOOM_STANDIN_KEY. Shown once: Loom keeps only its hash.${hook ? " Check webhook deliveries with the secret: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>." : ""}`,
+    };
+  }
+
+  private async updateStandin(actor: Agent, id: string, body: { scopes?: unknown; webhook?: unknown; name?: string }) {
+    const r = this.standinRow(id, actor);
+    if (r.revoked_at) throw new HttpError(409, "that stand-in was revoked; make a new one");
+    let webhookSecret: string | null = null;
+    if (body.scopes !== undefined) this.sql.exec("UPDATE standins SET scopes = ? WHERE id = ?", JSON.stringify(this.parseScopes(body.scopes)), id);
+    if (body.name?.trim()) this.sql.exec("UPDATE standins SET name = ? WHERE id = ?", body.name.trim().slice(0, 60), id);
+    if (body.webhook !== undefined) {
+      const webhook = this.webhookUrl(body.webhook);
+      const hook = webhook && webhook !== r.webhook ? await this.sealWebhookSecret() : null;
+      if (!webhook) this.sql.exec("UPDATE standins SET webhook = NULL, webhook_secret = NULL WHERE id = ?", id);
+      else if (hook) {
+        this.sql.exec("UPDATE standins SET webhook = ?, webhook_secret = ?, seen = ? WHERE id = ?", webhook, hook.sealed, JSON.stringify(this.attention(this.agentStates()).map((i) => shortKey(itemKey(i)))), id);
+        webhookSecret = hook.secret;
+      }
+    }
+    const view = this.standinView(this.sql.exec("SELECT * FROM standins WHERE id = ?", id).one());
+    this.emit("standin.updated", { actor: actor.id, to: r.person as string, data: { standin: id, name: view.name, scopes: view.scopes, webhook: !!view.webhook } });
+    return { ...view, webhookSecret };
+  }
+
+  private revokeStandin(actor: Agent, id: string) {
+    const r = this.standinRow(id, actor);
+    this.sql.exec("UPDATE standins SET revoked_at = COALESCE(revoked_at, ?) WHERE id = ?", Date.now(), id);
+    this.emit("standin.revoked", { actor: actor.id, to: r.person as string, data: { standin: id, name: r.name } });
+    return this.standins(actor);
+  }
+
+  private standinInfo(actor: Agent, origin: string) {
+    const r = this.sql.exec("SELECT * FROM standins WHERE id = ?", actor.standin!.id).one();
+    return {
+      standin: { id: r.id, name: r.name }, actsFor: { id: actor.id, name: actor.name },
+      can: Object.fromEntries(actor.standin!.scopes.map((s) => [s, SCOPES[s]])),
+      cannot: Object.fromEntries(Object.entries(SCOPES).filter(([s]) => !actor.standin!.scopes.includes(s as Scope))),
+      webhook: !!r.webhook, dashboard: `${origin}/?project=${this.project}`, feed: `${origin}/api/projects/${this.project}/attention`,
+      skill: `${origin}/api/projects/${this.project}/standin-skill`,
+    };
+  }
+
+  /** Whether the deputy gets the first go at what this event raised (so nobody is told about it yet). */
+  private deputyTakes(type: string): boolean {
+    const d = this.delegateConfig;
+    if (!d.enabled) return false;
+    return (type === "question.asked" && d.questions.enabled) || (type === "dispute.ready" && d.disputes.enabled) || (type === "approval.needs_human" && d.approvals.enabled);
+  }
+
+  private feedItem(i: any, actor: Agent, origin: string) {
+    const key = itemKey(i);
+    const scope = itemScope(i);
+    return {
+      key, id: shortKey(key), kind: i.kind, text: itemText(i, (id) => this.agentName(id)), since: i.since,
+      url: `${origin}/?project=${this.project}${i.change ? `#change/${i.change}` : ""}`,
+      youCan: scope ? { scope, allowed: !actor.standin || actor.standin.scopes.includes(scope) } : null,
+      detail: i,
+    };
+  }
+
+  /**
+   * What needs a person now. known is the last answer's known; items not in it
+   * are marked new. With wait (seconds, up to 25), holds until something new
+   * needs a person or time runs out.
+   */
+  private async attentionFeed(actor: Agent, known: string | null, wait: number, origin: string) {
+    const seen = new Set((known ?? "").split(/[.,\s]/).filter(Boolean));
+    const read = () => this.attention(this.agentStates()).map((i) => ({ ...this.feedItem(i, actor, origin), new: !seen.has(shortKey(itemKey(i))) }));
+    let items = read();
+    const until = Date.now() + Math.min(Math.max(wait, 0), 25) * 1000;
+    while (known !== null && !items.some((i) => i.new) && Date.now() < until) {
+      await new Promise<void>((done) => {
+        const w = { wants: (e: LoomEvent) => NEEDS_PERSON.has(e.type) && !this.deputyTakes(e.type), wake: () => { clearTimeout(t); setTimeout(done, 300); } };
+        const t = setTimeout(() => { this.waiters.delete(w); done(); }, until - Date.now());
+        this.waiters.add(w);
+      });
+      items = read();
+    }
+    return { items, known: items.map((i) => i.id).join("."), newCount: items.filter((i) => i.new).length };
+  }
+
+  private notifyPending = false;
+  /** Check stand-in webhooks shortly, once for a burst of events. */
+  private notifySoon() {
+    if (this.notifyPending) return;
+    if (!this.sql.exec("SELECT 1 FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL LIMIT 1").toArray().length) return;
+    this.notifyPending = true;
+    this.ctx.waitUntil(new Promise((r) => setTimeout(r, 1500))
+      .then(() => { this.notifyPending = false; return this.notifyWatchers(); })
+      .catch((err) => console.error("stand-in webhook", err)));
+  }
+
+  /** POST what newly needs a person to each stand-in's webhook. Each item goes once while it stays open. */
+  private async notifyWatchers() {
+    const hooks = this.sql.exec("SELECT * FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL").toArray();
+    if (!hooks.length) return;
+    const origin = this.meta("origin") ?? "";
+    const all = this.attention(this.agentStates());
+    for (const h of hooks) {
+      let actor: Agent;
+      try { actor = this.standinActor(h); } catch { continue; }
+      const items = all.map((i) => this.feedItem(i, actor, origin));
+      const seen = new Set(JSON.parse((h.seen as string) ?? "[]"));
+      const fresh = items.filter((i) => !seen.has(i.id));
+      this.sql.exec("UPDATE standins SET seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), h.id);
+      if (fresh.length) await this.deliver(h, fresh.map((i) => ({ ...i, new: true })), origin);
+    }
+    // Stuck work needs no event to need a person, so look again in a while.
+    await this.armAlarm(Date.now() + 5 * 60_000);
+  }
+
+  private async deliver(h: Record<string, SqlStorageValue>, items: any[], origin: string) {
+    const secret = h.webhook_secret ? await unseal(this.env, this.project, JSON.parse(h.webhook_secret as string)) : null;
+    const body = JSON.stringify({ project: this.project, standin: { id: h.id, name: h.name }, actsFor: this.agentName(h.person as string), dashboard: `${origin}/?project=${this.project}`, items });
+    let result: { at: number; status: number | null; error?: string };
+    try {
+      const res = await fetch(h.webhook as string, {
+        method: "POST", signal: AbortSignal.timeout(10_000),
+        headers: { "content-type": "application/json", "user-agent": "loom", "x-loom-event": "needs-person", ...(secret ? { "x-loom-signature": `sha256=${await signBody(secret, body)}` } : {}) },
+        body,
+      });
+      result = { at: Date.now(), status: res.status, ...(res.ok ? {} : { error: (await res.text().catch(() => "")).slice(0, 200) }) };
+    } catch (e: any) {
+      result = { at: Date.now(), status: null, error: String(e?.message ?? e).slice(0, 200) };
+    }
+    this.sql.exec("UPDATE standins SET last_delivery = ? WHERE id = ?", JSON.stringify({ ...result, items: items.length }), h.id);
+    return result;
+  }
+
+  private async testStandin(actor: Agent, id: string, origin: string) {
+    const r = this.standinRow(id, actor);
+    if (!r.webhook) throw new HttpError(400, "that stand-in has no webhook");
+    const item = { key: "test", id: shortKey("test"), kind: "test", text: `Test from Loom: ${r.name} will hear here when something on ${this.project} needs ${this.agentName(r.person as string)}.`, since: Date.now(), url: `${origin}/?project=${this.project}`, youCan: null, detail: {}, new: true };
+    return this.deliver(r, [item], origin);
   }
 
   // ── proposals: agents settle overlaps between themselves ────────────────

@@ -447,7 +447,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -784,8 +784,8 @@ $("#np-open").onclick = () => showNewProject();
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
-  let s, people;
-  try { [s, people] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members")]); } catch { return; }
+  let s, people, si;
+  try { [s, people, si] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] }))]); } catch { return; }
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
@@ -813,6 +813,15 @@ async function showSettings() {
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
+    <h2>Your agent</h2>
+    <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
+    <div class="card key-card">
+      <div class="row"><input id="si-name" placeholder="Your agent's name, e.g. my-assistant"></div>
+      ${Object.entries(si.scopes).map(([k, d]) => `<label class="check si-scope"><input type="checkbox" data-si-scope="${k}" ${k === "answer" ? "checked" : ""}> <b>${esc(k)}</b> <span class="meta">${esc(d)}</span></label>`).join("")}
+      <div class="row"><input id="si-hook" placeholder="Webhook (optional): https://… where Loom posts what needs you"><button id="si-go">Create stand-in key</button></div>
+      <div id="si-out"></div>
+    </div>
+    ${si.standins.map((x) => `<div class="qrow"><span class="grow"><b>${esc(x.name)}</b>${x.for !== me?.id ? ` <span class="meta">for ${esc(x.forName)}</span>` : ""} <span class="meta">${x.scopes.length ? esc(x.scopes.join(", ")) : "watch only"}${x.webhook ? " · webhook" : ""}${x.lastDelivery ? ` (last ${x.lastDelivery.status && x.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(x.lastDelivery.error || String(x.lastDelivery.status))}`})` : ""} · ${x.revoked ? "revoked" : x.lastUsed ? `used ${ago(x.lastUsed)}` : "not used yet"}</span></span>${!x.revoked && x.webhook ? `<button class="ghost mini" data-si-test="${x.id}">Test</button>` : ""}${x.revoked ? "" : `<button class="ghost mini" data-si-revoke="${x.id}">Revoke</button>`}</div>`).join("")}
     <h2>Keys</h2>
     <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
@@ -827,6 +836,28 @@ async function showSettings() {
     if (!input.value.trim()) return;
     try { await act("PUT", `/settings/keys/${b.dataset.keySave}`, { value: input.value.trim() }); } catch { return; }
     toast("Key saved");
+    showSettings();
+  };
+  $("#si-go").onclick = async () => {
+    const name = $("#si-name").value.trim();
+    if (!name) return toast("Name the agent that will hold the key");
+    const scopes = [...$("#detail-body").querySelectorAll("[data-si-scope]")].filter((c) => c.checked).map((c) => c.dataset.siScope);
+    let k;
+    try { k = await act("POST", "/standins", { name, scopes, webhook: $("#si-hook").value.trim() || null }); } catch { return; }
+    const install = `mkdir -p .claude/skills/loom-${project}-standin && curl -s -H \"Authorization: Bearer $LOOM_STANDIN_KEY\" "${k.skill}" > .claude/skills/loom-${project}-standin/SKILL.md`;
+    $("#si-out").innerHTML = `<p class="meta">Shown once. Give your agent the skill and the key; Loom keeps only the key's hash.</p>
+      <pre class="diff copy">export LOOM_STANDIN_KEY=${esc(k.key)}</pre>
+      ${k.webhookSecret ? `<p class="meta">Webhook signing secret: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>.</p><pre class="diff copy">${esc(k.webhookSecret)}</pre>` : ""}
+      <pre class="diff copy">${esc(install)}</pre>
+      <div class="row"><button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button><button class="ghost mini" data-copy="${esc(install)}">Copy install command</button></div>`;
+    wireCopy($("#si-out"));
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-si-test]")) b.onclick = async () => {
+    try { const r = await act("POST", `/standins/${b.dataset.siTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-si-revoke]")) b.onclick = async () => {
+    if (!await ask({ title: "Revoke this stand-in key?", body: "Your agent can no longer act for you or read what needs you here.", ok: "Revoke", danger: true })) return;
+    try { await act("DELETE", `/standins/${b.dataset.siRevoke}`); } catch { return; }
     showSettings();
   };
   if ($("#vis-toggle")) $("#vis-toggle").onclick = async () => {
@@ -1053,6 +1084,9 @@ function describe(e) {
     case "project.visibility": return ["directive", `${who} made the project ${esc(d.visibility)}`];
     case "member.added": return ["directive", `${who} added ${esc(d.login)} to the project${d.owner ? " as an owner" : ""}`];
     case "member.removed": return ["directive", `${who} removed ${esc(d.login)} from the project`];
+    case "standin.acted": return ["directive", `${who}, through ${esc(d.name)}: <span class="mono">${esc(d.action)}</span>`];
+    case "standin.created": return ["directive", `${who} gave ${to} a stand-in key for ${esc(d.name)} (${d.scopes.length ? esc(d.scopes.join(", ")) : "watch only"})`];
+    case "standin.revoked": return ["directive", `${who} revoked the stand-in key for ${esc(d.name)}`];
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
     case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];
