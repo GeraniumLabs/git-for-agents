@@ -226,6 +226,7 @@ function renderHealth() {
       <div class="bar">${seg(merged, "ok", "landed")}${seg(review, "info", "in review or queued")}${seg(active, "warn", "in progress")}${seg(open, "muted", "open")}</div>
       <div class="meta">${open} open · ${active} in progress · ${review} in review or queued</div>
     </div>
+    <div class="tile"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
     <div class="tile"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
     <div class="tile"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
     <div class="tile"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
@@ -475,6 +476,7 @@ async function showAgent(id) {
       ${p.reviewQueue.map((r) => `<div class="qrow"><a data-change="${r.change_id}">#${r.change_id}</a> <span class="grow ellipsis">${esc(r.title)}</span><span class="meta">asked by ${esc(r.requestedByName)} ${ago(r.created_at)} ago · ${esc(r.reason ?? "")}</span></div>`).join("")}` : ""}
     ${p.intents.length ? `<h2>Declared intents</h2>${p.intents.map((i) => `<div><span class="mono">${i.paths.map(esc).join(", ")}</span> ${esc(i.description)}</div>`).join("")}` : ""}
     ${p.changes.length ? `<h2>Changes</h2>${p.changes.map((c) => `<div class="qrow"><a data-change="${c.id}">#${c.id}</a> <span class="grow ellipsis">${esc(c.title)}</span><span class="pill ${c.status}">${c.status}</span></div>`).join("")}` : ""}
+    ${p.reviewTasks?.length ? `<h2>Review tasks</h2>${p.reviewTasks.map((t) => `<div class="qrow"><a data-change="${t.change}" class="grow ellipsis">${esc(t.title)}</a><span class="meta">${t.reviewers.find((r) => r.agent === p.agent.id)?.status ?? t.status}</span></div>`).join("")}` : ""}
     ${p.tasks.length && isHuman() ? `<h2>Tasks</h2>${p.tasks.map((t) => `<div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><span class="meta">${t.status}</span>${t.status !== "merged" ? `<button class="ghost mini" data-reassign="${t.id}">Reassign…</button>` : ""}</div>`).join("")}` : ""}
     ${p.threads.length ? `<h2>Conversations</h2>${p.threads.map((t) => `<div class="post"><span class="meta">${t.kind} · ${t.status}</span> ${esc(t.title)}</div>`).join("")}` : ""}
     <h2>Recent activity</h2><ol class="feed">${p.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("")}</ol>`;
@@ -828,7 +830,7 @@ async function showWork(note = "") {
     const only = $("#rq-person").checked;
     const rows = queue.filter((r) => !only || r.needsPerson || r.askedOfYou);
     $("#rq").innerHTML = rows.map((r) => `<div class="card rq ${r.needsPerson ? "person" : ""}">
-      <div class="qrow"><span class="badge ${r.needsPerson ? "person" : "agents"}">${r.needsPerson ? "Needs a person" : "Agents"}</span><a data-change="${r.id}" class="grow ellipsis">#${r.id} ${esc(r.title)}</a>${r.askedOfYou ? `<span class="pill review">asked of you</span>` : ""}${r.yourReview ? `<span class="pill">${r.yourReview.current ? "you reviewed it" : "changed since your review"}</span>` : ""}</div>
+      <div class="qrow"><span class="badge ${r.needsPerson ? "person" : "agents"}">${r.needsPerson ? "Needs a person" : "Agents"}</span><a data-change="${r.id}" class="grow ellipsis">#${r.id} ${esc(r.title)}</a>${r.askedOfYou ? `<span class="pill review">asked of you</span>` : `<span class="meta">${r.reviewers.length ? r.reviewers.map((x) => `${esc(x.name)} ${x.status}`).join(", ") : "nobody has taken it"}</span>`}${r.yourReview ? `<span class="pill">${r.yourReview.current ? "you reviewed it" : "changed since your review"}</span>` : ""}</div>
       <div class="meta">${who(r.agent)} · <span class="add">+${r.added}</span> <span class="del">−${r.removed}</span> in ${plural(r.files, ["file", "files"])} · approval ${r.approval.weight} of ${r.approval.needed}${r.openThreads ? ` · ${plural(r.openThreads, ["open thread", "open threads"])}` : ""} · ${ago(r.updated_at)} ago</div>
       ${r.reasons.length ? `<div class="meta">${r.reasons.slice(0, 3).map(esc).join(" · ")}</div>` : ""}</div>`).join("")
       || `<p class="meta">Nothing needs a person right now. ${queue.length} ${queue.length === 1 ? "change is" : "changes are"} with the agents.</p>`;

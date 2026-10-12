@@ -463,6 +463,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b && c === "interdiff") return json(await this.interdiff(Number(b), url.searchParams));
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
+      if (a === "review-tasks") return json(this.reviewTasks(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : undefined));
       if (a === "reviews") return json(await this.reviewQueue(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : null));
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
@@ -561,6 +562,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "workspaces" && b && c === "commit") return json(await this.commitToWorkspace(actor, b, body));
     if (a === "changes" && !b && m === "POST") return json(await this.submitChange(actor, body));
     if (a === "changes" && b && c === "reviewers" && d === "respond" && m === "POST") return json(this.respondToReview(actor, Number(b), body));
+    if (a === "changes" && b && c === "reviewers" && d === "take" && m === "POST") return json(this.takeReview(actor, Number(b)));
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
@@ -1274,6 +1276,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         files: (ch.files as FileChange[]).length, ...this.patchStats(patch),
         needsPerson: brief.needsPerson, verdict: brief.verdict, score: brief.score, reasons: brief.reasons.filter((x) => x.kind !== "ok").map((x) => x.text),
         approval: this.approval(ch.id), openThreads: this.openBlockingThreads(ch.id),
+        reviewers: this.sql.exec("SELECT reviewer, status FROM review_requests WHERE change_id = ? AND status IN ('open','accepted')", ch.id).toArray().map((x) => ({ agent: x.reviewer as string, name: this.agentName(x.reviewer as string), status: x.status === "accepted" ? "reviewing" : "asked" })),
         askedOfYou: !!asked, yourReview: mine ? { verdict: mine.verdict, current: mine.head === ch.head } : null,
       };
     }));
@@ -2280,6 +2283,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
         tasks: taskCounts, changes: changeCounts,
+        reviewTasks: this.reviewTasks().reduce((n: Record<string, number>, t) => ({ ...n, [t.status]: (n[t.status] ?? 0) + 1 }), { open: 0, assigned: 0, in_progress: 0 }),
         queue: { depth: queued.length, oldestWaitMs: queued.length ? now - Math.min(...queued.slice(0, 50).map((q) => waitedFor(q.id as number))) : 0 },
         mergedLastHour: mergedHour, conflictsLastHour: conflictsHour,
         conflictRate: mergedHour + conflictsHour ? conflictsHour / (mergedHour + conflictsHour) : 0,
@@ -2564,6 +2568,45 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { requested: this.reviewRequests(id) };
   }
 
+  /**
+   * Reviews as agent tasks: one per change waiting on review. Each is asked
+   * of someone (assigned), being done (in_progress), or open for any agent to
+   * take. With an agent: the ones it may do (not its own, not done already).
+   */
+  private reviewTasks(forAgent?: string) {
+    const rows = this.sql.exec("SELECT id, task_id, title, agent_id, head, updated_at FROM changes WHERE status = 'review' ORDER BY updated_at").toArray();
+    const out = [];
+    for (const c of rows) {
+      if (this.openContest(c.task_id as number)) continue; // contests are decided by votes
+      const approval = this.approval(c.id as number);
+      if (approval.ok) continue;
+      const reviewers = this.sql.exec("SELECT reviewer, status FROM review_requests WHERE change_id = ? AND status IN ('open','accepted')", c.id).toArray()
+        .map((r) => ({ agent: r.reviewer as string, name: this.agentName(r.reviewer as string), status: r.status === "accepted" ? "reviewing" : "asked" }));
+      const task = {
+        kind: "review", change: c.id as number, title: `Review #${c.id}: ${c.title}`, author: c.agent_id as string, authorName: this.agentName(c.agent_id as string),
+        status: reviewers.some((r) => r.status === "reviewing") ? "in_progress" : reviewers.length ? "assigned" : "open",
+        reviewers, approval: `${approval.weight} of ${approval.needed}`, needsPerson: approval.humanNeeded, since: c.updated_at as number,
+      };
+      if (forAgent) {
+        if (task.author === forAgent) continue;
+        if (this.sql.exec("SELECT 1 FROM reviews WHERE change_id = ? AND reviewer = ? AND head = ?", c.id, forAgent, c.head).toArray().length) continue;
+        if (task.status !== "open" && !reviewers.some((r) => r.agent === forAgent)) continue;
+      }
+      out.push(task);
+    }
+    return out;
+  }
+
+  /** Take an open review task: it becomes yours, accepted, with the usual time to deliver. */
+  private takeReview(actor: Agent, id: number) {
+    const ch = this.change(id);
+    if (ch.agent_id === actor.id) throw new HttpError(403, "agents cannot review their own change");
+    if (!["review", "changes_requested"].includes(ch.status)) throw new HttpError(409, `change ${id} is ${ch.status}, not in review`);
+    this.assignReviewer(id, actor.id, actor.id, "took it from the open review tasks");
+    if (actor.role !== "human") this.respondToReview(actor, id, { accept: true, reason: "took it" });
+    return { taken: id, requested: this.reviewRequests(id), next: "get_change (start with its brief), then review_change" };
+  }
+
   /** Ask the next best-placed agent, preferring ones who are around now. */
   private reroute(id: number, why: string) {
     const ch = this.change(id);
@@ -2664,6 +2707,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       events: this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE actor = ? OR to_agent = ? ORDER BY seq DESC LIMIT 60", a.id, a.id).toArray()),
       reviewQueue: this.sql.exec("SELECT r.change_id, r.reason, r.created_at, r.requested_by, c.title, c.status FROM review_requests r JOIN changes c ON c.id = r.change_id WHERE r.reviewer = ? AND r.status IN ('open','accepted') ORDER BY r.created_at LIMIT 20", a.id).toArray()
         .map((r) => ({ ...r, requestedByName: this.agentName(r.requested_by as string) })),
+      reviewTasks: this.reviewTasks(a.id).filter((t) => t.reviewers.some((r) => r.agent === a.id)),
       reviewStats: this.reviewStats(a.id),
       trust: a.role === "human" ? null : this.trustOf(a.id),
       knows: this.knows(a.id),
@@ -3155,8 +3199,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...tasks.filter((t) => !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
       ...this.contestsToVote(actor).map((c) => `Contest #${c.id} "${c.title}" has ${c.ready} attempts in: compare_attempts, then vote`),
     ];
+    const reviewTasks = this.reviewTasks(actor.id);
+    const untaken = reviewTasks.filter((t) => t.status === "open");
+    if (untaken.length && actor.role !== "human") todo.push(`${untaken.length} review task${untaken.length === 1 ? "" : "s"} nobody has taken (${untaken.slice(0, 3).map((t) => `#${t.change}`).join(", ")}${untaken.length > 3 ? ", …" : ""}): take_review one, then get_change and review_change`);
     return {
-      agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, tasks, changes,
+      agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, reviewTasks, tasks, changes,
       openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open'").one().n,
       inbox: this.inbox(actor.id),
     };
@@ -3243,7 +3290,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", remote: this.remoteUrl(this.mainRepo) },
-      agents, tasks, intents: this.activeIntents(), changes, reviews, events,
+      agents, tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
     };

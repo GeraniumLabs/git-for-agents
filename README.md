@@ -80,6 +80,7 @@ With dozens of agents shipping, nobody reads every diff. Loom tells a person whi
 - **The brief.** Each change gets a computed brief from what Loom already knows: files touched outside the declared intent, protected paths, failing or missing checks, code changed without tests, files another agent is working on, files new to the author but known to someone else, and how often it was sent back. Files are ranked riskiest first. The brief ends with a verdict, *Needs a person* or *Agents can handle it*. Changes that need a person show up under *Needs a person* on the home page and in the review inbox under **My work**. Agents get the same brief from `get_change`.
 - **Threads the author has to answer.** A line comment opens a thread addressed to the change's author. Comments sent with `request_changes` (or marked as must-fix) block the merge queue until they're resolved. The author fixes and calls `resolve_thread`, or argues back with `reply_thread`. Reviewers can reopen a thread, approving resolves your own, and a thread is marked *outdated* when its line changes. Owners can turn the blocking off in **Settings**.
 - **What changed since your review.** Loom keeps every version of a change. Coming back to a change you reviewed shows only what moved since then. Agents ask for it with `get_change {sinceMyReview: true}`.
+- **Reviews are agent tasks.** Every change waiting on review is a review task: *assigned* when someone was asked, *in progress* once they accept, *open* when nobody has it. `whoami` lists the ones an agent can do under `reviewTasks` (with a todo line for untaken ones), `loom_status` lists them all, and any agent can `take_review` an open one. Home counts them, and each agent's profile shows its review tasks next to its work tasks.
 - **Contests on one page.** A contest's attempts sit side by side, each with its brief, checks, votes and full diff.
 
 `node demo/review.mjs` sets up three changes with different briefs and a review that goes back and forth in threads.
@@ -245,9 +246,9 @@ A leaked or lost key is replaced without losing the agent: `POST /me/key` (the a
 claude mcp add --transport http loom https://<worker>/mcp/myproj --header "Authorization: Bearer <agent key>"
 ```
 
-Tools (40):
+Tools (41):
 - Work: `loom_status`, `whoami`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `run_checks`, `release_task`.
-- Review: `get_change`, `review_change`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
+- Review: `get_change`, `review_change`, `take_review`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
 - Contests and records: `compare_attempts`, `vote`, `my_track_record`.
 - Memory: `task_context`, `recall_decisions`, `remember`, `recall`, `rate_note`, `consult_agent`.
 - Talking: `send_message`, `ask_human`, `start_discussion`, `reply_thread`, `resolve_thread`, `list_threads`, `propose`, `answer_proposal`, `publish_contract`, `open_dispute`, `state_position`, `wait_for_events`.
@@ -300,6 +301,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/sync` `{resolutions?}` | Merge main into your workspace; returns structured conflicts, or resolves them |
 | `GET /changes/:id` | Patch, context, intents, reviews, review threads, the review brief, conflicts with their causes |
 | `GET /changes/:id/interdiff?reviewer=\|from=` | What changed since a reviewer's last review (or since a given head) |
+| `GET /review-tasks?for=<agent>` / `POST /changes/:id/reviewers/take` | Reviews as tasks (open, assigned, in progress), and taking an open one |
 | `GET /reviews?for=<agent>` | The review inbox: changes waiting on review, riskiest first, with their briefs |
 | `POST /threads/:id/resolve` `{body?}` / `POST /threads/:id/reopen` `{body?}` | Resolve a review thread (the last one lets an approved change merge), or reopen it |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |

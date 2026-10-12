@@ -120,3 +120,29 @@ test("review threads: the author must answer line comments before the change mer
   const s = (await ada.change(ch.id)).status;
   assert.ok(["queued", "merging", "merged"].includes(s), `resolving the last thread queues the approved change (${s})`);
 });
+
+test("reviews are agent tasks: an untaken review shows up in whoami and loom_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-rtasks");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "review tasks", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const bex = admin.as((await admin.addAgent("bex", "builder")).key);
+  const t = await ada.createTask("Comment db.js", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// done\n" }, "c");
+  const ch = await ada.submit(t.id, t.title, "comment");
+  const me = await bex.me();
+  const task = me.reviewTasks.find((x: any) => x.change === ch.id);
+  assert.equal(task?.status, "open", "nobody has taken the review yet");
+  assert.ok(me.todo.some((x: string) => /take_review/.test(x)));
+  assert.equal((await ada.me()).reviewTasks.some((x: any) => x.change === ch.id), false, "the author doesn't get its own review");
+  assert.ok((await admin.state()).reviewTasks.some((x: any) => x.change === ch.id));
+  await bex.req("POST", `/changes/${ch.id}/reviewers/take`);
+  const after = (await bex.me()).reviewTasks.find((x: any) => x.change === ch.id);
+  assert.equal(after.status, "in_progress");
+  assert.deepEqual(after.reviewers.map((r: any) => r.status), ["reviewing"]);
+  await bex.review(ch.id, "approve", "ok");
+  assert.equal((await bex.me()).reviewTasks.some((x: any) => x.change === ch.id), false, "done once reviewed");
+});
