@@ -88,6 +88,7 @@ async function signIn(key) {
   }
   renderMe();
   if (state) render();
+  if (location.hash) route();
 }
 const isHuman = () => me?.role === "human";
 const isOwner = () => !!me?.owner;
@@ -182,6 +183,7 @@ function onEvent(e, ws) {
   recent.push(e);
   if (recent.length > 2000) recent.splice(0, recent.length - 2000);
   if (showAll || isNotable(e)) addEvent(e, true);
+  reviewEvent(e);
   if (!refreshTimer) refreshTimer = setTimeout(() => { refreshTimer = null; ws.send("overview"); }, 1000);
 }
 
@@ -251,6 +253,9 @@ function renderAttention() {
     if (it.kind === "dispute") {
       const sides = it.parties.map((p) => `<div class="side">${who(p)} ${it.positions[p] ? esc(it.positions[p]) : `<i class="meta">hasn't stated a position yet</i>`}${me && it.positions[p] ? ` <button class="mini" data-rule="${it.thread}" data-for="${esc(p)}">Rule for ${esc(name(p))}</button>` : ""}</div>`).join("");
       return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}${me ? "" : signInToAct("rule on it")}`, "q");
+    }
+    if (it.kind === "brief") {
+      return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
     if (it.kind === "review") {
       return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
@@ -349,41 +354,6 @@ function renderContests() {
       ${a.change ? `<span class="votebar" title="${a.weight} of ${c.quorum} vote weight needed"><span style="width:${Math.min(100, (a.weight / c.quorum) * 100)}%"></span></span><span class="meta">${a.weight}</span>` : ""}${c.winner && a.change === c.winner ? ` <span class="pill merged">won</span>` : ""}</div>`).join("")}
     <div class="row"><button class="ghost mini" data-contest="${c.id}">Compare attempts</button></div></div>`).join("");
   wire($("#contests"));
-}
-
-async function showContest(id) {
-  const v = await api(`/contests/${id}`);
-  if (v.error) return toast(v.error);
-  const k = v.contest, open = k.status === "open";
-  const col = (a) => {
-    const c = a.change;
-    const tested = c?.context?.tested ? [].concat(c.context.tested).join("; ") : "";
-    return `<div class="card attempt${c && c.id === k.winner ? " won" : ""}${c?.status === "closed" ? " lost" : ""}">
-      <div class="kicker">${a.agent ? who(a.agent) : "unclaimed"} · ${c ? `<a data-change="${c.id}">#${c.id}</a> <span class="pill ${c.status}">${c.id === k.winner ? "won" : c.status}</span>` : esc(a.status)}</div>
-      ${c ? `<p>${esc(c.summary)}</p>
-        <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> · ${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div>
-        ${tested ? `<div class="meta">Tested: ${esc(tested)}</div>` : ""}
-        ${c.undeclared?.length ? `<div class="warn">Touches ${c.undeclared.map(esc).join(", ")} outside its declared intent</div>` : ""}
-        <div class="votes"><b>${c.votes.weight}</b> vote weight · ${plural(c.votes.votes, ["vote", "votes"])}</div>
-        ${isHuman() && open ? `<div class="row"><button class="mini" data-pick="${c.id}">Pick this one</button></div>` : ""}
-        <details><summary>Patch</summary>${diffView(c.patch, [], false)}</details>` : `<p class="meta">${a.agent ? "Still working on it." : "Nobody has claimed this attempt."}</p>`}
-    </div>`;
-  };
-  $("#detail-body").innerHTML = `
-    <h3>Contest #${k.id}: ${esc(k.title)} <span class="pill ${open ? "review" : "merged"}">${open ? "voting" : "decided"}</span></h3>
-    ${k.description ? `<p class="meta">${esc(k.description)}</p>` : ""}
-    <p>${open ? `${k.attempts} agents attempt this task independently. The others compare the attempts and vote; each vote counts by the voter's track record. An attempt wins with ${k.quorum} vote weight and a clear lead${isHuman() ? ", or when you pick it" : ""}.` : `Decided: <a data-change="${k.winner}">#${k.winner}</a> lands. The other attempts were closed; their context is kept, and why the winner won is on record as a decision.`}</p>
-    <div class="attempts">${v.attempts.map(col).join("")}</div>
-    <h2>Votes</h2>
-    ${v.votes.map((x) => `<div class="qrow">${who(x.voter)} <span class="pill" title="what this agent's vote counts for, from its track record">${x.weight}×</span> for <a data-change="${x.change}">#${x.change}</a> <span class="grow">“${esc(x.reason)}”</span></div>`).join("") || `<p class="empty">No votes yet.</p>`}`;
-  wire($("#detail-body"));
-  for (const b of $("#detail-body").querySelectorAll("[data-pick]")) b.onclick = async () => {
-    const note = prompt("Why this one? The agents will see it, and it goes on record. (optional)");
-    if (note === null) return;
-    await act("POST", `/contests/${id}/pick`, { changeId: Number(b.dataset.pick), note: note.trim() || undefined });
-    showContest(id);
-  };
-  if (!$("#detail").open) $("#detail").showModal();
 }
 
 // ── notes: what agents learned, for the agents after them ──────────────
@@ -765,6 +735,8 @@ async function showSettings() {
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
+    <p class="meta">${state?.project?.resolveThreads === false ? "<b>Threads don't hold changes back.</b> Line comments are advice; an approved change merges with threads still open." : "<b>Threads must be resolved.</b> A line comment sent with a request for changes (or marked as one to fix) keeps the change out of the merge queue until its author resolves it."}</p>
+    ${isOwner() ? `<div class="row"><button class="ghost" id="threads-toggle">${state?.project?.resolveThreads === false ? "Require open threads to be resolved" : "Let changes merge with open threads"}</button></div>` : ""}
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
@@ -799,6 +771,10 @@ async function showSettings() {
     try { const r = await act("POST", "/settings", { approvalMode: state.project.approvalMode === "count" ? "weighted" : "count" }); state.project.approvalMode = r.approvalMode; } catch { return; }
     showSettings();
   };
+  if ($("#threads-toggle")) $("#threads-toggle").onclick = async () => {
+    try { const r = await act("POST", "/settings", { resolveThreads: state.project.resolveThreads === false }); state.project.resolveThreads = r.resolveThreads; } catch { return; }
+    showSettings();
+  };
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }
     toast(state.project.checks ? "Checks saved" : "Checks turned off");
@@ -829,13 +805,15 @@ $("#settings-open").onclick = () => showSettings();
 // ── my work: people claim tasks, push with git, and submit like agents ───
 async function showWork(note = "") {
   if (!me) return toast("Sign in first");
-  const [p, open] = await Promise.all([api(`/agents/${encodeURIComponent(me.id)}`), api("/tasks?status=open&limit=30")]);
+  const [p, open, queue] = await Promise.all([api(`/agents/${encodeURIComponent(me.id)}`), api("/tasks?status=open&limit=30"), api(`/reviews?for=${encodeURIComponent(me.id)}`)]);
   const mine = (p.tasks ?? []).filter((t) => !["merged", "abandoned"].includes(t.status));
   const ready = open.filter((t) => !t.depends_on.length);
   $("#detail-body").innerHTML = `
     <h3>My work</h3>
     <p class="meta">You work like an agent does: take a task, clone its workspace, push your commits, submit. Reviews, conflicts and the merge queue treat you the same.</p>
     ${note}
+    <h2>Reviews <small>${queue.length ? `${queue.filter((r) => r.needsPerson).length} of ${queue.length} need a person` : "nothing waiting"}</small></h2>
+    ${queue.length ? `<label class="check meta"><input type="checkbox" id="rq-person" ${isHuman() && store.get("loom-rq-all") !== "1" ? "checked" : ""}> Only what needs a person; agents review the rest</label><div id="rq"></div>` : `<p class="meta">No changes are waiting on review.</p>`}
     <h2>Your tasks</h2>
     ${mine.length ? mine.map((t) => `<div class="card work"><div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><span class="meta">${t.status}</span></div>
       <div class="row"><button class="ghost mini" data-push="${t.id}">Clone and push</button><button class="ghost mini" data-submit="${t.id}">Submit for review</button><button class="ghost mini" data-release="${t.id}">Release</button></div>
@@ -845,6 +823,17 @@ async function showWork(note = "") {
     <h2>New task</h2>
     <input id="nt-title" placeholder="Title" style="width:100%"><textarea id="nt-desc" rows="2" placeholder="What needs doing" style="width:100%;margin-top:6px"></textarea>
     <div class="row"><button class="ghost" id="nt-add">Add to the board</button><button id="nt-take">Add and take it</button></div>`;
+  const drawQueue = () => {
+    if (!$("#rq")) return;
+    const only = $("#rq-person").checked;
+    const rows = queue.filter((r) => !only || r.needsPerson || r.askedOfYou);
+    $("#rq").innerHTML = rows.map((r) => `<div class="card rq ${r.needsPerson ? "person" : ""}">
+      <div class="qrow"><span class="badge ${r.needsPerson ? "person" : "agents"}">${r.needsPerson ? "Needs a person" : "Agents"}</span><a data-change="${r.id}" class="grow ellipsis">#${r.id} ${esc(r.title)}</a>${r.askedOfYou ? `<span class="pill review">asked of you</span>` : ""}${r.yourReview ? `<span class="pill">${r.yourReview.current ? "you reviewed it" : "changed since your review"}</span>` : ""}</div>
+      <div class="meta">${who(r.agent)} · <span class="add">+${r.added}</span> <span class="del">−${r.removed}</span> in ${plural(r.files, ["file", "files"])} · approval ${r.approval.weight} of ${r.approval.needed}${r.openThreads ? ` · ${plural(r.openThreads, ["open thread", "open threads"])}` : ""} · ${ago(r.updated_at)} ago</div>
+      ${r.reasons.length ? `<div class="meta">${r.reasons.slice(0, 3).map(esc).join(" · ")}</div>` : ""}</div>`).join("")
+      || `<p class="meta">Nothing needs a person right now. ${queue.length} ${queue.length === 1 ? "change is" : "changes are"} with the agents.</p>`;
+    wire($("#rq"));
+  };
   const pushInfo = (r) => `<pre class="diff copy">${esc(r.git.clone)}\ncd work\n# edit, commit, then:\ngit -c http.extraHeader="Authorization: Bearer ${esc(r.workspace.token)}" push origin HEAD:main</pre><p class="meta">The workspace is yours alone; main changes only through the merge queue.</p>
     <div class="row"><input data-intent="${r.task.id}" placeholder="Files you'll touch, e.g. src/db.js, docs/**" style="flex:1"><button class="ghost mini" data-declare="${r.task.id}">Declare</button></div>
     <p class="meta">Declaring warns agents headed for the same files, and tells you what was already decided about them.</p>`;
@@ -885,6 +874,8 @@ async function showWork(note = "") {
     const r = await act("POST", `/tasks/${t.id}/claim`);
     showWork(`<div class="card"><b>Task #${t.id} is yours.</b>${pushInfo(r)}</div>`);
   };
+  if ($("#rq-person")) $("#rq-person").onchange = () => { store.set("loom-rq-all", $("#rq-person").checked ? null : "1"); drawQueue(); };
+  drawQueue();
   $("#nt-add").onclick = () => addTask(false);
   $("#nt-take").onclick = () => addTask(true);
   if (!$("#detail").open) $("#detail").showModal();
@@ -1016,88 +1007,393 @@ function requestState(r) {
   return `<span class="pill ${cls}">${label}</span>`;
 }
 
-/** A patch as rows with new-file line numbers, review comments under their lines. */
-function diffView(patchText, comments, clickable) {
-  let path = null, line = 0;
-  const rows = [], shown = new Set();
-  const at = (p, n) => comments.filter((x) => x.path === p && x.line === n);
-  for (const l of patchText.split("\n")) {
-    if (l.startsWith("+++ ")) { path = l.slice(4).replace(/^b\//, ""); rows.push(`<div class="dl file">${esc(path === "/dev/null" ? "(deleted)" : path)}</div>`); continue; }
-    if (l.startsWith("--- ")) continue;
-    const h = /^@@ -\d+(?:,\d+)? \+(\d+)/.exec(l);
-    if (h) { line = Number(h[1]); rows.push(`<div class="dl hunk"><span class="ln"></span><code>${esc(l)}</code></div>`); continue; }
-    if (!l && !path) continue;
-    const kind = l.startsWith("+") ? "add" : l.startsWith("-") ? "del" : "ctx";
-    const n = kind === "del" ? null : line;
-    if (n) shown.add(`${path}:${n}`);
-    rows.push(`<div class="dl ${kind}${clickable && n ? " can" : ""}" ${n ? `data-path="${esc(path)}" data-line="${n}"` : ""}><span class="ln">${n ?? ""}</span><code>${esc(l)}</code></div>`);
-    if (n) for (const x of at(path, n)) rows.push(`<div class="dc ${x.verdict}"><a class="who" data-agent="${esc(x.reviewer)}">${esc(name(x.reviewer))}</a> ${esc(x.body)}</div>`);
-    if (kind !== "del") line++;
+// ── review: a change on its own page ────────────────────────────────────
+// With many agents shipping, nobody reads every diff. The page leads with
+// the brief (where to look, and whether a person needs to), ranks files by
+// risk, and keeps line comments as threads the author has to answer.
+
+/** A unified diff as files and hunks, with old and new line numbers. */
+function parsePatch(text) {
+  const files = [];
+  let f = null, h = null, oldN = 0, newN = 0, minus = null;
+  for (const l of (text ?? "").split("\n")) {
+    if (l.startsWith("--- ")) { minus = l.slice(4).replace(/^a\//, ""); continue; }
+    if (l.startsWith("+++ ")) {
+      const plus = l.slice(4).replace(/^b\//, "");
+      f = { path: plus === "/dev/null" ? minus : plus, deleted: plus === "/dev/null", added: minus === "/dev/null", hunks: [], plus: 0, minus: 0 };
+      files.push(f);
+      h = null;
+      continue;
+    }
+    if (!f) continue;
+    const m = /^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(l);
+    if (m) { oldN = Number(m[1]); newN = Number(m[2]); h = { header: l, lines: [] }; f.hunks.push(h); continue; }
+    // Every real line has a one-character prefix; an empty one is the patch's end.
+    if (!h || !l) continue;
+    if (l.startsWith("+")) { h.lines.push({ kind: "add", text: l.slice(1), old: null, new: newN++ }); f.plus++; }
+    else if (l.startsWith("-")) { h.lines.push({ kind: "del", text: l.slice(1), old: oldN++, new: null }); f.minus++; }
+    else if (l.startsWith(" ")) h.lines.push({ kind: "ctx", text: l.slice(1), old: oldN++, new: newN++ });
   }
-  // Comments on lines the patch doesn't show.
-  const rest = comments.filter((x) => !shown.has(`${x.path}:${x.line}`));
-  return `<div class="diffview">${rows.join("")}</div>${rest.length ? `<div class="meta">${rest.map((x) => `<div class="dc">${esc(name(x.reviewer))} on <span class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""}</span>: ${esc(x.body)}</div>`).join("")}</div>` : ""}`;
+  return files;
 }
 
-async function showChange(id) {
+/** A plain unified diff, for places that only show a patch (contests). */
+function diffView(patchText) {
+  return `<div class="diffview">${parsePatch(patchText).map((f) => `<div class="dl file">${esc(f.path)}</div>${f.hunks.map((h) => `<div class="dl hunk"><span class="ln"></span><code>${esc(h.header)}</code></div>${h.lines.map((l) => `<div class="dl ${l.kind}"><span class="ln">${l.new ?? ""}</span><code>${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${esc(l.text)}</code></div>`).join("")}`).join("")}`).join("")}</div>`;
+}
+
+let review = null; // the change on screen: { id, c, rv, pending, view, since, inter }
+const VERDICT = { approve: ["approved", "merged"], request_changes: ["requested changes", "changes_requested"], comment: ["commented", ""] };
+const viewedKey = () => `loom-viewed:${project}:${review.id}:${review.c.head}`;
+const viewed = () => new Set(JSON.parse(store.get(viewedKey()) ?? "[]"));
+const fileId = (p) => `rvf-${btoa(unescape(encodeURIComponent(p))).replace(/[^a-z0-9]/gi, "")}`;
+
+function showChange(id) {
+  if (location.hash === `#change/${id}`) route(); else location.hash = `change/${id}`;
+}
+function showContest(id) {
+  if (location.hash === `#contest/${id}`) route(); else location.hash = `contest/${id}`;
+}
+
+/** The dashboard, or a change or contest on its own page, from the URL. */
+function route() {
+  const m = /^#(change|contest)\/(\d+)$/.exec(location.hash);
+  document.body.classList.toggle("reviewing", !!m);
+  $("#review").hidden = !m;
+  if (!m) { review = null; $("#review").innerHTML = ""; return; }
+  if ($("#detail").open) $("#detail").close();
+  window.scrollTo(0, 0);
+  if (m[1] === "change") loadReview(Number(m[2])); else loadContest(Number(m[2]));
+}
+window.addEventListener("hashchange", route);
+
+async function loadReview(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
-  const inReview = ["review", "changes_requested"].includes(c.status);
+  if (c.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(c.error)}</p></div>`; return; }
+  const prev = review?.id === id ? review : null;
+  review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0 };
+  const lastMine = c.reviewedHeads.filter((r) => r.reviewer === me?.id).at(-1)?.head;
+  review.lastMine = lastMine && lastMine !== c.head ? lastMine : null;
+  if (review.since === null) review.since = !!review.lastMine;
+  if (review.since && review.lastMine) {
+    review.inter = await api(`/changes/${id}/interdiff?from=${review.lastMine}`);
+    if (!review.inter.available) review.since = false;
+  } else review.since = false;
+  drawReview();
+}
+
+function drawReview() {
+  const { c, rv } = review;
+  const canReview = me && !["merged", "abandoned", "closed"].includes(c.status) && me.id !== c.agent_id;
+  const patch = review.since ? review.inter.patch : c.patch;
+  const files = parsePatch(patch);
+  const briefOf = new Map(c.brief.files.map((f) => [f.path, f]));
+  // Riskiest first, as the brief ranks them.
+  const rank = new Map(c.brief.files.map((f, i) => [f.path, i]));
+  files.sort((a, b) => (rank.get(a.path) ?? 999) - (rank.get(b.path) ?? 999));
+  const seen = viewed();
+  const threadsAt = (path) => c.threads.filter((t) => t.path === path);
+  const open = c.threads.filter((t) => t.status === "open");
+  const added = c.brief.files.reduce((s, f) => s + f.added, 0), removed = c.brief.files.reduce((s, f) => s + f.removed, 0);
+
+  const fileList = files.map((f, i) => {
+    const b = briefOf.get(f.path), n = threadsAt(f.path).filter((t) => t.status === "open").length;
+    return `<li class="${seen.has(f.path) ? "seen" : ""}${i === review.file ? " on" : ""}" data-goto="${i}" title="${esc(f.path)}${b?.flags.length ? "\n" + b.flags.map((x) => "• " + x.text).join("\n") : ""}">
+      <input type="checkbox" data-viewed="${esc(f.path)}" ${seen.has(f.path) ? "checked" : ""} title="Viewed">
+      <span class="risk r${Math.min(3, Math.ceil((b?.score ?? 0) / 2))}"></span>
+      <span class="fname">${esc(f.path)}</span>
+      ${n ? `<span class="tcount" title="open threads">${n}</span>` : ""}
+      <span class="add">+${f.plus}</span><span class="del">−${f.minus}</span></li>`;
+  }).join("");
+
+  const reasons = c.brief.reasons.map((r) => `<li class="${r.kind === "ok" ? "ok" : r.kind === "threads" ? "thr-r" : ""}">${esc(r.text)}${r.files?.length ? ` <span class="meta">${r.files.slice(0, 4).map((p) => `<a class="mono" data-gotopath="${esc(p)}">${esc(p)}</a>`).join(", ")}${r.files.length > 4 ? "…" : ""}</span>` : ""}</li>`).join("");
+
+  $("#review").innerHTML = `
+    <div class="rv-top">
+      <a class="button ghost mini" href="#">← ${esc(project)}</a>
+      <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
+      <div class="meta">${who(c.agent_id)} wants to land this for task #${c.task.id} “${esc(c.task.title)}” · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
+      ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
+      <div class="row"><button class="ghost mini" data-browse>Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone>Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
+      <div id="clone-box"></div>
+    </div>
+    <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
+      <div class="rv-verdict"><span class="badge">${c.brief.needsPerson ? "Needs a person" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
+      ${reasons ? `<ul>${reasons}</ul>` : ""}
+    </div>
+    <div class="rv-grid">
+      <aside class="rv-files panel">
+        <div class="panel-head"><h2>Files</h2><small>${seen.size ? `${[...seen].filter((p) => files.some((f) => f.path === p)).length} of ${files.length} viewed` : "riskiest first"}</small></div>
+        <ol>${fileList || `<li class="meta">${review.since ? "Nothing changed since your review." : "No files."}</li>`}</ol>
+        <p class="meta keys"><kbd>j</kbd> <kbd>k</kbd> move between files · <kbd>v</kbd> mark viewed</p>
+      </aside>
+      <section class="rv-diff">
+        <div class="rv-tools">
+          <span class="seg"><button data-view="unified" class="${review.view === "unified" ? "on" : ""}">Unified</button><button data-view="split" class="${review.view === "split" ? "on" : ""}">Split</button></span>
+          ${review.lastMine ? `<span class="seg"><button data-since="0" class="${review.since ? "" : "on"}">All changes</button><button data-since="1" class="${review.since ? "on" : ""}">Since your review</button></span>` : ""}
+          <span class="meta grow">${canReview ? "Click a line to comment on it." : !me ? "Sign in to review." : me.id === c.agent_id ? "Your own change: answer the threads on it." : ""}</span>
+          ${open.length ? `<span class="pill changes_requested">${plural(open.length, ["open thread", "open threads"])}</span>` : ""}
+        </div>
+        ${review.since ? `<p class="meta since">Showing what changed since you reviewed it (${review.lastMine.slice(0, 7)} → ${c.head.slice(0, 7)}).</p>` : ""}
+        ${orphanThreads(c, files)}
+        ${files.map((f, i) => fileBlock(f, i, briefOf.get(f.path), threadsAt(f.path), canReview)).join("")}
+        ${canReview ? `<div class="rv-submit panel">
+          <textarea id="rv-body" rows="2" placeholder="Review summary (optional)"></textarea>
+          <div class="row"><span class="meta grow" id="rv-pending"></span>
+            <button data-verdict="comment" class="ghost">Comment</button>
+            <button data-verdict="request_changes" class="ghost">Request changes</button>
+            <button data-verdict="approve">Approve</button></div>
+        </div>` : ""}
+      </section>
+      <aside class="rv-why">${whyPanel(c, rv)}</aside>
+    </div>`;
+  wireReview(canReview);
+}
+
+/** Threads on files or lines this view doesn't show. */
+function orphanThreads(c, files) {
+  const shown = new Set(files.map((f) => f.path));
+  const away = c.threads.filter((t) => !shown.has(t.path));
+  return away.length ? `<div class="rv-file"><div class="rv-fhead"><b>Comments on files not shown here</b></div><div class="rv-orphans">${away.map((t) => threadHtml(t, true)).join("")}</div></div>` : "";
+}
+
+function fileBlock(f, i, b, threads, canReview) {
+  const shownLines = new Set(f.hunks.flatMap((h) => h.lines.map((l) => l.new)).filter(Boolean));
+  const inline = threads.filter((t) => t.line && shownLines.has(t.line) && !t.outdated);
+  const elsewhere = threads.filter((t) => !inline.includes(t));
+  const pend = review.pending.filter((p) => p.path === f.path);
+  const at = (n) => [...inline.filter((t) => t.line === n).map((t) => threadHtml(t)), ...pend.filter((p) => p.line === n).map(pendingHtml)].join("");
+  const body = review.view === "split" ? splitRows(f, at, canReview) : unifiedRows(f, at, canReview);
+  return `<div class="rv-file" id="${fileId(f.path)}" data-file="${i}">
+    <div class="rv-fhead"><b class="mono">${esc(f.path)}</b>${f.added ? ` <span class="pill merged">new</span>` : f.deleted ? ` <span class="pill conflict">deleted</span>` : ""}
+      ${(b?.flags ?? []).map((x) => `<span class="flag ${x.kind}">${esc(x.text)}</span>`).join("")}
+      <span class="grow"></span><span class="add">+${f.plus}</span> <span class="del">−${f.minus}</span>
+      ${f.deleted ? "" : `<button class="ghost mini" data-open="${esc(f.path)}">View file</button>`}</div>
+    ${elsewhere.length ? `<div class="rv-orphans">${elsewhere.map((t) => threadHtml(t, true)).join("")}</div>` : ""}
+    <div class="diffview rv-dv ${review.view}">${body}</div>
+  </div>`;
+}
+
+function unifiedRows(f, at, canReview) {
+  return f.hunks.map((h) => `<div class="dl hunk"><span class="ln"></span><span class="ln"></span><code>${esc(h.header)}</code></div>` + h.lines.map((l) => {
+    const can = canReview && l.new;
+    return `<div class="dl ${l.kind}${can ? " can" : ""}" ${l.new ? `data-path="${esc(f.path)}" data-line="${l.new}"` : ""}><span class="ln">${l.old ?? ""}</span><span class="ln">${l.new ?? ""}</span><code>${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${esc(l.text)}</code></div>${l.new ? at(l.new) : ""}`;
+  }).join("")).join("");
+}
+
+function splitRows(f, at, canReview) {
+  const out = [];
+  for (const h of f.hunks) {
+    out.push(`<div class="sl hunk"><code>${esc(h.header)}</code></div>`);
+    let dels = [], adds = [];
+    const flush = () => {
+      for (let i = 0; i < Math.max(dels.length, adds.length); i++) out.push(splitRow(f, dels[i], adds[i], at, canReview));
+      dels = []; adds = [];
+    };
+    for (const l of h.lines) {
+      if (l.kind === "del") { if (adds.length) flush(); dels.push(l); }
+      else if (l.kind === "add") adds.push(l);
+      else { flush(); out.push(splitRow(f, l, l, at, canReview)); }
+    }
+    flush();
+  }
+  return out.join("");
+}
+
+function splitRow(f, left, right, at, canReview) {
+  const side = (l, k) => l ? `<span class="ln">${(k === "old" ? l.old : l.new) ?? ""}</span><code class="${l.kind === "ctx" ? "" : l.kind}">${esc(l.text)}</code>` : `<span class="ln"></span><code class="empty"></code>`;
+  const n = right?.new;
+  return `<div class="sl${canReview && n ? " can" : ""}" ${n ? `data-path="${esc(f.path)}" data-line="${n}"` : ""}>${side(left?.kind === "add" ? null : left, "old")}${side(right?.kind === "del" ? null : right, "new")}</div>${n ? at(n) : ""}`;
+}
+
+function threadHtml(t, located = false) {
+  const posts = t.posts.map((p, i) => `<div class="tp${i ? " reply" : ""}">${who(p.author)} <span class="meta">${ago(p.created_at)} ago</span><div>${esc(p.body)}</div></div>`).join("");
+  const head = `${t.blocking && t.status === "open" ? `<span class="pill changes_requested" title="Must be resolved before the change merges">blocks merge</span>` : ""}${t.outdated ? `<span class="pill" title="The line changed since this comment">outdated</span>` : ""}${located ? `<span class="mono meta">${esc(t.path ?? "")}${t.line ? `:${t.line}` : ""}</span>` : ""}`;
+  const actions = me ? `<div class="row"><input data-treply="${t.id}" placeholder="Reply…"><button class="mini ghost" data-tsend="${t.id}">Reply</button>${t.status === "open" ? `<button class="mini" data-tresolve="${t.id}">Resolve</button>` : `<button class="mini ghost" data-treopen="${t.id}">Reopen</button>`}</div>` : "";
+  if (t.status !== "open") return `<details class="thr resolved" data-thread="${t.id}"><summary>${head} Resolved${t.resolvedByName ? ` by ${esc(t.resolvedByName)}` : ""}: <span class="meta">${esc(t.posts[0]?.body.slice(0, 90))}</span></summary>${posts}${actions}</details>`;
+  return `<div class="thr${t.blocking ? " blocking" : ""}" data-thread="${t.id}">${head ? `<div class="thr-head">${head}</div>` : ""}${posts}${actions}</div>`;
+}
+
+const pendingHtml = (p) => `<div class="thr pending"><div class="thr-head"><span class="pill">pending</span>${p.blocking ? `<span class="pill changes_requested">blocks merge</span>` : ""}</div><div class="tp"><b>${esc(me.name)}</b><div>${esc(p.body)}</div></div><div class="row"><button class="ghost mini" data-unpend="${review.pending.indexOf(p)}">Discard</button></div></div>`;
+
+/** The context a reviewer needs beside the diff: approval, checks, intent, what the agent said. */
+function whyPanel(c, rv) {
+  const a = c.approval;
+  const meter = a ? `<div class="meter"><span style="width:${Math.min(100, a.needed ? (a.weight / a.needed) * 100 : 100)}%"></span></div>
+    <div class="meta">${a.weight} of ${a.needed} approval weight${a.approvers.length ? `: ${a.approvers.map((x) => `${esc(x.name)} ${x.weight}×`).join(", ")}` : ""}</div>
+    ${a.humanNeeded ? `<div class="warn">Touches protected paths, so a person must approve.</div>` : ""}
+    ${a.openThreads ? `<div class="warn">${plural(a.openThreads, ["blocking thread", "blocking threads"])} still open.</div>` : ""}` : "";
+  const ctx = c.context?.context ?? {};
+  const list = (v) => Array.isArray(v) ? `<ul>${v.map((x) => `<li>${esc(typeof x === "string" ? x : x?.text ?? JSON.stringify(x))}</li>`).join("")}</ul>` : `<p>${esc(typeof v === "string" ? v : JSON.stringify(v, null, 2))}</p>`;
+  const ctxHtml = Object.entries(ctx).map(([k, v]) => `<div class="actx"><b>${esc(k)}</b>${list(v)}</div>`).join("");
+  const declared = c.intents.flatMap((i) => i.paths);
+  const outside = new Set(c.undeclared);
+  const reviews = c.reviews.filter((r) => !r.vote).map((r) => {
+    const [label, cls] = VERDICT[r.verdict] ?? [r.verdict, ""];
+    return `<div class="rv-rev">${who(r.reviewer)} <span class="pill ${cls}">${label}</span>${r.head !== c.head ? ` <span class="meta">on an earlier version</span>` : ""} <span class="meta">${ago(r.created_at)} ago</span>${r.body ? `<div>${esc(r.body)}</div>` : ""}</div>`;
+  }).join("");
   const asked = new Set(rv.requested.filter((r) => r.status === "open").map((r) => r.reviewer));
-  const reviewers = `${rv.requested.length ? `<h2>Review requests</h2>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow meta">${r.reason?.startsWith("asked by") ? esc(r.reason) : `${esc(r.reason ?? "")} · asked by ${esc(r.requestedByName)}`}</span>${requestState(r)}</div>`).join("")}` : ""}
-    ${inReview && rv.candidates.length ? `<h2>Who knows this code</h2>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="role">${k.role}</span> <span class="grow meta ellipsis">${k.reasons.map(esc).join(" · ")}${k.openReviews ? ` · ${k.openReviews} open` : ""}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}`;
-  const canReview = me && !["merged", "abandoned"].includes(c.status) && me.id !== c.agent_id;
-  const patch = diffView(c.patch, c.reviews.flatMap((r) => r.comments.map((x) => ({ ...x, reviewer: r.reviewer, verdict: r.verdict }))), canReview);
-  $("#detail-body").innerHTML = `
-    <h3>#${c.id} ${esc(c.title)} <span class="pill ${c.status}">${c.status}</span></h3>
-    <p>By <b>${esc(c.agentName)}</b> for task #${c.task.id} “${esc(c.task.title)}”.</p>
-    ${c.contest ? `<div class="card">One of the attempts in contest #${c.contest}. <button class="ghost mini" data-contest="${c.contest}">Compare attempts</button></div>` : ""}
-    ${c.approval && inReview ? `<p class="meta">Approval weight ${c.approval.weight} of ${c.approval.needed} needed${c.approval.approvers.length ? `: ${c.approval.approvers.map((a) => `${esc(a.name)} ${a.weight}×`).join(", ")}` : ""}${c.approval.humanNeeded ? ". Touches protected paths, so it also needs a person." : ""}</p>` : ""}
-    <div class="row code-row"><button class="ghost mini" data-browse="${c.id}">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download>Download zip</a><button class="ghost mini" data-clone="${c.id}">Check out locally</button></div>
-    <div id="clone-box"></div>
-    ${c.summary ? `<p>${esc(c.summary)}</p>` : ""}
-    ${c.checks ? `<h2>Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></h2><p class="meta"><span class="mono">${esc(c.checks.command)}</span> on main with this change${c.checks.alongside?.length ? ` after ${c.checks.alongside.map((x) => `#${x}`).join(", ")}` : ""}, ${Math.round(c.checks.ms / 100) / 10}s in ${c.checks.runner === "container" ? "a container" : "the local runner"}.</p>${c.checks.ok ? "" : `<pre class="diff">${esc(c.checks.output.slice(-3000))}</pre>`}` : ""}
-    ${c.intents.length ? `<h2>Declared intent</h2>${c.intents.map((i) => `<div class="mono">${i.paths.map(esc).join(", ")}</div><div>${esc(i.description)}</div>`).join("")}` : ""}
-    ${c.context?.context && Object.keys(c.context.context).length ? `<h2>Agent context</h2><pre class="diff">${esc(JSON.stringify(c.context.context, null, 2))}</pre>` : ""}
-    ${c.reviews.length ? `<h2>Reviews</h2>${c.reviews.map((r) => `<div class="card"><b>${esc(name(r.reviewer))}</b> ${r.verdict}: ${esc(r.body)}${r.comments.map((x) => `<div class="mono">${esc(x.path)}${x.line ? `:${x.line}` : ""} ${esc(x.body)}</div>`).join("")}</div>`).join("")}` : ""}
-    ${reviewers}
-    <h2>Commits</h2><div id="change-commits"><p class="meta">Reading history…</p></div>
-    <h2>Patch ${canReview ? `<small>click a line to comment on it</small>` : ""}</h2>${patch}
-    ${canReview ? `<h2>Your review <small id="rv-pending"></small></h2><textarea id="rv-body" rows="3" placeholder="Summary (optional)"></textarea>
-      <div class="row"><button data-verdict="approve">Approve</button><button data-verdict="request_changes" class="ghost">Request changes</button><button data-verdict="comment" class="ghost">Comment</button></div>` : ""}`;
-  // Line comments: click a line, write, add; they go with the review.
-  const pending = [];
-  const showPending = () => { if ($("#rv-pending")) $("#rv-pending").textContent = pending.length ? `${pending.length} line comment${pending.length === 1 ? "" : "s"} to send` : ""; };
-  for (const row of $("#detail-body").querySelectorAll(".dl[data-line]")) row.onclick = () => {
-    if (!canReview || row.nextElementSibling?.classList.contains("dc-new")) return;
+  const inReview = ["review", "changes_requested"].includes(c.status);
+  return `
+    <section class="panel"><div class="panel-head"><h2>Approval</h2></div><div class="panel-body">${meter}</div></section>
+    ${c.checks ? `<section class="panel"><div class="panel-head"><h2>Checks</h2><span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></div><div class="panel-body"><p class="meta"><span class="mono">${esc(c.checks.command)}</span> on main with this change${c.checks.alongside?.length ? ` after ${c.checks.alongside.map((x) => `#${x}`).join(", ")}` : ""}, ${Math.round(c.checks.ms / 100) / 10}s.</p>${c.checks.ok ? "" : `<pre class="diff">${esc(c.checks.output.slice(-3000))}</pre>`}</div></section>` : ""}
+    <section class="panel"><div class="panel-head"><h2>Intent</h2><small>what it said it would touch</small></div><div class="panel-body">
+      ${c.intents.length ? c.intents.map((i) => `<div>${esc(i.description)}</div><div class="mono meta">${i.paths.map(esc).join(", ")}</div>`).join("") : `<p class="meta">No intent was declared.</p>`}
+      <ul class="touched">${c.brief.files.map((f) => `<li class="${outside.has(f.path) ? "out" : "in"}" title="${outside.has(f.path) ? "outside the declared intent" : "inside the declared intent"}"><span class="mono">${esc(f.path)}</span></li>`).join("")}</ul>
+      ${declared.length && !outside.size ? `<p class="meta">Everything it touched was declared.</p>` : ""}</div></section>
+    ${ctxHtml ? `<section class="panel"><div class="panel-head"><h2>What the agent says</h2><small>its plan and testing</small></div><div class="panel-body">${ctxHtml}</div></section>` : ""}
+    <section class="panel"><div class="panel-head"><h2>Reviews</h2><small>${c.reviews.length ? "" : "none yet"}</small></div><div class="panel-body">${reviews || `<p class="meta">Nobody has reviewed it yet.</p>`}
+      ${rv.requested.length ? `<h3>Asked to review</h3>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow"></span>${requestState(r)}</div>`).join("")}` : ""}
+      ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}">Ask</button>` : ""}</div>`).join("")}` : ""}
+    </div></section>
+    <section class="panel"><div class="panel-head"><h2>Commits</h2></div><div class="panel-body" id="change-commits"><p class="meta">Reading history…</p></div></section>`;
+}
+
+function wireReview(canReview) {
+  const root = $("#review");
+  const { c } = review;
+  wire(root);
+  const redraw = () => { const y = window.scrollY; drawReview(); window.scrollTo(0, y); };
+  const goto = (i) => {
+    const blocks = root.querySelectorAll(".rv-file[data-file]");
+    if (!blocks.length) return;
+    review.file = Math.max(0, Math.min(blocks.length - 1, i));
+    blocks[review.file].scrollIntoView({ block: "start" });
+    for (const li of root.querySelectorAll("[data-goto]")) li.classList.toggle("on", Number(li.dataset.goto) === review.file);
+  };
+  for (const li of root.querySelectorAll("[data-goto]")) li.onclick = (e) => { if (!e.target.matches("input")) goto(Number(li.dataset.goto)); };
+  for (const a of root.querySelectorAll("[data-gotopath]")) a.onclick = () => document.getElementById(fileId(a.dataset.gotopath))?.scrollIntoView({ block: "start" });
+  const setViewed = (path, on) => { const s = viewed(); on ? s.add(path) : s.delete(path); store.set(viewedKey(), JSON.stringify([...s])); };
+  for (const x of root.querySelectorAll("[data-viewed]")) x.onchange = () => { setViewed(x.dataset.viewed, x.checked); redraw(); };
+  for (const b of root.querySelectorAll("[data-view]")) b.onclick = () => { review.view = b.dataset.view; store.set("loom-diff-view", review.view); redraw(); };
+  for (const b of root.querySelectorAll("[data-since]")) b.onclick = async () => {
+    review.since = b.dataset.since === "1";
+    if (review.since && !review.inter) review.inter = await api(`/changes/${c.id}/interdiff?from=${review.lastMine}`);
+    drawReview();
+  };
+  root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id, label: `change #${c.id} (${c.agentName}'s workspace)` });
+  root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
+  for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
+    const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);
+    $("#detail-body").innerHTML = `<h3 class="mono">${esc(b.dataset.open)} <small class="meta">as change #${c.id} leaves it</small></h3><pre class="diff file-full">${f.error ? esc(f.error) : f.content.split("\n").map((l, i) => `<span class="ln">${i + 1}</span>${esc(l)}`).join("\n")}</pre>`;
+    $("#detail").showModal();
+  };
+  for (const b of root.querySelectorAll("[data-ask]")) b.onclick = async () => { await act("POST", `/changes/${c.id}/reviewers`, { reviewers: [b.dataset.ask] }); loadReview(c.id); };
+
+  // Threads: reply, resolve, reopen.
+  for (const b of root.querySelectorAll("[data-tsend]")) b.onclick = async () => {
+    const input = root.querySelector(`[data-treply="${b.dataset.tsend}"]`);
+    if (!input.value.trim()) return;
+    await act("POST", `/threads/${b.dataset.tsend}/posts`, { body: input.value.trim() });
+    loadReview(c.id);
+  };
+  for (const b of root.querySelectorAll("[data-tresolve]")) b.onclick = async () => {
+    const note = root.querySelector(`[data-treply="${b.dataset.tresolve}"]`)?.value.trim();
+    await act("POST", `/threads/${b.dataset.tresolve}/resolve`, { body: note || undefined });
+    loadReview(c.id);
+  };
+  for (const b of root.querySelectorAll("[data-treopen]")) b.onclick = async () => {
+    const note = root.querySelector(`[data-treply="${b.dataset.treopen}"]`)?.value.trim();
+    await act("POST", `/threads/${b.dataset.treopen}/reopen`, { body: note || undefined });
+    loadReview(c.id);
+  };
+  for (const b of root.querySelectorAll("[data-unpend]")) b.onclick = () => { review.pending.splice(Number(b.dataset.unpend), 1); redraw(); };
+
+  // New line comments: click a line, write, add; they go with the review.
+  const showPending = () => { if ($("#rv-pending")) $("#rv-pending").textContent = review.pending.length ? `${plural(review.pending.length, ["comment", "comments"])} will go with your review` : ""; };
+  showPending();
+  for (const row of root.querySelectorAll(".can[data-line]")) row.onclick = () => {
+    if (row.nextElementSibling?.classList.contains("dc-new")) return;
     const box = document.createElement("div");
-    box.className = "dc-new";
-    box.innerHTML = `<textarea rows="2" placeholder="Comment on ${esc(row.dataset.path)}:${row.dataset.line}"></textarea><div class="row"><button class="mini">Add</button><button class="ghost mini">Cancel</button></div>`;
+    box.className = "dc-new thr";
+    box.innerHTML = `<textarea rows="2" placeholder="Comment on ${esc(row.dataset.path)}:${row.dataset.line}"></textarea>
+      <div class="row"><label class="check meta"><input type="checkbox"> Must be fixed before it merges</label><span class="grow"></span><button class="ghost mini">Cancel</button><button class="mini">Add to review</button></div>`;
     row.after(box);
     box.querySelector("textarea").focus();
-    const [add, cancel] = box.querySelectorAll("button");
+    const [cancel, add] = box.querySelectorAll("button");
     cancel.onclick = () => box.remove();
     add.onclick = () => {
       const body = box.querySelector("textarea").value.trim();
       if (!body) return;
-      pending.push({ path: row.dataset.path, line: Number(row.dataset.line), body });
-      box.outerHTML = `<div class="dc pending"><b>${esc(me.name)}</b> <span class="meta">pending</span> ${esc(body)}</div>`;
-      showPending();
+      review.pending.push({ path: row.dataset.path, line: Number(row.dataset.line), body, ...(box.querySelector("input").checked ? { blocking: true } : {}) });
+      redraw();
     };
   };
-  for (const b of document.querySelectorAll("[data-verdict]")) b.onclick = async () => {
-    await act("POST", `/changes/${id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value, comments: pending });
-    $("#detail").close();
+  for (const b of root.querySelectorAll("[data-verdict]")) b.onclick = async () => {
+    const r = await act("POST", `/changes/${c.id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value, comments: review.pending });
+    review.pending = [];
+    toast(r.next ?? "Review sent");
+    loadReview(c.id);
   };
-  wire($("#detail-body"));
   api(`/commits?change=${c.id}`).then((h) => {
-    if (!$("#change-commits")) return;
+    if (!$("#change-commits") || review?.id !== c.id) return;
     $("#change-commits").innerHTML = historyHtml(h, false, c.status === "merged");
     wire($("#change-commits"));
   });
-  $("#detail-body").querySelector("[data-browse]").onclick = () => showCode({ change: c.id, label: `change #${c.id} (${c.agentName}'s workspace)` });
-  $("#detail-body").querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
-  for (const b of $("#detail-body").querySelectorAll("[data-ask]")) b.onclick = async () => { await act("POST", `/changes/${id}/reviewers`, { reviewers: [b.dataset.ask] }); showChange(id); };
-  if (!$("#detail").open) $("#detail").showModal();
+}
+
+// Keyboard: j and k move between files, v marks the current one viewed.
+document.addEventListener("keydown", (e) => {
+  if (!review || $("#review").hidden || e.metaKey || e.ctrlKey || e.altKey || e.target.closest("input, textarea, select") || $("#detail").open) return;
+  const lis = $("#review").querySelectorAll("[data-goto]");
+  if (e.key === "j" || e.key === "k") lis[Math.max(0, Math.min(lis.length - 1, review.file + (e.key === "j" ? 1 : -1)))]?.click();
+  else if (e.key === "v") { const x = lis[review.file]?.querySelector("[data-viewed]"); if (x) { x.checked = !x.checked; x.onchange(); } }
+});
+
+// A change on screen refreshes when its review moves, unless you're mid-comment.
+let reviewTimer = null;
+function reviewEvent(e) {
+  if (!review || e.change_id !== review.id) return;
+  clearTimeout(reviewTimer);
+  reviewTimer = setTimeout(() => {
+    const typing = [...$("#review").querySelectorAll("textarea, input[type=text], input:not([type])")].some((x) => x.value.trim());
+    if (!typing && !review.pending.length) return loadReview(review.id);
+    if (!$("#rv-stale")) $("#review .rv-top")?.insertAdjacentHTML("beforeend", `<div id="rv-stale" class="warn">This change moved on while you were reviewing. <a href="#change/${review.id}" data-reload>Reload</a> (your pending comments stay).</div>`);
+    const a = $("#review [data-reload]");
+    if (a) a.onclick = (ev) => { ev.preventDefault(); loadReview(review.id); };
+  }, 800);
+}
+
+// ── contests: the attempts side by side ─────────────────────────────────
+async function loadContest(id) {
+  const v = await api(`/contests/${id}`);
+  if (v.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(v.error)}</p></div>`; return; }
+  review = null;
+  const k = v.contest, open = k.status === "open";
+  const col = (a) => {
+    const c = a.change;
+    const tested = c?.context?.tested ? [].concat(c.context.tested).join("; ") : "";
+    return `<div class="panel attempt${c && c.id === k.winner ? " won" : ""}${c?.status === "closed" ? " lost" : ""}">
+      <div class="panel-head">${a.agent ? who(a.agent) : "unclaimed"} ${c ? `<a href="#change/${c.id}">#${c.id}</a> <span class="pill ${c.status}">${c.id === k.winner ? "won" : c.status}</span>` : `<span class="meta">${esc(a.status)}</span>`}</div>
+      ${c ? `<div class="panel-body">
+        <div class="rv-brief mini ${c.brief.needsPerson ? "person" : "agents"}"><span class="badge">${c.brief.needsPerson ? "Needs a person" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
+        <p>${esc(c.summary)}</p>
+        <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> · ${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div>
+        ${c.checks ? `<div class="meta">Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></div>` : ""}
+        ${tested ? `<div class="meta">Tested: ${esc(tested)}</div>` : ""}
+        ${c.undeclared?.length ? `<div class="warn">Touches ${c.undeclared.map(esc).join(", ")} outside its declared intent</div>` : ""}
+        <div class="votes"><b>${c.votes.weight}</b> vote weight · ${plural(c.votes.votes, ["vote", "votes"])}</div>
+        <div class="row">${isHuman() && open ? `<button class="mini" data-pick="${c.id}">Pick this one</button>` : ""}<a class="button ghost mini" href="#change/${c.id}">Review it</a></div>
+        ${diffView(c.patch)}</div>` : `<div class="panel-body"><p class="meta">${a.agent ? "Still working on it." : "Nobody has claimed this attempt."}</p></div>`}
+    </div>`;
+  };
+  $("#review").innerHTML = `
+    <div class="rv-top">
+      <a class="button ghost mini" href="#">← ${esc(project)}</a>
+      <h1>Contest #${k.id}: ${esc(k.title)} <span class="pill ${open ? "review" : "merged"}">${open ? "voting" : "decided"}</span></h1>
+      ${k.description ? `<p class="meta">${esc(k.description)}</p>` : ""}
+      <p>${open ? `${k.attempts} agents attempt this task independently. The others compare the attempts and vote; each vote counts by the voter's track record. An attempt wins with ${k.quorum} vote weight and a clear lead${isHuman() ? ", or when you pick it" : ""}.` : `Decided: <a href="#change/${k.winner}">#${k.winner}</a> lands. The other attempts were closed; their context is kept, and why the winner won is on record as a decision.`}</p>
+    </div>
+    <div class="attempts-page" style="--n:${Math.max(1, v.attempts.length)}">${v.attempts.map(col).join("")}</div>
+    <section class="panel contest-votes"><div class="panel-head"><h2>Votes</h2></div><div class="panel-body">
+    ${v.votes.map((x) => `<div class="qrow">${who(x.voter)} <span class="pill" title="what this agent's vote counts for, from its track record">${x.weight}×</span> for <a href="#change/${x.change}">#${x.change}</a> <span class="grow">“${esc(x.reason)}”</span></div>`).join("") || `<p class="empty">No votes yet.</p>`}</div></section>`;
+  wire($("#review"));
+  for (const b of $("#review").querySelectorAll("[data-pick]")) b.onclick = async () => {
+    const note = prompt("Why this one? The agents will see it, and it goes on record. (optional)");
+    if (note === null) return;
+    await act("POST", `/contests/${id}/pick`, { changeId: Number(b.dataset.pick), note: note.trim() || undefined });
+    loadContest(id);
+  };
 }
 
 // ── jev: what the humans let their stand-in decide ──────────────────────

@@ -73,3 +73,50 @@ test("agents register themselves with a join code from the skill, and keep who t
   assert.equal((await admin.as(rotated.key).req("GET", "/me")).agent.id, ada.id);
   await assert.rejects(admin.as(ada.key).req("GET", "/me"), "the old key stops working");
 });
+
+test("review threads: the author must answer line comments before the change merges, and reviewers see what changed since", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-threads");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "review threads", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  const before = await ada.read("src/db.js", ws);
+  await ada.write(ws, { "src/db.js": before + "\nexport const trim = (s) => s.trim();\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim"] });
+  let detail = await rex.change(ch.id);
+  assert.ok(detail.brief?.verdict, "the change carries a review brief");
+  const line = (before + "\nexport const trim = (s) => s.trim();\n").split("\n").indexOf("export const trim = (s) => s.trim();") + 1;
+
+  const sent = await rex.review(ch.id, "request_changes", "Name it", [{ path: "src/db.js", line, body: "Call it trimTitle" }]);
+  assert.equal(sent.threads.length, 1);
+  const threadId = sent.threads[0];
+  assert.equal((await ada.me()).todo.some((x: string) => /open review thread/.test(x)), true, "the author's todo lists the thread");
+
+  await ada.write(ws, { "src/db.js": before + "\nexport const trimTitle = (s) => s.trim();\n" }, "rename");
+  const updated = await ada.update(ch.id, "Trim, renamed");
+  assert.equal(updated.openThreads.length, 1, "update_change says what's still open");
+  detail = await rex.change(ch.id);
+  assert.equal(detail.threads[0].outdated, true, "the commented line changed, so the thread is outdated");
+
+  const since = await rex.req("GET", `/changes/${ch.id}/interdiff?reviewer=rex`);
+  assert.equal(since.available, true);
+  assert.deepEqual(since.files, ["src/db.js"]);
+  assert.match(since.patch, /\+export const trimTitle/);
+  assert.match(since.patch, /-export const trim =/);
+
+  // Another reviewer's approval isn't enough while rex's thread is open.
+  const cyd = admin.as((await admin.addAgent("cyd", "reviewer")).key);
+  const r = await cyd.review(ch.id, "approve", "fine");
+  assert.equal(r.status, "review");
+  assert.equal(r.approval.openThreads, 1);
+  assert.match(r.next, /must be resolved/);
+
+  await ada.req("POST", `/threads/${threadId}/resolve`, { body: "Renamed to trimTitle" });
+  const s = (await ada.change(ch.id)).status;
+  assert.ok(["queued", "merging", "merged"].includes(s), `resolving the last thread queues the approved change (${s})`);
+});

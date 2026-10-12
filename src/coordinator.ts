@@ -15,6 +15,7 @@ import { zip } from "./zip";
 import { runCheck, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
+import { buildBrief, fileStats } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 
@@ -38,6 +39,12 @@ const MERGE_BATCH = 8;
 const WORKSPACE_GRACE_MS = 10 * 60_000;
 
 export type Role = "builder" | "reviewer" | "human";
+
+/** Both sides of every file a change touches, at one of its heads. */
+interface Snapshot {
+  before: Record<string, string | null>;
+  after: Record<string, string | null>;
+}
 
 export interface Agent {
   id: string;
@@ -117,6 +124,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
       "ALTER TABLE changes ADD COLUMN checks TEXT",
       "ALTER TABLE agents ADD COLUMN joined_via INTEGER",
+      "ALTER TABLE threads ADD COLUMN head TEXT",
+      "ALTER TABLE threads ADD COLUMN line_text TEXT",
+      "ALTER TABLE threads ADD COLUMN outdated INTEGER DEFAULT 0",
+      "ALTER TABLE threads ADD COLUMN resolved_by TEXT",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -267,6 +278,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private get requiredApprovals(): number {
     return Number(this.meta("required_approvals") ?? "1");
+  }
+
+  /** Whether open blocking review threads hold a change out of the merge queue (on unless an owner turns it off). */
+  private get threadsMustResolve(): boolean {
+    return this.meta("resolve_threads") !== "off";
   }
 
   private emit(type: string, e: { actor?: string | null; task?: number | null; change?: number | null; to?: string | null; data?: any }) {
@@ -445,7 +461,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
         .map((t) => ({ ...t, depends_on: JSON.parse(t.depends_on as string), assigneeName: t.assignee ? this.agentName(t.assignee as string) : null })));
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
+      if (a === "changes" && b && c === "interdiff") return json(await this.interdiff(Number(b), url.searchParams));
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
+      if (a === "reviews") return json(await this.reviewQueue(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : null));
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
       if (a === "archive") return await this.archive(url.searchParams);
@@ -503,11 +521,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
       if (body.checks !== undefined) this.setChecks(body.checks);
+      if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
@@ -559,7 +578,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "proposals" && b && c === "accept") return json(this.settle(actor, Number(b), true, body.body));
     if (a === "proposals" && b && c === "reject") return json(this.settle(actor, Number(b), false, body.body));
     if (a === "threads" && b && c === "posts") return json(this.post(actor, Number(b), body.body));
-    if (a === "threads" && b && c === "resolve") return json(this.resolveThread(actor, Number(b), body.body));
+    if (a === "threads" && b && c === "resolve") {
+      const t = this.resolveThread(actor, Number(b), body.body);
+      // The last open thread on an approved change lets it into the queue.
+      if (t.kind === "review" && t.change_id) await this.maybeEnqueue(t.change_id as number);
+      return json(this.thread(Number(b)));
+    }
+    if (a === "threads" && b && c === "reopen") return json(this.reopenThread(actor, Number(b), body.body));
     if (a === "consults" && !b && m === "POST") return json(this.consult(actor, body));
     if (a === "questions" && b === "answer" && m === "POST") return json(this.answerGroup(actor, body.threads ?? [], body.body));
     if (a === "disputes" && !b && m === "POST") return json(this.openDispute(actor, body));
@@ -1019,7 +1044,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         status, JSON.stringify(analysis.files), JSON.stringify(undeclared), JSON.stringify(analysis.symbols), now, now)
       .one();
     const id = row.id as number;
-    await this.saveContext(id, actor, body, analysis.patch);
+    await this.saveContext(id, actor, body, analysis.patch, analysis.head, analysis.snapshot);
     this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
     this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status } });
     if (status === "review") this.requestReview(id, actor.id);
@@ -1044,13 +1069,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // at submit; new context is merged over it, key by key.
     const prev = (await (await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
     const context = body.context && typeof body.context === "object" ? { ...prev, ...body.context } : prev;
-    await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch);
-    this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files } });
+    await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch, analysis.head, analysis.snapshot);
+    const outdated = this.markOutdated(id, analysis.snapshot);
+    this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
     const contest = this.openContest(ch.task_id);
     if (contest) await this.settleContest(contest.id as number);
-    return this.change(id);
+    return { ...this.change(id), openThreads: this.openThreadList(id) };
   }
 
   /** An attempt came in: once two are in, everyone who can vote hears about it. */
@@ -1096,19 +1122,25 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = diffFlat(B, H);
     let patch = "";
     const symbols: Record<string, string[]> = {};
+    // Both sides of every changed file, kept per head so a reviewer can see
+    // what changed since they last looked.
+    const snapshot: Snapshot = { before: {}, after: {} };
     for (const f of files) {
       const before = B.get(f.path), after = H.get(f.path);
       const a = before ? await w.readText(before.oid) : null, b = after ? await w.readText(after.oid) : null;
       patch += unifiedDiff(f.path, a, b);
+      snapshot.before[f.path] = a;
+      snapshot.after[f.path] = b;
       const names = symbolsTouched(a, b);
       if (names.length) symbols[f.path] = names;
     }
-    return { head, base, files, patch, symbols };
+    return { head, base, files, patch, symbols, snapshot };
   }
 
-  private async saveContext(id: number, actor: Agent, body: { summary?: string; context?: any }, patch: string) {
+  private async saveContext(id: number, actor: Agent, body: { summary?: string; context?: any }, patch: string, head?: string, snapshot?: Snapshot) {
     const key = `${this.project}/changes/${id}`;
     await this.env.CONTEXT.put(`${key}/patch.diff`, patch);
+    if (head && snapshot) await this.env.CONTEXT.put(`${key}/heads/${head}.json`, JSON.stringify(snapshot));
     await this.env.CONTEXT.put(`${key}/context.json`, JSON.stringify({ agent: actor, summary: body.summary ?? "", context: body.context ?? {}, savedAt: new Date().toISOString() }, null, 2));
   }
 
@@ -1119,16 +1151,158 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const reviews = this.sql.exec("SELECT * FROM reviews WHERE change_id = ? ORDER BY id", id).toArray().map((r) => ({ ...r, comments: JSON.parse(r.comments as string) }));
     const intents = this.sql.exec("SELECT * FROM intents WHERE task_id = ?", ch.task_id).toArray().map((r) => ({ ...r, paths: JSON.parse(r.paths as string) }));
     const task = this.task(ch.task_id);
-    return { ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null, patch: patch ? await patch.text() : "", context: ctx ? await ctx.json() : null };
+    const text = patch ? await patch.text() : "";
+    return {
+      ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
+      patch: text, context: ctx ? await ctx.json() : null,
+      threads: this.reviewThreads(id), brief: this.briefFor(ch, text),
+      reviewedHeads: this.sql.exec("SELECT reviewer, head, MAX(created_at) AS at FROM reviews WHERE change_id = ? AND COALESCE(vote, 0) = 0 GROUP BY reviewer, head ORDER BY at", id).toArray(),
+    };
   }
 
-  private async review(actor: Agent, id: number, body: { verdict: "approve" | "request_changes" | "comment"; body?: string; comments?: { path: string; line?: number; body: string }[] }) {
+  // ── review threads, the brief, and what changed since a review ──────────
+
+  /** A change's line comments as threads: replies, resolved or not, outdated once the line changed. */
+  private reviewThreads(changeId: number) {
+    return this.sql.exec("SELECT id FROM threads WHERE kind = 'review' AND change_id = ? ORDER BY id", changeId).toArray()
+      .map((r) => { const t = this.thread(r.id as number); return { ...t, outdated: !!t.outdated, resolvedByName: this.agentName(t.resolved_by) }; });
+  }
+
+  /** Open blocking threads, as an author agent needs them: where, what, and what to call. */
+  private openThreadList(changeId: number) {
+    return this.reviewThreads(changeId).filter((t) => t.status === "open" && t.blocking)
+      .map((t) => ({ thread: t.id, path: t.path, line: t.line, by: t.createdByName, says: t.posts.at(-1)?.body, outdated: t.outdated, advice: "fix it, then resolve_thread (or reply_thread if you disagree)" }));
+  }
+
+  /** An agent's id from its id or name (the name itself when nobody has it). */
+  private resolveAgent(idOrName: string): string {
+    return (this.sql.exec("SELECT id FROM agents WHERE id = ? OR name = ?", idOrName, idOrName).toArray()[0]?.id as string) ?? idOrName;
+  }
+
+  private openBlockingThreads(changeId: number): number {
+    return this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'review' AND change_id = ? AND status = 'open' AND blocking = 1", changeId).one().n as number;
+  }
+
+  private async snapshotOf(changeId: number, head: string): Promise<Snapshot | null> {
+    const o = await this.env.CONTEXT.get(`${this.project}/changes/${changeId}/heads/${head}.json`);
+    return o ? await o.json<Snapshot>() : null;
+  }
+
+  /** Threads whose line no longer reads as it did when the comment was written. */
+  private markOutdated(changeId: number, snap: Snapshot): number[] {
+    const out: number[] = [];
+    for (const t of this.sql.exec("SELECT id, path, line, line_text FROM threads WHERE kind = 'review' AND change_id = ? AND status = 'open' AND COALESCE(outdated, 0) = 0", changeId).toArray()) {
+      if (!t.path) continue;
+      const now = snap.after[t.path as string];
+      const line = now == null || !t.line ? null : now.split("\n")[(t.line as number) - 1] ?? null;
+      if (!((t.path as string) in snap.after) || (t.line && line !== t.line_text)) {
+        this.sql.exec("UPDATE threads SET outdated = 1 WHERE id = ?", t.id);
+        out.push(t.id as number);
+      }
+    }
+    return out;
+  }
+
+  /** Where a reviewer should look, and whether a person needs to. */
+  private briefFor(ch: any, patch: string) {
+    const files: FileChange[] = ch.files;
+    const paths = files.map((f) => f.path);
+    const stats = fileStats(patch);
+    const statOf = new Map(stats.map((s) => [s.path, s]));
+    const knownBy: Record<string, string[]> = {};
+    const authorKnows: string[] = [];
+    if (paths.length) {
+      const rows = this.sql.exec(`SELECT agent_id, path FROM familiarity WHERE kind = 'wrote' AND symbol = '' AND path IN (${paths.map(() => "?").join(",")}) ORDER BY n DESC`, ...paths).toArray();
+      for (const r of rows) {
+        if (r.agent_id === ch.agent_id) authorKnows.push(r.path as string);
+        else (knownBy[r.path as string] ??= []).push(this.agentName(r.agent_id as string) ?? (r.agent_id as string));
+      }
+    }
+    return buildBrief({
+      author: this.agentName(ch.agent_id) ?? ch.agent_id,
+      files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
+      undeclared: ch.undeclared, guarded: this.guardedFiles(files),
+      checks: ch.checks, checksConfigured: !!this.checks,
+      othersIntents: this.activeIntents(ch.agent_id).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
+      knownBy, authorKnows,
+      sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
+      openThreads: this.openBlockingThreads(ch.id),
+    });
+  }
+
+  /**
+   * What changed in a change between two of its heads: by default from the
+   * last head this reviewer reviewed to the current one.
+   */
+  private async interdiff(id: number, q: URLSearchParams) {
+    const ch = this.change(id);
+    let from = q.get("from");
+    const reviewer = q.get("reviewer");
+    if (!from && reviewer) {
+      const r = this.sql.exec("SELECT head FROM reviews WHERE change_id = ? AND reviewer = ? AND COALESCE(vote, 0) = 0 ORDER BY id DESC LIMIT 1", id, this.resolveAgent(reviewer)).toArray()[0];
+      from = (r?.head as string) ?? null;
+    }
+    const to = (q.get("to") ?? ch.head) as string;
+    if (!from) return { available: false, why: "nothing to compare with: no earlier review of this change by that reviewer" };
+    if (from === to) return { available: true, from, to, files: [], patch: "", note: "Nothing changed since that review." };
+    const [a, b] = await Promise.all([this.snapshotOf(id, from), this.snapshotOf(id, to)]);
+    if (!a || !b) return { available: false, from, to, why: "Loom didn't keep that version of the change (it predates per-version history)" };
+    let patch = "";
+    const files: string[] = [];
+    for (const path of [...new Set([...Object.keys(a.after), ...Object.keys(b.after)])].sort()) {
+      // A file the change no longer touches reads as main has it now.
+      const was = path in a.after ? a.after[path] : (b.before[path] ?? null);
+      const now = path in b.after ? b.after[path] : (a.before[path] ?? null);
+      if (was === now) continue;
+      const d = unifiedDiff(path, was, now);
+      if (d) { patch += d; files.push(path); }
+    }
+    return { available: true, from, to, files, patch };
+  }
+
+  /** Changes waiting on review, riskiest first: the review inbox. */
+  private async reviewQueue(actor: string | null) {
+    const rows = this.sql.exec("SELECT id FROM changes WHERE status IN ('review','changes_requested') ORDER BY updated_at DESC LIMIT 60").toArray();
+    const out = await Promise.all(rows.map(async (r) => {
+      const ch = this.change(r.id as number);
+      const patch = await (await this.env.CONTEXT.get(`${this.project}/changes/${ch.id}/patch.diff`))?.text() ?? "";
+      const brief = this.briefFor(ch, patch);
+      const asked = actor ? this.sql.exec("SELECT status FROM review_requests WHERE change_id = ? AND reviewer = ? AND status IN ('open','accepted')", ch.id, actor).toArray()[0] : null;
+      const mine = actor ? this.sql.exec("SELECT verdict, head FROM reviews WHERE change_id = ? AND reviewer = ? ORDER BY id DESC LIMIT 1", ch.id, actor).toArray()[0] : null;
+      return {
+        id: ch.id, title: ch.title, status: ch.status, agent: ch.agent_id, agentName: this.agentName(ch.agent_id), updated_at: ch.updated_at,
+        files: (ch.files as FileChange[]).length, ...this.patchStats(patch),
+        needsPerson: brief.needsPerson, verdict: brief.verdict, score: brief.score, reasons: brief.reasons.filter((x) => x.kind !== "ok").map((x) => x.text),
+        approval: this.approval(ch.id), openThreads: this.openBlockingThreads(ch.id),
+        askedOfYou: !!asked, yourReview: mine ? { verdict: mine.verdict, current: mine.head === ch.head } : null,
+      };
+    }));
+    return out.sort((x, y) => Number(y.askedOfYou) - Number(x.askedOfYou) || Number(y.needsPerson) - Number(x.needsPerson) || y.score - x.score);
+  }
+
+  private async review(actor: Agent, id: number, body: { verdict: "approve" | "request_changes" | "comment"; body?: string; comments?: { path: string; line?: number; body: string; blocking?: boolean }[] }) {
     const ch = this.change(id);
     if (!["approve", "request_changes", "comment"].includes(body.verdict)) throw new HttpError(400, "verdict must be approve, request_changes or comment");
     if (ch.agent_id === actor.id) throw new HttpError(403, "agents cannot review their own change");
+    const comments = (body.comments ?? []).filter((x) => x && x.path && x.body);
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-      id, actor.id, body.verdict, body.body ?? "", JSON.stringify(body.comments ?? []), ch.head, Date.now());
-    this.emit("review.submitted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { verdict: body.verdict, body: body.body ?? "", comments: body.comments ?? [] } });
+      id, actor.id, body.verdict, body.body ?? "", JSON.stringify(comments), ch.head, Date.now());
+    // Each line comment opens a thread the author answers. Comments that come
+    // with a request for changes must be resolved before the change merges.
+    const snap = comments.length ? await this.snapshotOf(id, ch.head) : null;
+    const threads = comments.map((x) => {
+      const t = this.openThread(actor, { silent: true, kind: "review", changeId: id, path: x.path, line: x.line, body: x.body, to: ch.agent_id });
+      const lineText = x.line ? snap?.after[x.path]?.split("\n")[x.line - 1] ?? null : null;
+      this.sql.exec("UPDATE threads SET head = ?, line_text = ?, blocking = ? WHERE id = ?", ch.head, lineText, (x.blocking ?? body.verdict === "request_changes") ? 1 : 0, t.id);
+      return t.id as number;
+    });
+    // Approving settles the approver's own open threads.
+    if (body.verdict === "approve") {
+      for (const t of this.sql.exec("SELECT id FROM threads WHERE kind = 'review' AND change_id = ? AND created_by = ? AND status = 'open'", id, actor.id).toArray()) {
+        this.sql.exec("UPDATE threads SET status = 'resolved', resolved_by = ?, updated_at = ? WHERE id = ?", actor.id, Date.now(), t.id);
+      }
+    }
+    this.emit("review.submitted", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { verdict: body.verdict, body: body.body ?? "", comments, threads } });
     this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND reviewer = ? AND status IN ('open','accepted')", Date.now(), id, actor.id);
     if (body.verdict !== "comment") this.learn(actor.id, "reviewed", ch.files, ch.symbols);
     if (body.verdict === "request_changes") {
@@ -1146,8 +1320,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       : now.status === "changes_requested" ? "Sent back to the author."
       : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
       : approval.humanNeeded ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).`
+      : approval.openThreads && approval.weight >= approval.needed ? `Approved, but ${approval.openThreads} review thread${approval.openThreads === 1 ? "" : "s"} must be resolved before it merges.`
       : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
-    return { recorded: { change: id, verdict: body.verdict, atHead: ch.head }, id, status: now.status, approval, next };
+    return { recorded: { change: id, verdict: body.verdict, atHead: ch.head }, id, status: now.status, approval, threads, next };
   }
 
   /** Queue a change once it has enough approval weight (a human's approval, if it touches protected paths). */
@@ -1201,7 +1376,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const needed = this.requiredApprovals;
     const guarded = this.guardedFiles(ch.files);
     const humanNeeded = guarded.length > 0 && !approvers.some((a) => a.human);
-    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, ok: weight >= needed && !humanNeeded };
+    const openThreads = this.threadsMustResolve ? this.openBlockingThreads(id) : 0;
+    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, ok: weight >= needed && !humanNeeded && !openThreads };
   }
 
   /** A person-readable track record and the weight it earns. */
@@ -1270,6 +1446,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
           id: ch.id, status: ch.status, title: ch.title, summary: ch.summary, files: (ch.files as FileChange[]).map((f) => f.path), undeclared: ch.undeclared,
           ...this.patchStats(text), patch: text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated; get_change for all of it)` : text,
           context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
+          checks: ch.checks, brief: this.briefFor(ch, text), openThreads: this.openBlockingThreads(ch.id),
         };
       }
       const who = this.agentName((e.task.assignee ?? ch?.agent_id ?? null) as string | null);
@@ -2098,7 +2275,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, checks: this.checks, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -2151,6 +2328,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (!this.guardedFiles(files.map((path) => ({ path } as FileChange))).length) continue;
       const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
       items.push({ kind: "approval", change: c.id, title: c.title, agent: c.agent_id, files, escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
+    }
+    // Changes whose review brief says a person should look (protected paths are listed above).
+    const listed = new Set(items.filter((i) => i.kind === "approval").map((i) => i.change));
+    for (const r of this.sql.exec("SELECT id FROM changes WHERE status = 'review' ORDER BY updated_at DESC LIMIT 30").toArray()) {
+      if (listed.has(r.id)) continue;
+      const c = this.change(r.id as number);
+      const brief = this.briefFor(c, "");
+      if (!brief.needsPerson || brief.reasons.some((x) => x.kind === "protected")) continue;
+      items.push({ kind: "brief", change: c.id, title: c.title, agent: c.agent_id, reasons: brief.reasons.filter((x) => x.kind !== "ok" && x.kind !== "threads").map((x) => x.text), since: c.updated_at });
     }
     // Reviews an agent asked a person for.
     for (const r of this.sql.exec(`SELECT r.change_id, r.reviewer, r.requested_by, r.reason, r.created_at, c.title FROM review_requests r
@@ -2842,7 +3028,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * "question" with to = "humans" (or an agent id) asks for an answer; a
    * blocking question parks the task until someone answers.
    */
-  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean; options?: unknown }) {
+  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract" | "review"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean; options?: unknown }) {
     if (!body.body) throw new HttpError(400, "body is required");
     const kind = body.kind ?? "discussion";
     const taskId = body.taskId ?? (body.changeId ? this.change(body.changeId).task_id : null);
@@ -2874,9 +3060,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("UPDATE threads SET updated_at = ? WHERE id = ?", Date.now(), threadId);
     // Everyone already in the thread hears about the reply.
     const participants = new Set<string>([t.created_by, ...t.posts.map((p: any) => p.author)]);
+    if (t.kind === "review" && t.to_agent && t.to_agent !== "humans") participants.add(t.to_agent);
     participants.delete(actor.id);
     this.emit("thread.reply", { actor: actor.id, task: t.task_id, change: t.change_id, data: { thread: threadId, body: text, participants: [...participants] } });
-    for (const p of participants) this.emit("thread.reply.notify", { actor: actor.id, to: p, task: t.task_id, data: { thread: threadId, body: text } });
+    for (const p of participants) this.emit("thread.reply.notify", { actor: actor.id, to: p, task: t.task_id, change: t.change_id, data: { thread: threadId, body: text, ...(t.kind === "review" ? { path: t.path, line: t.line } : {}) } });
     // An answer from someone other than the asker settles a question.
     if (t.kind === "question" && t.status === "open" && actor.id !== t.created_by) this.answer(t, actor, text);
     return this.thread(threadId);
@@ -2897,8 +3084,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const t = this.thread(threadId);
     if (text) this.post(actor, threadId, text);
     if (t.kind === "question" && t.status === "open" && !text) this.answer(t, actor, "(closed without an answer)");
-    this.sql.exec("UPDATE threads SET status = 'resolved', updated_at = ? WHERE id = ?", Date.now(), threadId);
-    this.emit("thread.resolved", { actor: actor.id, task: t.task_id, data: { thread: threadId } });
+    this.sql.exec("UPDATE threads SET status = 'resolved', resolved_by = ?, updated_at = ? WHERE id = ?", actor.id, Date.now(), threadId);
+    this.emit("thread.resolved", { actor: actor.id, task: t.task_id, change: t.change_id, to: t.kind === "review" && t.created_by !== actor.id ? t.created_by : null, data: { thread: threadId, path: t.path, line: t.line } });
+    return this.thread(threadId);
+  }
+
+  /** Reopen a resolved review thread, when the fix didn't settle it. */
+  private reopenThread(actor: Agent, threadId: number, text?: string) {
+    const t = this.thread(threadId);
+    if (t.kind !== "review") throw new HttpError(400, "only review threads can be reopened");
+    if (text) this.post(actor, threadId, text);
+    this.sql.exec("UPDATE threads SET status = 'open', resolved_by = NULL, updated_at = ? WHERE id = ?", Date.now(), threadId);
+    this.emit("thread.reopened", { actor: actor.id, task: t.task_id, change: t.change_id, to: t.to_agent, data: { thread: threadId, body: text ?? "", path: t.path, line: t.line } });
     return this.thread(threadId);
   }
 
@@ -2954,6 +3151,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const todo = [
       ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
       ...changes.filter((c) => ["conflict", "changes_requested", "checks_failed"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
+      ...changes.map((c) => ({ c, n: this.openBlockingThreads(c.id as number) })).filter((x) => x.n).map(({ c, n }) => `Your change #${c.id} has ${n} open review thread${n === 1 ? "" : "s"}: fix each and resolve_thread it, or reply_thread if you disagree (get_change lists them)`),
       ...tasks.filter((t) => !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
       ...this.contestsToVote(actor).map((c) => `Contest #${c.id} "${c.title}" has ${c.ready} attempts in: compare_attempts, then vote`),
     ];

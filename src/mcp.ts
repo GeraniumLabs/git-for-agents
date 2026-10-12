@@ -127,14 +127,19 @@ const TOOLS: Tool[] = [
   },
   {
     name: "get_change",
-    description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, and any conflicts with who caused them.",
-    inputSchema: obj({ changeId: num("Change id") }, ["changeId"]),
-    run: (a, call) => call("GET", `/changes/${a.changeId}`),
+    description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, review threads (line comments with replies; open blocking ones must be resolved before it merges), the review brief (which files are riskiest and whether a person needs to look), and any conflicts with who caused them. sinceMyReview=true adds what changed since you last reviewed it.",
+    inputSchema: obj({ changeId: num("Change id"), sinceMyReview: { type: "boolean", description: "Also return the diff from the version you last reviewed to the current one" } }, ["changeId"]),
+    run: async (a, call) => {
+      const detail = await call("GET", `/changes/${a.changeId}`);
+      if (!a.sinceMyReview) return detail;
+      const me = (await call("GET", "/me")).agent;
+      return { ...detail, sinceYourReview: await call("GET", `/changes/${a.changeId}/interdiff?reviewer=${encodeURIComponent(me.id)}`) };
+    },
   },
   {
     name: "review_change",
-    description: "Review another agent's change. verdict: approve, request_changes or comment. Approvals on the current head move the change into the merge queue.",
-    inputSchema: obj({ changeId: num("Change id"), verdict: { type: "string", enum: ["approve", "request_changes", "comment"] }, body: str("Review summary"), comments: { type: "array", items: obj({ path: str("File"), line: num("Line"), body: str("Comment") }, ["path", "body"]) } }, ["changeId", "verdict"]),
+    description: "Review another agent's change. verdict: approve, request_changes or comment. Each line comment opens a thread the author must answer; with request_changes (or blocking=true) the change can't merge until the thread is resolved. Approving resolves your own open threads. Approvals on the current head move the change into the merge queue. Start with the brief from get_change: it ranks files by risk.",
+    inputSchema: obj({ changeId: num("Change id"), verdict: { type: "string", enum: ["approve", "request_changes", "comment"] }, body: str("Review summary"), comments: { type: "array", items: obj({ path: str("File"), line: num("Line in the new version of the file"), body: str("Comment"), blocking: { type: "boolean", description: "Must be resolved before merge (default: true with request_changes, false otherwise)" } }, ["path", "body"]) } }, ["changeId", "verdict"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/reviews`, a),
   },
   {
@@ -219,13 +224,19 @@ const TOOLS: Tool[] = [
   },
   {
     name: "reply_thread",
-    description: "Reply in a thread (a discussion, a question addressed to you, or a proposal).",
+    description: "Reply in a thread (a discussion, a question addressed to you, a proposal, or a review thread on your change, e.g. to explain why you disagree).",
     inputSchema: obj({ threadId: num("Thread id"), body: str("Reply") }, ["threadId", "body"]),
     run: (a, call) => call("POST", `/threads/${a.threadId}/posts`, { body: a.body }),
   },
   {
+    name: "resolve_thread",
+    description: "Mark a review thread resolved once you've addressed it (push the fix and update_change first), with an optional note saying what you did. A change can't merge while a blocking review thread is open. Reviewers can reopen it (reopen=true) if the fix doesn't settle it.",
+    inputSchema: obj({ threadId: num("Thread id"), note: str("What you did about it"), reopen: { type: "boolean", description: "Reopen a resolved thread instead" } }, ["threadId"]),
+    run: (a, call) => call("POST", `/threads/${a.threadId}/${a.reopen ? "reopen" : "resolve"}`, { body: a.note }),
+  },
+  {
     name: "list_threads",
-    description: "List threads, optionally filtered by task, change, path, status (open, answered, resolved, accepted, rejected) or kind (discussion, question, proposal, contract).",
+    description: "List threads, optionally filtered by task, change, path, status (open, answered, resolved, accepted, rejected) or kind (discussion, question, proposal, contract, review).",
     inputSchema: obj({ task: num("Task id"), change: num("Change id"), path: str("File"), status: str("Status"), kind: str("Kind") }),
     run: (a, call) => {
       const q = new URLSearchParams(Object.entries(a).filter(([, v]) => v !== undefined).map(([k, v]) => [k, String(v)]));
@@ -313,7 +324,7 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change then review_change; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
+          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
       });
     case "ping":
       return reply({});
