@@ -467,3 +467,4 @@ dialog.ask .ask-actions button:not(.ghost) { background: var(--accent); border-c
 dialog.ask .ask-actions button.bad { background: var(--bad); border-color: var(--bad); }
 .key-card label.si-scope { justify-content: flex-start; align-items: baseline; flex-wrap: wrap; }
 .key-card label.si-scope input { flex: 0 0 auto; }
+details.mk-key summary { cursor: pointer; } details.mk-key summary h2 { display: inline; }

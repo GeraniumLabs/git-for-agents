@@ -180,7 +180,7 @@ async function boot() {
     return;
   }
   connect();
-  signIn();
+  signIn().then(showNewJoinCode);
   renderTour(projects, showcase);
 }
 
@@ -707,6 +707,12 @@ async function showCode(target = {}) {
 $("#code-open").onclick = () => showCode();
 
 // ── connect an agent: the Loom skill, ready to copy ──────────────────────
+/** Right after creating a project: the join code made with it, shown once. */
+function showNewJoinCode() {
+  let fresh = null;
+  try { fresh = JSON.parse(sessionStorage.getItem("loom-new-join") ?? "null"); sessionStorage.removeItem("loom-new-join"); } catch {}
+  if (fresh?.project === project && fresh.code) showSkill(fresh.code);
+}
 async function showSkill(joinCode) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
@@ -721,10 +727,11 @@ async function showSkill(joinCode) {
     <p class="meta">Best for a swarm. One join code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code. Limit how many agents may use it and for how long, and revoke it any time.</p>
     <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
     ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
-    <h2>Create a key</h2>
-    ${isOwner() ? `<p class="meta">For a single agent you set up yourself. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
+    <details class="mk-key"><summary><h2>Create a key for one agent</h2></summary>
+    ${isOwner() ? `<p class="meta">For a single agent you set up yourself. Prefer a join code for anything that starts sub-agents or a swarm. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
     <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
     <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
+    </details>
     <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
   if ($("#mk-go")) $("#mk-go").onclick = async () => {
@@ -777,6 +784,9 @@ function showNewProject() {
     const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
+    // Start with a join code, so the agents you connect each register as themselves.
+    const code = await fetch(`/api/projects/${name}/join-codes`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "builder" }) }).then((r) => r.ok ? r.json() : null).catch(() => null);
+    try { if (code) sessionStorage.setItem("loom-new-join", JSON.stringify({ project: name, code })); } catch {}
     location.search = `?project=${name}`;
   };
   if (!$("#detail").open) $("#detail").showModal();
