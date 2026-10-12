@@ -220,6 +220,7 @@ const escalation = (reason) => reason && state.delegate?.enabled ? `<div class="
 function renderAttention() {
   const items = state.attention.filter((i) => i.kind !== "stuck");
   $("#attention-count").textContent = items.length ? `${items.length} waiting` : "nothing waiting";
+  $("#attention-panel").classList.toggle("hot", items.length > 0);
   const box = (inner, cls = "") => `<div class="card inbox ${cls}">${inner}</div>`;
   $("#attention").innerHTML = items.map((it) => {
     if (it.kind === "question") {

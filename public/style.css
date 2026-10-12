@@ -1,11 +1,13 @@
 :root {
-  --bg: #f6f5f1; --panel: #ffffff; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1d9;
+  --bg: #ecebe5; --panel: #ffffff; --head: #f7f6f2; --ink: #1d1d1b; --muted: #6b6a64; --line: #e3e1d9; --edge: #d6d3c9;
+  --shadow: 0 1px 2px rgb(30 28 20 / .06), 0 1px 1px rgb(30 28 20 / .03);
   --accent: #f38020; --ok: #2f8f5b; --warn: #b7791f; --bad: #c53030; --info: #2b6cb0;
   --chip: #efede6; --code: #faf9f6;
 }
 @media (prefers-color-scheme: dark) {
   :root:not([data-theme="light"]) {
-    --bg: #121211; --panel: #1b1b19; --ink: #ecebe6; --muted: #9a988f; --line: #2c2b28;
+    --bg: #0d0d0c; --panel: #1b1b19; --head: #222220; --ink: #ecebe6; --muted: #9a988f; --line: #2c2b28; --edge: #34332f;
+    --shadow: 0 1px 2px rgb(0 0 0 / .5);
     --ok: #4fbf84; --warn: #e0a640; --bad: #f06363; --info: #63a4f0; --chip: #262522; --code: #161614;
   }
 }
@@ -269,3 +271,59 @@ body.setup { display: grid; place-items: start center; padding: 10vh 16px; }
 .attempt details { margin-top: 6px; }
 .add { color: var(--ok, #2da44e); }
 .del { color: var(--bad, #cf222e); }
+
+/* ── visual hierarchy: each group is a panel with its own header ─────── */
+header .nav { display: flex; gap: 2px; padding-left: 12px; border-left: 1px solid var(--line); }
+header .nav button { background: transparent; border-color: transparent; color: var(--ink); }
+header .nav button:hover { background: var(--chip); }
+header .proj { padding-left: 12px; border-left: 1px solid var(--line); }
+header .brand { flex: none; }
+
+main { gap: 20px; padding-top: 20px; }
+.col { display: flex; flex-direction: column; gap: 20px; }
+.panel { background: var(--panel); border: 1px solid var(--edge); border-radius: 12px; box-shadow: var(--shadow); overflow: hidden; min-width: 0; }
+.panel-head { display: flex; align-items: baseline; gap: 8px; padding: 10px 14px; background: var(--head); border-bottom: 1px solid var(--line); }
+.panel-head h2 { margin: 0; font-size: 14px; font-weight: 650; text-transform: none; letter-spacing: 0; color: var(--ink); }
+.panel-head small { color: var(--muted); font-size: 12px; }
+.panel-head .seg { float: none; margin-left: auto; align-self: center; }
+.panel-tools { padding: 8px 14px; border-bottom: 1px solid var(--line); }
+.panel-tools .feed-filter { margin: 0; }
+
+/* inside a panel, items are rows split by rules rather than cards on cards */
+.panel > .card, .panel-body > .card { background: transparent; border: 0; border-radius: 0; box-shadow: none; margin: 0; padding: 12px 14px; }
+.panel-body > .card + .card { border-top: 1px solid var(--line); }
+.panel > .card + .panel-body, .panel > .card + .card { border-top: 1px solid var(--line); }
+.panel-body.list { gap: 0; }
+.panel-body > .empty, .panel-body > p.meta { margin: 0; padding: 12px 14px; }
+.panel > .card > .empty:only-child { padding: 0; }
+.panel-body > .card.inbox.q, .panel-body > .card.stuck { border-left: 3px solid var(--warn); padding-left: 11px; }
+.panel-body > .card.stuck { border-left-color: var(--bad); }
+.panel .decisions { max-height: 460px; margin-top: 0; }
+.panel-body > .card > .empty:first-child { padding-top: 0; }
+.card.q { font-weight: inherit; }
+.panel .kicker { margin-bottom: 6px; }
+
+/* the exceptions panel stands out when something is waiting */
+.panel.attn.hot { border-color: color-mix(in srgb, var(--warn) 55%, var(--edge)); }
+.panel.attn.hot .panel-head { background: color-mix(in srgb, var(--warn) 12%, var(--panel)); }
+.panel.attn.hot .panel-head small { color: var(--warn); font-weight: 600; }
+
+/* activity: one list with rules between entries */
+.feed { gap: 0; }
+.ev { border: 0; border-radius: 0; border-left: 3px solid transparent; border-top: 1px solid var(--line); padding: 8px 12px 8px 11px; background: transparent; }
+.ev:first-child { border-top: 0; }
+.panel .feed { max-height: 70vh; }
+dialog .feed { border: 1px solid var(--line); border-radius: 10px; overflow: auto; max-height: 40vh; }
+
+/* health tiles sit on the page background like the panels */
+.health { gap: 12px; padding-top: 18px; }
+.tile, .stat { border-color: var(--edge); box-shadow: var(--shadow); border-radius: 12px; }
+.controls { box-shadow: var(--shadow); border-radius: 12px; }
+
+/* dialogs: sections separated by rules, headed in the same voice as panels */
+dialog { padding: 22px 24px; border-color: var(--edge); box-shadow: 0 20px 60px rgb(0 0 0 / .25); }
+#detail-body > h3:first-child { margin-top: 0; font-size: 18px; }
+#detail-body h2 { margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); font-size: 13.5px; font-weight: 650; text-transform: none; letter-spacing: 0; color: var(--ink); }
+#detail-body h2 small { color: var(--muted); font-size: 12px; font-weight: 400; }
+#detail-body .card + .card { margin-top: 8px; }
+#detail-body .card { border-radius: 10px; }
