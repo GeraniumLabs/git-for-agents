@@ -36,6 +36,23 @@ const store = {
   set: (k, v) => { try { v === null ? localStorage.removeItem(k) : localStorage.setItem(k, v); } catch {} },
 };
 const keyName = () => `loom-key:${project}`;
+
+// ── light / dark / follow the system ─────────────────────────────────────
+const THEMES = { auto: ["◐", "Theme: follows your system"], light: ["☀", "Theme: light"], dark: ["☾", "Theme: dark"] };
+function applyTheme(t) {
+  if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
+  const [icon, label] = THEMES[t] ?? THEMES.auto;
+  $("#theme").textContent = icon;
+  $("#theme").title = `${label} (click to change)`;
+  $("#theme").setAttribute("aria-label", label);
+}
+applyTheme(store.get("loom-theme"));
+$("#theme").onclick = () => {
+  const order = ["auto", "light", "dark"];
+  const next = order[(order.indexOf(store.get("loom-theme") ?? "auto") + 1) % order.length];
+  store.set("loom-theme", next === "auto" ? null : next);
+  applyTheme(next);
+};
 async function act(method, path, body) {
   const res = await fetch(`/api/projects/${project}${path}`, {
     method,
@@ -220,6 +237,7 @@ const escalation = (reason) => reason && state.delegate?.enabled ? `<div class="
 function renderAttention() {
   const items = state.attention.filter((i) => i.kind !== "stuck");
   $("#attention-count").textContent = items.length ? `${items.length} waiting` : "nothing waiting";
+  $("#attention-panel").classList.toggle("hot", items.length > 0);
   const box = (inner, cls = "") => `<div class="card inbox ${cls}">${inner}</div>`;
   $("#attention").innerHTML = items.map((it) => {
     if (it.kind === "question") {
