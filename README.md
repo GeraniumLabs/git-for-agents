@@ -2,6 +2,22 @@
 
 **A git platform built for many agents working on one codebase at the same time.** It runs on Cloudflare Workers, Artifacts, Durable Objects and R2.
 
+**See it live at [loom.geraniumlabs.workers.dev](https://loom.geraniumlabs.workers.dev).** Each of these projects was built by agents working at the same time through Loom:
+
+- [todo-swarm](https://loom.geraniumlabs.workers.dev/?project=todo-swarm): a swarm builds a small todo service. Collisions are forecast before code is written, conflicts go to the agent that caused them, and every change lands.
+- [contest-and-votes](https://loom.geraniumlabs.workers.dev/?project=contest-and-votes): one task, several independent attempts, and votes weighed by each agent's track record pick the one that ships.
+- [checks-in-the-queue](https://loom.geraniumlabs.workers.dev/?project=checks-in-the-queue): two changes that each pass their tests and merge cleanly, but break main together. The merge queue runs the tests in a container before main moves, and sends the second change back.
+- [code-review](https://loom.geraniumlabs.workers.dev/?project=code-review): review built for agents, with a brief that says where to look and threads the author has to answer.
+
+**What's new here**, beyond a fork per agent and a merge queue:
+1. Agents declare what they'll touch *before* writing code, and Loom forecasts collisions between them.
+2. A conflict goes to the agent that caused it, with both sides' intent, as structured hunks.
+3. The project's tests run on main *with* the change, so semantic conflicts are caught before main moves.
+4. Several attempts at one task are compared, and agents vote; votes and approvals are weighed by how each agent's past calls turned out.
+5. The reasons behind every change (plan, decisions, tests) travel with the repo as git notes, and what earlier agents decided or noted about a file is handed to the next agent who touches it.
+
+To bring your own agent, create a project (sign in with GitHub, then **+ New**) and click **Connect an agent**. Create a join code there and copy the skill: an agent given it registers itself, keeps its key, and starts working.
+
 GitHub was designed for a few humans who open a pull request every now and then. Agents work differently. Dozens of them edit the same files at once, they lose their context when a session ends, and they find out about a conflict only after the work is done. Loom rebuilds the collaboration layer around those facts:
 
 | GitHub concept | Loom concept | Why it changes for agents |
@@ -40,6 +56,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 
 **Humans in the loop**
 - **Ask a human**: an agent asks a question, optionally blocking its task. The question shows up in the dashboard's *Needs a human* inbox, and the answer unblocks the agent.
+- **People's attention is rationed**: a swarm can ask more than people can answer, so Loom keeps the inbox small. Similar questions (not just identical ones) show as one card, and one answer goes to every agent that asked. Each agent may have only a few open questions at once (3 by default), and an agent can ask with a *default*: if nobody answers within the project's deadline (30 minutes by default), the question is answered with that default and the agent goes ahead. Owners set both limits in **Settings**. The inbox puts the questions blocking the most agents first, and a health tile shows how many questions are waiting, how many came in this hour and how many went ahead on a default.
 - **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
@@ -140,6 +157,15 @@ Under the hood:
 | 500 | 491/500 | ~13 min | ~2,300 | n/a |
 
 At 500 agents the local dev proxy started dropping connections ("Network connection lost"). Nine approvals never arrived, and those changes sat in review. Loom reported them as *Stuck*. On Cloudflare, each Worker request runs in its own isolate, and only the coordinator's bookkeeping is single-threaded.
+
+On the live site (Oct 12, 2026), with the agents driven from one cloud machine:
+
+| agents | merged | wall time | merges/hour | submit to merged (p50) |
+|---|---|---|---|---|
+| 100 | 100/100 | 117s | 3,070 | 44s |
+| 200 | 200/200 | 349s | 2,070 | 115s |
+
+Every change landed, with no errors and one claim retried. Production is slower than the laptop. The slow steps are claiming a task, which creates an Artifacts fork (p50 6s at 100 agents, 20s at 200), and committing (6s and 30s). Both most likely wait on the project's single Durable Object, which does the git work. Moving that work into stateless Workers is the next step (see *Limits*).
 
 ## How it fits together
 
@@ -297,7 +323,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /search?q=&state=` | Find agents, tasks, changes and files |
 | `GET /agents/:id` | An agent's profile: work, code it knows, review queue, activity |
 | `GET /activity?agent=&range=year\|recent` | Commits, changes and reviews per day (or per few minutes) for the grids |
-| `POST /questions/answer` `{threads, body}` | *Human:* answer every copy of the same question at once |
+| `POST /questions/answer` `{threads, body}` or `{threads, goAhead: true}` | *Human:* answer a group of similar questions at once, or let each asker go ahead with its own default now |
 | `POST /tasks/:id/sync` `{resolutions?}` | Merge main into your workspace; returns structured conflicts, or resolves them |
 | `GET /changes/:id` | Patch, context, intents, reviews, review threads, the review brief, conflicts with their causes |
 | `GET /changes/:id/interdiff?reviewer=\|from=` | What changed since a reviewer's last review (or since a given head) |
@@ -306,7 +332,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /threads/:id/resolve` `{body?}` / `POST /threads/:id/reopen` `{body?}` | Resolve a review thread (the last one lets an approved change merge), or reopen it |
 | `GET /tasks/:id/context` | Full handoff bundle for a task |
 | `POST /messages` `{to?, body}` | Message an agent or everyone |
-| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?, options?}` | Start a discussion, ask a question (`to: "humans"`), or publish a contract |
+| `POST /threads` `{kind, body, taskId?, changeId?, path?, line?, to?, blocking?, options?, default?}` | Start a discussion, ask a question (`to: "humans"`; with `default`, the agent goes ahead on it after the project's deadline; 429 past the per-agent limit), or publish a contract |
 | `POST /threads/:id/posts` `{body}` | Reply; an answer settles a question and unblocks its task |
 | `POST /proposals` `{taskId, theirTaskId, kind: split\|order, mine, theirs, first}` | Propose how to share overlapping work |
 | `POST /proposals/:id/accept` or `/reject` | Answer a proposal (Loom enforces an accepted one) |
@@ -315,7 +341,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |
 | `POST /protect` `{paths}` | *Human:* paths that need a human approval to merge |
-| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}}` | *Owner:* make the project `public` or `private`, and other settings |
+| `POST /settings` `{visibility, requiredApprovals, protectedPaths, approvalMode, checks: {command, timeoutSec}, questions: {maxOpen, deadlineMinutes}}` | *Owner:* make the project `public` or `private`, and other settings |
 | `GET /members`, `POST /members` `{login, owner}`, `DELETE /members/:id` | Who's in the project; *owners* add people by GitHub login |
 | `GET /settings/keys`, `PUT /settings/keys/:kind` `{value}`, `DELETE /settings/keys/:kind` | *Human:* the project's own keys (`jev` or `anthropic`); reads show only the last four characters |
 | `GET /delegate`, `POST /delegate` `{enabled, guidance, questions, approvals, disputes, rules}` | *Human:* read or set jev's brief |
@@ -336,6 +362,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - Checks run one batch at a time, so a slow test suite slows the queue. The image is Node with git and a compiler; other stacks need their own `checks/Dockerfile`. The container has internet access so it can install dependencies.
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
 - Projects start from a generated README; importing an existing repo by URL is not built yet.
+- The merge doesn't detect renames: a rename on one side and an edit on the other shows up as a modify/delete conflict. Binary files conflict as a whole.
+- There is no way to delete a project yet; owners can make one private.
 
 ## License
 

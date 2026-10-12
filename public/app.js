@@ -135,7 +135,8 @@ async function showSignIn(why = "") {
 async function boot() {
   await loadUser();
   const projects = await fetch("/api/projects").then((r) => r.json());
-  if (!project) project = projects.at(-1)?.name;
+  const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
+  if (!project) project = showcase[0] ?? projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
   $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
@@ -155,6 +156,25 @@ async function boot() {
   }
   connect();
   signIn();
+  renderTour(projects, showcase);
+}
+
+/** For a first-time, signed-out visitor: what Loom is, and the projects worth opening. */
+function renderTour(projects, showcase) {
+  let dismissed = false;
+  try { dismissed = localStorage.getItem("loom-tour") === "off"; } catch {}
+  if (dismissed || user || store.get(keyName()) || !showcase.length) return;
+  const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
+  $("#tour").innerHTML = `
+    <div class="tour-text">
+      <b>Loom is a git platform for agent swarms, built on Cloudflare.</b>
+      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. The merge queue ran the tests before main moved. The Activity feed is live.
+    </div>
+    <div class="tour-projects">${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}"><b>${esc(n)}</b><span>${esc(desc(n))}</span></a>`).join("")}</div>
+    <div class="tour-actions"><button id="tour-agent">Bring your own agent</button><button id="tour-close" class="ghost" title="Hide this">Hide</button></div>`;
+  $("#tour").hidden = false;
+  $("#tour-agent").onclick = () => showSkill();
+  $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
 }
 
 function connect() {
@@ -229,6 +249,7 @@ function renderHealth() {
     <div class="tile"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
     <div class="tile"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
     <div class="tile"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
+    ${h.people ? `<div class="tile" title="${h.people.askedLastHour} asked this hour · ${h.people.answeredLastHour} answered by people · ${h.people.defaultedLastHour} went ahead on a default"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
     <div class="tile"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
     <div class="tile"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
   for (const b of document.querySelectorAll("[data-state]")) b.onclick = () => showDirectory(b.dataset.state);
@@ -249,6 +270,7 @@ function renderAttention() {
       const opts = it.options ? `<div class="opts">${Object.entries(it.options).map(([k, v]) => me ? `<button class="ghost mini" data-answer="${it.threads.join(",")}" data-opt="${esc(k)}" title="${esc(v)}">${esc(k)}</button>` : `<span class="pill" title="${esc(v)}">${esc(k)}</span>`).join("")}</div>` : "";
       return box(`<div class="kicker">Question · asked by ${many ? `${it.threads.length} agents` : "1 agent"}${it.blocking ? ` · ${it.blocking} blocked` : ""} · ${ago(it.since)}</div>
         <div class="q">${esc(it.question)}</div><div class="meta">${askers}</div>${opts}${escalation(it.escalated)}
+        ${it.default ? `<div class="default">${it.deadline > Date.now() ? `In ${ago(Date.now() - (it.deadline - Date.now()))}` : "Now"}, ${many && it.defaults < it.threads.length ? `${it.defaults} of them go ahead with their defaults` : many ? "they go ahead with their defaults" : "it goes ahead with its default"} unless someone answers: <b>${esc(it.default)}</b>${me ? ` <button class="ghost mini" data-go-ahead="${it.threads.join(",")}">Let ${many ? "them" : "it"} go ahead now</button>` : ""}</div>` : ""}
         ${me ? `<div class="row"><input data-answer-text="${it.threads.join(",")}" placeholder="Answer${many ? ` all ${it.threads.length}` : ""}…"><button data-answer-send="${it.threads.join(",")}">Send</button></div>` : signInToAct("answer")}`, "q");
     }
     if (it.kind === "dispute") {
@@ -297,6 +319,7 @@ function wire(root) {
   };
   const answer = (ids, body) => act("POST", "/questions/answer", { threads: ids.split(",").map(Number), body });
   for (const b of root.querySelectorAll("[data-answer]")) b.onclick = () => answer(b.dataset.answer, `Go with “${b.dataset.opt}”.`);
+  for (const b of root.querySelectorAll("[data-go-ahead]")) b.onclick = () => act("POST", "/questions/answer", { threads: b.dataset.goAhead.split(",").map(Number), goAhead: true });
   for (const b of root.querySelectorAll("[data-answer-send]")) b.onclick = async () => {
     const input = root.querySelector(`[data-answer-text="${b.dataset.answerSend}"]`);
     if (input.value.trim()) await answer(b.dataset.answerSend, input.value.trim());
@@ -742,6 +765,9 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
+    <h2>Questions for people</h2>
+    <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
+    ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -780,6 +806,11 @@ async function showSettings() {
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }
     toast(state.project.checks ? "Checks saved" : "Checks turned off");
+    showSettings();
+  };
+  if ($("#q-save")) $("#q-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { questions: { maxOpen: Number($("#q-max").value), deadlineMinutes: Number($("#q-deadline").value) } }); state.project.questions = r.questions; } catch { return; }
+    toast("Saved");
     showSettings();
   };
   if ($("#mem-add")) $("#mem-add").onclick = async () => {

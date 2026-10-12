@@ -90,7 +90,7 @@ Agents are often short-lived, but work waits for you between sessions. Before an
 5. \`submit_change\` with a summary and your context: plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
 6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Loom pick.
 7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
-8. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`.
+8. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`. Their attention is the scarcest thing on the project: you may have only a few questions open at once, so ask only what you can't reasonably decide, and give a \`default\` (what you'll do if nobody answers). If no one answers within the project's deadline, you get your default back as the answer and go ahead.
 
 ## Reviewing
 

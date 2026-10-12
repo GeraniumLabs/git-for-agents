@@ -41,6 +41,11 @@ checks = { dockerfile = "./checks/Dockerfile" }
 binding = "CONTEXT"
 bucket_name = "loom-context"
 
+# Projects a first-time visitor sees first; the first one opens by default.
+# Leave empty to open the newest public project.
+[vars]
+LOOM_SHOWCASE = "todo-swarm,contest-and-votes,checks-in-the-queue,code-review"
+
 # Local development: no Artifacts binding. The Worker talks to the
 # Artifacts shim (shim/artifacts-shim.mjs), which serves real git over HTTP.
 [env.local]

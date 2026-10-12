@@ -85,6 +85,9 @@ function randomId(bytes = 12): string {
   return [...b].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
 
+/** Two questions to people whose words overlap this much show as one card. */
+const SIMILAR_QUESTION = 0.6;
+
 export class ProjectCoordinator extends DurableObject<Env> {
   private sql: SqlStorage;
   private store: RepoStore;
@@ -128,6 +131,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN line_text TEXT",
       "ALTER TABLE threads ADD COLUMN outdated INTEGER DEFAULT 0",
       "ALTER TABLE threads ADD COLUMN resolved_by TEXT",
+      "ALTER TABLE threads ADD COLUMN default_answer TEXT",
+      "ALTER TABLE threads ADD COLUMN deadline INTEGER",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -273,6 +278,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const t = Number(body.timeoutSec);
       if (!(t >= 10 && t <= 1800)) throw new HttpError(400, "checks.timeoutSec is between 10 and 1800");
       this.setMeta("checks_timeout", String(t));
+    }
+  }
+
+  /** How much agents may ask of people: open questions per agent (0 = no limit), and how long a question with a default waits. */
+  private get questionRules(): { maxOpen: number; deadlineMinutes: number } {
+    return { maxOpen: Number(this.meta("questions_max_open") ?? "3"), deadlineMinutes: Number(this.meta("questions_deadline_min") ?? "30") };
+  }
+
+  private setQuestionRules(body: { maxOpen?: number; deadlineMinutes?: number }) {
+    if (body.maxOpen !== undefined) {
+      const n = Number(body.maxOpen);
+      if (!(Number.isInteger(n) && n >= 0 && n <= 100)) throw new HttpError(400, "questions.maxOpen is a whole number from 0 (no limit) to 100");
+      this.setMeta("questions_max_open", String(n));
+    }
+    if (body.deadlineMinutes !== undefined) {
+      const n = Number(body.deadlineMinutes);
+      if (!(n >= 1 && n <= 7 * 24 * 60)) throw new HttpError(400, "questions.deadlineMinutes is between 1 and 10080 (a week)");
+      this.setMeta("questions_deadline_min", String(n));
     }
   }
 
@@ -523,11 +546,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
       if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
+      if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules });
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
@@ -588,7 +612,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     if (a === "threads" && b && c === "reopen") return json(this.reopenThread(actor, Number(b), body.body));
     if (a === "consults" && !b && m === "POST") return json(this.consult(actor, body));
-    if (a === "questions" && b === "answer" && m === "POST") return json(this.answerGroup(actor, body.threads ?? [], body.body));
+    if (a === "questions" && b === "answer" && m === "POST") return json(this.answerGroup(actor, body.threads ?? [], body.body, !!body.goAhead));
     if (a === "disputes" && !b && m === "POST") return json(this.openDispute(actor, body));
     if (a === "disputes" && b && c === "position") return json(this.statePosition(actor, Number(b), body.position));
     if (a === "contests" && b && c === "votes" && m === "POST") return json(await this.vote(actor, Number(b), body));
@@ -1583,8 +1607,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
-    const nextDeadline = this.sweepReviewRequests();
-    if (nextDeadline) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
+    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity);
+    if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
     if (this.merging || this.meta("frozen")) return;
     this.merging = true;
@@ -1605,7 +1629,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const retry = this.sql.exec("SELECT MIN(updated_at) AS t FROM changes WHERE status = 'queued'").one().t as number | null;
     const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
     const done = this.sql.exec("SELECT MIN(done_at) AS t FROM workspaces WHERE status IN ('merged','closed') AND done_at IS NOT NULL").one().t as number | null;
-    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
+    const asked = this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
+    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
     if (next < Infinity) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 100));
   }
 
@@ -2278,7 +2303,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, visibility: this.isPrivate ? "private" : "public" },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -2287,6 +2312,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         queue: { depth: queued.length, oldestWaitMs: queued.length ? now - Math.min(...queued.slice(0, 50).map((q) => waitedFor(q.id as number))) : 0 },
         mergedLastHour: mergedHour, conflictsLastHour: conflictsHour,
         conflictRate: mergedHour + conflictsHour ? conflictsHour / (mergedHour + conflictsHour) : 0,
+        people: this.peopleLoad(now),
         series,
       },
       attention: this.attention(agents),
@@ -2304,23 +2330,44 @@ export class ProjectCoordinator extends DurableObject<Env> {
     };
   }
 
+  /** How much the swarm is asking of people: questions waiting, asked and answered in the last hour, and how many went ahead on a default. */
+  private peopleLoad(now: number) {
+    const hour = now - 3600_000;
+    const asked = this.sql.exec("SELECT COUNT(*) AS n FROM events WHERE type = 'question.asked' AND ts > ? AND json_extract(data, '$.audience') = 'humans'", hour).one().n as number;
+    const answered = this.sql.exec("SELECT json_extract(data, '$.defaulted') AS d, COUNT(*) AS n FROM events WHERE type = 'question.answered' AND ts > ? GROUP BY d", hour).toArray();
+    const waiting = this.sql.exec("SELECT COUNT(*) AS n, MIN(created_at) AS t FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open'").one();
+    return {
+      waiting: waiting.n as number, oldestMs: waiting.t ? now - (waiting.t as number) : 0,
+      askedLastHour: asked,
+      answeredLastHour: answered.filter((r) => !r.d).reduce((n, r) => n + (r.n as number), 0),
+      defaultedLastHour: answered.filter((r) => r.d).reduce((n, r) => n + (r.n as number), 0),
+      rules: this.questionRules,
+    };
+  }
+
   /** What needs a person, then what is stuck. Similar questions are grouped. */
   private attention(agents: ReturnType<ProjectCoordinator["agentStates"]>) {
     const now = Date.now();
     const items: any[] = [];
     const open = this.sql.exec("SELECT id FROM threads WHERE status = 'open' AND kind IN ('question','dispute','proposal') ORDER BY created_at").toArray().map((r) => this.thread(r.id as number));
-    const groups = new Map<string, any>();
+    // Similar questions are one card: agents ask the same thing in different words.
+    const groups: any[] = [];
     for (const t of open.filter((t) => t.kind === "question" && t.to_agent === "humans")) {
       const q = (t.posts[0]?.body ?? t.title) as string;
-      const key = q.toLowerCase().replace(/[^a-z0-9]+/g, " ").trim();
-      const g = groups.get(key) ?? { kind: "question", question: q, options: t.options, threads: [], askers: [], blocking: 0, escalated: t.escalated, since: t.created_at };
+      let g = groups.find((g) => sameQuestion(g.question, q) || similarity(g.question, q) >= SIMILAR_QUESTION);
+      if (!g) groups.push(g = { kind: "question", question: q, options: t.options, threads: [], askers: [], blocking: 0, defaults: 0, deadline: null, default: null, escalated: t.escalated, since: t.created_at });
       g.threads.push(t.id);
       g.askers.push(t.created_by);
       if (t.blocking) g.blocking++;
+      if (t.default_answer) {
+        g.defaults++;
+        if (!g.deadline || t.deadline < g.deadline) { g.deadline = t.deadline; g.default = t.default_answer; }
+      }
       g.escalated = g.escalated ?? t.escalated;
-      groups.set(key, g);
     }
-    items.push(...groups.values());
+    // The questions holding up the most agents come first.
+    groups.sort((a, b) => b.blocking - a.blocking || b.threads.length - a.threads.length || a.since - b.since);
+    items.push(...groups);
     for (const t of open.filter((t) => t.kind === "dispute")) {
       const terms = JSON.parse(t.terms);
       items.push({ kind: "dispute", thread: t.id, question: terms.question, parties: terms.parties, positions: terms.positions, change: terms.changeId, escalated: t.escalated, since: t.created_at });
@@ -2367,8 +2414,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
       items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
     }
-    const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, stuck: 3 };
-    return items.sort((a, b) => rank[a.kind] - rank[b.kind] || a.since - b.since);
+    const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, brief: 2, review: 2, stuck: 3 };
+    // Stable sort: questions keep their own order (most blocked first).
+    return items.sort((a, b) => rank[a.kind] - rank[b.kind] || (a.kind === "question" ? 0 : a.since - b.since));
   }
 
   /** Where in the codebase work is happening: folders with live intents, changes in flight, recent merges and conflicts. */
@@ -2628,6 +2676,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
   }
 
+  /** Questions with a default that nobody answered in time: the asker goes ahead with its default. */
+  private sweepQuestions() {
+    const now = Date.now();
+    for (const r of this.sql.exec("SELECT id FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL AND deadline <= ?", now).toArray()) {
+      const t = this.thread(r.id as number);
+      const asker: Agent = { id: t.created_by, name: this.agentName(t.created_by) ?? t.created_by, role: "builder" };
+      const text = `No one answered in time, so ${asker.name} goes ahead with its default: ${t.default_answer}`;
+      this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", t.id, asker.id, text, now);
+      this.answer(t, asker, t.default_answer, true);
+    }
+    return this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
+  }
+
   /** Mark review requests delivered once the reviewer has actually received them. */
   private markSeen(agent: string, events: LoomEvent[]) {
     for (const e of events) {
@@ -2715,12 +2776,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** Answer several agents' copies of the same question at once: one decision, every asker unblocked. */
-  private answerGroup(actor: Agent, threads: number[], text: string) {
-    if (!text) throw new HttpError(400, "body is required");
-    const open = threads.map((id) => this.thread(id)).filter((t) => t.kind === "question" && t.status === "open");
+  /** One answer for a group of similar questions; or, with goAhead, let each asker go ahead with its own default now. */
+  private answerGroup(actor: Agent, threads: number[], text: string, goAhead = false) {
+    if (!text && !goAhead) throw new HttpError(400, "body is required");
+    let open = threads.map((id) => this.thread(id)).filter((t) => t.kind === "question" && t.status === "open");
+    if (goAhead) open = open.filter((t) => t.default_answer);
     open.forEach((t, i) => {
-      this.citing = i > 0;
-      try { this.post(actor, t.id, text); } finally { this.citing = false; }
+      this.citing = !goAhead && i > 0;
+      try { this.post(actor, t.id, goAhead ? `Go ahead with your default: ${t.default_answer}` : text); } finally { this.citing = false; }
     });
     return { answered: open.map((t) => t.id) };
   }
@@ -3072,19 +3135,29 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * "question" with to = "humans" (or an agent id) asks for an answer; a
    * blocking question parks the task until someone answers.
    */
-  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract" | "review"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean; options?: unknown }) {
+  private openThread(actor: Agent, body: { silent?: boolean; kind?: "discussion" | "question" | "contract" | "review"; taskId?: number; changeId?: number; path?: string; line?: number; title?: string; body: string; to?: string; blocking?: boolean; options?: unknown; default?: string }) {
     if (!body.body) throw new HttpError(400, "body is required");
     const kind = body.kind ?? "discussion";
+    const toHumans = kind === "question" && body.to === "humans";
+    const rules = this.questionRules;
+    if (toHumans && actor.role !== "human" && actor.id !== "admin" && rules.maxOpen > 0) {
+      const open = this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open' AND created_by = ?", actor.id).one().n as number;
+      if (open >= rules.maxOpen) {
+        throw new HttpError(429, `You already have ${open} open question${open === 1 ? "" : "s"} for people, and this project allows ${rules.maxOpen}. Wait for those answers, check recall_decisions, or decide yourself and note why in your change context.`);
+      }
+    }
+    const fallback = toHumans && typeof body.default === "string" && body.default.trim() ? body.default.trim().slice(0, 2000) : null;
+    const deadline = fallback ? Date.now() + rules.deadlineMinutes * 60_000 : null;
     const taskId = body.taskId ?? (body.changeId ? this.change(body.changeId).task_id : null);
     const now = Date.now();
     const blocking = kind === "question" && !!body.blocking && !!taskId;
     const prev = blocking ? this.task(taskId!).status : null;
     const options = kind === "question" ? normalizeOptions(body.options) : null;
     const row = this.sql
-      .exec(`INSERT INTO threads (kind, task_id, change_id, path, line, title, created_by, to_agent, blocking, prev_task_status, options, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      .exec(`INSERT INTO threads (kind, task_id, change_id, path, line, title, created_by, to_agent, blocking, prev_task_status, options, default_answer, deadline, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         kind, taskId, body.changeId ?? null, body.path ?? null, body.line ?? null, body.title ?? body.body.split("\n")[0].slice(0, 80),
-        actor.id, body.to ?? null, blocking ? 1 : 0, prev, options ? JSON.stringify(options) : null, now, now)
+        actor.id, body.to ?? null, blocking ? 1 : 0, prev, options ? JSON.stringify(options) : null, fallback, deadline, now, now)
       .one();
     const id = row.id as number;
     this.sql.exec("INSERT INTO posts (thread_id, author, body, created_at) VALUES (?, ?, ?, ?)", id, actor.id, body.body, now);
@@ -3092,8 +3165,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const to = body.to && body.to !== "humans" ? body.to : null;
     if (!body.silent) this.emit(kind === "question" ? "question.asked" : kind === "contract" ? "contract.published" : "thread.opened", {
       actor: actor.id, task: taskId, change: body.changeId ?? null, to,
-      data: { thread: id, title: body.title ?? null, body: body.body, path: body.path ?? null, line: body.line ?? null, audience: body.to ?? "everyone", blocking, options },
+      data: { thread: id, title: body.title ?? null, body: body.body, path: body.path ?? null, line: body.line ?? null, audience: body.to ?? "everyone", blocking, options, default: fallback, deadline },
     });
+    if (deadline) void this.armAlarm(deadline);
     return this.thread(id);
   }
 
@@ -3113,7 +3187,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.thread(threadId);
   }
 
-  private answer(t: any, actor: Agent, text: string) {
+  private answer(t: any, actor: Agent, text: string, defaulted = false) {
     this.sql.exec("UPDATE threads SET status = 'answered', updated_at = ? WHERE id = ?", Date.now(), t.id);
     if (t.to_agent === "humans" && (actor.role === "human" || actor.id === "admin") && !this.citing) {
       this.recordDecision("answer", actor, { question: t.posts[0]?.body ?? t.title, decision: text, paths: this.threadPaths(t), task: t.task_id, change: t.change_id, thread: t.id });
@@ -3121,7 +3195,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (t.blocking && t.task_id) {
       this.sql.exec("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ? AND status = 'blocked'", t.prev_task_status ?? "claimed", Date.now(), t.task_id);
     }
-    this.emit("question.answered", { actor: actor.id, to: t.created_by, task: t.task_id, data: { thread: t.id, question: t.title, answer: text, unblocked: !!t.blocking } });
+    this.emit("question.answered", { actor: actor.id, to: t.created_by, task: t.task_id, data: { thread: t.id, question: t.title, answer: text, unblocked: !!t.blocking, defaulted } });
   }
 
   private resolveThread(actor: Agent, threadId: number, text?: string) {
@@ -3205,6 +3279,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return {
       agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, reviewTasks, tasks, changes,
       openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open'").one().n,
+      // How many questions for people this agent has open, against the project's limit.
+      questions: { open: this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open' AND created_by = ?", actor.id).one().n, ...this.questionRules },
       inbox: this.inbox(actor.id),
     };
   }
@@ -3309,3 +3385,4 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (msg === "overview") ws.send(JSON.stringify({ kind: "overview", overview: this.overview() }));
   }
 }
+
