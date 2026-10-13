@@ -29,6 +29,12 @@ export const AGENT_HEADER = "x-loom-agent";
 /** How many named agents one key may carry. */
 const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
+/** How long an unacknowledged directive keeps nagging the agents it went to. */
+const DIRECTIVE_TTL = 7 * 24 * 3600_000;
+/** An unacknowledged directive older than this shows under Stuck. */
+const DIRECTIVE_ACK_MS = 5 * 60_000;
+/** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
+export const DIRECTIVES_HEADER = "x-loom-directives";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
 /** Project-wide events every agent hears about, whatever it is working on. */
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
@@ -222,6 +228,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS directive_acks (
+        seq INTEGER, agent TEXT, note TEXT, acked_at INTEGER, PRIMARY KEY (seq, agent));
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
       CREATE INDEX IF NOT EXISTS events_actor ON events (actor, ts);
       CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
@@ -493,7 +501,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // What a stand-in did is on record as the person's, through it.
       const acted = this.standinActs.get(req);
       if (acted && res.ok) this.emit("standin.acted", { actor: acted.person, data: { standin: acted.id, name: acted.name, action: acted.action } });
-      return res;
+      return await this.withDirectives(req, res);
     } catch (e: any) {
       if (e instanceof HttpError) return json({ error: e.message }, e.status);
       console.error(e);
@@ -575,6 +583,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "threads" && b) return json(this.thread(Number(b)));
       if (a === "threads") return json(this.threads(url.searchParams));
       if (a === "decisions") return json(this.listDecisions(url.searchParams));
+      if (a === "directives" && b && c === "acks") return json(this.directiveAcks(Number(b)));
       if (a === "tasks" && b && c === "memory") return json(await this.taskMemory(Number(b)));
       if (a === "contests" && b) return json(await this.contest(Number(b)));
       if (a === "notes" && !b) return json(this.listNotes(url.searchParams));
@@ -591,6 +600,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     const who = await this.authenticate(req);
     const actor: Agent = who === "admin" ? { id: "admin", name: "admin", role: "human", owner: true } : who;
+    this.actors.set(req, actor.id);
     const ownerOnly = (what: string) => { if (!actor.owner) throw new HttpError(403, `only the project's owners can ${what}`); };
 
     // A stand-in reaches only what its person allowed, and never settings, people or keys.
@@ -661,6 +671,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
 
+    // Agents acknowledge directives (paused ones too: a directive may be why they're paused).
+    if (a === "directives" && c === "ack" && m === "POST") return json(this.ackDirectives(actor, b === "all" ? null : [Number(b)], body.note));
+    if (a === "directives" && b === "ack" && m === "POST") return json(this.ackDirectives(actor, Array.isArray(body.seqs) ? body.seqs.map(Number) : null, body.note));
     // Human controls. Humans (and the admin) steer; agents can't.
     const ruling = a === "disputes" && c === "rule";
     const deciding = a === "decisions" && m === "POST";
@@ -2156,7 +2169,80 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!body.body) throw new HttpError(400, "body is required");
     const e = this.emit("directive", { actor: actor.id, to: body.to ?? null, task: body.taskId ?? null, data: { body: body.body, from: actor.name } });
     if (!body.to) this.recordDecision("directive", actor, { question: "", decision: body.body, paths: [], task: body.taskId ?? null });
-    return { seq: e.seq };
+    return { seq: e.seq, awaitingAck: this.directiveTargets(e.seq).length };
+  }
+
+  /**
+   * The agents a directive went to: the one it named, or every agent that was
+   * in the project when it was sent (people and the deputy aren't asked to ack;
+   * later arrivals get broadcast directives as decisions instead).
+   */
+  private directiveTargets(seq: number): string[] {
+    const e = this.sql.exec("SELECT ts, to_agent FROM events WHERE seq = ? AND type = 'directive'", seq).toArray()[0];
+    if (!e) return [];
+    return this.sql.exec(`SELECT id FROM agents WHERE role != 'human' AND id != ? AND (id = ? OR (? IS NULL AND created_at <= ?))`,
+      DELEGATE_ID, e.to_agent, e.to_agent, e.ts).toArray().map((r) => r.id as string);
+  }
+
+  /** Directives sent to this agent in the last week that it hasn't acknowledged, oldest first. */
+  private pendingDirectives(agentId: string) {
+    return this.sql.exec(`SELECT e.seq, e.ts, e.to_agent, e.data FROM events e, agents a
+        WHERE a.id = ? AND a.role != 'human' AND a.id != ? AND e.type = 'directive' AND e.ts > ?
+          AND (e.to_agent = a.id OR (e.to_agent IS NULL AND a.created_at <= e.ts))
+          AND NOT EXISTS (SELECT 1 FROM directive_acks k WHERE k.seq = e.seq AND k.agent = a.id)
+        ORDER BY e.seq`, agentId, DELEGATE_ID, Date.now() - DIRECTIVE_TTL).toArray()
+      .map((r) => { const d = JSON.parse(r.data as string); return { seq: r.seq as number, from: d.from as string, body: d.body as string, toYouAlone: !!r.to_agent, since: r.ts as number }; });
+  }
+
+  /** Acknowledge directives (the listed ones, or every pending one): the agent has read them and is following them. */
+  private ackDirectives(actor: Agent, seqs: number[] | null, note?: string) {
+    const pending = this.pendingDirectives(actor.id);
+    if (seqs) {
+      for (const s of seqs) {
+        if (!this.directiveTargets(s).includes(actor.id)) throw new HttpError(404, `directive #${s} wasn't sent to you`);
+      }
+    }
+    const acking = seqs ? pending.filter((p) => seqs.includes(p.seq)) : pending;
+    const now = Date.now();
+    for (const p of acking) {
+      this.sql.exec("INSERT OR IGNORE INTO directive_acks (seq, agent, note, acked_at) VALUES (?, ?, ?, ?)", p.seq, actor.id, note ?? null, now);
+      const sender = this.sql.exec("SELECT actor FROM events WHERE seq = ?", p.seq).one().actor as string | null;
+      this.emit("directive.acked", { actor: actor.id, to: sender, data: { directive: p.seq, body: p.body, note: note ?? null } });
+    }
+    return { acked: acking.map((p) => p.seq), pending: this.pendingDirectives(actor.id) };
+  }
+
+  /** Who a directive went to and who has acknowledged it. */
+  private directiveAcks(seq: number) {
+    const acks = new Map(this.sql.exec("SELECT agent, note, acked_at FROM directive_acks WHERE seq = ?", seq).toArray().map((r) => [r.agent as string, r]));
+    return this.directiveTargets(seq).map((id) => {
+      const k = acks.get(id);
+      return { agent: id, name: this.agentName(id), acked: !!k, note: (k?.note as string | null) ?? null, at: (k?.acked_at as number | null) ?? null };
+    });
+  }
+
+  /** Busy agents only poll for what they expect, so every response carries their unacknowledged directives until they ack. */
+  private actors = new WeakMap<Request, string>();
+  private async withDirectives(req: Request, res: Response): Promise<Response> {
+    if (!this.sql.exec("SELECT 1 FROM events WHERE type = 'directive' AND ts > ? LIMIT 1", Date.now() - DIRECTIVE_TTL).toArray().length) return res;
+    const id = this.actors.get(req) ?? await this.peekAgent(req);
+    if (!id) return res;
+    const pending = this.pendingDirectives(id);
+    if (!pending.length) return res;
+    const out = new Response(res.body, res);
+    out.headers.set(DIRECTIVES_HEADER, encodeURIComponent(JSON.stringify(pending.slice(-5).map((p) => ({ seq: p.seq, from: p.from, body: p.body.slice(0, 400) })))));
+    return out;
+  }
+
+  /** The agent behind a request's key, without signing it in (reads skip authentication). */
+  private async peekAgent(req: Request): Promise<string | null> {
+    const key = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
+    if (!key) return null;
+    const row = this.sql.exec("SELECT id, name, role FROM agents WHERE key_hash = ?", await sha256(key)).toArray()[0];
+    if (!row || row.role === "human") return null;
+    const as = req.headers.get(AGENT_HEADER)?.trim();
+    if (!as || as.toLowerCase() === (row.name as string).toLowerCase()) return row.id as string;
+    return (this.sql.exec("SELECT id FROM agents WHERE via = ? AND lower(name) = lower(?)", row.id, as).toArray()[0]?.id as string | undefined) ?? null;
   }
 
   private pause(actor: Agent, agentId: string, reason?: string) {
@@ -2884,6 +2970,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
       } else if (t.status !== "open" && age > 10 * 60_000 && !t.reviewers.some((r) => r.status === "reviewing")) {
         items.push({ ...base, reason: `review requested from ${t.reviewers.map((r) => r.name).join(", ")}, no answer` });
       }
+    }
+    // Directives agents haven't acknowledged: shown with who hasn't, once those agents have had time to see them.
+    const byId = new Map(agents.map((a) => [a.id, a]));
+    for (const e of this.sql.exec("SELECT seq, ts, actor, data FROM events WHERE type = 'directive' AND ts > ? AND ts < ? ORDER BY seq", now - 24 * 3600_000, now - DIRECTIVE_ACK_MS).toArray()) {
+      const acked = new Set(this.sql.exec("SELECT agent FROM directive_acks WHERE seq = ?", e.seq).toArray().map((r) => r.agent as string));
+      // Only agents around to read it: still present, or seen since it went out.
+      const missing = this.directiveTargets(e.seq as number).filter((id) => !acked.has(id) && byId.get(id)
+        && (now - byId.get(id)!.lastSeen < PRESENT_MS || byId.get(id)!.lastSeen > (e.ts as number)));
+      if (!missing.length) continue;
+      const d = JSON.parse(e.data as string);
+      items.push({ kind: "stuck", reason: "directive not acknowledged", detail: `“${d.body}”`, directive: e.seq, by: e.actor, agents: missing, since: e.ts });
     }
     for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
@@ -3786,7 +3883,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const tasks = this.sql.exec("SELECT id, title, status FROM tasks WHERE assignee = ? AND status NOT IN ('merged','abandoned')", actor.id).toArray();
     const changes = this.sql.exec("SELECT id, task_id, title, status FROM changes WHERE agent_id = ? AND status NOT IN ('merged','abandoned') ORDER BY id DESC LIMIT 20", actor.id).toArray();
     const submitted = new Set(changes.map((c) => c.task_id));
+    const directives = this.pendingDirectives(actor.id);
     const todo = [
+      // Directives first: people's instructions come before the agent's own plan.
+      ...directives.map((d) => `Directive #${d.seq} from ${d.from}${d.toYouAlone ? " to you" : " to all agents"}: "${d.body}". Follow it over your own plan, then ack_directive (seq ${d.seq})`),
       ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
       ...changes.filter((c) => ["conflict", "changes_requested", "checks_failed"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
       ...changes.map((c) => ({ c, n: this.openBlockingThreads(c.id as number) })).filter((x) => x.n).map(({ c, n }) => `Your change #${c.id} has ${n} open review thread${n === 1 ? "" : "s"}: fix each and resolve_thread it, or reply_thread if you disagree (get_change lists them)`),
@@ -3798,7 +3898,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const untaken = reviewTasks.filter((t) => t.status === "open");
     if (untaken.length && actor.role !== "human") todo.push(`${untaken.length} review task${untaken.length === 1 ? "" : "s"} nobody has taken (${untaken.slice(0, 3).map((t) => `#${t.change}`).join(", ")}${untaken.length > 3 ? ", …" : ""}): take_review one, then get_change and review_change`);
     return {
-      agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, reviewTasks, tasks, changes,
+      agent: actor, mainFrozen: this.meta("frozen"), todo, directives, reviewRequests, reviewTasks, tasks, changes,
       openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open' AND assignee IS NULL").one().n,
       // How many questions for people this agent has open, against the project's limit.
       questions: { open: this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open' AND created_by = ?", actor.id).one().n, ...this.questionRules },

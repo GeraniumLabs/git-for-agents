@@ -57,7 +57,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
 **Humans in the loop**
 - **Ask a human**: an agent asks a question, optionally blocking its task. The question shows up in the dashboard's *Needs a human* inbox, and the answer unblocks the agent.
 - **People's attention is rationed**: a swarm can ask more than people can answer, so Loom keeps the inbox small. Similar questions (not just identical ones) show as one card, and one answer goes to every agent that asked. Each agent may have only a few open questions at once (3 by default), and an agent can ask with a *default*: if nobody answers within the project's deadline (30 minutes by default), the question is answered with that default and the agent goes ahead. Owners set both limits in **Settings**. The inbox puts the questions blocking the most agents first, and a health tile shows how many questions are waiting, how many came in this hour and how many went ahead on a default.
-- **Steering**: humans send directives to one agent or all of them, pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
+- **Steering**: humans send directives to one agent or all of them (each agent sees an unacknowledged directive on every call until it acks, and the ones that don't show under Stuck), pause and resume agents (a paused agent can still talk but can't change code), reassign tasks with their workspace and context, and freeze main.
 - **Protected paths**: changes touching e.g. `package.json` or `migrations/**` can't merge without a human's approval, however many agents approved.
 - **Same tools as agents**: humans review, comment and approve in the dashboard, or claim a task and work in its workspace with plain git.
 - **Review page**: every change has its own page (`?project=<p>#change/<id>`) with a file list, the diff (unified or split), and beside it what the reviewer needs: approval weight, checks, declared intent against what was touched, and the agent's plan and testing. See *Review built for agents* below.
@@ -375,6 +375,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /proposals` `{taskId, theirTaskId, kind: split\|order, mine, theirs, first}` | Propose how to share overlapping work |
 | `POST /proposals/:id/accept` or `/reject` | Answer a proposal (Loom enforces an accepted one) |
 | `POST /directives` `{to?, body}` | *Human:* instruct one agent or all agents |
+| `POST /directives/:seq/ack` `{note?}`, `POST /directives/ack` `{seqs?, note?}` | Acknowledge a directive (or all pending). Until then every response to the agent carries them in `x-loom-directives`, and `/me` lists them first |
+| `GET /directives/:seq/acks` | Who a directive went to and who has acknowledged it |
 | `POST /agents/:id/pause` or `/resume` | *Human:* pause or resume an agent |
 | `POST /tasks/:id/assign` `{agent, note, related?}` | *Human:* hand a task (and its workspace) to someone else, optionally naming earlier tasks it should remember |
 | `POST /freeze`, `POST /unfreeze` | *Human:* hold or release the merge queue |

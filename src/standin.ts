@@ -47,7 +47,7 @@ export function itemKey(i: any): string {
     case "approval":
     case "brief": return `${i.kind}:${i.change}`;
     case "task": return `task:${i.task}:${i.person}`;
-    default: return `${i.kind}:${i.change ?? i.task ?? i.thread ?? ""}:${String(i.reason ?? "").replace(/ from .*/, "")}`;
+    default: return `${i.kind}:${i.change ?? i.task ?? i.thread ?? i.directive ?? ""}:${String(i.reason ?? "").replace(/ from .*/, "")}`;
   }
 }
 
@@ -61,7 +61,7 @@ export function itemText(i: any, name: (id: string | null) => string | null): st
     case "brief": return `Change #${i.change} "${i.title}" should have a person look: ${(i.reasons ?? []).join("; ")}`;
     case "review": return `${name(i.agent) ?? "An agent"} asked ${name(i.reviewer) ?? "a person"} to review #${i.change} "${i.title}"`;
     case "task": return `${name(i.by) ?? "Someone"} gave ${name(i.person) ?? "a person"} task #${i.task} "${i.title}"`;
-    default: return `Stuck: ${i.reason}${i.detail ? ` (${i.detail})` : ""}`;
+    default: return `Stuck: ${i.reason}${i.detail ? ` (${i.detail})` : ""}${i.agents?.length ? `; waiting on ${asker(i.agents)}` : ""}`;
   }
 }
 
