@@ -432,6 +432,35 @@ test("a project created in the EU says so, and its name can't be reused elsewher
   assert.equal(await admin.read("eu.txt"), "bonjour\n");
 });
 
+test("agents attach files to a change; they show on the change and task, and stay private in a private project", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-attach");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "attachments", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Restyle", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// v1\n" }, "v1");
+  const ch = await ada.submit(t.id, t.title, "Restyle", {});
+  const base = `${url}/api/projects/${name}`;
+  const bytes = new Uint8Array([137, 80, 78, 71, 1, 2, 3]);
+  const shot = await (await fetch(`${base}/attachments?name=after.png&change=${ch.id}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "image/png" }, body: bytes })).json();
+  assert.equal(shot.kind, "image");
+  const log = await ada.req("POST", "/attachments", { name: "test.log", text: "ok\n", task: t.id });
+  assert.equal(log.task, t.id);
+  const page = await fetch(`${base}/attachments/${shot.id}/raw`);
+  assert.equal(page.headers.get("content-type"), "image/png");
+  assert.deepEqual(new Uint8Array(await page.arrayBuffer()), bytes);
+  assert.deepEqual((await ada.change(ch.id)).attachments.map((a: any) => a.name), ["after.png"]);
+  assert.deepEqual((await (await fetch(`${base}/tasks/${t.id}`)).json()).attachments.map((a: any) => a.name), ["test.log", "after.png"]);
+  const html = await ada.req("POST", "/attachments", { name: "report.html", text: "<script>alert(1)</script>" });
+  assert.match((await fetch(`${base}/attachments/${html.id}/raw`)).headers.get("content-disposition")!, /^attachment/);
+  await admin.req("POST", "/settings", { visibility: "private" });
+  assert.equal((await fetch(`${base}/attachments/${shot.id}/raw`)).status, 404);
+  assert.equal((await fetch(`${base}/attachments/${shot.id}/raw?key=${ada.key}`)).status, 200);
+});
+
 test("a directive reaches busy agents on every call until they acknowledge it, and people see who hasn't", { skip: !url, timeout: 120_000 }, async () => {
   const { Loom } = await import("../demo/client.mjs");
   const name = project("e2e-directive");

@@ -498,5 +498,22 @@ table.dir.tasks .mono { font-size: 11.5px; }
 @media (max-width: 900px) { .task-page { grid-template-columns: 1fr; } }
 table.dir.tasks td:last-child, table.dir.tasks td:nth-child(2) { white-space: nowrap; }
 .card.fresh { border-color: var(--accent, #e8772e); }
+
+/* attachments: screenshots, builds, logs and documents agents posted */
+.attachments { display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 10px; margin: 8px 0; }
+#attachments > .attachments { padding: 12px 14px; margin: 0; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); }
+#attachments .att img, #attachments .att video { height: 90px; }
+#attachments .att-icon { height: 44px; }
+.att { margin: 0; border: 1px solid var(--line); border-radius: 8px; overflow: hidden; background: var(--panel); display: flex; flex-direction: column; min-width: 0; }
+.att img, .att video { display: block; width: 100%; height: 130px; object-fit: cover; background: var(--head); }
+.att.image img { object-fit: contain; }
+.att audio { width: 100%; margin: 8px 0 0; }
+.att-icon { display: flex; align-items: center; justify-content: center; height: 64px; background: var(--head); color: var(--muted); font-weight: 600; font-size: 14px; text-decoration: none; }
+.att figcaption { padding: 6px 8px; font-size: 12px; min-width: 0; }
+.att figcaption > div:not(.meta) { margin-top: 2px; }
+.att-name { display: block; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+[data-unattach] { cursor: pointer; }
+.att-name { color: inherit; text-decoration: none; }
+.att-name:hover { text-decoration: underline; }
 .key-section { margin: 22px 0 6px; padding: 4px 14px 12px; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
 #detail-body .key-section h2 { border-top: 0; padding-top: 0; margin-top: 10px; }

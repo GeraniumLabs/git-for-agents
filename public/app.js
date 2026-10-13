@@ -247,6 +247,7 @@ function render() {
   renderAreas();
   renderDecisions();
   renderNotes();
+  renderAttachments();
   renderFeed();
 }
 
@@ -436,6 +437,39 @@ function renderNotes() {
     || `<li class="empty">Agents leave notes (remember, or notes in a change's context) about what they learned. The next agent on those files gets them.</li>`;
   wire($("#notes"));
   for (const b of document.querySelectorAll("[data-note-retire]")) b.onclick = () => act("POST", `/notes/${b.dataset.noteRetire}/retire`, {});
+}
+
+// ── attachments: screenshots, builds, logs and documents agents posted ─
+const bytes = (n) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
+const attUrl = (a, download = false) => `${a.url}?${download ? "download=1" : ""}${keyQuery()}`;
+const ATT_ICON = { video: "▶", audio: "♪", pdf: "PDF", text: "TXT", file: "⬇" };
+/** A gallery of attachments: images and video inline, everything else as a file to open or download. */
+function attachmentsHtml(list, { where = true } = {}) {
+  if (!list?.length) return "";
+  const canRemove = (a) => me && (isHuman() || me.id === a.agent);
+  const place = (a) => !where ? "" : a.change ? ` · <a data-change="${a.change}">#${a.change}</a>` : a.task ? ` · <a data-task="${a.task}">task #${a.task}</a>` : " · project";
+  return `<div class="attachments">${list.map((a) => `<figure class="att ${a.kind}">
+      ${a.kind === "image" ? `<a href="${attUrl(a)}" target="_blank" rel="noopener" title="Open full size"><img src="${attUrl(a)}" alt="${esc(a.caption || a.name)}" loading="lazy"></a>`
+        : a.kind === "video" ? `<video src="${attUrl(a)}" controls preload="metadata"></video>`
+        : a.kind === "audio" ? `<audio src="${attUrl(a)}" controls preload="none"></audio>`
+        : `<a class="att-icon" href="${attUrl(a, a.kind === "file")}" ${a.kind === "file" ? "download" : `target="_blank" rel="noopener"`}>${ATT_ICON[a.kind]}</a>`}
+      <figcaption><a class="att-name" href="${attUrl(a, true)}" download title="Download ${esc(a.name)}">${esc(a.name)}</a>${a.caption ? `<div>${esc(a.caption)}</div>` : ""}
+        <div class="meta">${who(a.agent)} · ${bytes(a.size)} · ${ago(a.createdAt)} ago${place(a)}${canRemove(a) ? ` · <a data-unattach="${a.id}" data-name="${esc(a.name)}">remove</a>` : ""}</div></figcaption>
+    </figure>`).join("")}</div>`;
+}
+function wireAttachments(root, after) {
+  for (const x of root.querySelectorAll("[data-unattach]")) x.onclick = async () => {
+    if (!(await ask({ title: `Remove ${x.dataset.name}?`, body: "It's deleted for everyone. The history keeps a line saying it was posted and removed.", ok: "Remove", danger: true }))) return;
+    try { await act("DELETE", `/attachments/${x.dataset.unattach}`); } catch { return; }
+    after?.();
+  };
+}
+function renderAttachments() {
+  const list = state.attachments ?? [];
+  $("#attachments-count").textContent = state.attachmentCount ? `${state.attachmentCount} posted` : "";
+  $("#attachments").innerHTML = attachmentsHtml(list) || `<p class="empty">Agents post screenshots, builds, logs and documents with the attach tool, on a change, a task or the project.</p>`;
+  wire($("#attachments"));
+  wireAttachments($("#attachments"));
 }
 
 // ── decisions ───────────────────────────────────────────────────────────
@@ -1158,6 +1192,8 @@ function describe(e) {
     case "review.rerouted": return ["review", `Review of #${e.change_id} rerouted: ${esc(d.why)}${d.toName ? `; asked ${esc(d.toName)}` : "; nobody else knows this code, so it waits for the reviewer pool"}`];
     case "review.requested": return ["review", `Review requested on #${e.change_id}`];
     case "review.submitted": return ["review", `${who} ${d.verdict === "approve" ? "approved" : d.verdict === "request_changes" ? "requested changes on" : "commented on"} #${e.change_id}${d.body ? `: “${esc(d.body.slice(0, 140))}”` : ""}`];
+    case "attachment.added": return ["", `${who} attached <a href="/api/projects/${project}/attachments/${d.id}/raw?${keyQuery()}" target="_blank" rel="noopener">${esc(d.name)}</a>${e.change_id ? ` to #${e.change_id}` : e.task_id ? ` to task #${e.task_id}` : ""}${d.caption ? `: ${esc(d.caption)}` : ""}`];
+    case "attachment.removed": return ["", `${who} removed the attachment ${esc(d.name)}`];
     case "change.queued": return ["", `#${e.change_id} entered the merge queue (position ${d.position})`];
     case "merge.started": return ["", `Merging #${e.change_id}…`];
     case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})`];
@@ -1347,6 +1383,7 @@ function drawReview() {
       <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
+      ${attachmentsHtml(c.attachments, { where: false })}
       <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
       <div id="clone-box"></div>
     </div>
@@ -1381,6 +1418,7 @@ function drawReview() {
       <aside class="rv-why">${whyPanel(c, rv)}</aside>
     </div>`;
   wireReview(canReview);
+  wireAttachments($("#review"), () => loadReview(review.id));
 }
 
 /** Threads on files or lines this view doesn't show. */
@@ -1639,6 +1677,7 @@ async function loadTask(id) {
       <div class="task-main">
         ${panel("Change", v.changes.map((c) => `<div class="qrow"><a data-change="${c.id}">#${c.id}</a> <span class="grow ellipsis">${esc(c.title)}</span>${who(c.agent_id)} ${taskStatus(c.status)}</div>
           <div class="meta mono files">${c.files.map(esc).join("  ")}</div>`).join("") || `<p class="empty">${t.assignee ? "Nothing submitted yet." : "Nothing submitted. Someone has to claim it first."}</p>`)}
+        ${v.attachments?.length ? panel("Attachments", attachmentsHtml(v.attachments, { where: false }), `<small>${v.attachments.length}</small>`) : ""}
         ${panel("Intent", v.intents.map((i) => `<div class="qrow">${who(i.agent_id)} <span class="mono grow">${i.paths.map(esc).join(", ")}</span><span class="meta">${i.released_at === null ? "declared" : "released"} ${ago(i.created_at)} ago</span></div>${i.description ? `<div class="meta">${esc(i.description)}</div>` : ""}`).join("") || `<p class="empty">No intent declared yet.</p>`, live.length ? `<small>${live.length} live</small>` : "")}
         ${v.threads.length ? panel("Conversations", v.threads.map((th) => `<div class="card inbox"><div class="kicker">${esc(th.kind)} · ${esc(th.status)}</div>${th.title ? `<div class="q">${esc(th.title)}</div>` : ""}${(th.posts ?? []).slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("")}</div>`).join("")) : ""}
         ${panel("History", `<ol class="feed">${v.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("") || `<p class="empty">Nothing yet.</p>`}</ol>`)}
@@ -1650,6 +1689,7 @@ async function loadTask(id) {
       </aside>
     </div>`;
   wire($("#review"));
+  wireAttachments($("#review"), () => loadTask(t.id));
   if ($("#task-assign")) $("#task-assign").onclick = async () => {
     const to = await ask({ title: `Who should take task #${t.id}?`, body: "An agent sees it in its todo. A person sees it under Needs a person, and so does their stand-in. Leave it blank to put it back on the board for any agent.", ok: "Assign", input: { label: "Agent or person", placeholder: "Name", rows: 1 } });
     if (to === null) return;
@@ -1805,6 +1845,7 @@ const HELP = {
   queue: "Approved changes wait here and land on main one batch at a time. If the project has checks, they run on main with the change before main moves, and a failure goes back to its author.",
   areas: "Folders where agents are working now: agents with intents or changes there, changes in flight, and what landed or conflicted in the last hour. Many agents in one folder is where collisions come from. Click a folder to search it.",
   decisions: "What people decided: answers to agents' questions, directives, rulings, requests for changes and rules recorded here. Each is tied to the files it covers, and agents get it when they declare an intent on those files. Retire one that no longer holds.",
+  attachments: "Files agents posted: screenshots of what they changed, builds, test logs, documents. Each belongs to a change, a task or the project. Images and video play here; other files download. In a private project only its members can open them.",
   notes: "What agents learned and left for the next agent on the same files, through remember or the notes in a change's context. Agents rate the notes they relied on.",
   activity: "Everything happening, live. Notable shows what a person would want to see; Everything adds routine agent traffic. Filter by an agent, a file or #change.",
 };
