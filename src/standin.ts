@@ -46,6 +46,7 @@ export function itemKey(i: any): string {
     case "review": return `review:${i.change}:${i.reviewer}`;
     case "approval":
     case "brief": return `${i.kind}:${i.change}`;
+    case "task": return `task:${i.task}:${i.person}`;
     default: return `${i.kind}:${i.change ?? i.task ?? i.thread ?? ""}:${String(i.reason ?? "").replace(/ from .*/, "")}`;
   }
 }
@@ -59,6 +60,7 @@ export function itemText(i: any, name: (id: string | null) => string | null): st
     case "approval": return `Change #${i.change} "${i.title}" touches protected files and needs a person's approval`;
     case "brief": return `Change #${i.change} "${i.title}" should have a person look: ${(i.reasons ?? []).join("; ")}`;
     case "review": return `${name(i.agent) ?? "An agent"} asked ${name(i.reviewer) ?? "a person"} to review #${i.change} "${i.title}"`;
+    case "task": return `${name(i.by) ?? "Someone"} gave ${name(i.person) ?? "a person"} task #${i.task} "${i.title}"`;
     default: return `Stuck: ${i.reason}${i.detail ? ` (${i.detail})` : ""}`;
   }
 }
@@ -129,6 +131,7 @@ Use the channels you already have for ${who ?? "them"} (Slack, email, a text). L
 
 - **Questions** (\`question\`) first, most agents blocked first. Quote the question, who asks, and the default with its deadline: if nobody answers by then, the agents go ahead with it.
 - **Disputes** and **changes that need a person** (\`approval\`, \`brief\`, \`review\`) next, with the link.
+- **Tasks** (\`task\`) someone gave ${who ?? "them"}: what it is, who filed it, and the link. Skip ones whose \`detail.person\` is someone else. The item goes away once they take the task.
 - **Stuck** work last. Batch these into one message; they rarely need the person in the next hour.
 - Tell them each item once (remember the keys you sent). Don't repeat an item because the feed shows it again.
 - Respect their quiet hours and how they asked to be reached. If they asked for a digest, send a digest.
@@ -142,7 +145,7 @@ Act only when your key has the scope **and** the answer is clearly theirs: they 
 - **answer**: \`POST ${api}/questions/answer {"threads": [<ids from the item>], "body": "<their answer>"}\` answers every agent in the group. \`{"threads": [...], "goAhead": true}\` lets each agent go ahead with its own default.
 - **review**: \`GET ${api}/changes/<id>\` (read the \`brief\`), then \`POST ${api}/changes/<id>/reviews {"verdict": "approve" | "request_changes" | "comment", "body": "..."}\`.
 - **decide**: \`POST ${api}/disputes/<thread>/rule {"for": "<agent id>", "note": "..."}\`; \`POST ${api}/decisions {"question", "decision", "paths"}\` records a rule agents will follow.
-- **steer**: \`POST ${api}/directives {"to": "<agent>", "body": "..."}\`, \`POST ${api}/agents/<id>/pause {"reason"}\`.
+- **steer**: \`POST ${api}/directives {"to": "<agent>", "body": "..."}\`, \`POST ${api}/agents/<id>/pause {"reason"}\`, \`POST ${api}/tasks {"title", "description", "assignee": "<agent or person, or leave out for anyone>"}\` files a task, \`POST ${api}/tasks/<id>/assign {"agent"}\` hands one over.
 - **freeze**: \`POST ${api}/freeze {"reason"}\` stops main moving. Use it only when they say so, or when they gave you a rule for it.
 
 A 403 means your key doesn't have that right. Tell them and send the link; don't look for another way in.

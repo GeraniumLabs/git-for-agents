@@ -31,7 +31,7 @@ const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "disp
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
-const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made"]);
+const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made", "task.assigned"]);
 /** Most queued changes merged together in one pass of the queue. */
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const CHATTER_LIMIT = 20;
@@ -815,11 +815,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── tasks and workspaces ─────────────────────────────────────────────────
 
-  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[]; parent?: number; related?: number[]; attempts?: number }) {
+  private createTask(actor: Agent, body: { title: string; description?: string; dependsOn?: number[]; parent?: number; related?: number[]; attempts?: number; assignee?: string | null }) {
     if (!body.title) throw new HttpError(400, "title is required");
     if (body.parent) this.task(body.parent);
     const attempts = Math.floor(Number(body.attempts ?? 1));
     if (attempts > 5) throw new HttpError(400, "attempts is between 2 and 5");
+    // Filing for someone is steering: people choose who works on what; agents file open tasks.
+    const assignee = body.assignee ? this.memberOrAgent(body.assignee) : null;
+    if (assignee && actor.role !== "human") throw new HttpError(403, "only people assign tasks; leave assignee out and the task goes on the board for any agent");
+    if (assignee && attempts > 1) throw new HttpError(400, "a contest is open to several agents; it can't be assigned to one");
     const now = Date.now();
     const row = this.sql
       .exec("INSERT INTO tasks (title, description, depends_on, parent, related, created_by, created_at, updated_at, attempts, contest_status, status) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
@@ -836,7 +840,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
         JSON.stringify(body.dependsOn ?? []), id, JSON.stringify(body.related ?? []), actor.id, now, now).one();
       this.emit("task.created", { actor: actor.id, task: child.id as number, data: { title: `${body.title} (attempt ${k} of ${attempts})`, parent: id, attempt: true } });
     }
+    if (assignee) this.assign(actor, id, assignee);
     return { ...this.task(id), attemptTasks: attempts > 1 ? this.contestAttempts(id).map((t) => t.id) : undefined };
+  }
+
+  /** An agent's or person's id from an id or name; 400 if there is nobody by that name. */
+  private memberOrAgent(idOrName: string): string {
+    const id = this.resolveAgent(String(idOrName).trim());
+    const row = this.sql.exec("SELECT paused FROM agents WHERE id = ?", id).toArray()[0];
+    if (!row || id === DELEGATE_ID || row.paused === "removed from the project") throw new HttpError(400, `nobody called "${idOrName}" on this project`);
+    return id;
   }
 
   private async claim(actor: Agent, taskId: number) {
@@ -853,6 +866,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (task.attempt && this.contestAttempts(task.parent).some((t) => t.assignee === actor.id && t.id !== taskId)) throw new HttpError(409, `you already hold an attempt at task ${task.parent}; one attempt per agent`);
     if (task.status === "closed") throw new HttpError(409, `task ${taskId} was closed`);
     if (task.status === "merged") throw new HttpError(409, `task ${taskId} already landed; create a new task for follow-up work`);
+    // A person handed this task to someone in particular; only a person can hand it on.
+    if (task.assignee && task.assignee !== actor.id && task.status === "open") throw new HttpError(409, `task ${taskId} was assigned to ${this.agentName(task.assignee)}; a person can reassign it`);
     if (task.assignee && task.assignee !== actor.id) {
       const holder = this.sql.exec("SELECT last_seen FROM agents WHERE id = ?", task.assignee).toArray()[0];
       const stale = !holder || Date.now() - (holder.last_seen as number) > 10 * 60_000;
@@ -2077,6 +2092,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** Hand a task to a specific agent (or to nobody). The workspace and context go with it. */
   private assign(actor: Agent, taskId: number, agentId: string | null, note?: string, related?: number[]) {
     const task = this.task(taskId);
+    if (agentId) agentId = this.memberOrAgent(agentId);
     if (related?.length) this.sql.exec("UPDATE tasks SET related = ? WHERE id = ?", JSON.stringify([...new Set([...task.related, ...related])]), taskId);
     this.sql.exec("UPDATE tasks SET assignee = ?, status = CASE WHEN ? IS NULL AND status = 'claimed' THEN 'open' ELSE status END, updated_at = ? WHERE id = ?", agentId, agentId, Date.now(), taskId);
     if (task.workspace) this.sql.exec("UPDATE workspaces SET agent_id = ? WHERE name = ?", agentId, task.workspace);
@@ -2462,7 +2478,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const scope = itemScope(i);
     return {
       key, id: shortKey(key), kind: i.kind, text: itemText(i, (id) => this.agentName(id)), since: i.since,
-      url: `${origin}/?project=${this.project}${i.change ? `#change/${i.change}` : ""}`,
+      url: `${origin}/?project=${this.project}${i.change ? `#change/${i.change}` : i.kind === "task" ? `#task/${i.task}` : ""}`,
       youCan: scope ? { scope, allowed: !actor.standin || actor.standin.scopes.includes(scope) } : null,
       detail: i,
     };
@@ -2741,6 +2757,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
                                    WHERE r.status IN ('open','accepted') AND a.role = 'human' AND c.status IN ('review','changes_requested') LIMIT 50`).toArray()) {
       items.push({ kind: "review", change: r.change_id, title: r.title, agent: r.requested_by, reviewer: r.reviewer, reason: r.reason, since: r.created_at });
     }
+    // Tasks handed to a person that they haven't taken yet.
+    for (const t of this.sql.exec(`SELECT t.id, t.title, t.assignee, t.updated_at,
+                                     (SELECT e.actor FROM events e WHERE e.type = 'task.assigned' AND e.task_id = t.id ORDER BY e.seq DESC LIMIT 1) AS assigned_by
+                                   FROM tasks t JOIN agents a ON a.id = t.assignee
+                                   WHERE t.status = 'open' AND a.role = 'human' AND t.assignee != 'admin' ORDER BY t.updated_at LIMIT 50`).toArray()) {
+      items.push({ kind: "task", task: t.id, title: t.title, person: t.assignee, by: t.assigned_by ?? null, since: t.updated_at });
+    }
     // Stuck: nobody asked for a person, but work isn't moving.
     for (const t of open.filter((t) => t.kind === "proposal" && now - t.created_at > 10 * 60_000)) {
       items.push({ kind: "stuck", reason: "proposal unanswered", detail: t.title, agent: t.to_agent, thread: t.id, since: t.created_at });
@@ -2760,7 +2783,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
       items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
     }
-    const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, brief: 2, review: 2, stuck: 3 };
+    const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, brief: 2, review: 2, task: 2, stuck: 3 };
     // Stable sort: questions keep their own order (most blocked first).
     return items.sort((a, b) => rank[a.kind] - rank[b.kind] || (a.kind === "question" ? 0 : a.since - b.since));
   }
@@ -3646,7 +3669,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
       ...changes.filter((c) => ["conflict", "changes_requested", "checks_failed"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
       ...changes.map((c) => ({ c, n: this.openBlockingThreads(c.id as number) })).filter((x) => x.n).map(({ c, n }) => `Your change #${c.id} has ${n} open review thread${n === 1 ? "" : "s"}: fix each and resolve_thread it, or reply_thread if you disagree (get_change lists them)`),
-      ...tasks.filter((t) => !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
+      ...tasks.filter((t) => t.status === "open").map((t) => `Task #${t.id} "${t.title}" was assigned to you: claim_task it to get its workspace, then work on it`),
+      ...tasks.filter((t) => t.status !== "open" && !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
       ...this.contestsToVote(actor).map((c) => `Contest #${c.id} "${c.title}" has ${c.ready} attempts in: compare_attempts, then vote`),
     ];
     const reviewTasks = this.reviewTasks(actor.id);
@@ -3654,7 +3678,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (untaken.length && actor.role !== "human") todo.push(`${untaken.length} review task${untaken.length === 1 ? "" : "s"} nobody has taken (${untaken.slice(0, 3).map((t) => `#${t.change}`).join(", ")}${untaken.length > 3 ? ", …" : ""}): take_review one, then get_change and review_change`);
     return {
       agent: actor, mainFrozen: this.meta("frozen"), todo, reviewRequests, reviewTasks, tasks, changes,
-      openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open'").one().n,
+      openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open' AND assignee IS NULL").one().n,
       // How many questions for people this agent has open, against the project's limit.
       questions: { open: this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open' AND created_by = ?", actor.id).one().n, ...this.questionRules },
       inbox: this.inbox(actor.id),

@@ -45,7 +45,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "create_task",
-    description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Use dependsOn for ordering. Set attempts (2-5) for a contest: that many agents each attempt the task independently, the others compare the attempts and vote, and the best one lands.",
+    description: "Add a task to the project's board. Break big work into tasks other agents can claim in parallel. Found a bug or a gap outside your own task? File it here (what's wrong, how to reproduce it, what done looks like) rather than widening your change; it goes on the board for any agent, and people can hand it to someone. Use dependsOn for ordering. Set attempts (2-5) for a contest: that many agents each attempt the task independently, the others compare the attempts and vote, and the best one lands.",
     inputSchema: obj({ title: str("Short imperative title"), description: str("What done looks like"), attempts: num("For a contest: how many independent attempts (2-5). Leave out for a normal task."), dependsOn: { type: "array", items: { type: "number" } }, parent: num("Parent task, when splitting your task into subtasks"), related: { type: "array", items: { type: "number" }, description: "Earlier tasks whose history the agent taking this one should see" } }, ["title"]),
     run: (a, call) => call("POST", "/tasks", a),
   },
