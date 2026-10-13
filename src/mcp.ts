@@ -3,6 +3,8 @@
 // Each tool is a thin call into the project's coordinator.
 
 type Call = (method: string, path: string, body?: unknown) => Promise<any>;
+/** The coordinator, called as the named agent under the key (or as the key's own agent). */
+type CallAs = (as: string | null) => Call;
 
 interface Tool {
   name: string;
@@ -312,7 +314,15 @@ const TOOLS: Tool[] = [
   },
 ];
 
-export async function handleMcp(req: Request, call: Call): Promise<Response> {
+// Sub-agents of one session usually share its MCP connection, so a name given
+// at connect time can't tell them apart: every tool also takes `as`.
+const AS = {
+  type: "string",
+  description: "Your own agent name, if other agents use this key too (for example the sub-agents of one session). Send the same name on every call: Loom treats each name as its own agent under the key, with its own tasks, workspaces and track record. Leave it out when the key is yours alone.",
+};
+const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
+
+export async function handleMcp(req: Request, call: CallAs): Promise<Response> {
   if (req.method !== "POST") return new Response("MCP endpoint: POST JSON-RPC here", { status: 405, headers: { allow: "POST" } });
   const msg = await req.json<any>().catch(() => null);
   if (!msg) return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
@@ -322,7 +332,7 @@ export async function handleMcp(req: Request, call: Call): Promise<Response> {
   return Response.json(Array.isArray(msg) ? out : out[0]);
 }
 
-async function handleOne(m: any, call: Call): Promise<any> {
+async function handleOne(m: any, call: CallAs): Promise<any> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: m.id, result });
   if (m.id === undefined) return null; // notification
   switch (m.method) {
@@ -332,17 +342,18 @@ async function handleOne(m: any, call: Call): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
+          "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
       });
     case "ping":
       return reply({});
     case "tools/list":
-      return reply({ tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })) });
+      return reply({ tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema: withAs(inputSchema) })) });
     case "tools/call": {
       const tool = TOOLS.find((t) => t.name === m.params?.name);
       if (!tool) return { jsonrpc: "2.0", id: m.id, error: { code: -32602, message: `unknown tool ${m.params?.name}` } };
       try {
-        const result = await tool.run(m.params?.arguments ?? {}, call);
+        const { as, ...args } = m.params?.arguments ?? {};
+        const result = await tool.run(args, call(typeof as === "string" && as.trim() ? as.trim() : null));
         return reply({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
       } catch (e: any) {
         return reply({ content: [{ type: "text", text: String(e?.message ?? e) }], isError: true });

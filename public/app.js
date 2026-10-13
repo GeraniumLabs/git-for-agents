@@ -180,7 +180,7 @@ async function boot() {
     return;
   }
   connect();
-  signIn();
+  signIn().then(showNewJoinCode);
   renderTour(projects, showcase);
 }
 
@@ -497,7 +497,7 @@ async function runSearch() {
   for (const a of r.agents) names[a.id] = a.name;
   const section = (title, rows) => rows ? `<div class="kicker">${title}</div>${rows}` : "";
   $("#search-results").innerHTML =
-    section(`Agents${r.total > r.agents.length ? ` (${r.total}, showing ${r.agents.length})` : ""}`, r.agents.map((a) => `<a class="hit" data-agent="${esc(a.id)}"><span class="dot ${a.state}"></span><b>${esc(a.name)}</b> <span class="meta">${a.state}${a.task ? ` · #${a.task.id} ${esc(a.task.title)}` : ""}</span></a>`).join(""))
+    section(`Agents${r.total > r.agents.length ? ` (${r.total}, showing ${r.agents.length})` : ""}`, r.agents.map((a) => `<a class="hit" data-agent="${esc(a.id)}"><span class="dot ${a.state}"></span><b>${esc(a.name)}</b> <span class="meta">${a.under ? `under ${esc(a.under.name)} · ` : ""}${a.state}${a.task ? ` · #${a.task.id} ${esc(a.task.title)}` : ""}</span></a>`).join(""))
     + section("Tasks", r.tasks.map((t) => `<a class="hit" data-task="${t.id}">#${t.id} ${esc(t.title)} <span class="meta">${t.status}${t.assigneeName ? ` · ${esc(t.assigneeName)}` : ""}</span></a>`).join(""))
     + section("Changes", r.changes.map((c) => `<a class="hit" data-change="${c.id}">#${c.id} ${esc(c.title)} <span class="meta">${c.status} · ${esc(c.agentName)}</span></a>`).join(""))
     || `<p class="empty">Nothing matches “${esc(q)}”.</p>`;
@@ -511,7 +511,7 @@ async function showDirectory(st) {
   for (const a of r.agents) names[a.id] = a.name;
   $("#detail-body").innerHTML = `<h3>${r.total} agent${r.total === 1 ? "" : "s"} ${esc((STATES.find(([k]) => k === st) ?? [, st])[1])}</h3>
     <table class="dir"><thead><tr><th>Agent</th><th>Task</th><th>Last seen</th></tr></thead><tbody>
-    ${r.agents.map((a) => `<tr><td>${who(a.id)}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
+    ${r.agents.map((a) => `<tr><td>${who(a.id)}${a.under ? ` <span class="meta">under ${esc(a.under.name)}</span>` : ""}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
     ${r.total > r.agents.length ? `<p class="meta">Showing ${r.agents.length} of ${r.total}. Search to narrow it down.</p>` : ""}`;
   wire($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
@@ -522,12 +522,14 @@ async function showAgent(id) {
   if (p.error) return toast(p.error);
   const a = p.agent;
   names[a.id] = a.name;
+  if (a.under) names[a.under.id] = a.under.name;
   const ctl = isHuman() && a.role !== "human" ? `<div class="row">
       <button data-op="${a.state === "paused" ? "resume" : "pause"}" class="${a.state === "paused" ? "" : "ghost"}">${a.state === "paused" ? "Resume" : "Pause"}</button>
       <input id="dm-body" placeholder="Directive to ${esc(a.name)} only"><button id="dm-send" class="ghost">Send</button></div>` : "";
   $("#detail-body").innerHTML = `
     <h3><span class="dot ${a.state}"></span> ${esc(a.name)} <span class="role">${a.role}</span> <span class="pill">${a.state}</span></h3>
-    <p class="meta">Last active ${ago(a.lastSeen)} ago${a.task ? ` · working on #${a.task.id} ${esc(a.task.title)} (${a.task.status})` : ""}</p>
+    <p class="meta">Last active ${ago(a.lastSeen)} ago${a.task ? ` · working on #${a.task.id} ${esc(a.task.title)} (${a.task.status})` : ""}${a.under ? ` · works under ${who(a.under.id)}'s key` : ""}</p>
+    ${p.underKey?.length ? `<h2>Agents under this key <small>${p.underKey.length}</small></h2>${p.underKey.map((u) => { names[u.id] = u.name; return `<div class="qrow"><span class="dot ${u.state}"></span>${who(u.id)} <span class="grow meta ellipsis">${u.state}${u.task ? ` · #${u.task.id} ${esc(u.task.title)}` : ""}</span></div>`; }).join("")}` : ""}
     ${p.trust ? `<div class="card"><div class="qrow"><b class="grow">Track record</b><span class="pill" title="what this agent's approvals and contest votes count for">${p.trust.weight}× vote</span></div><div class="meta">${esc(p.trust.summary)}</div></div>` : ""}
     ${ctl}
     <div id="agent-grid" class="card contrib-card"></div>
@@ -708,24 +710,40 @@ async function showCode(target = {}) {
 $("#code-open").onclick = () => showCode();
 
 // ── connect an agent: the Loom skill, ready to copy ──────────────────────
+/** Right after creating a project: the join code made with it, shown once. */
+function showNewJoinCode() {
+  let fresh = null;
+  try { fresh = JSON.parse(sessionStorage.getItem("loom-new-join") ?? "null"); sessionStorage.removeItem("loom-new-join"); } catch {}
+  if (fresh?.project === project && fresh.code) showSkill(fresh.code);
+}
+// Whether a skill without a join code was copied, so a code made afterwards says to copy again.
+let copiedPlainSkill = false;
 async function showSkill(joinCode) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
   const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
+  const owner = isOwner();
+  const codeRows = codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("");
+  // Owners go in order: make a join code, then copy the skill that carries it.
+  const step1 = joinCode
+    ? `<h2>1. Join code ready</h2><div class="card fresh"><b>Join code #${joinCode.id} is in the skill below</b> <span class="role">${esc(joinCode.role)}</span>
+        ${copiedPlainSkill ? `<p><b>Copy the skill again.</b> The one you copied earlier has no join code, so agents given it can't register.</p>` : ""}
+        <p class="meta">Any agent you give this skill registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. Sub-agents use that key with their own names. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
+    : `<h2>1. Let agents register themselves</h2>
+      <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
+      <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
-    ${joinCode ? `<div class="card"><b>This skill carries a join code</b> <span class="role">${esc(joinCode.role)}</span><p class="meta">Any agent you give it registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
-      : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${isOwner() ? "To let agents register themselves, create a join code: the skill then carries it, and each agent trades it for its own key." : "Each agent needs its own key or a join code from an owner."}</p>`}
-    <div class="row code-row"><button id="skill-copy">Copy skill</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
+    ${owner ? step1 : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${joinCode ? "It carries a join code: each agent trades it for its own key once." : "Each agent needs its own key or a join code from an owner."}</p>`}
+    ${owner ? `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "It has no join code yet: agents given it need a key you create for each one (below)."}</p>` : ""}
+    <div class="row code-row"><button id="skill-copy" class="${joinCode || !owner ? "" : "ghost"}">${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
-    ${isOwner() ? `<h2>Let agents register themselves</h2>
-    <p class="meta">Best for a swarm. One join code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code. Limit how many agents may use it and for how long, and revoke it any time.</p>
-    <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>
-    ${codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("")}` : ""}
-    <h2>Create a key</h2>
-    ${isOwner() ? `<p class="meta">For a single agent you set up yourself. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
+    ${owner && codes.length ? `<h2>Join codes</h2>${codeRows}${joinCode ? `<div class="row"><button class="ghost mini" id="jc-another">Create another join code</button></div>` : ""}` : ""}
+    <details class="mk-key"><summary><h2>Create a key for one agent</h2></summary>
+    ${isOwner() ? `<p class="meta">For a single agent you set up yourself. Prefer a join code for anything that starts sub-agents or a swarm. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
     <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
     <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
+    </details>
     <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
   if ($("#mk-go")) $("#mk-go").onclick = async () => {
@@ -740,7 +758,10 @@ async function showSkill(joinCode) {
   if ($("#jc-go")) $("#jc-go").onclick = async () => {
     try {
       const code = await act("POST", "/join-codes", { role: $("#jc-role").value, maxUses: Number($("#jc-max").value), expiresInHours: Number($("#jc-hours").value) });
-      showSkill(code);
+      await showSkill(code);
+      $("#detail-body").scrollTop = 0;
+      $("#detail-body").closest("dialog")?.scrollTo?.(0, 0);
+      toast(copiedPlainSkill ? "Join code created. Copy the skill again: it now carries the code" : "Join code created and added to the skill");
     } catch {}
   };
   for (const b of $("#detail-body").querySelectorAll("[data-jc-revoke]")) b.onclick = async () => {
@@ -748,8 +769,10 @@ async function showSkill(joinCode) {
     try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
     showSkill(joinCode);
   };
-  $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => toast("Skill copied"));
-  $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => toast("Command copied"));
+  const copied = (what) => { copiedPlainSkill = !joinCode; toast(joinCode ? `${what} copied, with join code #${joinCode.id}` : `${what} copied${owner ? " (no join code in it)" : ""}`); };
+  $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => copied("Skill"));
+  $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => copied("Install command"));
+  if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#skill-open").onclick = () => showSkill();
@@ -757,7 +780,7 @@ $("#skill-open").onclick = () => showSkill();
 // ── new projects ────────────────────────────────────────────────────────
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
   <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
-  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}.</p>
+  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Loom shows them as separate agents under ${esc(k.name)}.</p>
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
@@ -779,6 +802,9 @@ function showNewProject() {
     const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
+    // Start with a join code, so the agents you connect each register as themselves.
+    const code = await fetch(`/api/projects/${name}/join-codes`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "builder" }) }).then((r) => r.ok ? r.json() : null).catch(() => null);
+    try { if (code) sessionStorage.setItem("loom-new-join", JSON.stringify({ project: name, code })); } catch {}
     location.search = `?project=${name}`;
   };
   if (!$("#detail").open) $("#detail").showModal();
@@ -1038,7 +1064,7 @@ function describe(e) {
   const to = e.to_agent ? `<a class="who" data-agent="${esc(e.to_agent)}" style="color:${color(e.to_agent)}">${esc(name(e.to_agent))}</a>` : "";
   switch (e.type) {
     case "project.created": return ["", `Project created, main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>`];
-    case "agent.joined": return ["", `${who} joined as ${d.role}`];
+    case "agent.joined": return ["", `${who} joined as ${d.role}${d.via ? ` under ${esc(name(d.via))}'s key` : ""}`];
     case "task.created": return ["", `${who} created task #${e.task_id} “${esc(d.title)}”`];
     case "task.claimed": return ["", `${who} ${d.resumed ? "took over" : "claimed"} task #${e.task_id} in workspace <span class="mono">${esc(d.workspace)}</span>`];
     case "task.reassigned": return ["stale", `Task #${e.task_id} reassigned: ${esc(d.reason)}`];

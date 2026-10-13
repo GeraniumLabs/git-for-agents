@@ -4,6 +4,7 @@ import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
 import { projectOfWorkspace, pushOf } from "./events";
 
+import { AGENT_HEADER } from "./coordinator";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
@@ -107,10 +108,13 @@ export default {
     if (m) {
       const project = m[1];
       const auth = req.headers.get("authorization") ?? "";
-      return handleMcp(req, async (method, p, body) => {
+      // Which agent under the key: per tool call (as), else per connection (header or ?as=).
+      const named = req.headers.get(AGENT_HEADER) ?? url.searchParams.get("as");
+      return handleMcp(req, (as) => async (method, p, body) => {
+        const who = as ?? named;
         const res = await (await coordinator(env, project)).fetch(`https://do${p}`, {
           method,
-          headers: { authorization: auth, "content-type": "application/json" },
+          headers: { authorization: auth, "content-type": "application/json", ...(who ? { [AGENT_HEADER]: who } : {}) },
           body: body === undefined ? undefined : JSON.stringify(body),
         });
         const data = await res.json<any>();

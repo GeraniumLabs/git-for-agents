@@ -24,6 +24,10 @@ import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secr
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
+/** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
+export const AGENT_HEADER = "x-loom-agent";
+/** How many named agents one key may carry. */
+const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
 /** Project-wide events every agent hears about, whatever it is working on. */
@@ -62,6 +66,8 @@ export interface Agent {
   owner?: boolean;
   /** Set when a person's own agent is acting for them with a stand-in key. */
   standin?: { id: string; name: string; scopes: Scope[] };
+  /** Set when this agent works under another agent's key, by its own name. */
+  under?: { id: string; name: string };
 }
 
 export interface LoomEvent {
@@ -136,6 +142,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
       "ALTER TABLE changes ADD COLUMN checks TEXT",
       "ALTER TABLE agents ADD COLUMN joined_via INTEGER",
+      "ALTER TABLE agents ADD COLUMN via TEXT",
       "ALTER TABLE threads ADD COLUMN head TEXT",
       "ALTER TABLE threads ADD COLUMN line_text TEXT",
       "ALTER TABLE threads ADD COLUMN outdated INTEGER DEFAULT 0",
@@ -400,10 +407,35 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     if (await sameSecret(key, this.env.LOOM_ADMIN_TOKEN)) return "admin";
     const hash = await sha256(key);
-    const row = this.sql.exec("SELECT id, name, role, paused, identity, owner FROM agents WHERE key_hash = ?", hash).toArray()[0];
+    const row = this.sql.exec("SELECT id, name, role, paused, identity, owner, joined_via FROM agents WHERE key_hash = ?", hash).toArray()[0];
     if (!row) return this.standinFor(hash);
+    const as = req.headers.get(AGENT_HEADER)?.trim();
+    if (as && row.role !== "human" && as.toLowerCase() !== (row.name as string).toLowerCase()) return this.underKey(row, as);
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
     return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused as string | null) ?? null, identity: (row.identity as string | null) ?? null, owner: !!row.owner };
+  }
+
+  /**
+   * An agent working under another agent's key by its own name, such as one of
+   * the sub-agents a session starts. The key stays the credential; each name is
+   * its own agent, with its own tasks, workspaces and track record, created the
+   * first time the name is used. Pausing the key's agent pauses all of them.
+   */
+  private async underKey(key: Record<string, SqlStorageValue>, name: string): Promise<Agent> {
+    if (name.length > 40) throw new HttpError(400, "an agent name is 40 characters at most");
+    const hash = await sha256(`via_${randomId(20)}`); // never handed out: these agents use the key's own
+    let row = this.sql.exec("SELECT id, name, role, paused FROM agents WHERE via = ? AND lower(name) = lower(?)", key.id, name).toArray()[0];
+    if (!row) {
+      const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE via = ?", key.id).one().n as number;
+      if (n >= MAX_UNDER_KEY) throw new HttpError(429, `${key.name}'s key already carries ${MAX_UNDER_KEY} named agents; reuse a name, or ask an owner for another key`);
+      const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
+      this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen, joined_via, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        id, name, key.role, hash, Date.now(), Date.now(), key.joined_via ?? null, key.id);
+      this.emit("agent.joined", { actor: id, data: { name, role: key.role, by: `${key.name}'s key`, via: key.id } });
+      row = { id, name, role: key.role, paused: null };
+    }
+    this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
+    return { id: row.id as string, name: row.name as string, role: row.role as Role, paused: (row.paused ?? key.paused ?? null) as string | null, identity: null, owner: false, under: { id: key.id as string, name: key.name as string } };
   }
 
   private remote(repo: string, token: string): Remote {
@@ -983,7 +1015,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private workspaceFor(actor: Agent, name: string) {
     const ws = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", name).toArray()[0];
     if (!ws) throw new HttpError(404, `workspace ${name} not found`);
-    if (ws.agent_id !== actor.id && actor.id !== "admin") throw new HttpError(403, `workspace ${ws.name} belongs to ${this.agentName(ws.agent_id as string)}; you are calling as ${actor.name} (check your key)`);
+    if (ws.agent_id !== actor.id && actor.id !== "admin") throw new HttpError(403, `workspace ${ws.name} belongs to ${this.agentName(ws.agent_id as string)}; you are calling as ${actor.name} (check your key, and the agent name you send with it)`);
     return ws as any;
   }
 
@@ -2665,21 +2697,23 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** What each agent is doing, derived from what it holds. */
   private agentStates(where = "", ...args: SqlStorageValue[]) {
     const now = Date.now();
-    return this.sql.exec(`SELECT a.id, a.name, a.role, a.paused, a.last_seen,
+    return this.sql.exec(`SELECT a.id, a.name, a.role, a.paused, a.last_seen, a.via,
+        (SELECT k.name FROM agents k WHERE k.id = a.via) AS via_name, (SELECT k.paused FROM agents k WHERE k.id = a.via) AS via_paused,
         (SELECT t.id FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_id,
         (SELECT t.status FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_status,
         (SELECT t.title FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_title
       FROM agents a ${where}`, ...args).toArray().map((r) => {
       const quiet = now - (r.last_seen as number) > PRESENT_MS;
       const st = r.task_status as string | null;
-      const state = r.paused ? "paused"
+      const state = r.paused || r.via_paused ? "paused"
         : r.role === "human" || r.id === DELEGATE_ID ? "human"
         : st === "blocked" ? "waiting"
         : st === "conflict" ? "conflict"
         : st && quiet ? "quiet"
         : st ? "working"
         : quiet ? "away" : "idle";
-      return { id: r.id as string, name: r.name as string, role: r.role as string, state, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null };
+      return { id: r.id as string, name: r.name as string, role: r.role as string, state, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null,
+        under: r.via ? { id: r.via as string, name: r.via_name as string } : null };
     });
   }
 
@@ -3222,6 +3256,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!a) throw new HttpError(404, `no agent ${id}`);
     return {
       agent: a,
+      // Agents working under this agent's key by their own names.
+      underKey: this.agentStates("WHERE a.via = ? ORDER BY a.created_at", a.id),
       tasks: this.sql.exec("SELECT id, title, status, updated_at FROM tasks WHERE assignee = ? OR id IN (SELECT task_id FROM changes WHERE agent_id = ?) ORDER BY updated_at DESC LIMIT 20", a.id, a.id).toArray(),
       intents: this.activeIntents().filter((i) => i.agent_id === a.id),
       changes: this.sql.exec("SELECT id, title, status, files, updated_at FROM changes WHERE agent_id = ? ORDER BY id DESC LIMIT 20", a.id).toArray().map((c) => ({ ...c, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path) })),
