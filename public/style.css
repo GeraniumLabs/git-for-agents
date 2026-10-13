@@ -129,6 +129,17 @@ dialog#jev { width: min(560px, 94vw); }
 .jev-form legend { padding: 0 4px; }
 .jev-form legend label { margin: 0; font-weight: 600; }
 .jev-form input[type=range] { width: 100%; }
+.jev-form label.jev-master { flex-wrap: wrap; font-weight: 600; font-size: 14px; }
+.jev-form label.jev-master small { flex-basis: 100%; margin-left: 22px; }
+.jev-form fieldset .meta { margin: 2px 0 4px; font-size: 12px; }
+.jev-summary { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; margin: 8px 0; font-size: 12.5px; }
+.jev-summary ul { margin: 2px 0 6px; padding-left: 18px; }
+.jev-summary li { margin: 2px 0; }
+.jev-context { margin: 6px 0 8px; font-size: 12.5px; }
+.jev-context summary { cursor: pointer; color: var(--muted); }
+.jev-context #jev-context { display: grid; gap: 2px; margin: 6px 0 2px; }
+.jev-off { border-left: 3px solid var(--warn); padding: 6px 10px; margin: 8px 0; font-size: 13px; }
+.jev-form.off fieldset, .jev-form.off > label:not(.jev-master) { opacity: .5; }
 .jev-form .row button { margin-top: 4px; }
 .agent.delegate .dot { outline: 2px dashed var(--accent); outline-offset: 1px; }
 .decisions { margin-top: 6px; max-height: 420px; overflow: auto; }
@@ -467,3 +478,22 @@ dialog.ask .ask-actions button:not(.ghost) { background: var(--accent); border-c
 dialog.ask .ask-actions button.bad { background: var(--bad); border-color: var(--bad); }
 .key-card label.si-scope { justify-content: flex-start; align-items: baseline; flex-wrap: wrap; }
 .key-card label.si-scope input { flex: 0 0 auto; }
+
+/* tasks: the list behind the count, and a task on its own page */
+a.tile-link { display: block; color: inherit; text-decoration: none; cursor: pointer; }
+a.tile-link:hover span { color: var(--accent); text-decoration: underline; }
+.tile .meta a { color: inherit; cursor: pointer; text-decoration: none; }
+.tile .meta a:hover { color: var(--accent); }
+.bar span[data-tasks] { cursor: pointer; }
+.tasks-tools { gap: 8px; align-items: center; margin: 6px 0 10px; flex-wrap: wrap; }
+.tasks-tools .seg { float: none; }
+.tasks-tools .seg button { padding: 3px 10px; font-size: 12.5px; margin-top: 0; }
+.tasks-tools input { flex: 1; min-width: 160px; }
+table.dir.tasks td:first-child { min-width: 220px; }
+table.dir.tasks .mono { font-size: 11.5px; }
+#detail:has(table.tasks) { width: min(1100px, 96vw); }
+.task-page { display: grid; grid-template-columns: minmax(0, 2.2fr) minmax(0, 1fr); gap: 14px; align-items: start; }
+.task-main, .task-side { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.task-page .files { margin: 2px 0 8px; overflow-wrap: anywhere; }
+@media (max-width: 900px) { .task-page { grid-template-columns: 1fr; } }
+table.dir.tasks td:last-child, table.dir.tasks td:nth-child(2) { white-space: nowrap; }
