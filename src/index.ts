@@ -3,6 +3,7 @@ import { USER_HEADER, handleAuth, isAdmin, sessionUser, type User } from "./auth
 import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
 import { projectOfWorkspace, pushOf } from "./events";
+import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
 import { AGENT_HEADER } from "./coordinator";
 export { ProjectCoordinator } from "./coordinator";
@@ -102,6 +103,10 @@ export default {
 
     let m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(.*)$/);
     if (m && /^(init|registry|visible|artifacts-event)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
+    // Turn away an oversized attachment before its bytes travel on to the coordinator.
+    if (m && m[2] === "attachments" && req.method === "POST" && Number(req.headers.get("content-length") ?? 0) > MAX_ATTACHMENT_BYTES) {
+      return Response.json({ error: tooBig(Number(req.headers.get("content-length"))).message }, { status: 413, headers: { connection: "close" } });
+    }
     if (m) return forward(env, req, m[1], m[2]);
 
     m = path.match(/^\/mcp\/([a-z0-9-]+)$/);

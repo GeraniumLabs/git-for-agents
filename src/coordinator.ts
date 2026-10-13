@@ -21,6 +21,7 @@ import { skill } from "./skill";
 import { buildBrief, fileStats, isTest } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
+import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
@@ -222,6 +223,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS attachments (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, content_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT,
+        caption TEXT, agent_id TEXT, task_id INTEGER, change_id INTEGER, created_at INTEGER);
+      CREATE INDEX IF NOT EXISTS attachments_change ON attachments (change_id);
+      CREATE INDEX IF NOT EXISTS attachments_task ON attachments (task_id);
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
       CREATE INDEX IF NOT EXISTS events_actor ON events (actor, ts);
       CREATE INDEX IF NOT EXISTS events_ts ON events (ts);
@@ -506,7 +512,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const parts = url.pathname.split("/").filter(Boolean); // after /api/projects/:name
     const [a, b, c, d] = parts;
     const m = req.method;
-    const body = m === "POST" || m === "PUT" ? await req.json<any>().catch(() => ({})) : {};
+    // An attachment can arrive as raw bytes rather than JSON.
+    const rawUpload = a === "attachments" && !b && m === "POST" && (url.searchParams.has("name") || !/json/i.test(req.headers.get("content-type") ?? ""));
+    const body = (m === "POST" || m === "PUT") && !rawUpload ? await req.json<any>().catch(() => ({})) : {};
     // Where links in webhooks point; the Durable Object only learns its origin from requests.
     if (url.hostname !== "do" && this.meta("project") && this.meta("origin") !== url.origin) this.setMeta("origin", url.origin);
 
@@ -578,6 +586,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "tasks" && b && c === "memory") return json(await this.taskMemory(Number(b)));
       if (a === "contests" && b) return json(await this.contest(Number(b)));
       if (a === "notes" && !b) return json(this.listNotes(url.searchParams));
+      if (a === "attachments" && !b) return json(this.listAttachments(url.searchParams));
+      if (a === "attachments" && b && c === "raw") return await this.serveAttachment(Number(b), url.searchParams.get("download") === "1");
+      if (a === "attachments" && b && !c) return json(this.attachmentView(this.attachmentRow(Number(b))));
     }
 
     // Agents register themselves with a join code an owner shared.
@@ -681,7 +692,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "decisions" && b && c === "retire") return json(this.retireDecision(actor, Number(b)));
     }
     // A paused agent can still read, talk and answer, but not change code.
-    const talking = ["threads", "messages", "proposals", "consults", "disputes"].includes(a);
+    const talking = ["threads", "messages", "proposals", "consults", "disputes", "attachments"].includes(a);
     if (actor.paused && !talking) throw new HttpError(423, `you are paused: ${actor.paused}. Wait for a human to resume you; you can still post in threads.`);
     if (a === "tasks" && !b && m === "POST") return json(this.createTask(actor, body));
     if (a === "tasks" && b && c === "claim") return json(await this.claim(actor, Number(b)));
@@ -722,6 +733,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "disputes" && b && c === "position") return json(this.statePosition(actor, Number(b), body.position));
     if (a === "contests" && b && c === "votes" && m === "POST") return json(await this.vote(actor, Number(b), body));
     if (a === "notes" && !b && m === "POST") return json(this.remember(actor, body));
+    if (a === "attachments" && !b && m === "POST") return json(await this.attach(actor, req, rawUpload ? Object.fromEntries(url.searchParams) : body, rawUpload));
+    if (a === "attachments" && b && !c && m === "DELETE") return json(await this.removeAttachment(actor, Number(b)));
     if (a === "notes" && b && c === "votes" && m === "POST") return json(this.rateNote(actor, Number(b), body));
     if (a === "notes" && b && c === "retire" && m === "POST") return json(this.retireNote(actor, Number(b)));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
@@ -1355,7 +1368,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return {
       ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
       patch: text, context: ctx ? await ctx.json() : null,
-      threads: this.reviewThreads(id), brief: this.briefFor(ch, text),
+      threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
       reviewedHeads: this.sql.exec("SELECT reviewer, head, MAX(created_at) AS at FROM reviews WHERE change_id = ? AND COALESCE(vote, 0) = 0 GROUP BY reviewer, head ORDER BY at", id).toArray(),
     };
   }
@@ -2782,6 +2795,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 30"),
       contests: this.contestSummaries(),
       notes: this.noteRows("retired_at IS NULL ORDER BY id DESC LIMIT 12"),
+      attachments: this.attachmentsWhere("1 = 1", undefined, 12),
+      attachmentCount: this.sql.exec("SELECT COUNT(*) AS n FROM attachments").one().n as number,
       discussions: this.sql.exec("SELECT id FROM threads WHERE kind IN ('discussion','contract') AND status = 'open' ORDER BY updated_at DESC LIMIT 6").toArray().map((r) => this.thread(r.id as number)),
       notable: this.notable(agents.length),
       names: Object.fromEntries(this.sql.exec("SELECT id, name FROM agents WHERE id IN (SELECT DISTINCT actor FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events) UNION SELECT DISTINCT to_agent FROM events WHERE seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events)) OR role = 'human'").toArray().map((r) => [r.id, r.name])),
@@ -3911,8 +3926,90 @@ export class ProjectCoordinator extends DurableObject<Env> {
       intents, changes,
       threads: this.sql.exec("SELECT id FROM threads WHERE task_id = ? ORDER BY updated_at DESC LIMIT 20", taskId).toArray().map((r) => this.thread(r.id as number)),
       decisions: this.decisionRows("task_id = ? ORDER BY id DESC LIMIT 20", taskId),
+      attachments: this.attachmentsWhere("task_id = ?", taskId),
       events,
     };
+  }
+
+  // ── attachments: screenshots, builds, logs and documents agents post ─────
+
+  private attachmentRow(id: number) {
+    const r = this.sql.exec("SELECT * FROM attachments WHERE id = ?", id).toArray()[0];
+    if (!r) throw new HttpError(404, `no attachment ${id}`);
+    return r as any;
+  }
+
+  private attachmentView(r: any) {
+    return {
+      id: r.id, name: r.name, contentType: r.content_type, kind: kindOf(r.content_type), size: r.size, sha256: r.sha256, caption: r.caption ?? "",
+      agent: r.agent_id, agentName: this.agentName(r.agent_id), task: r.task_id, change: r.change_id, createdAt: r.created_at,
+      url: `/api/projects/${this.project}/attachments/${r.id}/raw`,
+    };
+  }
+
+  private attachmentsWhere(where: string, arg?: number, limit = 200) {
+    return this.sql.exec(`SELECT * FROM attachments WHERE ${where} ORDER BY id DESC LIMIT ?`, ...(arg === undefined ? [] : [arg]), limit).toArray().map((r) => this.attachmentView(r));
+  }
+
+  private listAttachments(q: URLSearchParams) {
+    const limit = Math.min(200, Math.max(1, Number(q.get("limit") ?? 50)));
+    if (q.get("change")) return this.attachmentsWhere("change_id = ?", Number(q.get("change")), limit);
+    if (q.get("task")) return this.attachmentsWhere("task_id = ?", Number(q.get("task")), limit);
+    if (q.get("project") === "1") return this.attachmentsWhere("task_id IS NULL AND change_id IS NULL", undefined, limit);
+    return this.attachmentsWhere("1 = 1", undefined, limit);
+  }
+
+  /** Store a file an agent posts, on a change, a task, or the project when it names neither. */
+  private async attach(actor: Agent, req: Request, body: any, raw: boolean) {
+    try {
+      const name = cleanName(body.name);
+      const type = typeOf(name, raw ? req.headers.get("content-type") : body.contentType);
+      const declared = Number(req.headers.get("content-length") ?? "0");
+      const used = (this.sql.exec("SELECT COALESCE(SUM(size), 0) AS n FROM attachments").one().n as number);
+      if (raw && declared) checkSize(declared, used);
+      const bytes = raw ? new Uint8Array(await req.arrayBuffer()) : bytesOf(body);
+      checkSize(bytes.byteLength, used);
+      let changeId: number | null = body.change !== undefined && body.change !== null && body.change !== "" ? Number(body.change) : null;
+      let taskId: number | null = body.task !== undefined && body.task !== null && body.task !== "" ? Number(body.task) : null;
+      if (changeId !== null) {
+        const ch = this.change(changeId);
+        if (taskId !== null && taskId !== ch.task_id) throw new HttpError(400, `change #${changeId} is for task #${ch.task_id}, not #${taskId}`);
+        taskId = ch.task_id as number;
+      } else if (taskId !== null) this.task(taskId);
+      const caption = typeof body.caption === "string" ? body.caption.trim().slice(0, 500) : "";
+      const digest = await digestOf(bytes);
+      const id = this.sql.exec("INSERT INTO attachments (name, content_type, size, sha256, caption, agent_id, task_id, change_id, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+        name, type, bytes.byteLength, digest, caption, actor.id, taskId, changeId, Date.now()).one().id as number;
+      try {
+        await this.context.put(`${this.project}/attachments/${id}`, bytes, { httpMetadata: { contentType: type }, sha256: digest });
+      } catch (e) {
+        this.sql.exec("DELETE FROM attachments WHERE id = ?", id);
+        throw e;
+      }
+      const view = this.attachmentView(this.attachmentRow(id));
+      this.emit("attachment.added", { actor: actor.id, task: taskId, change: changeId, data: { id, name, kind: view.kind, size: view.size, caption } });
+      return view;
+    } catch (e) {
+      if (e instanceof AttachmentError) throw new HttpError(e.status, e.message);
+      throw e;
+    }
+  }
+
+  private async serveAttachment(id: number, download: boolean): Promise<Response> {
+    const r = this.attachmentRow(id);
+    const obj = await this.context.get(`${this.project}/attachments/${id}`);
+    if (!obj) throw new HttpError(404, `attachment ${id} is missing from storage`);
+    return new Response(obj.body, { headers: serveHeaders(r, { download }) });
+  }
+
+  /** Whoever posted it, or a person, can take an attachment down. */
+  private async removeAttachment(actor: Agent, id: number) {
+    const r = this.attachmentRow(id);
+    if (r.agent_id !== actor.id && actor.role !== "human") throw new HttpError(403, "only whoever posted an attachment, or a person, can remove it");
+    await this.context.delete(`${this.project}/attachments/${id}`);
+    this.sql.exec("DELETE FROM attachments WHERE id = ?", id);
+    this.emit("attachment.removed", { actor: actor.id, task: r.task_id, change: r.change_id, data: { id, name: r.name } });
+    return { removed: id };
   }
 
   private async handoff(taskId: number) {
