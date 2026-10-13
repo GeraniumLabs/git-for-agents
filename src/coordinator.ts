@@ -1270,12 +1270,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
         status, JSON.stringify(analysis.files), JSON.stringify(undeclared), JSON.stringify(analysis.symbols), now, now)
       .one();
     const id = row.id as number;
+    this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
     await this.saveContext(id, actor, body, analysis.patch, analysis.head, analysis.snapshot);
     await this.checkChangeIntent(id, analysis.patch);
-    this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
     this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status } });
-    if (status === "review") this.requestReview(id, actor.id);
-    else await this.enqueue(id);
+    // A reviewer can find the change, approve it and the queue land it while
+    // the context is saved; then there's nothing left to ask for or enqueue.
+    const current = this.change(id).status;
+    if (current === "review") this.requestReview(id, actor.id);
+    else if (current === "queued" && status === "queued") await this.enqueue(id);
     const contest = this.openContest(body.taskId);
     if (contest) this.contestEntered(contest.id as number);
     // Who already knows this code, so the author can ask them to review it.
