@@ -1047,15 +1047,62 @@ function renderControls() {
   $("#freeze").textContent = frozen ? "Unfreeze main" : "Freeze main";
   $("#freeze").className = frozen ? "bad" : "ghost";
   if (document.activeElement !== $("#protect-paths")) $("#protect-paths").value = (state.project.protectedPaths ?? []).join(", ");
+  loadDirTo();
 }
 $("#dir-send").onclick = async () => {
   const body = $("#dir-body").value.trim();
   if (!body) return;
-  const r = await act("POST", "/directives", { body });
+  const to = $("#dir-to").value || undefined;
+  const r = await act("POST", "/directives", { body, to });
   $("#dir-body").value = "";
-  toast(r.awaitingAck ? `Sent to ${r.awaitingAck} agent${r.awaitingAck === 1 ? "" : "s"}. Each sees it on its next call until it acknowledges; any that haven't after 5 minutes show under Stuck.` : "Sent. No agents are in the project yet; new ones get it as a decision.");
+  toast(to ? `Sent to ${name(to)}. It sees it on its next call until it acknowledges; if it hasn't after 5 minutes it shows under Stuck.`
+    : r.awaitingAck ? `Sent to ${r.awaitingAck} agent${r.awaitingAck === 1 ? "" : "s"}. Each sees it on its next call until it acknowledges; any that haven't after 5 minutes show under Stuck.` : "Sent. No agents are in the project yet; new ones get it as a decision.");
 };
-$("#dir-to").title = "Directives here go to every agent; open an agent (search) to send one to it alone.";
+
+// Who gets the directive: every agent, or one of those around now (most
+// recently active first, sub-agents grouped under their key). Agents that
+// are away, or past the first 200, are one search away.
+const FIND = "__find__";
+let dirToAt = 0;
+async function loadDirTo() {
+  const sel = $("#dir-to");
+  if (document.activeElement === sel || Date.now() - dirToAt < 15_000) return;
+  dirToAt = Date.now();
+  const r = await api("/search?state=present&limit=200");
+  if (!r.agents || document.activeElement === sel) return;
+  for (const a of r.agents) { names[a.id] = a.name; if (a.under) names[a.under.id] = a.under.name; }
+  const picked = sel.value;
+  const opt = (a) => `<option value="${esc(a.id)}">${esc(a.name)} · ${esc(a.state)}${a.task ? ` · #${a.task.id}` : ""}</option>`;
+  const groups = new Map();
+  for (const a of r.agents) {
+    const root = a.under?.id ?? a.id;
+    if (!groups.has(root)) groups.set(root, []);
+    groups.get(root)[a.under ? "push" : "unshift"](a);
+  }
+  const solo = [], keyed = [];
+  for (const [root, rows] of groups) (rows.length > 1 || rows[0].under ? keyed : solo).push([root, rows]);
+  const nested = keyed.length > 0;
+  sel.innerHTML = `<option value="">All agents</option>`
+    + (nested && solo.length ? `<optgroup label="Agents">${solo.map(([, rows]) => opt(rows[0])).join("")}</optgroup>` : solo.map(([, rows]) => opt(rows[0])).join(""))
+    + keyed.map(([root, rows]) => { const n = rows.filter((a) => a.under).length; return `<optgroup label="${esc(name(root))}: key with ${n} sub-agent${n === 1 ? "" : "s"}">${rows.map(opt).join("")}</optgroup>`; }).join("")
+    + `<option value="${FIND}">${r.total > r.agents.length ? `Find one of the other ${r.total - r.agents.length}…` : "Find another agent…"}</option>`;
+  if (picked && picked !== FIND && !sel.querySelector(`option[value="${CSS.escape(picked)}"]`)) sel.insertAdjacentHTML("beforeend", `<option value="${esc(picked)}">${esc(name(picked))}</option>`);
+  sel.value = picked === FIND ? "" : picked;
+  sel.title = `Who gets the directive: all agents, or one of the ${r.total} around now. Pick "Find…" for one that's away`;
+}
+$("#dir-to").onchange = async () => {
+  const sel = $("#dir-to");
+  if (sel.value !== FIND) return;
+  sel.value = "";
+  const q = await ask({ title: "Send the directive to which agent?", body: "Search by name, task or file.", ok: "Find", input: { label: "Agent", placeholder: "e.g. builder-ui", rows: 1 } });
+  if (!q) return;
+  const r = await api(`/search?q=${encodeURIComponent(q)}&limit=20`);
+  const a = (r.agents ?? []).find((x) => x.state !== "human");
+  if (!a) return toast(`No agent “${q}”`);
+  names[a.id] = a.name;
+  if (!sel.querySelector(`option[value="${CSS.escape(a.id)}"]`)) sel.insertAdjacentHTML("beforeend", `<option value="${esc(a.id)}">${esc(a.name)} · ${esc(a.state)}</option>`);
+  sel.value = a.id;
+};
 $("#freeze").onclick = async () => {
   if (state.project.frozen) await act("POST", "/unfreeze", {});
   else {
