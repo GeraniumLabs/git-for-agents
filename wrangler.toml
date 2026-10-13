@@ -12,6 +12,13 @@ run_worker_first = ["/api/*", "/mcp", "/mcp/*", "/auth/*"]
 binding = "ARTIFACTS"
 namespace = "loom"
 
+# Data residency: projects that keep their data in the EU. Create the
+# namespace with jurisdiction "eu" BEFORE deploying (README, "Data residency"):
+# a namespace made any other way is unrestricted for good.
+[[artifacts]]
+binding = "ARTIFACTS_EU"
+namespace = "loom-eu"
+
 [[durable_objects.bindings]]
 name = "PROJECT"
 class_name = "ProjectCoordinator"
@@ -41,6 +48,17 @@ checks = { dockerfile = "./checks/Dockerfile" }
 binding = "CONTEXT"
 bucket_name = "loom-context"
 
+[[r2_buckets]]
+binding = "CONTEXT_EU"
+bucket_name = "loom-context-eu"
+jurisdiction = "eu"
+
+# Artifacts event subscriptions: each workspace's pushes arrive here (src/events.ts).
+[[queues.consumers]]
+queue = "loom-artifacts-events"
+max_batch_size = 20
+max_batch_timeout = 1
+
 # Projects a first-time visitor sees first; the first one opens by default.
 # Leave empty to open the newest public project.
 # Workers AI: Clef judges for the deputy when a project brings no key of its own.
@@ -62,3 +80,9 @@ class_name = "ProjectCoordinator"
 [[env.local.r2_buckets]]
 binding = "CONTEXT"
 bucket_name = "loom-context"
+
+# EU projects locally: the shim stands in for both namespaces.
+[[env.local.r2_buckets]]
+binding = "CONTEXT_EU"
+bucket_name = "loom-context-eu"
+jurisdiction = "eu"

@@ -189,6 +189,26 @@ test("reviews are agent tasks: an untaken review shows up in whoami and loom_sta
   assert.equal((await bex.me()).reviewTasks.some((x: any) => x.change === ch.id), false, "done once reviewed");
 });
 
+test("a review no other agent can take is stuck right away, and stops being stuck once someone could take it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-rstuck");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "lonely review", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Comment db.js", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// done\n" }, "c");
+  const ch = await ada.submit(t.id, t.title, "comment");
+  const stuck = async () => (await admin.req("GET", "/overview")).attention.filter((i: any) => i.kind === "stuck" && i.change === ch.id);
+  const alone = await stuck();
+  assert.equal(alone.length, 1, "the only agent is the author, so nobody can take the review");
+  assert.equal(alone[0].reason, "no other agent to review it");
+  assert.equal(alone[0].action, "review");
+  await admin.addAgent("bex", "builder");
+  assert.deepEqual(await stuck(), [], "bex could take it, so it isn't stuck yet");
+});
+
 test("questions for people: similar ones share a card, each agent has a limit, and a default wins when nobody answers in time", { skip: !url, timeout: 150_000 }, async () => {
   const { Loom, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-questions");
@@ -310,4 +330,63 @@ test("stand-ins: a person's own agent watches what needs them, hears by webhook,
   } finally {
     server.close();
   }
+});
+
+test("a plain git push to a workspace updates its change, through Artifacts push events", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-push");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "push events", requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Say hello", "");
+  const claim = await ada.claim(t.id);
+  await ada.intent(t.id, ["hello.txt"], "hello");
+  await ada.write(claim.workspace.name, { "hello.txt": "hello\n" }, "v1");
+  const ch = await ada.submit(t.id, t.title, "hello", {});
+
+  // A real git client, as an agent with a shell would push.
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(`${tmpdir()}/loom-push-`);
+  const git = (...a: string[]) => run("git", ["-c", `http.extraHeader=Authorization: Bearer ${claim.workspace.token}`, "-c", "user.name=ada", "-c", "user.email=ada@example.com", ...a], { cwd: dir });
+  await git("clone", claim.workspace.remote, ".");
+  const { writeFile } = await import("node:fs/promises");
+  await writeFile(`${dir}/hello.txt`, "hello, world\n");
+  await git("commit", "-am", "v2");
+  await git("push", "origin", "HEAD:main");
+  const head = (await git("rev-parse", "HEAD")).stdout.trim();
+
+  let detail: any;
+  for (let i = 0; i < 40; i++) {
+    detail = await ada.change(ch.id);
+    if (detail.head === head) break;
+    await sleep(250);
+  }
+  assert.equal(detail.head, head, "the change follows the push");
+  const events = (await admin.req("GET", "/events?after=0")).events;
+  assert.ok(events.some((e: any) => e.type === "workspace.pushed" && e.data.head === head));
+  assert.ok(events.some((e: any) => e.type === "change.updated" && e.data.via === "push"));
+  // Loom's own commit (v1, over the API) was not announced as a push.
+  assert.equal(events.filter((e: any) => e.type === "workspace.pushed").length, 1);
+});
+
+test("a project created in the EU says so, and its name can't be reused elsewhere", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-eu");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await assert.rejects(admin.createProject({ name, jurisdiction: "mars" }), /400/);
+  await admin.createProject({ name, description: "kept in the EU", jurisdiction: "eu", requiredApprovals: 0 });
+  assert.equal((await admin.state()).project.jurisdiction, "eu");
+  assert.equal((await admin.req("GET", "/api/projects")).find((p: any) => p.name === name)?.jurisdiction, "eu");
+  await assert.rejects(admin.createProject({ name }), /409/);
+
+  // The whole loop works there: claim, commit, submit, merge.
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Add a file", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "eu.txt": "bonjour\n" }, "add");
+  const ch = await ada.submit(t.id, t.title, "add a file", {});
+  for (let i = 0; i < 40 && (await ada.change(ch.id)).status !== "merged"; i++) await new Promise((r) => setTimeout(r, 250));
+  assert.equal((await ada.change(ch.id)).status, "merged");
+  assert.equal(await admin.read("eu.txt"), "bonjour\n");
 });

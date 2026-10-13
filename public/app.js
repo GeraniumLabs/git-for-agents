@@ -327,7 +327,7 @@ function renderAttention() {
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   $("#stuck").innerHTML = items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
-    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}</div></div>`).join("")
+    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`;
   wire($("#stuck"));
@@ -794,11 +794,12 @@ function showNewProject() {
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
+    ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div class="row"><button id="np-create">Create project</button></div>`;
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
     // Start with a join code, so the agents you connect each register as themselves.
@@ -822,6 +823,8 @@ async function showSettings() {
     <h2>Visibility</h2>
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
+    <h2>Where the data lives</h2>
+    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
@@ -1069,9 +1072,10 @@ function describe(e) {
     case "collision.forecast": return ["collision", `Collision forecast: ${who} and ${to} both plan to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>. Both notified before any code was written.`];
     case "intent.released": return ["", `${who} released an intent`];
     case "workspace.committed": return ["", `${who} committed to their workspace: ${esc(d.message)}`];
+    case "workspace.pushed": return ["", `${who} pushed ${d.commits ? `${d.commits} commit${d.commits === 1 ? "" : "s"} ` : ""}to their workspace${d.head ? ` <span class="mono">${esc(d.head.slice(0, 7))}</span>` : ""}`];
     case "change.off_intent": return ["conflict", `${esc(d.model)} doubts change #${e.change_id} does what its intent declared (${Math.round(d.score * 100)}%)`];
     case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}`];
-    case "change.updated": return ["review", `Change #${e.change_id} updated${d.reason ? `: ${esc(d.reason)}` : ""}`];
+    case "change.updated": return ["review", `Change #${e.change_id} updated${d.via === "push" ? " from a git push" : ""}${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "review.assigned": return ["review", `${who} asked ${to} to review #${e.change_id}${d.reason ? ` (${esc(d.reason)})` : ""}${d.note ? `: “${esc(d.note.slice(0, 140))}”` : ""}`];
     case "review.accepted": return ["review", `${who} accepted the review of #${e.change_id}`];
     case "review.declined": return ["review", `${who} declined to review #${e.change_id}${d.reason ? `: “${esc(d.reason)}”` : ""}`];
@@ -1709,7 +1713,7 @@ $("#jev").onclose = async () => {
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
   attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
-  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a change nobody reviewed for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
+  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
   flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",

@@ -195,6 +195,8 @@ Every change landed, with no errors and one claim retried. Production is slower 
 - **Durable Objects**: one `ProjectCoordinator` per project is the single writer for main and the place where coordination happens. Its SQLite holds the project state; WebSockets stream events to the dashboard and agents.
 - **R2** keeps each change's context bundle and patch. Delete the bucket and the Worker and everything is gone.
 - **Workers** serve the API, MCP endpoint and dashboard, and run git itself (isomorphic-git on an in-memory filesystem) for merges, syncs and API commits.
+- **Artifacts event subscriptions** tell Loom about every push. Each workspace fork is subscribed to its `pushed` events, which arrive on a Queue. The Worker's queue handler passes each push to the project's coordinator. It records the push in the activity and refreshes the task's open change, which goes back to review or the merge queue. So an agent with a shell can just `git push`; `update_change` is only needed to change the summary or context.
+- **Data residency**: a project can keep its data in the EU, chosen when it is created (**New project**, or `"jurisdiction": "eu"` over the API). Its repos then live in an Artifacts namespace created with jurisdiction `eu`, its coordinator is a Durable Object in the EU jurisdiction, and its change context goes to an R2 bucket created in the EU. None of the three can move later, so neither can the project. The registry stays global; it holds project names, visibility and where each project lives.
 
 ## Run it locally (no Cloudflare account needed)
 
@@ -262,7 +264,32 @@ curl -X POST https://<worker>/api/projects/myproj/agents -H "authorization: Bear
   -d '{"name":"ada","role":"builder"}'        # returns the agent's key
 ```
 
-To tear it all down: `npx wrangler delete`, delete the `loom-context` bucket, and delete the `loom` Artifacts namespace's repos.
+To tear it all down: `npx wrangler delete`, delete the `loom-context` and `loom-context-eu` buckets and the `loom-artifacts-events` queue, and delete the repos in the `loom` and `loom-eu` Artifacts namespaces.
+
+### Push events
+
+Create the queue the Worker consumes, then let Loom subscribe each workspace to it. Subscriptions are per repository (source `artifacts.repo`) and made over the REST API, because `wrangler queues subscription create` can't name a repository yet. The token needs Queues Write.
+
+```sh
+npx wrangler queues create loom-artifacts-events          # note the queue id
+npx wrangler secret put CF_EVENTS_TOKEN                     # API token with Queues Write
+npx wrangler secret put CF_ACCOUNT_ID
+npx wrangler secret put ARTIFACTS_EVENTS_QUEUE_ID           # the id from the first command
+```
+
+Without them, Loom makes no subscriptions and agents call `update_change` after pushing. A workspace's subscription is deleted along with the workspace. Locally, the shim posts the same `cf.artifacts.repo.pushed` messages to the Worker after each push (`LOOM_EVENTS_URL=off` turns that off).
+
+### Data residency
+
+Create both EU stores **before** deploying. An Artifacts namespace gets its jurisdiction only when it is created, and one created any other way (for example by a first push) is unrestricted for good.
+
+```sh
+curl -X POST "https://api.cloudflare.com/client/v4/accounts/$CF_ACCOUNT_ID/artifacts/namespaces" \
+  -H "authorization: Bearer $CLOUDFLARE_API_TOKEN" -d '{"name":"loom-eu","jurisdiction":"eu"}'
+npx wrangler r2 bucket create loom-context-eu --jurisdiction eu
+```
+
+(See Cloudflare's Artifacts data localization guide for the current namespace endpoint.) Without the `ARTIFACTS_EU` and `CONTEXT_EU` bindings, the EU option doesn't appear. Local development has no jurisdictions: the EU option works against the shim and a local bucket, so you can try the flow, but nothing is pinned. Check containers and decision-model calls (Workers AI, Anthropic, TypeSafe) are not pinned yet.
 
 ## Connect an agent
 
@@ -369,7 +396,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - Merges hold both trees in Worker memory, so this suits repos up to tens of MB. Bigger repos would move merging to Sandbox containers.
 - The intent overlap check is path-based. Review routing already knows functions and classes, so symbol-level intents are the obvious next step.
 - Commits and merges run git in the coordinator Durable Object. With hundreds of agents, the next step is to move that CPU work into stateless Workers.
-- Artifacts event subscriptions (`pushed`) could replace the explicit `submit` and `update` calls.
+- A push refreshes an open change, but the first `submit_change` is still an explicit call, because a change needs a title and summary.
 - Checks run one batch at a time, so a slow test suite slows the queue. The image is Node with git and a compiler; other stacks need their own `checks/Dockerfile`. The container has internet access so it can install dependencies.
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
 - Projects start from a generated README; importing an existing repo by URL is not built yet.

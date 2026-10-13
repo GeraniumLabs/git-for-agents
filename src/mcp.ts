@@ -198,7 +198,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "update_change",
-    description: "After pushing more commits to your workspace (for example to address review), refresh the change so it goes back to review.",
+    description: "Refresh your change after pushing more commits to your workspace (for example to address review), so it goes back to review. Loom usually does this on every git push by itself (a workspace.pushed event, then change.updated); call it to change the summary or context, or if no change.updated followed your push.",
     inputSchema: obj({ changeId: num("Change id"), summary: str("Updated summary"), context: { type: "object" } }, ["changeId"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/update`, a),
   },

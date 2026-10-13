@@ -7,6 +7,8 @@ import { DurableObject } from "cloudflare:workers";
 import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
 import { anyOverlap, matches, normalizePattern } from "./paths";
 import { makeStore, type RepoStore } from "./store";
+import { contextBucket, artifactsNamespace, type Jurisdiction } from "./residency";
+import { subscribePushes, unsubscribe, type Push } from "./events";
 import type { Env } from "./env";
 import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge, type ProjectContext } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
@@ -102,7 +104,7 @@ const SIMILAR_QUESTION = 0.6;
 
 export class ProjectCoordinator extends DurableObject<Env> {
   private sql: SqlStorage;
-  private store: RepoStore;
+  private repos?: RepoStore;
   /** Long-polls waiting for events; each is woken only by events it would receive. */
   private waiters = new Set<{ wants: (e: LoomEvent) => boolean; wake: () => void }>();
   private merging = false;
@@ -110,7 +112,6 @@ export class ProjectCoordinator extends DurableObject<Env> {
   constructor(ctx: DurableObjectState, env: Env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
-    this.store = makeStore(env);
     ctx.blockConcurrencyWhile(async () => this.migrate());
   }
 
@@ -135,6 +136,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE tasks ADD COLUMN attempts INTEGER",
       "ALTER TABLE tasks ADD COLUMN attempt INTEGER DEFAULT 0",
       "ALTER TABLE tasks ADD COLUMN winner INTEGER",
+      "ALTER TABLE projects ADD COLUMN jurisdiction TEXT",
+      "ALTER TABLE workspaces ADD COLUMN subscription TEXT",
       "ALTER TABLE tasks ADD COLUMN contest_status TEXT",
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
       "ALTER TABLE changes ADD COLUMN checks TEXT",
@@ -245,6 +248,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const p = this.meta("project");
     if (!p) throw new HttpError(404, "project not found");
     return p;
+  }
+  /** Where the project keeps its data: "eu", or null for anywhere. Set once, at init. */
+  private get jurisdiction(): Jurisdiction | null {
+    return this.meta("jurisdiction") === "eu" ? "eu" : null;
+  }
+  private get store(): RepoStore {
+    return (this.repos ??= makeStore(this.env, this.jurisdiction));
+  }
+  /** Change context and patches, in the project's own jurisdiction. */
+  private get context(): R2Bucket {
+    return contextBucket(this.env, this.jurisdiction);
   }
   private get mainRepo(): string {
     return this.meta("main_repo")!;
@@ -509,16 +523,22 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return json({ ok: true });
     }
     if (a === "registry") {
-      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private })));
+      if (m === "GET" && b === "where") {
+        const r = this.sql.exec("SELECT jurisdiction FROM projects WHERE name = ?", url.searchParams.get("name")).toArray()[0];
+        return json({ exists: !!r, jurisdiction: r?.jurisdiction ?? null });
+      }
+      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private })));
       if (b === "visibility") {
         this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
         return json({ ok: true });
       }
-      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private) VALUES (?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0);
+      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction) VALUES (?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null);
       return json({ ok: true });
     }
 
     if (a === "init" && m === "POST") return json(await this.init(body));
+    // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
+    if (a === "artifacts-event" && m === "POST") return json(await this.onPush(body));
 
     // A private project shows nothing, not even that it exists, to anyone
     // who isn't a member, an owner or one of its agents.
@@ -709,9 +729,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number } }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
+    // Before the first repo is made: the jurisdiction picks the Artifacts namespace and R2 bucket.
+    if (body.jurisdiction === "eu") this.setMeta("jurisdiction", "eu");
     const repo = `${name}`;
     const created = await this.store.create(repo, body.description);
     this.setMeta("project", name);
@@ -727,7 +749,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
     await w.push({ url: created.remote, token: created.token }, commit);
     this.setMeta("main_head", commit);
-    this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null } });
+    this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null, jurisdiction: this.jurisdiction } });
     if (body.owner) await this.addPerson(body.owner.login, body.owner.id, true, null);
     return { name, remote: created.remote, head: commit };
   }
@@ -911,6 +933,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const head = this.meta("main_head");
       this.sql.exec("INSERT INTO workspaces (name, task_id, agent_id, remote, base_commit, base_version, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
         ws, taskId, actor.id, forked.remote, head, this.mainVersion, Date.now());
+      this.ctx.waitUntil(this.watchPushes(ws));
     } else {
       this.sql.exec("UPDATE workspaces SET agent_id = ? WHERE name = ?", actor.id, ws);
     }
@@ -1003,6 +1026,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const w = await Workspace.open(remote);
     const parent = await w.head();
     const commit = await w.commitFiles(parent, files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    this.setMeta(`pushed:${name}`, commit);
     await w.push(remote, commit);
     this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(files), message: body.message } });
     return { commit, files: Object.keys(files) };
@@ -1142,6 +1166,44 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { repo, ref, files: [...flat.keys()].sort() };
   }
 
+  // ── push events: a git push to a workspace refreshes its change ──────────
+
+  /** Subscribe to the workspace's pushes (see events.ts). Agents can still call update_change without it. */
+  private async watchPushes(ws: string) {
+    try {
+      const id = await subscribePushes(this.env, artifactsNamespace(this.env, this.jurisdiction), ws);
+      if (id) this.sql.exec("UPDATE workspaces SET subscription = ? WHERE name = ?", id, ws);
+    } catch (e) {
+      console.error("subscribing to pushes", ws, e);
+    }
+  }
+
+  /**
+   * Artifacts says someone pushed to a workspace. Loom's own pushes (API
+   * commits, syncs) are already handled where they happen; any other push
+   * shows in the activity, and an open change follows its workspace.
+   */
+  private async onPush(p: Push) {
+    const ws = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", p.repo).toArray()[0] as any;
+    if (!ws || ws.status === "deleted") return { ignored: "not a workspace of this project" };
+    if (p.ref && p.ref !== "refs/heads/main") return { ignored: `only pushes to main count (got ${p.ref})` };
+    if (p.after && this.meta(`pushed:${p.repo}`) === p.after) return { ignored: "Loom's own push" };
+    this.emit("workspace.pushed", { actor: ws.agent_id, task: ws.task_id, data: { workspace: p.repo, head: p.after, before: p.before, commits: p.commits } });
+    const ch = this.sql.exec("SELECT id, agent_id, head FROM changes WHERE task_id = ? AND workspace = ? AND status NOT IN ('merged','merging','abandoned','closed')", ws.task_id, p.repo).toArray()[0];
+    if (!ch) return { change: null };
+    if (p.after && ch.head === p.after) return { change: ch.id, unchanged: true };
+    const owner = this.sql.exec("SELECT id, name, role FROM agents WHERE id = ?", ch.agent_id).toArray()[0] as unknown as Agent | undefined;
+    if (!owner) return { change: ch.id, ignored: "its author is gone" };
+    try {
+      const updated = await this.updateChange(owner, ch.id as number, {}, "push");
+      return { change: ch.id, status: updated.status };
+    } catch (e) {
+      // Merging meanwhile, or nothing against main any more: the push stays in the activity.
+      if (e instanceof HttpError) return { change: ch.id, ignored: e.message };
+      throw e;
+    }
+  }
+
   // ── changes: the agent-native pull request ───────────────────────────────
 
   private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any }) {
@@ -1177,7 +1239,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { ...this.change(id), suggestedReviewers: status === "review" ? await this.rankedCandidates(id, 3) : [] };
   }
 
-  private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }) {
+  private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }, via: "push" | null = null) {
     const ch = this.change(id);
     if (ch.agent_id !== actor.id) throw new HttpError(403, `change ${id} is ${this.agentName(ch.agent_id as string)}'s, not yours (${actor.name})`);
     if (ch.status === "merged" || ch.status === "merging") throw new HttpError(409, `change ${id} is ${ch.status}`);
@@ -1189,12 +1251,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
     // An update (or a sync) without new context keeps what the author said
     // at submit; new context is merged over it, key by key.
-    const prev = (await (await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
+    const prev = (await (await this.context.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
     const context = body.context && typeof body.context === "object" ? { ...prev, ...body.context } : prev;
     await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch, analysis.head, analysis.snapshot);
     await this.checkChangeIntent(id, analysis.patch);
     const outdated = this.markOutdated(id, analysis.snapshot);
-    this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
+    this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(via ? { via } : {}), ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
     const contest = this.openContest(ch.task_id);
@@ -1262,15 +1324,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async saveContext(id: number, actor: Agent, body: { summary?: string; context?: any }, patch: string, head?: string, snapshot?: Snapshot) {
     const key = `${this.project}/changes/${id}`;
-    await this.env.CONTEXT.put(`${key}/patch.diff`, patch);
-    if (head && snapshot) await this.env.CONTEXT.put(`${key}/heads/${head}.json`, JSON.stringify(snapshot));
-    await this.env.CONTEXT.put(`${key}/context.json`, JSON.stringify({ agent: actor, summary: body.summary ?? "", context: body.context ?? {}, savedAt: new Date().toISOString() }, null, 2));
+    await this.context.put(`${key}/patch.diff`, patch);
+    if (head && snapshot) await this.context.put(`${key}/heads/${head}.json`, JSON.stringify(snapshot));
+    await this.context.put(`${key}/context.json`, JSON.stringify({ agent: actor, summary: body.summary ?? "", context: body.context ?? {}, savedAt: new Date().toISOString() }, null, 2));
   }
 
   private async changeDetail(id: number) {
     const ch = this.change(id);
     const key = `${this.project}/changes/${id}`;
-    const [patch, ctx] = await Promise.all([this.env.CONTEXT.get(`${key}/patch.diff`), this.env.CONTEXT.get(`${key}/context.json`)]);
+    const [patch, ctx] = await Promise.all([this.context.get(`${key}/patch.diff`), this.context.get(`${key}/context.json`)]);
     const reviews = this.sql.exec("SELECT * FROM reviews WHERE change_id = ? ORDER BY id", id).toArray().map((r) => ({ ...r, comments: JSON.parse(r.comments as string) }));
     const intents = this.sql.exec("SELECT * FROM intents WHERE task_id = ?", ch.task_id).toArray().map((r) => ({ ...r, paths: JSON.parse(r.paths as string) }));
     const task = this.task(ch.task_id);
@@ -1307,7 +1369,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async snapshotOf(changeId: number, head: string): Promise<Snapshot | null> {
-    const o = await this.env.CONTEXT.get(`${this.project}/changes/${changeId}/heads/${head}.json`);
+    const o = await this.context.get(`${this.project}/changes/${changeId}/heads/${head}.json`);
     return o ? await o.json<Snapshot>() : null;
   }
 
@@ -1396,7 +1458,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const rows = this.sql.exec("SELECT id FROM changes WHERE status IN ('review','changes_requested') ORDER BY updated_at DESC LIMIT 60").toArray();
     const out = await Promise.all(rows.map(async (r) => {
       const ch = this.change(r.id as number);
-      const patch = await (await this.env.CONTEXT.get(`${this.project}/changes/${ch.id}/patch.diff`))?.text() ?? "";
+      const patch = await (await this.context.get(`${this.project}/changes/${ch.id}/patch.diff`))?.text() ?? "";
       const brief = this.briefFor(ch, patch);
       const asked = actor ? this.sql.exec("SELECT status FROM review_requests WHERE change_id = ? AND reviewer = ? AND status IN ('open','accepted')", ch.id, actor).toArray()[0] : null;
       const mine = actor ? this.sql.exec("SELECT verdict, head FROM reviews WHERE change_id = ? AND reviewer = ? ORDER BY id DESC LIMIT 1", ch.id, actor).toArray()[0] : null;
@@ -1569,7 +1631,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       let detail: any = null;
       if (ch) {
         const key = `${this.project}/changes/${ch.id}`;
-        const [patch, ctx] = await Promise.all([this.env.CONTEXT.get(`${key}/patch.diff`), this.env.CONTEXT.get(`${key}/context.json`)]);
+        const [patch, ctx] = await Promise.all([this.context.get(`${key}/patch.diff`), this.context.get(`${key}/context.json`)]);
         const text = patch ? await patch.text() : "";
         const saved = ctx ? ((await ctx.json()) as any) : null;
         const reviews = this.sql.exec("SELECT reviewer, verdict, body, vote FROM reviews WHERE change_id = ? AND head = ? ORDER BY id", ch.id, ch.head).toArray()
@@ -1928,7 +1990,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async gitNote(id: number): Promise<string> {
     const ch = this.change(id);
     const task = this.task(ch.task_id);
-    const ctx = await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`);
+    const ctx = await this.context.get(`${this.project}/changes/${id}/context.json`);
     const saved = ctx ? ((await ctx.json()) as any) : null;
     const clip = (v: unknown, n = 600) => {
       const t = typeof v === "string" ? v : JSON.stringify(v);
@@ -1966,10 +2028,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * then the agent can still read its workspace.
    */
   private async sweepWorkspaces() {
-    const due = this.sql.exec("SELECT name FROM workspaces WHERE status IN ('merged','closed') AND done_at < ? LIMIT 10", Date.now() - WORKSPACE_GRACE_MS).toArray();
+    const due = this.sql.exec("SELECT name, subscription FROM workspaces WHERE status IN ('merged','closed') AND done_at < ? LIMIT 10", Date.now() - WORKSPACE_GRACE_MS).toArray();
     for (const r of due) {
       const name = r.name as string;
       try {
+        if (r.subscription) await unsubscribe(this.env, r.subscription as string);
         await this.store.delete(name);
       } catch (e) {
         console.error("deleting workspace", name, e);
@@ -2059,6 +2122,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     const author = actor.id === "admin" ? { name: "admin", email: "admin@loom.dev" } : { name: actor.name, email: `${actor.id}@agents.loom.dev` };
     const commit = await w.commit(result.tree, [ours, main], `Merge main into workspace${resolutions ? " (conflicts resolved)" : ""}`, author);
+    this.setMeta(`pushed:${task.workspace}`, commit);
     await w.push(wsRemote, commit);
     this.sql.exec("UPDATE workspaces SET base_commit = ?, base_version = ? WHERE name = ?", main, this.mainVersion, task.workspace);
     this.emit("workspace.synced", { actor: actor.id, change: ch?.id ?? null, task: taskId, data: { commit, resolved: Object.keys(resolutions ?? {}) } });
@@ -2682,7 +2746,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public" },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -2782,11 +2846,21 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const c of this.sql.exec("SELECT id, title, agent_id, updated_at FROM changes WHERE status = 'conflict' AND updated_at < ?", now - 5 * 60_000).toArray()) {
       items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
     }
-    // A change waiting on review that nobody has reviewed: say who was asked, if anyone.
-    for (const c of this.sql.exec(`SELECT c.id, c.title, c.agent_id, c.updated_at, (SELECT GROUP_CONCAT(reviewer) FROM review_requests r WHERE r.change_id = c.id AND r.status IN ('open','accepted')) AS asked
-                                   FROM changes c WHERE c.status = 'review' AND c.updated_at < ? AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = c.id AND v.head = c.head) LIMIT 50`, now - 10 * 60_000).toArray()) {
-      const asked = c.asked ? (c.asked as string).split(",").map((r) => this.agentName(r)).join(", ") : null;
-      items.push({ kind: "stuck", reason: asked ? `review requested from ${asked}, no answer` : "waiting for review, nobody asked", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
+    // Reviews that aren't moving: no agent can take one, nobody has taken one, or whoever was asked hasn't answered.
+    const listedChanges = new Set(items.filter((i) => i.change).map((i) => i.change));
+    for (const t of this.reviewTasks()) {
+      if (t.needsPerson || listedChanges.has(t.change)) continue; // already waiting on a person above
+      const left = this.reviewersLeft(t.change);
+      const age = now - t.since;
+      const base = { kind: "stuck", detail: `#${t.change} ${t.title.replace(/^Review #\d+: /, "")}`, agent: t.author, change: t.change, since: t.since };
+      if (!left.length && t.status === "open") {
+        const others = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", t.author, DELEGATE_ID).one().n as number;
+        items.push({ ...base, reason: others ? "no agent left to review it" : "no other agent to review it", action: "review" });
+      } else if (t.status === "open" && age > 5 * 60_000) {
+        items.push({ ...base, reason: left.some((a) => a.present) ? "review task nobody has taken" : "review task nobody has taken, no reviewer around", action: "review" });
+      } else if (t.status !== "open" && age > 10 * 60_000 && !t.reviewers.some((r) => r.status === "reviewing")) {
+        items.push({ ...base, reason: `review requested from ${t.reviewers.map((r) => r.name).join(", ")}, no answer` });
+      }
     }
     for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
@@ -3055,6 +3129,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return out;
   }
 
+  /** Agents who could still review a change: not its author, not a person, not paused, and not already done or passed on it. */
+  private reviewersLeft(id: number) {
+    const ch = this.change(id);
+    const now = Date.now();
+    return this.sql.exec(`SELECT id, last_seen FROM agents a WHERE a.role != 'human' AND a.id NOT IN (?, ?) AND (a.paused IS NULL OR a.paused = '')
+        AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = ? AND v.reviewer = a.id AND v.head = ?)
+        AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE r.change_id = ? AND r.reviewer = a.id AND r.status IN ('declined','expired'))`,
+      ch.agent_id, DELEGATE_ID, id, ch.head, id).toArray()
+      .map((a) => ({ id: a.id as string, present: now - ((a.last_seen as number) ?? 0) < PRESENT_MS }));
+  }
+
   /** Take an open review task: it becomes yours, accepted, with the usual time to deliver. */
   private takeReview(actor: Agent, id: number) {
     const ch = this.change(id);
@@ -3264,7 +3349,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** What an earlier change on these files did, why, and what people objected to. */
   private async effort(changeRow: Record<string, SqlStorageValue>, paths: string[]) {
     const id = changeRow.id as number;
-    const ctx = await this.env.CONTEXT.get(`${this.project}/changes/${id}/context.json`);
+    const ctx = await this.context.get(`${this.project}/changes/${id}/context.json`);
     const saved = ctx ? ((await ctx.json()) as any) : null;
     const files = (JSON.parse(changeRow.files as string) as FileChange[]).map((f) => f.path);
     const objections = this.sql.exec("SELECT reviewer, body FROM reviews WHERE change_id = ? AND verdict = 'request_changes' AND body != '' ORDER BY id", id).toArray()
@@ -3425,7 +3510,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** When a change lands, the notes its author left in its context become the project's. */
   private async notesFromContext(ch: any) {
-    const ctx = await this.env.CONTEXT.get(`${this.project}/changes/${ch.id}/context.json`);
+    const ctx = await this.context.get(`${this.project}/changes/${ch.id}/context.json`);
     const saved = ctx ? ((await ctx.json()) as any) : null;
     const raw = saved?.context?.notes;
     if (!Array.isArray(raw)) return;
@@ -3826,7 +3911,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", remote: this.remoteUrl(this.mainRepo) },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, remote: this.remoteUrl(this.mainRepo) },
       agents, tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
