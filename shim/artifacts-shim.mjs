@@ -175,7 +175,27 @@ function gitHttp(req, res, url) {
     res.write(buf.subarray(idx + 4));
   });
   child.stderr.on("data", (d) => process.stderr.write(d));
-  child.on("close", () => res.end());
+  child.on("close", () => {
+    res.end();
+    if (write && req.method === "POST") announcePush(m[1]).catch((e) => console.error("push event", e.message));
+  });
+}
+
+/**
+ * Like an Artifacts event subscription: after a push, POST a
+ * cf.artifacts.repo.pushed message to the Worker's dev endpoint, or to
+ * LOOM_EVENTS_URL ("off" for none).
+ */
+const EVENTS_URL = process.env.LOOM_EVENTS_URL === "off" ? null : process.env.LOOM_EVENTS_URL ?? "http://127.0.0.1:8787/api/dev/artifacts-events";
+const lastHead = new Map();
+async function announcePush(repo) {
+  if (!EVENTS_URL) return;
+  const after = (await run("git", ["--git-dir", repoDir(repo), "rev-parse", "refs/heads/main"]).catch(() => ({ stdout: "" }))).stdout.trim();
+  if (!after || lastHead.get(repo) === after) return;
+  const before = lastHead.get(repo) ?? null;
+  lastHead.set(repo, after);
+  const message = { type: "cf.artifacts.repo.pushed", source: { type: "artifacts.repo", namespace: NAMESPACE, repoName: repo }, payload: { ref: "refs/heads/main", before, after } };
+  await fetch(EVENTS_URL, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify([message]) });
 }
 
 /**

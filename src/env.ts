@@ -28,5 +28,15 @@ export interface Env {
   /** Containers that run each project's checks. Absent in local development, where the shim runs them. */
   CHECKS?: DurableObjectNamespace<CheckRunner>;
   CONTEXT: R2Bucket;
+  /** EU residency: an Artifacts namespace created with jurisdiction "eu", and an R2 bucket created in the EU. Both or neither. */
+  ARTIFACTS_EU?: Artifacts;
+  CONTEXT_EU?: R2Bucket;
+  /** Artifacts namespace names, as in wrangler.toml; push subscriptions name them. Default "loom" and "loom-eu". */
+  ARTIFACTS_NAMESPACE?: string;
+  ARTIFACTS_EU_NAMESPACE?: string;
+  /** Artifacts push events: the queue they arrive on, and an API token (Queues Write) to subscribe each workspace. */
+  CF_ACCOUNT_ID?: string;
+  CF_EVENTS_TOKEN?: string;
+  ARTIFACTS_EVENTS_QUEUE_ID?: string;
   ASSETS: Fetcher;
 }
