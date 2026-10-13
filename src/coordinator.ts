@@ -2812,11 +2812,21 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const c of this.sql.exec("SELECT id, title, agent_id, updated_at FROM changes WHERE status = 'conflict' AND updated_at < ?", now - 5 * 60_000).toArray()) {
       items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
     }
-    // A change waiting on review that nobody has reviewed: say who was asked, if anyone.
-    for (const c of this.sql.exec(`SELECT c.id, c.title, c.agent_id, c.updated_at, (SELECT GROUP_CONCAT(reviewer) FROM review_requests r WHERE r.change_id = c.id AND r.status IN ('open','accepted')) AS asked
-                                   FROM changes c WHERE c.status = 'review' AND c.updated_at < ? AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = c.id AND v.head = c.head) LIMIT 50`, now - 10 * 60_000).toArray()) {
-      const asked = c.asked ? (c.asked as string).split(",").map((r) => this.agentName(r)).join(", ") : null;
-      items.push({ kind: "stuck", reason: asked ? `review requested from ${asked}, no answer` : "waiting for review, nobody asked", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
+    // Reviews that aren't moving: no agent can take one, nobody has taken one, or whoever was asked hasn't answered.
+    const listedChanges = new Set(items.filter((i) => i.change).map((i) => i.change));
+    for (const t of this.reviewTasks()) {
+      if (t.needsPerson || listedChanges.has(t.change)) continue; // already waiting on a person above
+      const left = this.reviewersLeft(t.change);
+      const age = now - t.since;
+      const base = { kind: "stuck", detail: `#${t.change} ${t.title.replace(/^Review #\d+: /, "")}`, agent: t.author, change: t.change, since: t.since };
+      if (!left.length && t.status === "open") {
+        const others = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", t.author, DELEGATE_ID).one().n as number;
+        items.push({ ...base, reason: others ? "no agent left to review it" : "no other agent to review it", action: "review" });
+      } else if (t.status === "open" && age > 5 * 60_000) {
+        items.push({ ...base, reason: left.some((a) => a.present) ? "review task nobody has taken" : "review task nobody has taken, no reviewer around", action: "review" });
+      } else if (t.status !== "open" && age > 10 * 60_000 && !t.reviewers.some((r) => r.status === "reviewing")) {
+        items.push({ ...base, reason: `review requested from ${t.reviewers.map((r) => r.name).join(", ")}, no answer` });
+      }
     }
     for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
@@ -3083,6 +3093,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
       out.push(task);
     }
     return out;
+  }
+
+  /** Agents who could still review a change: not its author, not a person, not paused, and not already done or passed on it. */
+  private reviewersLeft(id: number) {
+    const ch = this.change(id);
+    const now = Date.now();
+    return this.sql.exec(`SELECT id, last_seen FROM agents a WHERE a.role != 'human' AND a.id NOT IN (?, ?) AND (a.paused IS NULL OR a.paused = '')
+        AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = ? AND v.reviewer = a.id AND v.head = ?)
+        AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE r.change_id = ? AND r.reviewer = a.id AND r.status IN ('declined','expired'))`,
+      ch.agent_id, DELEGATE_ID, id, ch.head, id).toArray()
+      .map((a) => ({ id: a.id as string, present: now - ((a.last_seen as number) ?? 0) < PRESENT_MS }));
   }
 
   /** Take an open review task: it becomes yours, accepted, with the usual time to deliver. */
