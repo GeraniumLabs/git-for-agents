@@ -319,9 +319,17 @@ function renderAttention() {
     if (it.kind === "review") {
       return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
+    if (it.kind === "task") {
+      const yours = it.person === me?.id;
+      return box(`<div class="kicker">Task for ${yours ? "you" : esc(name(it.person))}${it.by ? ` · from ${esc(name(it.by))}` : ""} · ${ago(it.since)}</div><div><a data-task="${it.task}">#${it.task} ${esc(it.title)}</a></div>${yours ? `<div class="row"><button data-task="${it.task}">Open</button><button class="ghost" data-take-task="${it.task}">Take it</button></div>` : ""}`, "q");
+    }
     return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("approve")}`, "q");
   }).join("") || `<p class="empty">Nothing needs a person right now.</p>`;
   wire($("#attention"));
+  for (const b of $("#attention").querySelectorAll("[data-take-task]")) b.onclick = async () => {
+    const r = await act("POST", `/tasks/${b.dataset.takeTask}/claim`);
+    showWork(`<div class="card"><b>Task #${r.task.id} is yours.</b>${pushInfo(r)}</div>`);
+  };
 }
 
 function renderStuck() {
@@ -948,11 +956,15 @@ async function showSettings() {
 $("#settings-open").onclick = () => showSettings();
 
 // ── my work: people claim tasks, push with git, and submit like agents ───
+/** How to clone and push a claimed task's workspace. */
+const pushInfo = (r) => `<pre class="diff copy">${esc(r.git.clone)}\ncd work\n# edit, commit, then:\ngit -c http.extraHeader="Authorization: Bearer ${esc(r.workspace.token)}" push origin HEAD:main</pre><p class="meta">The workspace is yours alone; main changes only through the merge queue.</p>
+    <div class="row"><input data-intent="${r.task.id}" placeholder="Files you'll touch, e.g. src/db.js, docs/**" style="flex:1"><button class="ghost mini" data-declare="${r.task.id}">Declare</button></div>
+    <p class="meta">Declaring warns agents headed for the same files, and tells you what was already decided about them.</p>`;
 async function showWork(note = "") {
   if (!me) return toast("Sign in first");
   const [p, open, queue] = await Promise.all([api(`/agents/${encodeURIComponent(me.id)}`), api("/tasks?status=open&limit=30"), api(`/reviews?for=${encodeURIComponent(me.id)}`)]);
   const mine = (p.tasks ?? []).filter((t) => !["merged", "abandoned"].includes(t.status));
-  const ready = open.filter((t) => !t.depends_on.length);
+  const ready = open.filter((t) => !t.depends_on.length && (!t.assignee || t.assignee === me.id));
   $("#detail-body").innerHTML = `
     <h3>My work</h3>
     <p class="meta">You work like an agent does: take a task, clone its workspace, push your commits, submit. Reviews, conflicts and the merge queue treat you the same.</p>
@@ -966,8 +978,10 @@ async function showWork(note = "") {
     <h2>Open tasks <small>${ready.length} ready</small></h2>
     ${ready.length ? ready.map((t) => `<div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><button class="mini" data-take="${t.id}">Take it</button></div>`).join("") : `<p class="meta">Nothing open.</p>`}
     <h2>New task</h2>
-    <input id="nt-title" placeholder="Title" style="width:100%"><textarea id="nt-desc" rows="2" placeholder="What needs doing" style="width:100%;margin-top:6px"></textarea>
-    <div class="row"><button class="ghost" id="nt-add">Add to the board</button><button id="nt-take">Add and take it</button></div>`;
+    <input id="nt-title" placeholder="Title" style="width:100%"><textarea id="nt-desc" rows="3" placeholder="What's wrong or needed, how to reproduce it, what done looks like" style="width:100%;margin-top:6px"></textarea>
+    <div class="row"><input id="nt-for" placeholder="For: an agent or person by name, or blank for any agent" style="flex:1"></div>
+    <p class="meta">Left blank, any agent can claim it. Given to an agent, it shows in that agent's todo. Given to a person, it waits under Needs a person, where their stand-in sees it, until they take it. The change that fixes it is linked from the task, and the task closes when that change lands.</p>
+    <div class="row"><button class="ghost" id="nt-add">File it</button><button id="nt-take">File it and take it</button></div>`;
   const drawQueue = () => {
     if (!$("#rq")) return;
     const only = $("#rq-person").checked;
@@ -979,9 +993,6 @@ async function showWork(note = "") {
       || `<p class="meta">Nothing needs a person right now. ${queue.length} ${queue.length === 1 ? "change is" : "changes are"} with the agents.</p>`;
     wire($("#rq"));
   };
-  const pushInfo = (r) => `<pre class="diff copy">${esc(r.git.clone)}\ncd work\n# edit, commit, then:\ngit -c http.extraHeader="Authorization: Bearer ${esc(r.workspace.token)}" push origin HEAD:main</pre><p class="meta">The workspace is yours alone; main changes only through the merge queue.</p>
-    <div class="row"><input data-intent="${r.task.id}" placeholder="Files you'll touch, e.g. src/db.js, docs/**" style="flex:1"><button class="ghost mini" data-declare="${r.task.id}">Declare</button></div>
-    <p class="meta">Declaring warns agents headed for the same files, and tells you what was already decided about them.</p>`;
   $("#detail-body").onclick = async (e) => {
     const b = e.target.closest("[data-declare]");
     if (!b) return;
@@ -1014,8 +1025,9 @@ async function showWork(note = "") {
   const addTask = async (take) => {
     const title = $("#nt-title").value.trim();
     if (!title) return;
-    const t = await act("POST", "/tasks", { title, description: $("#nt-desc").value.trim() });
-    if (!take) return showWork(`<p class="meta">Added #${t.id}.</p>`);
+    const assignee = take ? null : $("#nt-for").value.trim() || null;
+    const t = await act("POST", "/tasks", { title, description: $("#nt-desc").value.trim(), assignee });
+    if (!take) return showWork(`<p class="meta">Filed <a data-task="${t.id}">#${t.id}</a>${t.assignee ? ` for ${esc(name(t.assignee))}` : " for any agent"}.</p>`);
     const r = await act("POST", `/tasks/${t.id}/claim`);
     showWork(`<div class="card"><b>Task #${t.id} is yours.</b>${pushInfo(r)}</div>`);
   };
@@ -1523,7 +1535,7 @@ async function showTasks(stage = "", q = "") {
   const label = (TASK_STAGES.find(([k]) => k === stage) ?? TASK_STAGES[0])[1];
   $("#detail-body").innerHTML = `<h3>${rows.length === 200 ? "Latest 200" : rows.length} ${stage ? label.toLowerCase() + " " : ""}task${rows.length === 1 ? "" : "s"}${q ? ` matching “${esc(q)}”` : ""}</h3>
     <div class="row tasks-tools"><span class="seg" role="tablist">${TASK_STAGES.map(([k, l]) => `<button data-stage="${k}" class="${k === stage ? "on" : ""}" role="tab">${l}</button>`).join("")}</span>
-      <input id="tasks-q" type="search" placeholder="Filter by title or #number" value="${esc(q)}"></div>
+      <input id="tasks-q" type="search" placeholder="Filter by title or #number" value="${esc(q)}">${me ? `<button class="mini" id="tasks-new">New task</button>` : ""}</div>
     <table class="dir tasks"><thead><tr><th>Task</th><th>Status</th><th>Held by</th><th>Intent</th><th>Change</th></tr></thead><tbody>
     ${rows.map((t) => `<tr>
       <td><a data-task="${t.id}">#${t.id} ${esc(t.title)}</a>${t.attempts ? ` <span class="meta">· contest of ${t.attempts}</span>` : ""}</td>
@@ -1535,6 +1547,7 @@ async function showTasks(stage = "", q = "") {
     ${rows.length === 200 ? `<p class="meta">Showing the newest 200. Filter or search to find older ones.</p>` : ""}`;
   wire($("#detail-body"));
   for (const b of $("#detail-body").querySelectorAll("[data-stage]")) b.onclick = () => showTasks(b.dataset.stage, $("#tasks-q").value.trim());
+  if ($("#tasks-new")) $("#tasks-new").onclick = async () => { await showWork(); $("#nt-title")?.scrollIntoView({ block: "center" }); $("#nt-title")?.focus(); };
   let t;
   $("#tasks-q").oninput = () => { clearTimeout(t); t = setTimeout(async () => { const v = $("#tasks-q").value.trim(); await showTasks(stage, v); const i = $("#tasks-q"); i.focus(); i.setSelectionRange(v.length, v.length); }, 250); };
   if (!$("#detail").open) $("#detail").showModal();
@@ -1553,9 +1566,9 @@ async function loadTask(id) {
     <div class="rv-top">
       <a class="button ghost mini" href="#">← ${esc(project)}</a>
       <h1>${esc(t.title)} <span class="meta">task #${t.id}</span> ${taskStatus(t.status)}</h1>
-      <div class="meta">${t.assignee ? `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago</div>
+      <div class="meta">${t.assignee ? t.status === "open" ? `Assigned to ${who(t.assignee)}, not taken yet` : `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago</div>
       ${t.description ? `<p class="rv-summary">${esc(t.description)}</p>` : ""}
-      <div class="row">${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}</div>
+      <div class="row">${isHuman() && !t.attempts && !["merged", "closed"].includes(t.status) ? `<button class="ghost mini" id="task-assign">${t.assignee ? "Reassign…" : "Assign…"}</button>` : ""}${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}</div>
     </div>
     <div class="task-page">
       <div class="task-main">
@@ -1572,6 +1585,12 @@ async function loadTask(id) {
       </aside>
     </div>`;
   wire($("#review"));
+  if ($("#task-assign")) $("#task-assign").onclick = async () => {
+    const to = await ask({ title: `Who should take task #${t.id}?`, body: "An agent sees it in its todo. A person sees it under Needs a person, and so does their stand-in. Leave it blank to put it back on the board for any agent.", ok: "Assign", input: { label: "Agent or person", placeholder: "Name", rows: 1 } });
+    if (to === null) return;
+    try { await act("POST", `/tasks/${t.id}/assign`, { agent: to.trim() || null }); } catch { return; }
+    loadTask(t.id);
+  };
 }
 
 async function loadContest(id) {
@@ -1712,7 +1731,7 @@ $("#jev").onclose = async () => {
 
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
-  attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
+  attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, reviews an agent asked you for, and tasks someone gave a person that they haven't taken yet. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
   stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",

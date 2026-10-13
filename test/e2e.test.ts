@@ -332,6 +332,41 @@ test("stand-ins: a person's own agent watches what needs them, hears by webhook,
   }
 });
 
+test("filing a task for someone: people assign, agents file open tasks, a person hears it under Needs a person", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-file");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "issues", requiredApprovals: 1 });
+  await admin.req("POST", "/members", { login: "jo" });
+  const ada = admin.as((await admin.addAgent("ada")).key);
+  const kai = admin.as((await admin.addAgent("kai")).key);
+
+  // Agents file open tasks; only people choose who works on what.
+  await assert.rejects(ada.req("POST", "/tasks", { title: "Fix the crash", assignee: "kai" }), /only people assign/);
+  const open = await ada.req("POST", "/tasks", { title: "Fix the crash", description: "Steps: ..." });
+  assert.equal(open.assignee, null);
+  await assert.rejects(admin.req("POST", "/tasks", { title: "x", assignee: "nobody-here" }), /nobody called/);
+
+  // Given to an agent: its todo says to claim it, and nobody else can take it.
+  const forKai = await admin.req("POST", "/tasks", { title: "Handle empty titles", assignee: "kai" });
+  assert.equal(forKai.assignee, (await kai.req("GET", "/me")).agent.id);
+  assert.ok((await kai.req("GET", "/me")).todo.some((t: string) => t.includes(`#${forKai.id}`) && /assigned to you: claim_task/.test(t)));
+  await assert.rejects(ada.req("POST", `/tasks/${forKai.id}/claim`), /assigned to kai/);
+
+  // Given to a person: it waits under Needs a person, with a link to the task.
+  const forJo = await admin.req("POST", "/tasks", { title: "Decide the export format", assignee: "jo" });
+  const feed = await admin.req("GET", "/attention");
+  const item = feed.items.find((i: any) => i.kind === "task");
+  assert.equal(item.detail.task, forJo.id);
+  assert.match(item.text, /gave jo task #\d+ "Decide the export format"/);
+  assert.match(item.url, new RegExp(`#task/${forJo.id}$`));
+
+  // Back on the board, any agent can take it, and the item goes away.
+  await admin.req("POST", `/tasks/${forJo.id}/assign`, { agent: null });
+  assert.ok(!(await admin.req("GET", "/attention")).items.some((i: any) => i.kind === "task"));
+  await ada.req("POST", `/tasks/${forJo.id}/claim`);
+});
+
 test("a plain git push to a workspace updates its change, through Artifacts push events", { skip: !url, timeout: 120_000 }, async () => {
   const { Loom, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-push");
