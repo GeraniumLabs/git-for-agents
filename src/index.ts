@@ -4,7 +4,7 @@ import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
 import { projectOfWorkspace, pushOf } from "./events";
 
-import { AGENT_HEADER } from "./coordinator";
+import { AGENT_HEADER, DIRECTIVES_HEADER } from "./coordinator";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
@@ -110,16 +110,23 @@ export default {
       const auth = req.headers.get("authorization") ?? "";
       // Which agent under the key: per tool call (as), else per connection (header or ?as=).
       const named = req.headers.get(AGENT_HEADER) ?? url.searchParams.get("as");
-      return handleMcp(req, (as) => async (method, p, body) => {
-        const who = as ?? named;
-        const res = await (await coordinator(env, project)).fetch(`https://do${p}`, {
-          method,
-          headers: { authorization: auth, "content-type": "application/json", ...(who ? { [AGENT_HEADER]: who } : {}) },
-          body: body === undefined ? undefined : JSON.stringify(body),
-        });
-        const data = await res.json<any>();
-        if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
-        return data;
+      return handleMcp(req, (as) => {
+        // The last response's unacknowledged directives, shown with the tool's result.
+        let directives: { seq: number; from: string; body: string }[] = [];
+        const call = async (method: string, p: string, body?: unknown) => {
+          const who = as ?? named;
+          const res = await (await coordinator(env, project)).fetch(`https://do${p}`, {
+            method,
+            headers: { authorization: auth, "content-type": "application/json", ...(who ? { [AGENT_HEADER]: who } : {}) },
+            body: body === undefined ? undefined : JSON.stringify(body),
+          });
+          const pending = res.headers.get(DIRECTIVES_HEADER);
+          directives = pending ? JSON.parse(decodeURIComponent(pending)) : [];
+          const data = await res.json<any>();
+          if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+          return data;
+        };
+        return Object.assign(call, { directives: () => directives });
       });
     }
 
