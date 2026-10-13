@@ -142,10 +142,17 @@ export class ShimStore implements RepoStore {
 
 export interface StoreEnv {
   ARTIFACTS?: Artifacts;
+  ARTIFACTS_EU?: Artifacts;
   ARTIFACTS_SHIM_URL?: string;
 }
 
-export function makeStore(env: StoreEnv): RepoStore {
+/** The repos of a project, in the EU namespace when it keeps its data there. */
+export function makeStore(env: StoreEnv, jurisdiction: "eu" | null = null): RepoStore {
+  if (jurisdiction === "eu") {
+    if (env.ARTIFACTS_EU) return new ArtifactsStore(env.ARTIFACTS_EU);
+    if (env.ARTIFACTS_SHIM_URL) return new ShimStore(env.ARTIFACTS_SHIM_URL);
+    throw new Error("this project keeps its data in the EU, but the Worker has no ARTIFACTS_EU binding");
+  }
   if (env.ARTIFACTS) return new ArtifactsStore(env.ARTIFACTS);
   if (env.ARTIFACTS_SHIM_URL) return new ShimStore(env.ARTIFACTS_SHIM_URL);
   throw new Error("No Artifacts binding and no ARTIFACTS_SHIM_URL configured");
