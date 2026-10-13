@@ -454,3 +454,42 @@ test("agents attach files to a change; they show on the change and task, and sta
   assert.equal((await fetch(`${base}/attachments/${shot.id}/raw`)).status, 404);
   assert.equal((await fetch(`${base}/attachments/${shot.id}/raw?key=${ada.key}`)).status, 200);
 });
+
+test("a directive reaches busy agents on every call until they acknowledge it, and people see who hasn't", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-directive");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "directives", requiredApprovals: 1 });
+  const ada = await admin.addAgent("ada", "builder");
+  const bo = await admin.addAgent("bo", "builder");
+  const mcp = async (key: string, tool: string, args: Record<string, unknown> = {}) => {
+    const res = await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${key}`, "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }) });
+    return (await res.json()).result.content.map((c: any) => c.text) as string[];
+  };
+  assert.equal((await mcp(ada.key, "list_files")).length, 1, "no notice before a directive");
+  const sent = await admin.req("POST", "/directives", { body: "Don't add new dependencies" });
+  assert.equal(sent.awaitingAck, 2);
+  // Whatever a busy agent calls, the directive comes first.
+  const out = await mcp(ada.key, "list_files");
+  assert.match(out[0], /NEW DIRECTIVE/);
+  assert.match(out[0], /Don't add new dependencies/);
+  const me = await admin.as(ada.key).req("GET", "/me");
+  assert.match(me.todo[0], /Directive #\d+ .*ack_directive/);
+  assert.equal(me.directives[0].seq, sent.seq);
+  // Plain HTTP carries it in a header.
+  const raw = await fetch(`${url}/api/projects/${name}/files`, { headers: { authorization: `Bearer ${bo.key}` } });
+  assert.equal(JSON.parse(decodeURIComponent(raw.headers.get("x-loom-directives")!))[0].seq, sent.seq);
+
+  const ack = await mcp(ada.key, "ack_directive", { seq: sent.seq, note: "no new deps" });
+  assert.doesNotMatch(ack[0], /NEW DIRECTIVE/);
+  assert.deepEqual(JSON.parse(ack[0]).acked, [sent.seq]);
+  assert.equal((await mcp(ada.key, "list_files")).length, 1, "the notice stops once acknowledged");
+  assert.equal((await admin.as(ada.key).req("GET", "/me")).directives.length, 0);
+  const acks = await admin.req("GET", `/directives/${sent.seq}/acks`);
+  assert.deepEqual(acks.map((a: any) => [a.name, a.acked]).sort(), [["ada", true], ["bo", false]]);
+  // A directive to one agent isn't the others'.
+  const solo = await admin.req("POST", "/directives", { to: bo.id, body: "Pause the refactor" });
+  await assert.rejects(admin.as(ada.key).req("POST", `/directives/${solo.seq}/ack`, {}), /wasn't sent to you/);
+  assert.deepEqual((await admin.as(bo.key).req("POST", "/directives/ack", {})).acked, [sent.seq, solo.seq], "no seq acknowledges all");
+});

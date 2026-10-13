@@ -2,7 +2,10 @@
 // project with one URL and its agent key: POST /mcp/<project>.
 // Each tool is a thin call into the project's coordinator.
 
-type Call = (method: string, path: string, body?: unknown) => Promise<any>;
+type Call = ((method: string, path: string, body?: unknown) => Promise<any>) & {
+  /** Directives the agent hasn't acknowledged, from the last response (Loom sends them on every one). */
+  directives?: () => { seq: number; from: string; body: string }[];
+};
 /** The coordinator, called as the named agent under the key (or as the key's own agent). */
 type CallAs = (as: string | null) => Call;
 
@@ -44,6 +47,12 @@ const TOOLS: Tool[] = [
     description: "Check in. Your identity, a todo list of what's waiting for you (review requests to answer, changes sent back, tasks without a change), and the latest events addressed to you. Call it first whenever you come back to this project.",
     inputSchema: obj({}),
     run: (_a, call) => call("GET", "/me"),
+  },
+  {
+    name: "ack_directive",
+    description: "Acknowledge a directive from a person: you've read it and are following it over your own plan. Until you do, every Loom response carries it and whoami lists it first; people see who hasn't acknowledged. Leave out seq to acknowledge every directive waiting for you. Add a note if it changes what you're doing (\"stopping the refactor, switching to the fix\").",
+    inputSchema: obj({ seq: num("The directive's number (whoami todo, or the notice on any response)"), note: str("What you're doing about it") }),
+    run: (a, call) => a.seq == null ? call("POST", "/directives/ack", { note: a.note }) : call("POST", `/directives/${a.seq}/ack`, { note: a.note }),
   },
   {
     name: "create_task",
@@ -354,7 +363,7 @@ async function handleOne(m: any, call: CallAs): Promise<any> {
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
         instructions:
-          "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: check whoami regularly for directives, pause notices, reassignments and answers, and follow directives over your own plan. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
+          "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
       });
     case "ping":
       return reply({});
@@ -362,18 +371,31 @@ async function handleOne(m: any, call: CallAs): Promise<any> {
       return reply({ tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema: withAs(inputSchema) })) });
     case "tools/call": {
       const tool = TOOLS.find((t) => t.name === m.params?.name);
+      let c: Call | null = null;
       if (!tool) return { jsonrpc: "2.0", id: m.id, error: { code: -32602, message: `unknown tool ${m.params?.name}` } };
       try {
         const { as, ...args } = m.params?.arguments ?? {};
-        const result = await tool.run(args, call(typeof as === "string" && as.trim() ? as.trim() : null));
-        return reply({ content: [{ type: "text", text: JSON.stringify(result, null, 2) }] });
+        c = call(typeof as === "string" && as.trim() ? as.trim() : null);
+        const result = await tool.run(args, c);
+        return reply({ content: [...notice(c), { type: "text", text: JSON.stringify(result, null, 2) }] });
       } catch (e: any) {
-        return reply({ content: [{ type: "text", text: String(e?.message ?? e) }], isError: true });
+        return reply({ content: [...notice(c), { type: "text", text: String(e?.message ?? e) }], isError: true });
       }
     }
     default:
       return { jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `method not found: ${m.method}` } };
   }
+}
+
+/**
+ * A directive the agent hasn't acknowledged rides on every tool result, first,
+ * so an agent busy with its own work sees it whatever it called.
+ */
+function notice(c: Call | null) {
+  const pending = c?.directives?.() ?? [];
+  if (!pending.length) return [];
+  const lines = pending.map((d) => `#${d.seq} from ${d.from}: "${d.body}"`);
+  return [{ type: "text", text: `NEW DIRECTIVE${pending.length > 1 ? "S" : ""} from people on this project. Follow ${pending.length > 1 ? "them" : "it"} over your own plan, then call ack_directive${pending.length > 1 ? " (no seq acknowledges all)" : ` with seq ${pending[0].seq}`}:\n${lines.join("\n")}` }];
 }
 
 /** One line per event: who did what, to which task or change, and the gist. */

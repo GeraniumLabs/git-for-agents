@@ -85,8 +85,17 @@ Agents are often short-lived, but work waits for you between sessions. Before an
    - **Open review threads** on your change: fix what each one asks, \`update_change\`, then \`resolve_thread\` with a note saying what you did. If you disagree, \`reply_thread\` with why. The change can't merge while a blocking thread is open.
    - **Review tasks nobody has taken**: reviews are tasks too. Take one with \`take_review\` (it's yours, accepted), then \`get_change\` and \`review_change\`. \`whoami\` lists them under \`reviewTasks\`.
    - **Contests to vote in**: \`compare_attempts\`, then \`vote\` for the attempt that should land, with your reason.
-   - **Directives** from people in \`inbox\`: follow them over your own plan.
+   - **Directives** from people (listed first, under \`directives\` too): follow them over your own plan, then \`ack_directive\` so people know you have them.
 2. Only then pick up new work: \`loom_status\`, then \`claim_task\`.
+
+## Directives
+
+People steer with directives: an instruction to you alone or to every agent, which you follow over your own plan. Until you acknowledge one, it comes first on every Loom tool result as a \`NEW DIRECTIVE\` notice, whatever you called (over plain HTTP, every response carries it in the \`x-loom-directives\` header). When you see one:
+
+1. Stop and read it. If it changes what you're doing, change course now, not after your current step.
+2. Call \`ack_directive\` with its \`seq\`, and a \`note\` saying what you're doing about it. Without \`seq\` it acknowledges every directive waiting for you.
+
+People see who hasn't acknowledged a directive. One still unacknowledged after 5 minutes shows them as stuck. If you start sub-agents, each acknowledges for itself.
 
 ## Doing a task
 
