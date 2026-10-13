@@ -42,7 +42,7 @@
   <span class="sep"></span>
   <button id="freeze" class="ghost" title="Stop the merge queue: nothing lands on main until you unfreeze. Agents keep working and submitting">Freeze main</button>
   <span class="sep"></span>
-  <button id="jev-open" class="ghost" title="Brief the deputy to answer questions, approve protected changes or settle disputes for you, within your guidance">Delegate…</button>
+  <button id="jev-open" class="ghost" title="Brief the deputy to answer questions, approve protected or flagged changes, or settle disputes for you, within your guidance">Delegate…</button>
 </section>
 
 <section class="tour" id="tour" hidden></section>
@@ -121,12 +121,16 @@
   <form id="jev-form" method="dialog" class="jev-form">
     <h3><span id="jev-title">deputy</span>: a stand-in for the humans</h3>
     <p class="meta">Decide what the deputy may handle for you. It answers only within this brief, using house rules and a decision model (Cloudflare's Clef, unless you add a key), and hands everything else to a person with the reason. <span id="jev-status"></span></p>
-    <label class="check"><input type="checkbox" name="enabled"> Let the deputy act for the humans</label>
+    <label class="check jev-master"><input type="checkbox" name="enabled"> Let the deputy act for the humans <small>the master switch: while it's off, nothing below does anything</small></label>
+    <div id="jev-summary" aria-live="polite"></div>
+    <details class="jev-context"><summary>What the deputy knows about the project</summary><div id="jev-context" class="meta">Loading…</div>
+      <p class="meta">It gets this with every decision, so your guidance can depend on it (“early on”, “while it's a few agents”, “once there are tests”). The concept is the project description in Settings.</p></details>
     <label>Name <input name="name" maxlength="24"></label>
-    <label>Guidance <small>what the deputy judges by, in your words</small>
+    <label>Guidance <small>what the deputy judges by, in your words. It isn't a power itself: it only takes effect through the powers you tick below</small>
       <textarea name="guidance" rows="4" placeholder="e.g. Prefer the stricter option on validation. Keep the API backwards compatible. No new runtime dependencies."></textarea></label>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="q_enabled"> Answer agents' questions</label></legend>
+      <p class="meta">When an agent asks the humans a question, the deputy answers it with a house rule, an earlier decision, or one of the options the agent listed.</p>
       <label>Only about <input name="q_topics" placeholder="any topic, or e.g. naming, validation, tests"></label>
       <label><span>Act when the model is at least <output id="q_conf_out"></output> sure</span> <input type="range" name="q_conf" min="0.5" max="0.99" step="0.01"></label>
       <label>House rules <small>one per line: <span class="mono">pattern =&gt; answer</span></small>
@@ -134,9 +138,16 @@
     </fieldset>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="a_enabled"> Approve changes to protected paths</label></legend>
+      <p class="meta">Changes that touch a protected path need a person's approval to merge. The deputy can give it for the paths listed here, but never for a change with files outside its declared intent.</p>
       <label>Only these paths <input name="a_paths" placeholder="e.g. README.md, docs/**"></label>
       <label class="check"><input type="checkbox" name="a_review"> Only after an agent reviewer approved</label>
       <label><span>Act when the model is at least <output id="a_conf_out"></output> sure</span> <input type="range" name="a_conf" min="0.5" max="0.99" step="0.01"></label>
+    </fieldset>
+    <fieldset>
+      <legend><label class="check"><input type="checkbox" name="f_enabled"> Clear changes flagged “Needs a person”</label></legend>
+      <p class="meta">A change's review brief flags it for a person when it touches files outside its declared intent, changes code without tests, or is new ground for its author. The deputy can approve it for the humans when your guidance allows it. It knows where the project stands, so guidance like “during bootstrap” works. Never protected paths or failing checks.</p>
+      <label class="check"><input type="checkbox" name="f_review"> Only after an agent reviewer approved</label>
+      <label><span>Act when the model is at least <output id="f_conf_out"></output> sure</span> <input type="range" name="f_conf" min="0.5" max="0.99" step="0.01"></label>
     </fieldset>
     <fieldset>
       <legend><label class="check"><input type="checkbox" name="d_enabled"> Settle disputes between agents</label></legend>
