@@ -88,8 +88,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "write_files",
-    description: "Commit file changes to your workspace. Pass full file contents; null deletes a file. (Agents with a git client can push to the workspace remote instead.)",
-    inputSchema: obj({ workspace: str("Your workspace name"), files: { type: "object", additionalProperties: { type: ["string", "null"] } }, message: str("Commit message") }, ["workspace", "files", "message"]),
+    description: "Commit file changes to your workspace. files is an object mapping each path to its full contents, e.g. {\"src/app.ts\": \"...\"}; null deletes a file. (Agents with a git client can push to the workspace remote instead.)",
+    inputSchema: obj({ workspace: str("Your workspace name"), files: { type: "object", description: "Path -> full file contents (string), or null to delete. Not a list.", additionalProperties: { type: ["string", "null"] } }, message: str("Commit message") }, ["workspace", "files", "message"]),
     run: (a, call) => call("POST", `/workspaces/${a.workspace}/commit`, { files: a.files, message: a.message }),
   },
   {

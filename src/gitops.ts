@@ -262,6 +262,7 @@ export class Workspace {
     for (const [path, content] of Object.entries(files)) {
       const p = path.replace(/^\/+/, "");
       if (content === null) flat.delete(p);
+      else if (typeof content !== "string") throw new Error(`${p}: file contents must be a string, got ${typeof content}`);
       else flat.set(p, { oid: await this.writeText(content), mode: flat.get(p)?.mode ?? "100644" });
     }
     const tree = await this.writeFlat(flat);

@@ -269,16 +269,17 @@ function renderHealth() {
   const t = h.tasks;
   const open = (t.open ?? 0), active = (t.claimed ?? 0) + (t.blocked ?? 0) + (t.conflict ?? 0), review = (t.in_review ?? 0) + (t.queued ?? 0), merged = t.merged ?? 0;
   const total = open + active + review + merged || 1;
-  const seg = (n, cls, label) => n ? `<span class="seg-${cls}" style="flex:${n}" title="${n} ${label}"></span>` : "";
+  const STAGE_OF = { ok: "landed", info: "review", warn: "active", muted: "open" };
+  const seg = (n, cls, label) => n ? `<span class="seg-${cls}" style="flex:${n}" title="${n} ${label}" data-tasks="${STAGE_OF[cls]}"></span>` : "";
   $("#health").innerHTML = `
     <div class="tile wide" title="Agents in this project, by what they're doing now. Click a state to list those agents">
       <b>${h.agents.total}</b><span>agents</span>
       <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}" title="${STATE_HELP[k] ?? ""}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
     </div>
-    <div class="tile wide" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage">
-      <b>${merged}<small>/${total === 1 && !merged ? 0 : total}</small></b><span>tasks landed</span>
+    <div class="tile wide" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage. Click to list the tasks">
+      <a class="tile-link" data-tasks="" href="#tasks"><b>${merged}<small>/${total === 1 && !merged ? 0 : total}</small></b><span>tasks landed</span></a>
       <div class="bar">${seg(merged, "ok", "landed")}${seg(review, "info", "in review or queued")}${seg(active, "warn", "in progress")}${seg(open, "muted", "open")}</div>
-      <div class="meta">${open} open · ${active} in progress · ${review} in review or queued</div>
+      <div class="meta"><a data-tasks="open" href="#tasks">${open} open</a> · <a data-tasks="active" href="#tasks">${active} in progress</a> · <a data-tasks="review" href="#tasks">${review} in review or queued</a></div>
     </div>
     <div class="tile" title="Changes waiting for review. Each is a task any agent can take (take_review); untaken ones are offered to agents who know the code"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
     <div class="tile" title="Approved changes waiting to land on main. They land one batch at a time, after the project's checks pass"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
@@ -287,6 +288,7 @@ function renderHealth() {
     <div class="tile" title="Share of merge attempts in the last hour that hit a conflict. Over 20% shows red: look at Where the work is"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
     <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
   for (const b of document.querySelectorAll("[data-state]")) b.onclick = () => showDirectory(b.dataset.state);
+  for (const b of $("#health").querySelectorAll("[data-tasks]")) b.onclick = (e) => { e.preventDefault(); showTasks(b.dataset.tasks); };
 }
 
 // ── what needs a person ─────────────────────────────────────────────────
@@ -312,7 +314,7 @@ function renderAttention() {
       return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}${me ? "" : signInToAct("rule on it")}`, "q");
     }
     if (it.kind === "brief") {
-      return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
+      return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
     if (it.kind === "review") {
       return box(`<div class="kicker">Review asked of ${it.reviewer === me?.id ? "you" : esc(name(it.reviewer))} · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div>${it.reason ? `<div class="meta">${esc(it.reason)}</div>` : ""}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
@@ -333,7 +335,7 @@ function renderStuck() {
 
 function renderDiscussions() {
   const posts = (t) => t.posts.slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("");
-  $("#discussions").innerHTML = state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · task #${t.task_id}` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
+  $("#discussions").innerHTML = state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · <a data-task="${t.task_id}">task #${t.task_id}</a>` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
     ${me ? `<div class="row"><input data-reply="${t.id}" placeholder="Reply…"><button data-send="${t.id}">Send</button></div>` : signInToAct("reply")}</div>`).join("")
     || `<p class="empty">No open discussions.</p>`;
   wire($("#discussions"));
@@ -345,6 +347,7 @@ function wire(root) {
   for (const a of root.querySelectorAll("[data-agent]")) a.onclick = (e) => { e.preventDefault(); showAgent(a.dataset.agent); };
   for (const a of root.querySelectorAll("[data-change]")) a.onclick = (e) => { e.preventDefault(); showChange(Number(a.dataset.change)); };
   for (const a of root.querySelectorAll("[data-contest]")) a.onclick = (e) => { e.preventDefault(); showContest(Number(a.dataset.contest)); };
+  for (const a of root.querySelectorAll("[data-task]")) a.onclick = (e) => { e.preventDefault(); showTask(Number(a.dataset.task)); };
   for (const b of root.querySelectorAll("[data-send]")) b.onclick = async () => {
     const input = root.querySelector(`[data-reply="${b.dataset.send}"]`);
     if (!input.value.trim()) return;
@@ -495,7 +498,7 @@ async function runSearch() {
   const section = (title, rows) => rows ? `<div class="kicker">${title}</div>${rows}` : "";
   $("#search-results").innerHTML =
     section(`Agents${r.total > r.agents.length ? ` (${r.total}, showing ${r.agents.length})` : ""}`, r.agents.map((a) => `<a class="hit" data-agent="${esc(a.id)}"><span class="dot ${a.state}"></span><b>${esc(a.name)}</b> <span class="meta">${a.under ? `under ${esc(a.under.name)} · ` : ""}${a.state}${a.task ? ` · #${a.task.id} ${esc(a.task.title)}` : ""}</span></a>`).join(""))
-    + section("Tasks", r.tasks.map((t) => `<a class="hit" ${t.assignee ? `data-agent="${esc(t.assignee)}"` : ""}>#${t.id} ${esc(t.title)} <span class="meta">${t.status}${t.assigneeName ? ` · ${esc(t.assigneeName)}` : ""}</span></a>`).join(""))
+    + section("Tasks", r.tasks.map((t) => `<a class="hit" data-task="${t.id}">#${t.id} ${esc(t.title)} <span class="meta">${t.status}${t.assigneeName ? ` · ${esc(t.assigneeName)}` : ""}</span></a>`).join(""))
     + section("Changes", r.changes.map((c) => `<a class="hit" data-change="${c.id}">#${c.id} ${esc(c.title)} <span class="meta">${c.status} · ${esc(c.agentName)}</span></a>`).join(""))
     || `<p class="empty">Nothing matches “${esc(q)}”.</p>`;
   $("#search-results").hidden = false;
@@ -536,7 +539,7 @@ async function showAgent(id) {
     ${p.intents.length ? `<h2>Declared intents</h2>${p.intents.map((i) => `<div><span class="mono">${i.paths.map(esc).join(", ")}</span> ${esc(i.description)}</div>`).join("")}` : ""}
     ${p.changes.length ? `<h2>Changes</h2>${p.changes.map((c) => `<div class="qrow"><a data-change="${c.id}">#${c.id}</a> <span class="grow ellipsis">${esc(c.title)}</span><span class="pill ${c.status}">${c.status}</span></div>`).join("")}` : ""}
     ${p.reviewTasks?.length ? `<h2>Review tasks</h2>${p.reviewTasks.map((t) => `<div class="qrow"><a data-change="${t.change}" class="grow ellipsis">${esc(t.title)}</a><span class="meta">${t.reviewers.find((r) => r.agent === p.agent.id)?.status ?? t.status}</span></div>`).join("")}` : ""}
-    ${p.tasks.length && isHuman() ? `<h2>Tasks</h2>${p.tasks.map((t) => `<div class="qrow">#${t.id} <span class="grow ellipsis">${esc(t.title)}</span><span class="meta">${t.status}</span>${t.status !== "merged" ? `<button class="ghost mini" data-reassign="${t.id}">Reassign…</button>` : ""}</div>`).join("")}` : ""}
+    ${p.tasks.length && isHuman() ? `<h2>Tasks</h2>${p.tasks.map((t) => `<div class="qrow"><a data-task="${t.id}">#${t.id}</a> <span class="grow ellipsis">${esc(t.title)}</span><span class="meta">${t.status}</span>${t.status !== "merged" ? `<button class="ghost mini" data-reassign="${t.id}">Reassign…</button>` : ""}</div>`).join("")}` : ""}
     ${p.threads.length ? `<h2>Conversations</h2>${p.threads.map((t) => `<div class="post"><span class="meta">${t.kind} · ${t.status}</span> ${esc(t.title)}</div>`).join("")}` : ""}
     <h2>Recent activity</h2><ol class="feed">${p.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("")}</ol>`;
   wire($("#detail-body"));
@@ -1200,16 +1203,19 @@ function showChange(id) {
 function showContest(id) {
   if (location.hash === `#contest/${id}`) route(); else location.hash = `contest/${id}`;
 }
+function showTask(id) {
+  if (location.hash === `#task/${id}`) route(); else location.hash = `task/${id}`;
+}
 
 /** The dashboard, or a change or contest on its own page, from the URL. */
 function route() {
-  const m = /^#(change|contest)\/(\d+)$/.exec(location.hash);
+  const m = /^#(change|contest|task)\/(\d+)$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!m);
   $("#review").hidden = !m;
   if (!m) { review = null; $("#review").innerHTML = ""; return; }
   if ($("#detail").open) $("#detail").close();
   window.scrollTo(0, 0);
-  if (m[1] === "change") loadReview(Number(m[2])); else loadContest(Number(m[2]));
+  if (m[1] === "change") loadReview(Number(m[2])); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
 window.addEventListener("hashchange", route);
 
@@ -1258,7 +1264,7 @@ function drawReview() {
     <div class="rv-top">
       <a class="button ghost mini" href="#">← ${esc(project)}</a>
       <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
-      <div class="meta">${who(c.agent_id)} wants to land this for task #${c.task.id} “${esc(c.task.title)}” · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
+      <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
       <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
       <div id="clone-box"></div>
@@ -1501,6 +1507,69 @@ function reviewEvent(e) {
 }
 
 // ── contests: the attempts side by side ─────────────────────────────────
+// ── tasks: the list behind the "tasks landed" count, and one task on its own ─
+const TASK_STAGES = [["", "All"], ["open", "Open"], ["active", "In progress"], ["review", "In review"], ["landed", "Landed"], ["closed", "Closed"]];
+const TASK_PILL = { merged: "merged", conflict: "conflict", blocked: "conflict", in_review: "review", queued: "queued", claimed: "", open: "", closed: "" };
+const taskStatus = (st) => `<span class="pill ${TASK_PILL[st] ?? ""}">${esc(String(st).replace("_", " "))}</span>`;
+
+async function showTasks(stage = "", q = "") {
+  const rows = await api(`/tasks?limit=200${stage ? `&stage=${stage}` : ""}${q ? `&q=${encodeURIComponent(q)}` : ""}`);
+  if (rows.error) return toast(rows.error);
+  for (const t of rows) if (t.assignee && t.assigneeName) names[t.assignee] = t.assigneeName;
+  const label = (TASK_STAGES.find(([k]) => k === stage) ?? TASK_STAGES[0])[1];
+  $("#detail-body").innerHTML = `<h3>${rows.length === 200 ? "Latest 200" : rows.length} ${stage ? label.toLowerCase() + " " : ""}task${rows.length === 1 ? "" : "s"}${q ? ` matching “${esc(q)}”` : ""}</h3>
+    <div class="row tasks-tools"><span class="seg" role="tablist">${TASK_STAGES.map(([k, l]) => `<button data-stage="${k}" class="${k === stage ? "on" : ""}" role="tab">${l}</button>`).join("")}</span>
+      <input id="tasks-q" type="search" placeholder="Filter by title or #number" value="${esc(q)}"></div>
+    <table class="dir tasks"><thead><tr><th>Task</th><th>Status</th><th>Held by</th><th>Intent</th><th>Change</th></tr></thead><tbody>
+    ${rows.map((t) => `<tr>
+      <td><a data-task="${t.id}">#${t.id} ${esc(t.title)}</a>${t.attempts ? ` <span class="meta">· contest of ${t.attempts}</span>` : ""}</td>
+      <td>${taskStatus(t.status)}</td>
+      <td>${t.assignee ? who(t.assignee) : `<span class="meta">nobody</span>`}</td>
+      <td>${t.intent ? `<span class="mono">${t.intent.paths.map(esc).join(", ")}</span>${t.intent.description ? ` <span class="meta">${esc(t.intent.description)}</span>` : ""}` : `<span class="meta">none declared</span>`}</td>
+      <td>${t.change ? `<a data-change="${t.change.id}">#${t.change.id}</a> ${taskStatus(t.change.status)}` : `<span class="meta">none yet</span>`}</td></tr>`).join("")
+      || `<tr><td colspan="5" class="empty">No tasks here.</td></tr>`}</tbody></table>
+    ${rows.length === 200 ? `<p class="meta">Showing the newest 200. Filter or search to find older ones.</p>` : ""}`;
+  wire($("#detail-body"));
+  for (const b of $("#detail-body").querySelectorAll("[data-stage]")) b.onclick = () => showTasks(b.dataset.stage, $("#tasks-q").value.trim());
+  let t;
+  $("#tasks-q").oninput = () => { clearTimeout(t); t = setTimeout(async () => { const v = $("#tasks-q").value.trim(); await showTasks(stage, v); const i = $("#tasks-q"); i.focus(); i.setSelectionRange(v.length, v.length); }, 250); };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
+async function loadTask(id) {
+  const v = await api(`/tasks/${id}`);
+  if (v.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(v.error)}</p></div>`; return; }
+  review = null;
+  Object.assign(names, v.names);
+  const t = v.task;
+  const live = v.intents.filter((i) => i.released_at === null);
+  const taskLink = (x) => `<a data-task="${x.id}">#${x.id} ${esc(x.title)}</a> ${taskStatus(x.status)}`;
+  const panel = (title, body, extra = "") => `<section class="panel"><div class="panel-head"><h2>${title}</h2>${extra}</div><div class="panel-body">${body}</div></section>`;
+  $("#review").innerHTML = `
+    <div class="rv-top">
+      <a class="button ghost mini" href="#">← ${esc(project)}</a>
+      <h1>${esc(t.title)} <span class="meta">task #${t.id}</span> ${taskStatus(t.status)}</h1>
+      <div class="meta">${t.assignee ? `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago</div>
+      ${t.description ? `<p class="rv-summary">${esc(t.description)}</p>` : ""}
+      <div class="row">${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}</div>
+    </div>
+    <div class="task-page">
+      <div class="task-main">
+        ${panel("Change", v.changes.map((c) => `<div class="qrow"><a data-change="${c.id}">#${c.id}</a> <span class="grow ellipsis">${esc(c.title)}</span>${who(c.agent_id)} ${taskStatus(c.status)}</div>
+          <div class="meta mono files">${c.files.map(esc).join("  ")}</div>`).join("") || `<p class="empty">${t.assignee ? "Nothing submitted yet." : "Nothing submitted. Someone has to claim it first."}</p>`)}
+        ${panel("Intent", v.intents.map((i) => `<div class="qrow">${who(i.agent_id)} <span class="mono grow">${i.paths.map(esc).join(", ")}</span><span class="meta">${i.released_at === null ? "declared" : "released"} ${ago(i.created_at)} ago</span></div>${i.description ? `<div class="meta">${esc(i.description)}</div>` : ""}`).join("") || `<p class="empty">No intent declared yet.</p>`, live.length ? `<small>${live.length} live</small>` : "")}
+        ${v.threads.length ? panel("Conversations", v.threads.map((th) => `<div class="card inbox"><div class="kicker">${esc(th.kind)} · ${esc(th.status)}</div>${th.title ? `<div class="q">${esc(th.title)}</div>` : ""}${(th.posts ?? []).slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("")}</div>`).join("")) : ""}
+        ${panel("History", `<ol class="feed">${v.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("") || `<p class="empty">Nothing yet.</p>`}</ol>`)}
+      </div>
+      <aside class="task-side">
+        ${v.dependsOn.length || v.waitsFor ? panel("Waits on", [...v.dependsOn, ...(v.waitsFor && !v.dependsOn.some((d) => d.id === v.waitsFor.id) ? [v.waitsFor] : [])].map((d) => `<div class="qrow">${taskLink(d)}</div>`).join("")) : ""}
+        ${v.subtasks.length ? panel(t.attempts ? "Attempts" : "Subtasks", v.subtasks.map((x) => `<div class="qrow">${taskLink(x)} ${x.assignee ? who(x.assignee) : ""}</div>`).join("")) : ""}
+        ${v.decisions.length ? panel("Decisions", v.decisions.map((d) => `<div class="post">${esc(d.decision)} <span class="meta">${esc(d.byName ?? "")}</span></div>`).join("")) : ""}
+      </aside>
+    </div>`;
+  wire($("#review"));
+}
+
 async function loadContest(id) {
   const v = await api(`/contests/${id}`);
   if (v.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(v.error)}</p></div>`; return; }
@@ -1563,15 +1632,65 @@ function fillJev() {
   field("a_conf").value = d.approvals.minConfidence;
   field("d_enabled").checked = d.disputes.enabled;
   field("d_conf").value = d.disputes.minConfidence;
+  field("f_enabled").checked = d.flagged.enabled;
+  field("f_review").checked = d.flagged.requireAgentReview;
+  field("f_conf").value = d.flagged.minConfidence;
   showConf();
+}
+// What the deputy will and won't do with the brief as it stands in the form, in plain words.
+function jevSummary() {
+  const n = esc(field("name").value.trim() || "the deputy");
+  const pctOf = (k) => `${Math.round(field(k).value * 100)}%`;
+  if (!field("enabled").checked) {
+    return `<p class="jev-off"><b>${n} is off.</b> It won't do anything, whatever you set below: every question, approval and flagged change waits for a person. Tick “Let the deputy act for the humans” to turn it on.</p>`;
+  }
+  const guided = !!field("guidance").value.trim();
+  const model = !!state.delegate?.jevConnected;
+  const rules = field("rules").value.split("\n").filter((l) => l.includes("=>")).length;
+  const topics = listOf(field("q_topics").value), paths = listOf(field("a_paths").value);
+  const will = [], wont = [];
+  if (field("q_enabled").checked) {
+    will.push(`Answer questions agents ask the humans${topics.length ? ` that mention ${topics.map(esc).join(", ")}` : ", on any topic"}: ${rules ? `${rules} house rule${rules === 1 ? "" : "s"} first, then ` : ""}earlier decisions${guided && model ? `, then picking from the agent's options when the guidance covers it and the model is ${pctOf("q_conf")} sure` : ""}.`);
+  } else wont.push("Answer agents' questions.");
+  if (field("a_enabled").checked && paths.length && model) {
+    will.push(`Approve changes to protected paths under ${paths.map(esc).join(", ")}${field("a_review").checked ? ", after an agent reviewer approved" : ""}, when the model is ${pctOf("a_conf")} sure they follow the guidance. Never a change with files outside its declared intent.`);
+  } else wont.push(!field("a_enabled").checked ? "Approve changes to protected paths." : !paths.length ? "Approve protected changes: no paths are listed yet." : "Approve protected changes: that needs a decision model.");
+  if (field("f_enabled").checked && guided && model) {
+    will.push(`Clear changes flagged “Needs a person” (files outside the intent, no tests, new to the author…)${field("f_review").checked ? " after an agent reviewer approved" : ""}, when the model is ${pctOf("f_conf")} sure the guidance lets them through at this stage of the project. Never protected paths or failing checks.`);
+  } else wont.push(!field("f_enabled").checked ? "Clear changes flagged “Needs a person”." : !guided ? "Clear flagged changes: write guidance first; it's what the deputy judges them by." : "Clear flagged changes: that needs a decision model.");
+  if (field("d_enabled").checked && guided && model) will.push(`Settle disputes between two agents when the model is ${pctOf("d_conf")} sure the guidance favors one side.`);
+  else wont.push(!field("d_enabled").checked ? "Settle disputes between agents." : !guided ? "Settle disputes: write guidance first." : "Settle disputes: that needs a decision model.");
+  if (!guided) wont.push("Use your guidance: none is written, so only house rules and earlier decisions apply.");
+  if (!model) wont.push("Ask a decision model: none is connected (add a key in Settings), so only house rules and earlier decisions apply.");
+  wont.push("Anything the model judges high-stakes or risky. That always goes to a person, with the reason.");
+  return `<div class="jev-summary"><b>${n} will</b><ul>${will.map((x) => `<li>${x}</li>`).join("") || "<li>Nothing yet: tick a power below.</li>"}</ul><b>${n} won't</b><ul>${wont.map((x) => `<li>${x}</li>`).join("")}</ul></div>`;
 }
 function showConf() {
   $("#q_conf_out").textContent = `${Math.round(field("q_conf").value * 100)}%`;
   $("#a_conf_out").textContent = `${Math.round(field("a_conf").value * 100)}%`;
   $("#d_conf_out").textContent = `${Math.round(field("d_conf").value * 100)}%`;
+  $("#f_conf_out").textContent = `${Math.round(field("f_conf").value * 100)}%`;
+  jevForm.classList.toggle("off", !field("enabled").checked);
+  $("#jev-summary").innerHTML = jevSummary();
 }
 jevForm.oninput = showConf;
-$("#jev-open").onclick = () => { fillJev(); $("#jev").showModal(); };
+async function fillJevContext() {
+  const box = $("#jev-context");
+  try {
+    const c = await api("/delegate/context");
+    const row = (k, v) => `<div><b>${k}</b> ${v}</div>`;
+    box.innerHTML = [
+      row("Concept", c.concept ? esc(c.concept) : "<i>none written: add a project description in Settings</i>"),
+      row("Age", `${c.age_days} day${c.age_days === 1 ? "" : "s"}`),
+      row("Agents", `${c.agents.total} agent${c.agents.total === 1 ? "" : "s"}, ${c.agents.working_now} working now; ${c.agents.people} ${c.agents.people === 1 ? "person" : "people"}`),
+      row("Main", `${c.main.merged_changes} change${c.main.merged_changes === 1 ? "" : "s"} merged, ${c.main.test_files} test file${c.main.test_files === 1 ? "" : "s"}`),
+      row("In flight", `${c.in_flight.open_tasks} open task${c.in_flight.open_tasks === 1 ? "" : "s"}, ${c.in_flight.changes_in_review} change${c.in_flight.changes_in_review === 1 ? "" : "s"} in review`),
+      c.recently_merged.length ? row("Recently merged", c.recently_merged.map(esc).join(" · ")) : "",
+      row("Protected paths", c.protected_paths.length ? c.protected_paths.map(esc).join(", ") : "none"),
+    ].join("");
+  } catch { box.textContent = "Couldn't load it right now."; }
+}
+$("#jev-open").onclick = () => { fillJev(); fillJevContext(); $("#jev").showModal(); };
 $("#jev").onclose = async () => {
   if ($("#jev").returnValue !== "save") return;
   await act("POST", "/delegate", {
@@ -1581,6 +1700,7 @@ $("#jev").onclose = async () => {
     questions: { enabled: field("q_enabled").checked, topics: listOf(field("q_topics").value), minConfidence: Number(field("q_conf").value) },
     approvals: { enabled: field("a_enabled").checked, paths: listOf(field("a_paths").value), requireAgentReview: field("a_review").checked, minConfidence: Number(field("a_conf").value) },
     disputes: { enabled: field("d_enabled").checked, minConfidence: Number(field("d_conf").value) },
+    flagged: { enabled: field("f_enabled").checked, requireAgentReview: field("f_review").checked, minConfidence: Number(field("f_conf").value) },
     rules: field("rules").value.split("\n").map((l) => l.split("=>")).filter((p) => p.length === 2 && p[0].trim() && p[1].trim()).map(([pattern, answer]) => ({ pattern: pattern.trim(), answer: answer.trim() })),
   });
   toast(`Saved ${field("name").value.trim() || "deputy"}'s brief`);
