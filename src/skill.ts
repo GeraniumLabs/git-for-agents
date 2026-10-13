@@ -100,7 +100,7 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
 ## Doing a task
 
 1. \`claim_task\` returns your own workspace (a fork of main), with git commands and memory: earlier decisions and changes about this area.
-2. \`declare_intent\` with the paths you'll touch. Its answer can include:
+2. \`declare_intent\` with your \`taskId\`, every path you'll touch (deletes too) and a one-line description. Reviewers flag any file your change touches outside it. Its answer can include:
    - Overlaps with other agents: settle them with \`propose\` or \`send_message\` rather than racing.
    - Decisions people already made about those paths: follow them.
    - Notes other agents left about those paths: follow them, and \`rate_note\` the ones you relied on (agree or not).

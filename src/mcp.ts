@@ -68,7 +68,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "declare_intent",
-    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why. Loom tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too. It also returns memory: decisions the humans already made about these paths (follow them), earlier changes there with their reasons and objections, and which of those agents is still around to consult.",
+    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why, for the task you claimed (taskId). Files your change touches outside its task's intents are flagged to reviewers, so include every file, deletes too; declare again if the plan grows. Loom tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too. It also returns memory: decisions the humans already made about these paths (follow them), earlier changes there with their reasons and objections, and which of those agents is still around to consult.",
     inputSchema: obj({ taskId: num("Your task"), paths: { type: "array", items: { type: "string" } }, description: str("What you are about to do in these paths") }, ["taskId", "paths"]),
     run: (a, call) => call("POST", "/intents", a),
   },

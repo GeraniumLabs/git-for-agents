@@ -999,6 +999,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string }) {
     const paths = (body.paths ?? []).map(normalizePattern).filter(Boolean);
     if (!paths.length) throw new HttpError(400, "paths is required");
+    body = { ...body, taskId: this.intentTask(actor, body) };
     const row = this.sql
       .exec("INSERT INTO intents (agent_id, task_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
         actor.id, body.taskId ?? null, JSON.stringify(paths), body.description ?? "", Date.now())
@@ -1241,6 +1242,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
 
+    this.adoptIntents(body.taskId, actor.id, analysis.files);
     const undeclared = this.undeclared(body.taskId, analysis.files);
 
     const now = Date.now();
@@ -1275,6 +1277,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // The merge queue may have taken the change while we were analyzing.
     if (["merged", "merging"].includes(this.change(id).status)) throw new HttpError(409, `change ${id} was merged meanwhile`);
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) ? "review" : "queued";
+    this.adoptIntents(ch.task_id, ch.agent_id, analysis.files);
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
     // An update (or a sync) without new context keeps what the author said
@@ -1304,6 +1307,40 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private guardedFiles(files: FileChange[]): string[] {
     const prot = this.protectedPaths;
     return files.map((f) => f.path).filter((f) => prot.some((p) => matches(p, f)));
+  }
+
+  /**
+   * The task an intent is for. An intent without one never counts for any
+   * change, so every file the agent then touches reads as outside its intent.
+   * Agents leave it out (or spell it task_id); when they hold one task it can
+   * only be that one, and when they hold several we ask rather than guess.
+   */
+  private intentTask(actor: Agent, body: Record<string, any>): number | undefined {
+    const given = body.taskId ?? body.task_id ?? body.task;
+    if (given != null && given !== "") {
+      const id = Number(given);
+      if (!Number.isInteger(id)) throw new HttpError(400, `taskId must be a task number, not ${JSON.stringify(given)}`);
+      this.task(id);
+      return id;
+    }
+    const held = this.sql.exec("SELECT id, title FROM tasks WHERE assignee = ? AND status NOT IN ('merged','abandoned') ORDER BY id", actor.id).toArray();
+    if (held.length === 1) return held[0].id as number;
+    if (held.length > 1) throw new HttpError(400, `pass taskId: you (${actor.name}) hold ${held.length} tasks (${held.map((t) => `#${t.id} ${t.title}`).join("; ")}). If sub-agents share your key, give each its own name with \`as\`.`);
+    return undefined;
+  }
+
+  /**
+   * Intents the author declared without a task, adopted by the task whose
+   * change touches their paths, when the task has none of its own. Covers
+   * intents declared before declare_intent filled the task in.
+   */
+  private adoptIntents(taskId: number, agentId: string, files: FileChange[]) {
+    if (this.sql.exec("SELECT 1 FROM intents WHERE task_id = ? LIMIT 1", taskId).toArray().length) return;
+    const loose = this.sql.exec("SELECT id, paths FROM intents WHERE task_id IS NULL AND agent_id = ? AND released_at IS NULL", agentId).toArray();
+    for (const r of loose) {
+      const paths = JSON.parse(r.paths as string) as string[];
+      if (files.some((f) => paths.some((p) => matches(p, f.path)))) this.sql.exec("UPDATE intents SET task_id = ? WHERE id = ?", taskId, r.id);
+    }
   }
 
   /** Files a change touches that its task never declared an intent for. */
