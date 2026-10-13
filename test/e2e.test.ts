@@ -147,6 +147,26 @@ test("reviews are agent tasks: an untaken review shows up in whoami and loom_sta
   assert.equal((await bex.me()).reviewTasks.some((x: any) => x.change === ch.id), false, "done once reviewed");
 });
 
+test("a review no other agent can take is stuck right away, and stops being stuck once someone could take it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-rstuck");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "lonely review", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Comment db.js", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// done\n" }, "c");
+  const ch = await ada.submit(t.id, t.title, "comment");
+  const stuck = async () => (await admin.req("GET", "/overview")).attention.filter((i: any) => i.kind === "stuck" && i.change === ch.id);
+  const alone = await stuck();
+  assert.equal(alone.length, 1, "the only agent is the author, so nobody can take the review");
+  assert.equal(alone[0].reason, "no other agent to review it");
+  assert.equal(alone[0].action, "review");
+  await admin.addAgent("bex", "builder");
+  assert.deepEqual(await stuck(), [], "bex could take it, so it isn't stuck yet");
+});
+
 test("questions for people: similar ones share a card, each agent has a limit, and a default wins when nobody answers in time", { skip: !url, timeout: 150_000 }, async () => {
   const { Loom, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-questions");

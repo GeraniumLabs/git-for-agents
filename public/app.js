@@ -327,7 +327,7 @@ function renderAttention() {
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   $("#stuck").innerHTML = items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
-    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}</div></div>`).join("")
+    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`;
   wire($("#stuck"));
@@ -1683,7 +1683,7 @@ $("#jev").onclose = async () => {
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
   attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, and reviews an agent asked you for. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
-  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a change nobody reviewed for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
+  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task, a merge that failed 3 times. Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
   flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",
