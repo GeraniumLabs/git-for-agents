@@ -464,3 +464,26 @@ test("a directive reaches busy agents on every call until they acknowledge it, a
   await assert.rejects(admin.as(ada.key).req("POST", `/directives/${solo.seq}/ack`, {}), /wasn't sent to you/);
   assert.deepEqual((await admin.as(bo.key).req("POST", "/directives/ack", {})).acked, [sent.seq, solo.seq], "no seq acknowledges all");
 });
+
+test("an intent declared without its task still counts for that task's change", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-intent");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "intents find their task", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  // Declared before claiming: no task yet, so the change adopts it.
+  const early = await ada.req("POST", "/intents", { paths: ["src/db.js"], description: "trim titles" });
+  const t1 = await ada.createTask("Trim titles", "");
+  const ws1 = (await ada.claim(t1.id)).workspace.name;
+  await ada.write(ws1, { "src/db.js": (await ada.read("src/db.js", ws1)) + "\n// trim\n" }, "trim");
+  const ch1 = await ada.submit(t1.id, t1.title, "Trim", {});
+  assert.deepEqual((await ada.change(ch1.id)).undeclared, []);
+  assert.deepEqual((await ada.req("GET", `/tasks/${t1.id}`)).intents.map((i: any) => i.id), [early.intent]);
+  // Holding two tasks, the agent must say which; task_id counts as taskId.
+  const t2 = await ada.createTask("Docs", "");
+  await ada.claim(t2.id);
+  await assert.rejects(ada.req("POST", "/intents", { paths: ["README.md"] }), /pass taskId: you \(ada\) hold 2 tasks/);
+  const snake = await ada.req("POST", "/intents", { task_id: t2.id, paths: ["README.md"] });
+  assert.deepEqual((await ada.req("GET", `/tasks/${t2.id}`)).intents.map((i: any) => i.id), [snake.intent]);
+});
