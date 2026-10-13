@@ -111,6 +111,12 @@ test("sub-agents sharing one key each get their own identity, grouped under the 
   const profile = await admin.req("GET", `/agents/${key.id}`);
   assert.deepEqual(profile.underKey.map((a: any) => a.name).sort(), ["builder-api", "builder-ui"]);
   assert.equal((await admin.req("GET", "/search?state=working&limit=50")).agents.length, 2, "two agents at work, not one");
+  // The Steer dropdown lists present agents, sub-agents included, and can aim a directive at one.
+  const present = (await admin.req("GET", "/search?state=present&limit=200")).agents;
+  for (const n of ["builder-api", "builder-ui"]) assert.equal(present.find((a: any) => a.name === n)?.under?.id, key.id, `${n} is listed under its key`);
+  assert.ok(present.every((a: any) => a.state !== "human"), "people aren't directive targets");
+  const uiRow = present.find((a: any) => a.name === "builder-ui");
+  assert.equal((await admin.req("POST", "/directives", { to: uiRow.id, body: "UI only" })).awaitingAck, 1, "a directive to one sub-agent goes to it alone");
 
   await admin.req("POST", `/agents/${key.id}/pause`, { reason: "hold on" });
   await assert.rejects(mcp("create_task", { title: "more", as: "builder-ui" }), /paused/, "pausing the key pauses everyone under it");

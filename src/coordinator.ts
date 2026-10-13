@@ -3069,7 +3069,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       text ? "WHERE lower(a.name) LIKE ? OR lower(a.id) LIKE ? OR a.id IN (SELECT assignee FROM tasks WHERE lower(title) LIKE ? OR id = ?) OR a.id IN (SELECT agent_id FROM intents WHERE released_at IS NULL AND lower(paths) LIKE ?) OR a.id IN (SELECT agent_id FROM changes WHERE id = ?)" : "",
       ...(text ? [like, like, like, num || -1, like, num || -1] : []),
     ).filter((a) => a.state !== "human" || !state);
-    if (state) agents = agents.filter((a) => a.state === state);
+    // "present": every agent that isn't away, the ones a person might steer right now.
+    if (state === "present") agents = agents.filter((a) => a.state !== "human" && a.state !== "away");
+    else if (state) agents = agents.filter((a) => a.state === state);
+    agents.sort((a, b) => b.lastSeen - a.lastSeen);
     const total = agents.length;
     const tasks = text ? this.sql.exec("SELECT id, title, status, assignee FROM tasks WHERE lower(title) LIKE ? OR id = ? ORDER BY updated_at DESC LIMIT 8", like, num || -1).toArray().map((t) => ({ ...t, assigneeName: this.agentName(t.assignee as string) })) : [];
     const changes = text ? this.sql.exec("SELECT id, title, status, agent_id FROM changes WHERE lower(title) LIKE ? OR id = ? OR lower(files) LIKE ? ORDER BY updated_at DESC LIMIT 8", like, num || -1, like).toArray().map((c) => ({ ...c, agentName: this.agentName(c.agent_id as string) })) : [];
