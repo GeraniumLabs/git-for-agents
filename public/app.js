@@ -728,6 +728,8 @@ function showNewJoinCode() {
 let copiedPlainSkill = false;
 async function showSkill(joinCode) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
+  // A pasted code is checked by the server, which only puts a live join code into the skill.
+  if (joinCode?.pasted && !text.includes(joinCode.code)) { toast(`That join code isn't valid for ${project}: it may have expired, been used up or revoked`); return showSkill(); }
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
   const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
   const owner = isOwner();
@@ -742,7 +744,13 @@ async function showSkill(joinCode) {
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
-    ${owner ? step1 : `<p class="meta">Give an agent this skill. It covers how to work here and how to check back for new work, which matters because agents come and go. ${joinCode ? "It carries a join code: each agent trades it for its own key once." : "Each agent needs its own key or a join code from an owner."}</p>`}
+    ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
+      : `<h2>1. Get a join code</h2>
+      <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Loom shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
+      <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (loomjoin_…)"><button id="jc-use">Use code</button></div>
+      <p class="meta">${user ? `${me ? `You aren't an owner of ${esc(project)}: ask one for a join code.` : `Ask an owner of ${esc(project)} for a join code.`} Or <a href="#" id="jc-new-project">create your own project</a>: it comes with a join code.`
+        : `Own ${esc(project)}? <a href="#" id="jc-signin">Sign in</a> to make one. Want your own? Sign in and create a project: it comes with a join code.`}</p>`}
+    ${owner ? "" : `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "Without a join code it covers how to work here, but each agent needs a key from an owner."}</p>`}
     ${owner ? `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "It has no join code yet: agents given it need a key you create for each one (below)."}</p>` : ""}
     <div class="row code-row"><button id="skill-copy" class="${joinCode || !owner ? "" : "ghost"}">${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
     <pre class="diff copy">${esc(save)}</pre>
@@ -778,9 +786,16 @@ async function showSkill(joinCode) {
     try { await act("DELETE", `/join-codes/${b.dataset.jcRevoke}`); } catch { return; }
     showSkill(joinCode);
   };
-  const copied = (what) => { copiedPlainSkill = !joinCode; toast(joinCode ? `${what} copied, with join code #${joinCode.id}` : `${what} copied${owner ? " (no join code in it)" : ""}`); };
+  const copied = (what) => { copiedPlainSkill = !joinCode; toast(joinCode ? `${what} copied, with ${joinCode.id ? `join code #${joinCode.id}` : "your join code"}` : `${what} copied${owner ? " (no join code in it)" : ""}`); };
   $("#skill-copy").onclick = () => navigator.clipboard?.writeText(text).then(() => copied("Skill"));
   $("#skill-copy-cmd").onclick = () => navigator.clipboard?.writeText(save).then(() => copied("Install command"));
+  if ($("#jc-use")) {
+    const use = () => { const c = $("#jc-paste").value.trim(); if (c) showSkill({ code: c, pasted: true }); };
+    $("#jc-use").onclick = use;
+    $("#jc-paste").onkeydown = (e) => { if (e.key === "Enter") use(); };
+  }
+  if ($("#jc-signin")) $("#jc-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to make a join code for ${project}.`); };
+  if ($("#jc-new-project")) $("#jc-new-project").onclick = (e) => { e.preventDefault(); showNewProject(); };
   if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
   if (!$("#detail").open) $("#detail").showModal();
 }
