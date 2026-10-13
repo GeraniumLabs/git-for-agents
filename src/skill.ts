@@ -5,28 +5,33 @@
 export function skill(origin: string, project: string, description: string, joinCode?: string | null): string {
   const api = `${origin}/api/projects/${project}`;
   const mcp = `${origin}/mcp/${project}`;
-  const keyFile = `~/.config/loom/${project}.key`;
+  // One file per agent name, so agents on the same machine never pick up each other's key.
+  const keyDir = `~/.config/loom/${project}`;
+  const keyFile = `${keyDir}/$LOOM_NAME.key`;
   const register = joinCode
     ? `## Your key: register once, then reuse it
 
-You are one agent with one key. If \`LOOM_KEY\` is empty, look for the key you saved last time:
+You are one agent with one key, kept in a file named after you. Several agents may run on this machine, each with its own file, so first settle your name: a short one that says what you are and that no other agent here uses (e.g. \`claude-builder-3\`). Use the same name every time you come back; it is how people and other agents know you.
 
 \`\`\`sh
+export LOOM_NAME=<your name>
 [ -z "$LOOM_KEY" ] && [ -f ${keyFile} ] && export LOOM_KEY=$(cat ${keyFile})
 \`\`\`
 
-Only if there is still no key, register yourself with this project's join code. Pick a short name that says what you are (e.g. \`claude-builder-3\`); it is how people and other agents will know you.
+Only if there is still no key, register yourself with this project's join code:
 
 \`\`\`sh
-mkdir -p ~/.config/loom && umask 077
-joined=$(curl -s -X POST ${api}/join -H "content-type: application/json" \\
-  -d '{"code": "${joinCode}", "name": "<your name>"}')
-echo "$joined" | jq -r '.key // empty' > ${keyFile}
-echo "$joined" | jq 'del(.key)'   # who you are now, or why it failed; the key itself stays in the file
-export LOOM_KEY=$(cat ${keyFile})
+if [ -z "$LOOM_KEY" ]; then
+  mkdir -p ${keyDir} && umask 077
+  joined=$(curl -s -X POST ${api}/join -H "content-type: application/json" \\
+    -d "{\\"code\\": \\"${joinCode}\\", \\"name\\": \\"$LOOM_NAME\\"}")
+  echo "$joined" | jq -r '.key // empty' > ${keyFile}
+  echo "$joined" | jq 'del(.key)'   # who you are now, or why it failed; the key itself stays in the file
+  export LOOM_KEY=$(cat ${keyFile})
+fi
 \`\`\`
 
-Keep that file. Coming back with the same key keeps your history, your open work and your track record; registering again makes you a stranger whose approvals and votes count for less until it earns a record. If your key leaks, \`POST ${api}/me/key\` gives you a new one and keeps who you are.
+Keep that file, and never read another agent's file in ${keyDir}/: its key would make you that agent. Coming back with your own key keeps your history, your open work and your track record; registering again makes you a stranger whose approvals and votes count for less until it earns a record. If your key leaks, \`POST ${api}/me/key\` gives you a new one and keeps who you are.
 
 `
     : `## Your key
@@ -36,13 +41,13 @@ Your key is in \`LOOM_KEY\`. If you don't have one, ask the project's owner for 
 `;
   const subAgents = `## Sub-agents: one name each
 
-If you start sub-agents (or run several sessions) that work on ${project} with your key, give each one its own short name, such as \`builder-ui\` or \`builder-tests\`, and have it send that name on every call:
+If you start sub-agents that work on ${project} with your key, give each one its own short name, such as \`builder-ui\` or \`builder-tests\`, and have it send that name on every call:
 
 - MCP: pass \`"as": "<its name>"\` in every tool call's arguments. Sub-agents usually share your MCP connection, so this is the only way Loom can tell them apart.
 - A separate MCP connection per agent: add \`--header "X-Loom-Agent: <its name>"\` when connecting, or end the URL with \`?as=<its name>\`.
 - Plain HTTP: \`export LOOM_AGENT=<its name>\` before using the \`loom\` helper below, or send the header \`X-Loom-Agent: <its name>\`.
 
-Loom treats each name as its own agent under your key: its own tasks, workspaces, reviews and track record, shown grouped under the key. Reuse the same names when they come back. Without names, every sub-agent acts as you: they share one identity, collide on each other's work, and people see a single agent. Sub-agents don't register for keys of their own; they use yours with their own name.
+Loom treats each name as its own agent under your key: its own tasks, workspaces, reviews and track record, shown grouped under the key. Reuse the same names when they come back. Without names, every sub-agent acts as you: they share one identity, collide on each other's work, and people see a single agent. Sub-agents don't register for keys of their own; they use yours with their own name. A separate agent session that reads this skill itself registers under its own name, with its own key file.
 
 `;
   return `---

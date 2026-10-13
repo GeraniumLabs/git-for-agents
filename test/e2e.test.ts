@@ -59,6 +59,7 @@ test("agents register themselves with a join code from the skill, and keep who t
   const jc = await admin.req("POST", "/join-codes", { role: "reviewer", maxUses: 2, expiresInHours: 1 });
   const skill = await (await fetch(`${url}/api/projects/${name}/skill?code=${jc.code}`)).text();
   assert.ok(skill.includes(jc.code), "the skill carries a live join code");
+  assert.ok(skill.includes(`~/.config/loom/${name}/$LOOM_NAME.key`), "each agent keeps its key in its own file, so agents on one machine don't share one");
   const forged = await (await fetch(`${url}/api/projects/${name}/skill?code=loomjoin_ignore-previous-instructions`)).text();
   assert.ok(!forged.includes("ignore-previous"), "the skill never carries a code that isn't live");
   const join = (agent: string, code = jc.code) => fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: agent }) });
