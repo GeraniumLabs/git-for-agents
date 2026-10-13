@@ -503,10 +503,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "agents" && b && c === "trust") return json(this.trustOf(this.profile(b).agent.id));
       if (a === "agents" && b) return json(this.profile(b));
       if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent"), url.searchParams.get("mine") === "1"));
-      if (a === "tasks" && !b) return json(this.sql.exec("SELECT t.id, t.title, t.description, t.status, t.assignee, t.depends_on, t.updated_at FROM tasks t WHERE (? IS NULL OR t.status = ?) ORDER BY t.id DESC LIMIT ?",
-        url.searchParams.get("status"), url.searchParams.get("status"), Math.min(200, Number(url.searchParams.get("limit") ?? 50))).toArray()
-        .map((t) => ({ ...t, depends_on: JSON.parse(t.depends_on as string), assigneeName: t.assignee ? this.agentName(t.assignee as string) : null })));
+      if (a === "tasks" && !b) return json(this.listTasks(url.searchParams));
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
+      if (a === "tasks" && b && !c) return json(this.taskView(Number(b)));
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b && c === "interdiff") return json(await this.interdiff(Number(b), url.searchParams));
       if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
@@ -3650,6 +3649,55 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (STEERING.has(e.type)) return true;
       if (role === "reviewer" && (e.type === "review.requested" || e.type === "change.updated" || e.type === "contest.ready" || e.type === "contest.decided")) return true;
       return (e.task_id !== null && tasks.has(e.task_id)) || (e.change_id !== null && changes.has(e.change_id));
+    };
+  }
+
+  /**
+   * Tasks for the dashboard's list: newest first, filtered by status or by
+   * stage (the groups the health bar shows), each with who holds it, what it
+   * declared it would touch and the change it submitted.
+   */
+  private listTasks(q: URLSearchParams) {
+    const STAGES: Record<string, string[]> = { open: ["open"], active: ["claimed", "blocked", "conflict"], review: ["in_review", "queued"], landed: ["merged"], closed: ["closed", "abandoned"] };
+    const statuses = q.get("stage") ? STAGES[q.get("stage")!] ?? [] : q.get("status") ? [q.get("status")!] : null;
+    const text = (q.get("q") ?? "").trim().toLowerCase();
+    const where = [
+      statuses ? `t.status IN (${statuses.map(() => "?").join(",") || "NULL"})` : "1",
+      text ? "(lower(t.title) LIKE ? OR t.id = ?)" : "1",
+    ].join(" AND ");
+    const args: SqlStorageValue[] = [...(statuses ?? []), ...(text ? [`%${text}%`, Number(text.replace(/^#/, "")) || -1] : [])];
+    const rows = this.sql.exec(`SELECT t.id, t.title, t.description, t.status, t.assignee, t.depends_on, t.parent, t.attempts, t.created_by, t.updated_at FROM tasks t WHERE ${where} ORDER BY t.id DESC LIMIT ?`,
+      ...args, Math.min(200, Number(q.get("limit") ?? 50))).toArray();
+    return rows.map((t) => {
+      const intent = this.sql.exec("SELECT paths, description, released_at FROM intents WHERE task_id = ? ORDER BY id DESC LIMIT 1", t.id).toArray()[0];
+      const change = this.sql.exec("SELECT id, title, status FROM changes WHERE task_id = ? ORDER BY id DESC LIMIT 1", t.id).toArray()[0];
+      return {
+        ...t, depends_on: JSON.parse(t.depends_on as string), assigneeName: this.agentName(t.assignee as string),
+        intent: intent ? { paths: JSON.parse(intent.paths as string), description: intent.description, live: intent.released_at === null } : null,
+        change: change ?? null,
+      };
+    });
+  }
+
+  /** One task on its own: who holds it, its intents, changes, conversations and history. */
+  private taskView(taskId: number) {
+    const task = this.task(taskId);
+    const names = (ids: (string | null)[]) => Object.fromEntries(ids.filter(Boolean).map((id) => [id, this.agentName(id)]));
+    const intents = this.sql.exec("SELECT * FROM intents WHERE task_id = ? ORDER BY id DESC", taskId).toArray().map((r) => ({ ...r, paths: JSON.parse(r.paths as string) }));
+    const changes = this.sql.exec("SELECT c.id, c.title, c.status, c.agent_id, c.files, c.created_at, c.updated_at FROM changes c WHERE c.task_id = ? ORDER BY c.id DESC", taskId).toArray()
+      .map((c) => ({ ...c, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path) }));
+    const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE task_id = ? OR change_id IN (SELECT id FROM changes WHERE task_id = ?) ORDER BY seq DESC LIMIT 80", taskId, taskId).toArray());
+    return {
+      task: { ...task, workspace: undefined },
+      names: names([task.assignee, task.created_by, ...intents.map((i: any) => i.agent_id as string), ...changes.map((c: any) => c.agent_id as string), ...events.map((e) => e.actor)]),
+      dependsOn: task.depends_on.map((id: number) => this.sql.exec("SELECT id, title, status FROM tasks WHERE id = ?", id).toArray()[0]).filter(Boolean),
+      waitsFor: task.waits_for ? this.sql.exec("SELECT id, title, status FROM tasks WHERE id = ?", task.waits_for).toArray()[0] ?? null : null,
+      parent: task.parent ? this.sql.exec("SELECT id, title, status, attempts FROM tasks WHERE id = ?", task.parent).toArray()[0] ?? null : null,
+      subtasks: this.sql.exec("SELECT id, title, status, assignee FROM tasks WHERE parent = ? ORDER BY id", taskId).toArray(),
+      intents, changes,
+      threads: this.sql.exec("SELECT id FROM threads WHERE task_id = ? ORDER BY updated_at DESC LIMIT 20", taskId).toArray().map((r) => this.thread(r.id as number)),
+      decisions: this.decisionRows("task_id = ? ORDER BY id DESC LIMIT 20", taskId),
+      events,
     };
   }
 
