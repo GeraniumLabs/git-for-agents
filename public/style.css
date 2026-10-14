@@ -519,3 +519,11 @@ table.dir.tasks td:last-child, table.dir.tasks td:nth-child(2) { white-space: no
 #detail-body .key-section h2 { border-top: 0; padding-top: 0; margin-top: 10px; }
 .attempt .approach { margin: 6px 0 8px; padding: 8px 10px; border-left: 3px solid var(--accent, #f58220); background: var(--panel-2, rgba(127,127,127,.08)); }
 .attempt .approach b { display: block; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; }
+.glance { margin-bottom: 14px; }
+.glance table { width: 100%; border-collapse: collapse; }
+.glance th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .04em; opacity: .7; padding: 6px 8px; }
+.glance td { padding: 8px; border-top: 1px solid var(--line, rgba(127,127,127,.2)); vertical-align: top; }
+.glance td:nth-child(2) { width: 60%; }
+.glance tr.won td { background: rgba(45,164,78,.08); }
+.glance tr.lost { opacity: .6; }
+@media (max-width: 700px) { .glance td:nth-child(3), .glance th:nth-child(3), .glance td:nth-child(4), .glance th:nth-child(4) { display: none; } }

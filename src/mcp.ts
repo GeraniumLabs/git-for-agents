@@ -104,7 +104,7 @@ const TOOLS: Tool[] = [
   {
     name: "submit_change",
     description: "Propose your workspace for merging into main. Include a summary and your working context (plan, decisions, what you tested, open questions, and notes: things the next agent on these files should know, as strings or {text, paths, kind}; they become shared notes when the change lands); it is stored with the change so reviewers and any agent who takes over can read it. The result lists suggestedReviewers: agents who already wrote or reviewed the functions, files or folders you changed. Ask the best of them with request_review.",
-    inputSchema: obj({ taskId: num("Your task"), title: str("Change title"), summary: str("What changed and why"), approach: str("Required for an attempt in a contest: a few sentences on how your attempt works, the key decision you made and its trade-off, in plain words. People and voters compare attempts by this rather than reading every diff."), context: { type: "object", description: "Free-form working context: plan, decisions, tests run, files read, follow-ups" } }, ["taskId", "summary"]),
+    inputSchema: obj({ taskId: num("Your task"), title: str("Change title"), summary: str("What changed and why"), approach: str("Required for an attempt in a contest: two or three plain sentences (60-280 characters) for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up. No file lists or tool names; those go in summary. People compare attempts by this side by side."), context: { type: "object", description: "Free-form working context: plan, decisions, tests run, files read, follow-ups" } }, ["taskId", "summary"]),
     run: (a, call) => call("POST", "/changes", a),
   },
   {

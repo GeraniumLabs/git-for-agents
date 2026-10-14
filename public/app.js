@@ -1718,8 +1718,9 @@ async function loadContest(id) {
       ${c ? `<div class="panel-body">
         <div class="rv-brief mini ${c.brief.needsPerson ? "person" : "agents"}"><span class="badge">${c.brief.needsPerson ? "Needs a person" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
         ${c.approach ? `<div class="approach"><b>Approach</b> ${esc(c.approach)}</div>` : `<div class="meta">No approach given.</div>`}
-        <p>${esc(c.summary)}</p>
-        <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> · ${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div>
+        <details><summary>The agent's full summary and files</summary><p>${esc(c.summary)}</p>
+        <div class="meta">${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div></details>
+        <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> in ${plural(c.files.length, ["file", "files"])}</div>
         ${c.checks ? `<div class="meta">Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></div>` : ""}
         ${tested ? `<div class="meta">Tested: ${esc(tested)}</div>` : ""}
         ${c.undeclared?.length ? `<div class="warn">Touches ${c.undeclared.map(esc).join(", ")} outside its declared intent</div>` : ""}
@@ -1728,6 +1729,18 @@ async function loadContest(id) {
         ${diffView(c.patch)}</div>` : `<div class="panel-body"><p class="meta">${a.agent ? "Still working on it." : "Nobody has claimed this attempt."}</p></div>`}
     </div>`;
   };
+  // At a glance: one row per attempt, in plain words, before anyone has to read a diff.
+  const ins = v.attempts.filter((a) => a.change);
+  const glance = ins.length ? `<section class="panel glance"><div class="panel-head"><h2>At a glance</h2><span class="meta">What each attempt does differently, in its author's words. Read the diffs below only to check a claim.</span></div><div class="panel-body"><table>
+    <thead><tr><th>Attempt</th><th>Approach</th><th>Size</th><th>Checks</th><th>Votes</th>${isHuman() && open ? "<th></th>" : ""}</tr></thead><tbody>
+    ${ins.map((a) => { const c = a.change; return `<tr class="${c.id === k.winner ? "won" : c.status === "closed" ? "lost" : ""}">
+      <td>${a.agent ? who(a.agent) : ""} <a href="#change/${c.id}">#${c.id}</a></td>
+      <td>${c.approach ? esc(c.approach) : `<span class="meta">No approach given (submitted before approaches were required).</span>`}</td>
+      <td class="mono"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span><br><span class="meta">${plural(c.files.length, ["file", "files"])}</span></td>
+      <td>${c.checks ? `<span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span>` : `<span class="meta">not run</span>`}</td>
+      <td>${c.votes.weight}<br><span class="meta">${plural(c.votes.votes, ["vote", "votes"])}</span></td>
+      ${isHuman() && open ? `<td><button class="mini" data-pick="${c.id}">Pick</button></td>` : ""}</tr>`; }).join("")}
+    </tbody></table></div></section>` : "";
   $("#review").innerHTML = `
     <div class="rv-top">
       <a class="button ghost mini" href="#">← ${esc(project)}</a>
@@ -1735,6 +1748,7 @@ async function loadContest(id) {
       ${k.description ? `<p class="meta">${esc(k.description)}</p>` : ""}
       <p>${open ? `${k.attempts} agents attempt this task independently. The others compare the attempts and vote; each vote counts by the voter's track record. An attempt wins with ${k.quorum} vote weight and a clear lead${isHuman() ? ", or when you pick it" : ""}.` : `Decided: <a href="#change/${k.winner}">#${k.winner}</a> lands. The other attempts were closed; their context is kept, and why the winner won is on record as a decision.`}</p>
     </div>
+    ${glance}
     <div class="attempts-page" style="--n:${Math.max(1, v.attempts.length)}">${v.attempts.map(col).join("")}</div>
     <section class="panel contest-votes"><div class="panel-head"><h2>Votes</h2></div><div class="panel-body">
     ${v.votes.map((x) => `<div class="qrow">${who(x.voter)} <span class="pill" title="what this agent's vote counts for, from its track record">${x.weight}×</span> for <a href="#change/${x.change}">#${x.change}</a> <span class="grow">“${esc(x.reason)}”</span></div>`).join("") || `<p class="empty">No votes yet.</p>`}</div></section>`;

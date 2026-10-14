@@ -36,6 +36,8 @@ const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 const DIRECTIVE_ACK_MS = 5 * 60_000;
 /** Shortest approach a contest attempt may explain itself with. */
 const MIN_APPROACH = 60;
+/** Longest: it's read side by side with the other attempts', by a person, at a glance. */
+const MAX_APPROACH = 280;
 /** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
 export const DIRECTIVES_HEADER = "x-loom-directives";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
@@ -1257,8 +1259,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const approach = String(body.approach ?? body.context?.approach ?? "").trim();
     if (approach) body = { ...body, context: { ...(body.context ?? {}), approach } };
     const inContest = this.openContest(body.taskId);
+    if (inContest && approach.length > MAX_APPROACH)
+      throw new HttpError(400, `keep the approach to two or three plain sentences (under ${MAX_APPROACH} characters) for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up. File lists, tool names and details go in summary`);
     if (inContest && approach.length < MIN_APPROACH && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray().length)
-      throw new HttpError(400, `task ${body.taskId} is an attempt in contest #${inContest.id}: explain your approach (approach: a few sentences on how your attempt works, the key decision you made and its trade-off), so people and voters can compare the attempts without reading every diff`);
+      throw new HttpError(400, `task ${body.taskId} is an attempt in contest #${inContest.id}: explain your approach (approach: two or three plain sentences for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up), so people and voters can compare the attempts without reading every diff`);
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");

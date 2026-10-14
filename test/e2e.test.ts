@@ -542,6 +542,7 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
     for (const f of files) edits[f] = (await a.read(f, ws)) + `\n// ${who}\n`;
     await a.write(ws, edits, who);
     await assert.rejects(a.submit(claim.task.id, `Logging by ${who}`, "log"), /explain your approach/, "an attempt has to say how it works");
+    await assert.rejects(a.submit(claim.task.id, `Logging by ${who}`, "log", { approach: "x ".repeat(200) }), /two or three plain sentences/, "an approach is short enough to read at a glance");
     changes.push((await a.submit(claim.task.id, `Logging by ${who}`, "log", { approach: `${who} logs each request with a one-line comment in every file it touches.` })).id);
   }
   const view = await admin.req("GET", `/contests/${contest.id}`);
