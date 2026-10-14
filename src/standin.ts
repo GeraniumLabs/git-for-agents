@@ -47,6 +47,7 @@ export function itemKey(i: any): string {
     case "approval":
     case "brief": return `${i.kind}:${i.change}`;
     case "task": return `task:${i.task}:${i.person}`;
+    case "contest": return `contest:${i.contest}`;
     default: return `${i.kind}:${i.change ?? i.task ?? i.thread ?? i.directive ?? ""}:${String(i.reason ?? "").replace(/ from .*/, "")}`;
   }
 }
@@ -59,6 +60,7 @@ export function itemText(i: any, name: (id: string | null) => string | null): st
     case "dispute": return `Dispute to rule: ${i.question}`;
     case "approval": return `Change #${i.change} "${i.title}" touches protected files and needs a person's approval`;
     case "brief": return `Change #${i.change} "${i.title}" should have a person look: ${(i.reasons ?? []).join("; ")}`;
+    case "contest": return `Contest #${i.contest} "${i.title}": pick the attempt that lands (${i.in} of ${i.attempts} in, ${i.changes.length} flagged for a person)`;
     case "review": return `${name(i.agent) ?? "An agent"} asked ${name(i.reviewer) ?? "a person"} to review #${i.change} "${i.title}"`;
     case "task": return `${name(i.by) ?? "Someone"} gave ${name(i.person) ?? "a person"} task #${i.task} "${i.title}"`;
     default: return `Stuck: ${i.reason}${i.detail ? ` (${i.detail})` : ""}${i.agents?.length ? `; waiting on ${asker(i.agents)}` : ""}`;
@@ -67,7 +69,7 @@ export function itemText(i: any, name: (id: string | null) => string | null): st
 
 /** Which scope would let a stand-in act on an item itself, if any. */
 export function itemScope(i: any): Scope | null {
-  return i.kind === "question" ? "answer" : i.kind === "dispute" ? "decide" : ["approval", "brief", "review"].includes(i.kind) ? "review" : null;
+  return i.kind === "question" ? "answer" : i.kind === "dispute" || i.kind === "contest" ? "decide" : ["approval", "brief", "review"].includes(i.kind) ? "review" : null;
 }
 
 /** Hex HMAC-SHA256 of a webhook body, sent as x-loom-signature: sha256=<hex>. */

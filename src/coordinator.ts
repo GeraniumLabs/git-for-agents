@@ -1484,12 +1484,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
         else (knownBy[r.path as string] ??= []).push(this.agentName(r.agent_id as string) ?? (r.agent_id as string));
       }
     }
+    // Attempts at the same contest overlap by design; that isn't other agents on the same files.
+    const contest = ch.task_id ? this.openContest(ch.task_id) : null;
+    const siblings = new Set<number>(contest ? this.contestAttempts(contest.id as number).map((t) => t.id as number) : []);
     const brief = buildBrief({
       author: this.agentName(ch.agent_id) ?? ch.agent_id,
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
       checks: ch.checks, checksConfigured: !!this.checks,
-      othersIntents: this.activeIntents(ch.agent_id).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
+      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id)).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
@@ -2987,6 +2990,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const c = this.change(r.id as number);
       const brief = this.briefFor(c, "");
       if (!brief.needsPerson || brief.reasons.some((x) => x.kind === "protected")) continue;
+      // An attempt in an open contest: the person's decision is which attempt lands, so its attempts are one card.
+      const contest = c.task_id ? this.openContest(c.task_id) : null;
+      if (contest) {
+        let item = items.find((i) => i.kind === "contest" && i.contest === contest.id);
+        if (!item) {
+          const entries = this.contestEntries(contest.id as number);
+          items.push(item = { kind: "contest", contest: contest.id, title: contest.title, attempts: entries.length, in: entries.filter((e) => e.change && e.change.status !== "closed").length, changes: [], since: c.updated_at });
+        }
+        item.changes.push({ change: c.id, title: c.title, agent: c.agent_id, reasons: brief.reasons.filter((x) => x.kind !== "ok" && x.kind !== "threads").map((x) => x.text) });
+        continue;
+      }
       const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
       items.push({ kind: "brief", change: c.id, title: c.title, agent: c.agent_id, reasons: brief.reasons.filter((x) => x.kind !== "ok" && x.kind !== "threads").map((x) => x.text), escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
     }
@@ -3011,7 +3025,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
     }
     // Reviews that aren't moving: no agent can take one, nobody has taken one, or whoever was asked hasn't answered.
-    const listedChanges = new Set(items.filter((i) => i.change).map((i) => i.change));
+    const listedChanges = new Set(items.flatMap((i) => i.change ? [i.change] : i.kind === "contest" ? i.changes.map((x: any) => x.change) : []));
     for (const t of this.reviewTasks()) {
       if (t.needsPerson || listedChanges.has(t.change)) continue; // already waiting on a person above
       const left = this.reviewersLeft(t.change);

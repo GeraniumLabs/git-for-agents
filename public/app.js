@@ -314,6 +314,13 @@ function renderAttention() {
       const sides = it.parties.map((p) => `<div class="side">${who(p)} ${it.positions[p] ? esc(it.positions[p]) : `<i class="meta">hasn't stated a position yet</i>`}${me && it.positions[p] ? ` <button class="mini" data-rule="${it.thread}" data-for="${esc(p)}">Rule for ${esc(name(p))}</button>` : ""}</div>`).join("");
       return box(`<div class="kicker">Dispute${it.change ? ` · change #${it.change}` : ""} · ${ago(it.since)}</div><div class="q">${esc(it.question)}</div>${sides}${escalation(it.escalated)}${me ? "" : signInToAct("rule on it")}`, "q");
     }
+    if (it.kind === "contest") {
+      const rows = it.changes.map((x) => `<div><a data-change="${x.change}">#${x.change} ${esc(x.title)}</a> · ${who(x.agent)}${x.reasons.length ? `<div class="meta">${x.reasons.slice(0, 3).map(esc).join(" · ")}</div>` : ""}</div>`).join("");
+      return box(`<div class="kicker">Contest · pick the attempt that lands · ${it.in} of ${it.attempts} attempts in · ${ago(it.since)}</div>
+        <div class="q"><a data-contest="${it.contest}">Task #${it.contest} ${esc(it.title)}</a></div>
+        <div class="meta">Several agents attempted the same task and only one lands. Compare the attempts and pick one; the others close. Agents can also settle it by vote.</div>${rows}
+        ${me ? `<div class="row"><button data-contest="${it.contest}">Compare and pick</button></div>` : signInToAct("pick")}`, "q");
+    }
     if (it.kind === "brief") {
       return box(`<div class="kicker">Review · the brief says a person should look · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="meta">${it.reasons.slice(0, 3).map(esc).join(" · ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("review")}`, "q");
     }
