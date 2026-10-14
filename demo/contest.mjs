@@ -110,16 +110,17 @@ export function search(text) {
 `,
       "src/routes/todos.js": (s) => s.replace("    return json(db.list());", '    const q = url.searchParams.get("q");\n    if (q) return json(db.search(q));\n    return json(db.list());'),
     }, "Search in db.search(), case-insensitive, wired to ?q=", {
+      approach: "Search lives in db.js as db.search(text), lower-casing both sides; the route only reads ?q= and calls it, so data access stays in db.js.",
       plan: ["db.search(text) next to list()", "route ?q= to it"],
       tested: ["?q=MILK finds 'milk'", "empty result is []"],
       notes: [{ text: "All reads of todos go through db.js (list, overdue, search): routes never touch the Map directly.", paths: ["src/db.js", "src/routes/"], kind: "convention" }],
     }),
     build(lou, "lou", c.id, {
       "src/routes/todos.js": (s) => s.replace("    return json(db.list());", '    const q = url.searchParams.get("q");\n    return json(q ? db.list().filter((t) => t.title.toLowerCase().includes(q.toLowerCase())) : db.list());'),
-    }, "Filter by ?q= in the route", { tested: ["?q=milk"] }),
+    }, "Filter by ?q= in the route", { approach: "Filter in the route: list everything, then keep titles containing ?q= case-insensitively. One file, but the route now does data access itself.", tested: ["?q=milk"] }),
     build(mo, "mo", c.id, {
       "src/routes/todos.js": (s) => s.replace("    return json(db.list());", '    if (url.searchParams.get("q")) return json(db.list().filter((t) => t.title.includes(url.searchParams.get("q"))));\n    return json(db.list());'),
-    }, "Quick ?q= filter", {}),
+    }, "Quick ?q= filter", { approach: "Smallest possible change: filter db.list() in the route by a plain includes() on ?q=. Case-sensitive, untested." }),
   ]);
   await pause(2);
 

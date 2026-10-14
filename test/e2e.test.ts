@@ -523,3 +523,43 @@ test("an intent declared without its task still counts for that task's change", 
   const snake = await ada.req("POST", "/intents", { task_id: t2.id, paths: ["README.md"] });
   assert.deepEqual((await ada.req("GET", `/tasks/${t2.id}`)).intents.map((i: any) => i.id), [snake.intent]);
 });
+
+test("contest attempts don't flag each other for a person; flagged attempts are one card to pick from", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-contest-card");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "contest attempts in Needs a person", files: SEED, requiredApprovals: 1 });
+  const files = ["src/db.js", "src/routes/todos.js", "src/server.js"];
+  const contest = await admin.req("POST", "/tasks", { title: "Log every request", description: "", attempts: 3 });
+  const changes: number[] = [];
+  for (const who of ["kai", "lou", "mo"]) {
+    const a = admin.as((await admin.addAgent(who, "builder")).key);
+    const claim = await a.claim(contest.id);
+    const ws = claim.workspace.name;
+    await a.intent(claim.task.id, files, "log requests");
+    const edits: Record<string, string> = {};
+    for (const f of files) edits[f] = (await a.read(f, ws)) + `\n// ${who}\n`;
+    await a.write(ws, edits, who);
+    await assert.rejects(a.submit(claim.task.id, `Logging by ${who}`, "log"), /explain your approach/, "an attempt has to say how it works");
+    await assert.rejects(a.submit(claim.task.id, `Logging by ${who}`, "log", { approach: "x ".repeat(200) }), /two or three plain sentences/, "an approach is short enough to read at a glance");
+    changes.push((await a.submit(claim.task.id, `Logging by ${who}`, "log", { approach: `${who} logs each request with a one-line comment in every file it touches.` })).id);
+  }
+  const view = await admin.req("GET", `/contests/${contest.id}`);
+  assert.ok(view.attempts.every((a: any) => /logs each request/.test(a.change.approach)), "the comparison leads with each attempt's approach");
+  const reasons = async (id: number) => (await admin.change(id)).brief.reasons.map((r: any) => r.kind);
+  for (const id of changes) assert.ok(!(await reasons(id)).includes("contested"), "sibling attempts aren't other agents on the same files");
+  const needs = async () => (await admin.req("GET", "/overview")).attention;
+  let attention = await needs();
+  assert.ok(!attention.some((i: any) => i.kind === "contest" || i.kind === "brief"), "nothing for a person from the attempts alone");
+  // An agent outside the contest on the same files does flag them: one card, the decision is which attempt lands.
+  const zed = admin.as((await admin.addAgent("zed", "builder")).key);
+  const other = await zed.createTask("Rename routes", "");
+  await zed.claim(other.id);
+  await zed.intent(other.id, files, "rename");
+  attention = await needs();
+  const card = attention.find((i: any) => i.kind === "contest");
+  assert.equal(card?.contest, contest.id);
+  assert.deepEqual(card.changes.map((x: any) => x.change).sort(), [...changes].sort());
+  assert.ok(!attention.some((i: any) => i.kind === "brief" && changes.includes(i.change)), "no separate review card per attempt");
+});

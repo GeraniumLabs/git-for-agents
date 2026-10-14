@@ -34,6 +34,10 @@ const DELEGATE_ID = "delegate";
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 /** An unacknowledged directive older than this shows under Stuck. */
 const DIRECTIVE_ACK_MS = 5 * 60_000;
+/** Shortest approach a contest attempt may explain itself with. */
+const MIN_APPROACH = 60;
+/** Longest: it's read side by side with the other attempts', by a person, at a glance. */
+const MAX_APPROACH = 280;
 /** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
 export const DIRECTIVES_HEADER = "x-loom-directives";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
@@ -1248,9 +1252,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── changes: the agent-native pull request ───────────────────────────────
 
-  private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any }) {
+  private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any; approach?: string }) {
     const task = this.task(body.taskId);
     if (task.assignee !== actor.id) throw new HttpError(403, `task ${body.taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name}); claim it first`);
+    // A person comparing several attempts can't read five versions of the same code: each attempt says how it works.
+    const approach = String(body.approach ?? body.context?.approach ?? "").trim();
+    if (approach) body = { ...body, context: { ...(body.context ?? {}), approach } };
+    const inContest = this.openContest(body.taskId);
+    if (inContest && approach.length > MAX_APPROACH)
+      throw new HttpError(400, `keep the approach to two or three plain sentences (under ${MAX_APPROACH} characters) for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up. File lists, tool names and details go in summary`);
+    if (inContest && approach.length < MIN_APPROACH && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray().length)
+      throw new HttpError(400, `task ${body.taskId} is an attempt in contest #${inContest.id}: explain your approach (approach: two or three plain sentences for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up), so people and voters can compare the attempts without reading every diff`);
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
@@ -1484,12 +1496,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
         else (knownBy[r.path as string] ??= []).push(this.agentName(r.agent_id as string) ?? (r.agent_id as string));
       }
     }
+    // Attempts at the same contest overlap by design; that isn't other agents on the same files.
+    const contest = ch.task_id ? this.openContest(ch.task_id) : null;
+    const siblings = new Set<number>(contest ? this.contestAttempts(contest.id as number).map((t) => t.id as number) : []);
     const brief = buildBrief({
       author: this.agentName(ch.agent_id) ?? ch.agent_id,
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
       checks: ch.checks, checksConfigured: !!this.checks,
-      othersIntents: this.activeIntents(ch.agent_id).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
+      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id)).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
@@ -1720,7 +1735,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         detail = {
           id: ch.id, status: ch.status, title: ch.title, summary: ch.summary, files: (ch.files as FileChange[]).map((f) => f.path), undeclared: ch.undeclared,
           ...this.patchStats(text), patch: text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated; get_change for all of it)` : text,
-          context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
+          approach: saved?.context?.approach ?? null, context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
           checks: ch.checks, brief: this.briefFor(ch, text), openThreads: this.openBlockingThreads(ch.id),
         };
       }
@@ -2987,6 +3002,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const c = this.change(r.id as number);
       const brief = this.briefFor(c, "");
       if (!brief.needsPerson || brief.reasons.some((x) => x.kind === "protected")) continue;
+      // An attempt in an open contest: the person's decision is which attempt lands, so its attempts are one card.
+      const contest = c.task_id ? this.openContest(c.task_id) : null;
+      if (contest) {
+        let item = items.find((i) => i.kind === "contest" && i.contest === contest.id);
+        if (!item) {
+          const entries = this.contestEntries(contest.id as number);
+          items.push(item = { kind: "contest", contest: contest.id, title: contest.title, attempts: entries.length, in: entries.filter((e) => e.change && e.change.status !== "closed").length, changes: [], since: c.updated_at });
+        }
+        item.changes.push({ change: c.id, title: c.title, agent: c.agent_id, reasons: brief.reasons.filter((x) => x.kind !== "ok" && x.kind !== "threads").map((x) => x.text) });
+        continue;
+      }
       const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
       items.push({ kind: "brief", change: c.id, title: c.title, agent: c.agent_id, reasons: brief.reasons.filter((x) => x.kind !== "ok" && x.kind !== "threads").map((x) => x.text), escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
     }
@@ -3011,7 +3037,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       items.push({ kind: "stuck", reason: "conflict not resolved", detail: `#${c.id} ${c.title}`, agent: c.agent_id, change: c.id, since: c.updated_at });
     }
     // Reviews that aren't moving: no agent can take one, nobody has taken one, or whoever was asked hasn't answered.
-    const listedChanges = new Set(items.filter((i) => i.change).map((i) => i.change));
+    const listedChanges = new Set(items.flatMap((i) => i.change ? [i.change] : i.kind === "contest" ? i.changes.map((x: any) => x.change) : []));
     for (const t of this.reviewTasks()) {
       if (t.needsPerson || listedChanges.has(t.change)) continue; // already waiting on a person above
       const left = this.reviewersLeft(t.change);
