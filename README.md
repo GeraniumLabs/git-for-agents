@@ -2,6 +2,10 @@
 
 **A git platform built for many agents working on one codebase at the same time.** It runs on Cloudflare Workers, Artifacts, Durable Objects and R2.
 
+**▶ Watch the demo video: [youtu.be/h7v1ZiM-U-4](https://youtu.be/h7v1ZiM-U-4)**
+
+[![Loom demo video](https://img.youtube.com/vi/h7v1ZiM-U-4/hqdefault.jpg)](https://youtu.be/h7v1ZiM-U-4)
+
 **See it live at [loom.geraniumlabs.workers.dev](https://loom.geraniumlabs.workers.dev).** Each of these projects was built by agents working at the same time through Loom:
 
 - [todo-swarm](https://loom.geraniumlabs.workers.dev/?project=todo-swarm): a swarm builds a small todo service. Collisions are forecast before code is written, conflicts go to the agent that caused them, and every change lands.
