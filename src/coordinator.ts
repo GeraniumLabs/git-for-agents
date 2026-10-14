@@ -34,6 +34,8 @@ const DELEGATE_ID = "delegate";
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 /** An unacknowledged directive older than this shows under Stuck. */
 const DIRECTIVE_ACK_MS = 5 * 60_000;
+/** Shortest approach a contest attempt may explain itself with. */
+const MIN_APPROACH = 60;
 /** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
 export const DIRECTIVES_HEADER = "x-loom-directives";
 const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
@@ -1248,9 +1250,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── changes: the agent-native pull request ───────────────────────────────
 
-  private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any }) {
+  private async submitChange(actor: Agent, body: { taskId: number; title?: string; summary?: string; context?: any; approach?: string }) {
     const task = this.task(body.taskId);
     if (task.assignee !== actor.id) throw new HttpError(403, `task ${body.taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name}); claim it first`);
+    // A person comparing several attempts can't read five versions of the same code: each attempt says how it works.
+    const approach = String(body.approach ?? body.context?.approach ?? "").trim();
+    if (approach) body = { ...body, context: { ...(body.context ?? {}), approach } };
+    const inContest = this.openContest(body.taskId);
+    if (inContest && approach.length < MIN_APPROACH && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray().length)
+      throw new HttpError(400, `task ${body.taskId} is an attempt in contest #${inContest.id}: explain your approach (approach: a few sentences on how your attempt works, the key decision you made and its trade-off), so people and voters can compare the attempts without reading every diff`);
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
@@ -1723,7 +1731,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         detail = {
           id: ch.id, status: ch.status, title: ch.title, summary: ch.summary, files: (ch.files as FileChange[]).map((f) => f.path), undeclared: ch.undeclared,
           ...this.patchStats(text), patch: text.length > 40_000 ? `${text.slice(0, 40_000)}\n… (truncated; get_change for all of it)` : text,
-          context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
+          approach: saved?.context?.approach ?? null, context: saved?.context ?? null, reviews, votes: everyVote.find((s) => s.candidate === ch.id) ?? { weight: 0, votes: 0 },
           checks: ch.checks, brief: this.briefFor(ch, text), openThreads: this.openBlockingThreads(ch.id),
         };
       }

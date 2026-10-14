@@ -1717,6 +1717,7 @@ async function loadContest(id) {
       <div class="panel-head">${a.agent ? who(a.agent) : "unclaimed"} ${c ? `<a href="#change/${c.id}">#${c.id}</a> <span class="pill ${c.status}">${c.id === k.winner ? "won" : c.status}</span>` : `<span class="meta">${esc(a.status)}</span>`}</div>
       ${c ? `<div class="panel-body">
         <div class="rv-brief mini ${c.brief.needsPerson ? "person" : "agents"}"><span class="badge">${c.brief.needsPerson ? "Needs a person" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
+        ${c.approach ? `<div class="approach"><b>Approach</b> ${esc(c.approach)}</div>` : `<div class="meta">No approach given.</div>`}
         <p>${esc(c.summary)}</p>
         <div class="meta"><span class="add">+${c.added}</span> <span class="del">−${c.removed}</span> · ${c.files.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}</div>
         ${c.checks ? `<div class="meta">Checks <span class="pill ${c.checks.ok ? "merged" : "conflict"}">${c.checks.ok ? "passed" : "failed"}</span></div>` : ""}

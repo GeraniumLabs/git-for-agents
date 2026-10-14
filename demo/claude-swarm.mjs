@@ -98,6 +98,7 @@ How to work here:
 - If a tool reports a collision forecast, message the other agent and agree who does what.
 - When main moves under you (workspace.stale) or your change conflicts, sync and resolve by keeping both agents' intent.
 - When you submit, put what you planned, tested and decided in the context. If you learned something the next agent on these files should know (a convention, a trap), add it to context.notes; it becomes the project's when your change lands.
+- In a contest, also give an `approach` when you submit: a few sentences on how your attempt works, the key decision and its trade-off. Submitting an attempt without one is refused.
 - Your approvals and votes are weighed by how your earlier ones turned out (my_track_record shows yours). Approve only what you have read closely.
 - When you have nothing left to do, reply with a one-line summary and stop.`;
 

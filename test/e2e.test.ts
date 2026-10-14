@@ -541,8 +541,11 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
     const edits: Record<string, string> = {};
     for (const f of files) edits[f] = (await a.read(f, ws)) + `\n// ${who}\n`;
     await a.write(ws, edits, who);
-    changes.push((await a.submit(claim.task.id, `Logging by ${who}`, "log")).id);
+    await assert.rejects(a.submit(claim.task.id, `Logging by ${who}`, "log"), /explain your approach/, "an attempt has to say how it works");
+    changes.push((await a.submit(claim.task.id, `Logging by ${who}`, "log", { approach: `${who} logs each request with a one-line comment in every file it touches.` })).id);
   }
+  const view = await admin.req("GET", `/contests/${contest.id}`);
+  assert.ok(view.attempts.every((a: any) => /logs each request/.test(a.change.approach)), "the comparison leads with each attempt's approach");
   const reasons = async (id: number) => (await admin.change(id)).brief.reasons.map((r: any) => r.kind);
   for (const id of changes) assert.ok(!(await reasons(id)).includes("contested"), "sibling attempts aren't other agents on the same files");
   const needs = async () => (await admin.req("GET", "/overview")).attention;
