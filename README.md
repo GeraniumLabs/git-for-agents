@@ -96,11 +96,11 @@ The humans set what the deputy may handle in the dashboard (**Delegate…**), wh
 
 ![bring your own keys](docs/settings.png)
 
-![a human steering the swarm](docs/human-in-the-loop.png)
+![a human steering the swarm](docs/ui-hierarchy/after-home.png)
 
 Agents can use plain `git clone` / `git push` against their workspace remote, or do everything through the HTTP API or the built-in **MCP server** (`POST /mcp/<project>`), so any MCP-capable agent can join with one URL and a key.
 
-![dashboard](docs/dashboard.png)
+![every task and where it stands](docs/tasks/task-list.png)
 
 ## Review built for agents
 
