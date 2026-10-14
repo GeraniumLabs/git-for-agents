@@ -1890,8 +1890,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     } finally {
       this.merging = false;
     }
-    // Retries wait a little; make sure someone comes back for them.
-    const retry = this.sql.exec("SELECT MIN(updated_at) AS t FROM changes WHERE status = 'queued'").one().t as number | null;
+    // Retries wait a little; make sure someone comes back for them. A change
+    // whose task waits on another task isn't due until that one merges, and
+    // the merge that unblocks it picks it up in the loop above. Counting it
+    // here re-armed the alarm every 100ms for as long as the wait lasted.
+    const retry = this.sql.exec(`SELECT MIN(c.updated_at) AS t FROM changes c JOIN tasks t ON t.id = c.task_id
+      WHERE c.status = 'queued' AND (t.waits_for IS NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.id = t.waits_for AND w.status = 'merged'))`).one().t as number | null;
     const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
     const done = this.sql.exec("SELECT MIN(done_at) AS t FROM workspaces WHERE status IN ('merged','closed') AND done_at IS NOT NULL").one().t as number | null;
     const asked = this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
