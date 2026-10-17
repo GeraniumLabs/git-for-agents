@@ -25,6 +25,7 @@ import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type I
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
+import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
@@ -40,7 +41,7 @@ const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 /** The project's check minutes for the day are used up; the merge queue waits until `until`. */
 class CheckBudgetError extends Error {
   constructor(readonly minutes: number, readonly until: number) {
-    super(`This project used its ${minutes} minutes of checks for today. The merge queue waits until ${new Date(until).toISOString().slice(0, 16).replace("T", " ")} UTC, or whoever runs this server can raise LOOM_CHECK_MINUTES_PER_DAY.`);
+    super(`This project used its ${minutes} minutes of checks for today. The merge queue waits until ${new Date(until).toISOString().slice(0, 16).replace("T", " ")} UTC, or its owner's plan can be raised.`);
   }
 }
 /** At most one "needs you" email per person this often. */
@@ -227,6 +228,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         task_id INTEGER, change_id INTEGER, to_agent TEXT, data TEXT);
       CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, description TEXT, created_at INTEGER);
       CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
+      CREATE TABLE IF NOT EXISTS plans (login TEXT PRIMARY KEY, plan TEXT, status TEXT, customer TEXT, subscription TEXT, renews INTEGER, event_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
       CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
@@ -619,6 +621,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
           owns: this.sql.exec("SELECT COUNT(*) AS n FROM projects WHERE owner = ?", login).one().n as number,
         });
       }
+      // People's plans (src/billing.ts), set from Stripe's webhooks.
+      if (b === "plan") {
+        if (m === "GET") {
+          const login = (url.searchParams.get("login") ?? "").toLowerCase();
+          const r = this.sql.exec("SELECT login, plan, status, customer, subscription, renews FROM plans WHERE login = ?", login).toArray()[0];
+          const owned = this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", login).toArray();
+          return json({ ...(r ?? { login, plan: "free", status: null, customer: null, subscription: null, renews: null }), owned });
+        }
+        const u = body as PlanRow & { at: number };
+        const r = this.sql.exec("SELECT event_at FROM plans WHERE login = ?", u.login).toArray()[0];
+        // Stripe doesn't promise order: an older event never undoes a newer one.
+        if (r && Number(r.event_at ?? 0) > u.at) return json({ applied: false });
+        this.sql.exec(`INSERT INTO plans (login, plan, status, customer, subscription, renews, event_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(login) DO UPDATE SET plan = excluded.plan, status = excluded.status, customer = COALESCE(excluded.customer, plans.customer),
+          subscription = COALESCE(excluded.subscription, plans.subscription), renews = COALESCE(excluded.renews, plans.renews), event_at = excluded.event_at, updated_at = excluded.updated_at`,
+          u.login, u.plan, u.status, u.customer, u.subscription, u.renews, u.at, Date.now());
+        return json({ applied: true, owned: this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", u.login).toArray() });
+      }
       if (b === "hidden") {
         this.sql.exec("UPDATE projects SET hidden = ? WHERE name = ?", body.hidden ? 1 : 0, body.name);
         return json({ ok: true });
@@ -637,6 +657,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
 
     if (a === "init" && m === "POST") return json(await this.init(body));
+    // From the Worker when the owner's plan changes; never routed from outside.
+    if (a === "plan" && m === "POST" && url.hostname === "do") {
+      this.setMeta("plan", String(body.plan));
+      return json({ plan: this.meta("plan"), limits: this.limits });
+    }
     // Deleted (or never made): nothing here answers.
     if (!this.meta("project")) throw new HttpError(404, "no such project");
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
@@ -855,7 +880,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; plan?: ProjectPlan; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     let from: string | null = null;
@@ -902,6 +927,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
     this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
     if (body.checks) this.setChecks(body.checks);
+    if (body.plan) this.setMeta("plan", body.plan);
     this.setMeta("main_head", commit);
     if (imported) this.setMeta("imported_from", JSON.stringify(imported));
     this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null, jurisdiction: this.jurisdiction, importedFrom: imported } });
@@ -1024,11 +1050,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** A project holds at most LOOM_MAX_AGENTS agents (default 300), so one project can't grow without bound on the server's bill. */
   private assertAgentRoom() {
-    const max = Number(this.env.LOOM_MAX_AGENTS ?? 300);
+    const max = this.limits.agents;
     if (!(max > 0)) return;
     const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", DELEGATE_ID, REVIEW_AGENT_ID).one().n as number;
-    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most this server allows; reuse an agent's key, or ask whoever runs this server`);
+    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most its plan allows; reuse an agent's key${this.meta("plan") === "free" ? ", or its owner can move to Loom Pro" : ", or ask whoever runs this server"}`);
   }
+
+  /** What this project may use: from its owner's plan, or the server's limits. */
+  private get limits() { return projectLimits(this.env, this.meta("plan")); }
 
   // ── people: GitHub sign-in, owners and members ───────────────────────────
 
@@ -2196,7 +2225,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
     const { command, timeoutSec } = this.checks!;
     const day = new Date().toISOString().slice(0, 10);
-    const budget = Number(this.env.LOOM_CHECK_MINUTES_PER_DAY ?? 120) * 60_000;
+    const budget = this.limits.checkMinutes * 60_000;
     const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
     if (budget > 0 && used >= budget) throw new CheckBudgetError(budget / 60_000, Date.parse(`${day}T00:00:00Z`) + 86_400_000);
     const r = await runCheck(this.env, this.project, files, command, timeoutSec);
@@ -3245,7 +3274,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },

@@ -6,10 +6,22 @@ import { projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
 import { AGENT_HEADER, DIRECTIVES_HEADER } from "./coordinator";
+import { PLANS, billingOn, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
 const PROJECT_NAME = /^[a-z0-9][a-z0-9-]{1,40}$/;
+
+async function planOf(env: Env, login: string) {
+  return registry(env).fetch(`https://do/registry/plan?login=${encodeURIComponent(login.toLowerCase())}`).then((r) => r.json<PlanRow & { owned: { name: string; jurisdiction: Jurisdiction | null }[] }>());
+}
+
+/** A plan changed: record it, then tell each project the person owns, so its limits follow. */
+async function applyPlan(env: Env, u: PlanRow & { at: number }) {
+  const r = await registry(env).fetch("https://do/registry/plan", { method: "POST", body: JSON.stringify(u) }).then((r) => r.json<{ applied: boolean; owned?: { name: string }[] }>());
+  if (!r.applied || logins(env.LOOM_OWNERS).includes(u.login)) return;
+  for (const p of r.owned ?? []) await (await coordinator(env, p.name)).fetch("https://do/plan", { method: "POST", body: JSON.stringify({ plan: u.plan }) });
+}
 
 function registry(env: Env) {
   return env.PROJECT.get(env.PROJECT.idFromName("__registry"));
@@ -62,18 +74,26 @@ const logins = (v: string | undefined) => (v ?? "").split(",").map((l) => l.trim
  * the waitlist, which everyone else joins by trying. Past the owners of the
  * server, each person owns at most LOOM_PROJECTS_PER_PERSON projects.
  */
-async function mayCreate(env: Env, user: User): Promise<{ ok: true } | { ok: false; error: string }> {
+async function mayCreate(env: Env, user: User): Promise<{ ok: true; plan: ProjectPlan } | { ok: false; error: string }> {
   const login = user.login.toLowerCase();
-  if (logins(env.LOOM_OWNERS).includes(login)) return { ok: true };
+  if (logins(env.LOOM_OWNERS).includes(login)) return { ok: true, plan: "unlimited" };
   const list = logins(env.LOOM_CREATORS ?? "*");
   const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}`).then((r) => r.json<{ approved: boolean; owns: number }>());
   if (!list.includes("*") && !list.includes(login) && !r.approved) {
     await registry(env).fetch("https://do/registry/waitlist", { method: "POST", body: JSON.stringify({ login, name: user.name }) });
     return { ok: false, error: `Loom is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
   }
-  const cap = Number(env.LOOM_PROJECTS_PER_PERSON ?? 5);
-  if (cap > 0 && r.owns >= cap) return { ok: false, error: `You own ${r.owns} projects, the most this server allows each person. Delete one in its Settings to make room.` };
-  return { ok: true };
+  if (!billingOn(env)) {
+    const cap = serverLimits(env).projects;
+    if (cap > 0 && r.owns >= cap) return { ok: false, error: `You own ${r.owns} projects, the most this server allows each person. Delete one in its Settings to make room.` };
+    return { ok: true, plan: "free" };
+  }
+  const plan = (await planOf(env, login)).plan;
+  const cap = PLANS[plan].projects;
+  if (r.owns >= cap) return { ok: false, error: plan === "free"
+    ? `The free plan has ${cap} project${cap === 1 ? "" : "s"}, and you have ${r.owns}. Loom Pro (${PLANS.pro.price}) gives you ${PLANS.pro.projects}: upgrade under Billing, or delete one in its Settings.`
+    : `You own ${r.owns} projects, the most Loom Pro allows. Delete one in its Settings to make room.` };
+  return { ok: true, plan };
 }
 
 export default {
@@ -94,6 +114,44 @@ export default {
       if (user) headers[USER_HEADER] = JSON.stringify(user);
       const seen = await Promise.all(all.map(async (p) => !p.private || (await (await coordinator(env, p.name)).fetch("https://do/visible", { headers }).then((r) => r.json<{ visible: boolean }>()).catch(() => ({ visible: false }))).visible));
       return Response.json(all.filter((_, i) => seen[i]).map((p) => ({ ...p, jurisdiction: p.jurisdiction ?? null })));
+    }
+
+    // Billing: a person's plan, Checkout to upgrade, Stripe's portal to manage it, and Stripe's webhook.
+    if (path === "/api/stripe/webhook" && req.method === "POST") {
+      if (!billingOn(env)) return Response.json({ error: "billing is off" }, { status: 404 });
+      const raw = await req.text();
+      if (!(await verifyStripe(env.STRIPE_WEBHOOK_SECRET!, req.headers.get("stripe-signature"), raw))) return Response.json({ error: "bad signature" }, { status: 400 });
+      const u = planUpdate(JSON.parse(raw));
+      if (u) await applyPlan(env, u);
+      return Response.json({ received: true });
+    }
+    if (path.startsWith("/api/billing")) {
+      const user = await sessionUser(env, req);
+      if (path === "/api/billing" && req.method === "GET") {
+        if (!billingOn(env)) return Response.json({ enabled: false });
+        if (!user) return Response.json({ enabled: true, plans: PLANS });
+        const p = await planOf(env, user.login);
+        const unlimited = logins(env.LOOM_OWNERS).includes(user.login.toLowerCase());
+        return Response.json({ enabled: true, plans: PLANS, plan: unlimited ? "unlimited" : p.plan, status: p.status, renews: p.renews, projects: p.owned.length, manage: !!p.customer });
+      }
+      if (!billingOn(env)) return Response.json({ error: "this server takes no payments" }, { status: 404 });
+      if (!user) return Response.json({ error: "sign in with GitHub first" }, { status: 401 });
+      const p = await planOf(env, user.login);
+      const back = (await req.json<{ back?: string }>().catch(() => ({} as { back?: string }))).back;
+      const ret = typeof back === "string" && back.startsWith("/") && !back.startsWith("//") ? back : "/";
+      try {
+        if (path === "/api/billing/checkout" && req.method === "POST") {
+          if (p.plan === "pro") return Response.json({ error: "you're already on Loom Pro" }, { status: 409 });
+          return Response.json({ url: await checkoutSession(env, user.login.toLowerCase(), p.customer, url.origin, ret) });
+        }
+        if (path === "/api/billing/portal" && req.method === "POST") {
+          if (!p.customer) return Response.json({ error: "you have no billing account yet" }, { status: 404 });
+          return Response.json({ url: await portalSession(env, p.customer, `${url.origin}${ret}`) });
+        }
+      } catch (e: any) {
+        return Response.json({ error: String(e?.message ?? e) }, { status: 502 });
+      }
+      return Response.json({ error: "not found" }, { status: 404 });
     }
 
     // The admin: who may create projects, who's waiting, and which projects are listed.
@@ -125,9 +183,11 @@ export default {
       const admin = await isAdmin(env, req);
       const user = admin ? null : await sessionUser(env, req);
       if (!admin && !user) return Response.json({ error: "sign in with GitHub to create a project" }, { status: 401 });
+      let plan: ProjectPlan = "unlimited";
       if (user) {
         const may = await mayCreate(env, user);
         if (!may.ok) return Response.json({ error: may.error }, { status: 403 });
+        plan = may.plan;
       }
       const body = await req.json<any>();
       if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
@@ -138,7 +198,7 @@ export default {
       // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
       if ((await locate(env, body.name)).exists) return Response.json({ error: "project already exists" }, { status: 409 });
       const ns = projectNamespace(env, jurisdiction);
-      const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined }) });
+      const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined, plan }) });
       if (res.ok) {
         await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null }) });
         located.set(body.name, jurisdiction);

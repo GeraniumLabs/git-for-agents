@@ -26,6 +26,13 @@ export interface Env {
   LOOM_MAX_AGENTS?: string;
   /** Minutes of checks one project may run a day (UTC). Default 120; 0 means no limit. Past it, the merge queue waits for the next day. */
   LOOM_CHECK_MINUTES_PER_DAY?: string;
+  /** Stripe: with both set, people get the free plan and can pay for Loom Pro (src/billing.ts). */
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  /** A Stripe price for Loom Pro; without one, Checkout uses $10 a month. */
+  STRIPE_PRICE_ID?: string;
+  /** Tests point this at a stand-in. Defaults to https://api.stripe.com. */
+  STRIPE_API_URL?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */

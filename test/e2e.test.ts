@@ -841,3 +841,46 @@ test("creating projects is invite-only: others join the waitlist until the admin
   assert.equal((await fetch(`${url}/api/projects/${name}/overview`)).status, 200, "a hidden project still opens by name");
   await admin("DELETE", `creators/${login}`);
 });
+
+test("anyone on the free plan gets one project; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
+  const { signStripe } = await import("../src/billing.ts");
+  const login = `pay${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const as = (method: string, path: string, body?: unknown) => fetch(`${url}${path}`, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  // This server is invite-only too: let them in first.
+  await fetch(`${url}/api/admin/creators`, { method: "POST", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ login }) });
+  const webhook = async (event: unknown) => {
+    const body = JSON.stringify(event), t = Math.floor(Date.now() / 1000);
+    return fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": `t=${t},v1=${await signStripe("whsec_local", t, body)}` }, body });
+  };
+
+  const b = await (await as("GET", "/api/billing")).json();
+  assert.equal(b.plan, "free");
+  const first = project("e2e-pay");
+  assert.equal((await as("POST", "/api/projects", { name: first, description: "x" })).status, 200);
+  const second = await as("POST", "/api/projects", { name: project("e2e-pay2"), description: "x" });
+  assert.equal(second.status, 403);
+  assert.match((await second.json()).error, /free plan has 1 project/);
+
+  const co = await (await as("POST", "/api/billing/checkout", { back: `/?project=${first}` })).json();
+  assert.match(co.url, /\/stripe\/pay\/cs_test_/);
+  assert.match(decodeURIComponent(co.url), new RegExp(`login=${login}.*billing=done`));
+
+  assert.equal((await fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": "t=1,v1=00" }, body: "{}" })).status, 400);
+  const created = Math.floor(Date.now() / 1000);
+  await webhook({ type: "checkout.session.completed", created, data: { object: { mode: "subscription", client_reference_id: login, customer: "cus_e2e", subscription: "sub_e2e" } } });
+  const pro = await (await as("GET", "/api/billing")).json();
+  assert.equal(pro.plan, "pro");
+  assert.equal(pro.manage, true);
+  assert.match((await (await as("POST", "/api/billing/portal", {})).json()).url, /\/stripe\/portal\/cus_e2e/);
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  const ov = await (await as("GET", `/api/projects/${first}/overview`)).json();
+  assert.equal(ov.project.limits.checkMinutes, 300, "the project they already had moved to Pro's limits");
+
+  // An older event arriving late doesn't undo a newer one; cancelling does end it.
+  await webhook({ type: "customer.subscription.updated", created: created - 10, data: { object: { id: "sub_e2e", status: "incomplete", customer: "cus_e2e", metadata: { login } } } });
+  assert.equal((await (await as("GET", "/api/billing")).json()).plan, "pro");
+  await webhook({ type: "customer.subscription.deleted", created: created + 10, data: { object: { id: "sub_e2e", status: "canceled", customer: "cus_e2e", metadata: { login } } } });
+  assert.equal((await (await as("GET", "/api/billing")).json()).plan, "free");
+  assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.checkMinutes, 30);
+});

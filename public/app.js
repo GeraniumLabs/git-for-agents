@@ -856,11 +856,34 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
-function showNewProject(draft = null) {
+/** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
+async function planHtml() {
+  const b = await fetch("/api/billing", { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
+  if (!b.enabled || !b.plan || b.plan === "unlimited") return "";
+  const p = b.plans[b.plan], pro = b.plans.pro;
+  const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  return b.plan === "pro"
+    ? `<p class="meta">You're on <b>${esc(p.name)}</b>: ${limits(p)}.${b.status && b.status !== "active" ? ` Payment status: <b>${esc(b.status)}</b>.` : ""}${b.renews ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}</p>${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`
+    : `<p class="meta">You're on the <b>free plan</b>: ${limits(p)}. <b>${esc(pro.name)}</b> (${esc(pro.price)}) gives you ${limits(pro)}.</p><div class="row"><button data-billing="checkout">Upgrade to ${esc(pro.name)}</button>${b.manage ? `<button class="ghost" data-billing="portal">Billing history</button>` : ""}</div>`;
+}
+
+function wireBilling(root) {
+  for (const btn of root.querySelectorAll("[data-billing]")) btn.onclick = async () => {
+    btn.disabled = true;
+    const res = await fetch(`/api/billing/${btn.dataset.billing}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ back: `${location.pathname}${location.search}` }) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || !d.url) { btn.disabled = false; return toast(d.error ?? `HTTP ${res.status}`); }
+    location.href = d.url;
+  };
+}
+
+async function showNewProject(draft = null) {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
+  const plan = await planHtml();
   $("#detail-body").innerHTML = `
     <h3>New project</h3>
     <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. You'll be its owner, signed in as <b>${esc(user.login)}</b>.</p>
+    ${plan}
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
     <h2>Start from</h2>
@@ -880,6 +903,7 @@ function showNewProject(draft = null) {
     ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
+  wireBilling($("#detail-body"));
   const importing = () => $('input[name="np-from"]:checked').value === "import";
   if (draft) {
     // Back from GitHub: put the form back as it was.
@@ -969,14 +993,20 @@ if (new URLSearchParams(location.search).get("new") === "1") {
   history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`);
   loadUser().then(() => showNewProject(draft));
 }
+// Back from Stripe Checkout: the webhook may land a moment after the person does.
+if (new URLSearchParams(location.search).get("billing") === "done") {
+  const q = new URLSearchParams(location.search); q.delete("billing");
+  history.replaceState(null, "", `${location.pathname}${q.size ? `?${q}` : ""}${location.hash}`);
+  setTimeout(() => toast("Thanks: you're on Loom Pro"), 500);
+}
 try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null;
-  try { [s, people, si, mail] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null]); } catch { return; }
+  let mail = null, plan = "";
+  try { [s, people, si, mail, plan] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? planHtml() : ""]); } catch { return; }
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
@@ -1012,6 +1042,7 @@ async function showSettings() {
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
+    ${plan ? `<h2>Your plan</h2>${plan}` : ""}
     ${mail ? `<h2>Email me</h2>
     <p class="meta">${mail.email ? `Loom emails <b>${esc(mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : `Get an email when something on ${esc(project)} needs you, with a link straight to it.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
     <div class="row"><input id="mail-to" type="email" class="grow" placeholder="you@example.com" value="${esc(mail.email ?? "")}"><button class="ghost" id="mail-save">${mail.email ? "Save" : "Turn on"}</button>${mail.email ? `<button class="ghost" id="mail-off">Turn off</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : ""}</div>` : ""}
@@ -1114,6 +1145,7 @@ async function showSettings() {
     toast(state.project.reviewAgent.enabled ? "Review agent on" : "Review agent off");
     showSettings();
   };
+  wireBilling($("#detail-body"));
   if ($("#mail-save")) $("#mail-save").onclick = async () => {
     try { await act("POST", "/me/email", { email: $("#mail-to").value }); } catch { return; }
     toast($("#mail-to").value.trim() ? "Email on" : "Email off");
