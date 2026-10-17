@@ -345,6 +345,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `GET /tasks?status=` | List tasks |
 | `POST /import/issues` `{url?, token?}` | *Owners:* file a task for each open issue of the GitHub repository the project was imported from (or `url`), skipping issues already brought in |
+| `DELETE /api/projects/<project>?confirm=<project>` | *Owners:* delete the project for good: its repository and workspaces, change context and attachments, and everything the coordinator holds. Also in **Settings › Delete project** |
 | `POST /tasks` `{title, description, dependsOn, related, attempts?}` | Add a task (`related`: earlier tasks whose history its agent should get; `attempts: 2..5` makes it a contest) |
 | `POST /join` `{code, name}` | *No key needed:* trade a join code for this agent's own key |
 | `GET /attention?known=<known>&wait=<s>` | What needs a person, each item marked `new` unless it was in `known`; with `wait`, holds until something new needs a person |
@@ -422,7 +423,6 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
 - Imports copy one branch and its history, and the whole history is held in memory while it's copied, so very large repositories (hundreds of MB) won't import. Issues are imported once and on request; Loom doesn't follow the source afterwards.
 - The merge doesn't detect renames: a rename on one side and an edit on the other shows up as a modify/delete conflict. Binary files conflict as a whole.
-- There is no way to delete a project yet; owners can make one private.
 
 ## License
 

@@ -634,3 +634,41 @@ test("a merge whose base is older than the history a workspace fetches still fin
   assert.ok(merged.base, "the merge base was found by fetching further back");
   assert.deepEqual(merged.conflicts, [], "a clean merge, not an add/add conflict from a missing base");
 });
+
+test("an owner deletes a project: its repositories, attachments and listing go, and the name can be used again", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
+  const name = project("e2e-delete");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "to be deleted", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Restyle", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// v1\n" }, "v1");
+  const ch = await ada.submit(t.id, t.title, "Restyle", {});
+  const shot = await ada.req("POST", "/attachments", { name: "test.log", text: "ok\n", change: ch.id });
+  const repos = async () => (await (await fetch(`${shim}/repos`)).json()).repos.map((r: any) => r.name).filter((r: string) => r === name || r.startsWith(`${name}-`));
+  assert.equal((await repos()).length, 2, "main and ada's workspace");
+
+  await assert.rejects(ada.req("DELETE", `/api/projects/${name}?confirm=${name}`), /403/, "an agent can't delete it");
+  await assert.rejects(admin.req("DELETE", `/api/projects/${name}?confirm=nope`), /400.*confirm/, "the name has to be typed back");
+  await assert.rejects(admin.req("DELETE", `/api/projects/${name}/project?confirm=${name}`), /404/, "only through DELETE /api/projects/<name>");
+  assert.equal((await fetch(`${url}/api/projects/${name}/attachments/${shot.id}/raw`)).status, 200, "still there after the refusals");
+
+  const gone = await admin.req("DELETE", `/api/projects/${name}?confirm=${name}`);
+  assert.deepEqual([gone.deleted, gone.repos], [name, 2]);
+  assert.ok(gone.objects >= 2, "the change context and the attachment");
+  assert.deepEqual(await repos(), []);
+  assert.ok(!(await admin.req("GET", "/api/projects")).some((p: any) => p.name === name));
+  assert.equal((await fetch(`${url}/api/projects/${name}/state`)).status, 404);
+  assert.equal((await fetch(`${url}/api/projects/${name}/attachments/${shot.id}/raw`)).status, 404);
+  await assert.rejects(ada.createTask("After", ""), /404/, "the agent's key is gone with it");
+  await assert.rejects(admin.req("DELETE", `/api/projects/${name}?confirm=${name}`), /404/);
+
+  await admin.createProject({ name, description: "the name again" });
+  const fresh = await (await fetch(`${url}/api/projects/${name}/state`)).json();
+  assert.equal(fresh.project.description, "the name again");
+  assert.equal(fresh.tasks?.length ?? 0, 0);
+  assert.equal((await repos()).length, 1);
+});

@@ -1017,7 +1017,19 @@ async function showSettings() {
       <div class="meta">${esc(k.uses)}${k.saved ? ` Saved by ${esc(k.saved.setByName)} on ${when(k.saved.setAt)}.` : k.serverKey ? " The server has one; a project key takes its place." : ""}</div>
       ${k.saved && !k.saved.readable ? `<div class="warn">The secret that sealed this key is gone, so it can't be read. Save it again.</div>` : ""}
       <div class="row"><input type="password" autocomplete="off" data-key-input="${k.kind}" placeholder="${esc(k.hint)}"><button data-key-save="${k.kind}" ${s.canSave ? "" : "disabled"}>${k.saved ? "Replace" : "Save"}</button>${k.saved ? `<button class="ghost" data-key-remove="${k.kind}">Remove</button>` : ""}</div>
-    </div>`).join("")}`;
+    </div>`).join("")}
+    ${isOwner() ? `<h2>Delete project</h2>
+    <p class="meta">Removes the repository with all its history, every workspace, and the project's tasks, reviews, attachments, people and keys. Agents' keys stop working. This can't be undone.</p>
+    <div class="row"><button class="bad" id="proj-delete">Delete this project…</button></div>` : ""}`;
+  if ($("#proj-delete")) $("#proj-delete").onclick = async () => {
+    const typed = await ask({ title: `Delete ${project}?`, body: "Everything in it goes, for good. Type the project's name to confirm.", ok: "Delete forever", danger: true, input: { label: "Project name", placeholder: project, required: true } });
+    if (typed === null) return;
+    if (typed !== project) return toast(`That isn't ${project}; nothing was deleted`);
+    $("#proj-delete").disabled = true;
+    try { await act("DELETE", `?confirm=${encodeURIComponent(typed)}`); } catch { $("#proj-delete").disabled = false; return; }
+    try { sessionStorage.setItem("loom-toast", `Deleted ${project}`); } catch {}
+    location.href = "/";
+  };
   for (const b of $("#detail-body").querySelectorAll("[data-key-save]")) b.onclick = async () => {
     const input = $(`[data-key-input="${b.dataset.keySave}"]`);
     if (!input.value.trim()) return;
