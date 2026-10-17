@@ -996,6 +996,9 @@ async function showSettings() {
     ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
       return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
         + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
+    <h2>Review agent</h2>
+    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
+      + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -1094,6 +1097,11 @@ async function showSettings() {
       toast($(id).checked ? "Turned on" : "Turned off");
     };
   }
+  if ($("#review-agent-save")) $("#review-agent-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { reviewAgent: { enabled: $("#review-agent-on").checked, afterMinutes: Number($("#review-agent-after").value) } }); state.project.reviewAgent = { ...state.project.reviewAgent, ...r.reviewAgent }; } catch { return; }
+    toast(state.project.reviewAgent.enabled ? "Review agent on" : "Review agent off");
+    showSettings();
+  };
   if ($("#q-save")) $("#q-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { questions: { maxOpen: Number($("#q-max").value), deadlineMinutes: Number($("#q-deadline").value) } }); state.project.questions = r.questions; } catch { return; }
     toast("Saved");

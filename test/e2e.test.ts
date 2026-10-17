@@ -686,3 +686,50 @@ test("a write with no message is committed under the task's title, not a generic
   const log = await admin.req("GET", `/commits?workspace=${ws}&limit=1`);
   assert.equal(log.commits[0].message.split("\n")[0], `Add a health route (task #${t.id})`);
 });
+
+test("with no reviewer around, Loom's review agent reviews the change: an approval lands it, a blocking comment sends it back", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-reviewagent");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "review agent", files: SEED, requiredApprovals: 1 });
+  const settings = await admin.req("POST", "/settings", { reviewAgent: { afterMinutes: 0 } });
+  assert.deepEqual(settings.reviewAgent, { enabled: true, afterMinutes: 0 }, "on by default");
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const until = async (id: number, ok: (c: any) => boolean) => {
+    for (let i = 0; i < 60; i++) {
+      const c = await admin.change(id);
+      if (ok(c)) return c;
+      await new Promise((r) => setTimeout(r, 500));
+    }
+    return admin.change(id);
+  };
+  const land = async (title: string, line: string) => {
+    const t = await ada.createTask(title, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, ["src/db.js"], title);
+    await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + `\n${line}\n` }, title);
+    return ada.submit(t.id, title, "", { plan: [title] });
+  };
+
+  const good = await land("Add a trim helper", "export const trim = (s) => s.trim();");
+  const merged = await until(good.id, (c) => c.status === "merged");
+  assert.equal(merged.status, "merged", "the review agent's approval lands it");
+  assert.equal(merged.reviews[0].reviewer, "loom-reviewer");
+  assert.match(merged.reviews[0].body, /Loom's review agent/);
+
+  const bad = await land("Add a broken helper", "export const broken = () => null; // LOOM-TEST-BUG");
+  const sent = await until(bad.id, (c) => c.status === "changes_requested");
+  assert.equal(sent.status, "changes_requested", "a blocking comment sends it back");
+  const thread = sent.threads.find((t: any) => t.created_by === "loom-reviewer");
+  assert.equal(thread.path, "src/db.js");
+  assert.ok(thread.blocking);
+
+  // Off in Settings: the next change waits for a person or an agent.
+  assert.equal((await admin.req("POST", "/settings", { reviewAgent: { enabled: false } })).reviewAgent.enabled, false);
+  const waits = await land("Add another helper", "export const two = 2;");
+  await new Promise((r) => setTimeout(r, 4000));
+  const still = await admin.change(waits.id);
+  assert.equal(still.status, "review");
+  assert.equal(still.reviews.length, 0);
+});

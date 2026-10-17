@@ -230,6 +230,30 @@ async function runCheck(req, res) {
   }
 }
 
+// A stand-in for the Messages API, for Loom's review agent in local
+// development: it approves, unless the diff contains LOOM-TEST-BUG, which it
+// asks to fix in a blocking comment on that line.
+async function reviewStandIn(req, res) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  const prompt = String(body.messages?.[0]?.content ?? "");
+  let file = null, line = 0, bug = null;
+  for (const l of prompt.split("\n")) {
+    const f = l.match(/^\+\+\+ b\/(.+)$/);
+    const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+    if (f) file = f[1];
+    else if (h) line = Number(h[1]) - 1;
+    else if (file && !l.startsWith("-")) {
+      line++;
+      if (!bug && l.includes("LOOM-TEST-BUG")) bug = { path: file, line, body: "This line is marked as a bug; fix it before it lands.", blocking: true };
+    }
+  }
+  const review = bug ? { verdict: "request_changes", summary: "One blocking problem.", comments: [bug] } : { verdict: "approve", summary: "Does what the task asks.", comments: [] };
+  send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+    content: [{ type: "text", text: JSON.stringify(review) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
+}
+
 createServer((req, res) => {
   const url = new URL(req.url, base());
   const done = (e) => {
@@ -240,6 +264,7 @@ createServer((req, res) => {
     if (url.pathname.startsWith("/git/")) return gitHttp(req, res, url);
     if (url.pathname.startsWith("/repos")) return api(req, res, url).catch(done);
     if (url.pathname === "/checks/run" && req.method === "POST") return runCheck(req, res).catch(done);
+    if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return reviewStandIn(req, res).catch(done);
     send(res, 200, { service: "artifacts-shim", repos: REPOS });
   } catch (e) {
     done(e);
