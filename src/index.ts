@@ -103,8 +103,17 @@ export default {
       return res;
     }
 
+    // Deleting a project: its coordinator removes everything it holds, then this isolate forgets where it lived.
+    const del = req.method === "DELETE" && path.match(/^\/api\/projects\/([a-z0-9-]+)$/);
+    if (del) {
+      if (!(await locate(env, del[1])).exists) return Response.json({ error: "no such project" }, { status: 404 });
+      const res = await forward(env, req, del[1], "project");
+      if (res.ok) located.delete(del[1]);
+      return res;
+    }
+
     let m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(.*)$/);
-    if (m && /^(init|registry|visible|artifacts-event)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
+    if (m && /^(init|registry|visible|artifacts-event|project)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
     // Turn away an oversized attachment before its bytes travel on to the coordinator.
     if (m && m[2] === "attachments" && req.method === "POST" && Number(req.headers.get("content-length") ?? 0) > MAX_ATTACHMENT_BYTES) {
       return Response.json({ error: tooBig(Number(req.headers.get("content-length"))).message }, { status: 413, headers: { connection: "close" } });

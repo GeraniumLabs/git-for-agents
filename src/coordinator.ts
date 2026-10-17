@@ -562,11 +562,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
         return json({ ok: true });
       }
+      if (m === "DELETE") {
+        this.sql.exec("DELETE FROM projects WHERE name = ?", url.searchParams.get("name"));
+        return json({ ok: true });
+      }
       this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction) VALUES (?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null);
       return json({ ok: true });
     }
 
     if (a === "init" && m === "POST") return json(await this.init(body));
+    // Deleted (or never made): nothing here answers.
+    if (!this.meta("project")) throw new HttpError(404, "no such project");
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
     if (a === "artifacts-event" && m === "POST") return json(await this.onPush(body));
 
@@ -634,6 +640,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (!need) throw new HttpError(403, `a stand-in key can't ${m} /${parts.join("/")}; ask ${actor.name} to do it in Loom`);
       if (need !== "watch" && !actor.standin.scopes.includes(need)) throw new HttpError(403, `this stand-in key doesn't have the "${need}" right (${SCOPES[need].toLowerCase()}); ${actor.name} can grant it in Settings`);
       if (need !== "watch") this.standinActs.set(req, { id: actor.standin.id, name: actor.standin.name, person: actor.id, action: `${m} /${parts.join("/")}` });
+    }
+    if (a === "project" && m === "DELETE") {
+      ownerOnly("delete the project");
+      return json(await this.deleteProject(url.searchParams.get("confirm") ?? body.confirm ?? ""));
     }
     if (a === "attention" && m === "GET") return json(await this.attentionFeed(actor, url.searchParams.get("known"), Number(url.searchParams.get("wait") ?? 0), url.origin));
     if (a === "standins") {
@@ -2217,6 +2227,49 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.tokens.delete(`${name}:read`);
       this.tokens.delete(`${name}:write`);
     }
+  }
+
+  /**
+   * Delete the project for good: its repositories (main and every workspace),
+   * change context and attachments, its place in the list, and everything the
+   * coordinator holds. The name has to be typed back to confirm. If a
+   * repository won't go, nothing else is removed, so the owner can try again.
+   */
+  private async deleteProject(confirm: string) {
+    const name = this.project;
+    if (confirm !== name) throw new HttpError(400, `to delete it, confirm with the project's name, ${name}`);
+    for (const r of this.sql.exec("SELECT subscription FROM workspaces WHERE subscription IS NOT NULL AND status != 'deleted'").toArray()) {
+      await unsubscribe(this.env, r.subscription as string).catch((e) => console.error("unsubscribing", e));
+    }
+    const gone = new Set(this.sql.exec("SELECT name FROM workspaces WHERE status = 'deleted'").toArray().map((r) => r.name as string));
+    const repos = this.sql.exec("SELECT substr(key, 8) AS repo FROM meta WHERE key LIKE 'remote:%'").toArray().map((r) => r.repo as string).filter((r) => !gone.has(r));
+    const failed: string[] = [];
+    for (const repo of repos) {
+      try {
+        await this.store.delete(repo);
+      } catch (e: any) {
+        if (e?.code !== "NOT_FOUND") { console.error("deleting repo", repo, e); failed.push(repo); }
+      }
+    }
+    if (failed.length) throw new HttpError(502, `couldn't delete ${failed.join(", ")}; nothing else was removed, so try again`);
+    let objects = 0;
+    for (let cursor: string | undefined, more = true; more; ) {
+      const page = await this.context.list({ prefix: `${name}/`, cursor });
+      if (page.objects.length) await this.context.delete(page.objects.map((o) => o.key));
+      objects += page.objects.length;
+      more = page.truncated;
+      cursor = page.truncated ? page.cursor : undefined;
+    }
+    await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch(`https://do/registry?name=${encodeURIComponent(name)}`, { method: "DELETE" });
+    for (const ws of this.ctx.getWebSockets()) ws.close(1000, "project deleted");
+    await this.ctx.storage.deleteAlarm();
+    await this.ctx.storage.deleteAll();
+    // Start over empty, so the name can be used again.
+    this.repos = undefined;
+    this.tokens.clear();
+    this.keyCache.clear();
+    this.migrate();
+    return { deleted: name, repos: repos.length, objects };
   }
 
   private async retryMerge(ids: number[], e: any) {
