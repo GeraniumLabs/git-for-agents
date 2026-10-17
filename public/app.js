@@ -849,7 +849,7 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
-function showNewProject() {
+function showNewProject(draft = null) {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
   $("#detail-body").innerHTML = `
     <h3>New project</h3>
@@ -862,7 +862,8 @@ function showNewProject() {
     <div id="np-import" hidden>
       <label>Git URL <input id="np-url" placeholder="https://github.com/owner/repo"></label>
       <label>Branch <input id="np-branch" placeholder="its default branch"></label>
-      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="used once to read it, never stored"></label>
+      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "not needed: Loom reads it with your GitHub access" : "used once to read it, never stored"}"></label>
+      <div id="np-access" class="meta"></div>
       <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
       <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
     </div>
@@ -872,6 +873,31 @@ function showNewProject() {
     ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div class="row"><button id="np-create">Create project</button></div>`;
   const importing = () => $('input[name="np-from"]:checked').value === "import";
+  if (draft) {
+    // Back from GitHub: put the form back as it was.
+    for (const [id, v] of Object.entries(draft.fields)) if ($(id)) $(id).value = v;
+    for (const id of draft.checked) if ($(id)) $(id).checked = true;
+    $("#np-name").dataset.typed = "1";
+    $("#np-import").hidden = !importing();
+  }
+  const isGitHub = () => /^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
+  // When GitHub won't let Loom read the repository: first ask for the person's GitHub access, then for the app to be installed on it.
+  const offerAccess = () => {
+    if (!isGitHub() || !auth.github || $("#np-token").value.trim()) return;
+    if (!auth.repoAccess) {
+      $("#np-access").innerHTML = `Private? <button class="ghost mini" id="np-grant">Use my GitHub access</button> GitHub asks you to confirm, then you come back here.`;
+      $("#np-grant").onclick = () => {
+        const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch"].map((id) => [id, $(id).value]));
+        const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
+        try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked })); } catch {}
+        const back = new URLSearchParams(location.search);
+        back.set("new", "1");
+        location.href = `/auth/github?grant=repo&return=${encodeURIComponent(`${location.pathname}?${back}`)}`;
+      };
+    } else if (auth.githubInstall) {
+      $("#np-access").innerHTML = `Loom can't see this repository with your GitHub access yet. <a class="button ghost mini" href="${esc(auth.githubInstall)}" target="_blank" rel="noopener">Install Loom on it</a> Pick the repository on GitHub, then press Create again.`;
+    }
+  };
   for (const r of document.querySelectorAll('input[name="np-from"]')) r.onchange = () => { $("#np-import").hidden = !importing(); };
   $("#np-url").oninput = () => {
     // Suggest a name from the repository, and offer issues only for GitHub.
@@ -892,6 +918,7 @@ function showNewProject() {
     if (!res.ok) {
       $("#np-create").disabled = false;
       $("#np-create").textContent = "Create project";
+      if (imp) offerAccess();
       return toast(data.error ?? `HTTP ${res.status}`);
     }
     if (data.issues) {
@@ -905,6 +932,15 @@ function showNewProject() {
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#np-open").onclick = () => showNewProject();
+// Back from granting GitHub access for an import: reopen the form where it was.
+if (new URLSearchParams(location.search).get("new") === "1") {
+  let draft = null;
+  try { draft = JSON.parse(sessionStorage.getItem("loom-np-draft") ?? "null"); sessionStorage.removeItem("loom-np-draft"); } catch {}
+  const rest = new URLSearchParams(location.search);
+  rest.delete("new");
+  history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`);
+  loadUser().then(() => showNewProject(draft));
+}
 try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
 // ── settings: keys people bring for this project ────────────────────────
@@ -921,7 +957,7 @@ async function showSettings() {
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
     ${state?.project?.importedFrom ? `<h2>Imported</h2>
     <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Loom is its home: nothing is written back.</p>
-    ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="Token, if the repository is private"><button class="ghost" id="imp-issues">Bring in new open issues</button></div>` : ""}` : ""}
+    ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
     <h2>Where the data lives</h2>
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
     <h2>Approvals</h2>

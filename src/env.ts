@@ -12,6 +12,8 @@ export interface Env {
   /** GitHub OAuth app for people signing in. */
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  /** The GitHub app's name in its URL, for its install link, when the app came from secrets rather than /auth/setup. */
+  GITHUB_APP_SLUG?: string;
   /** GitHub logins (comma-separated) who own every project. */
   LOOM_OWNERS?: string;
   /** Comma-separated public projects to show first-time visitors, the first one opening by default. */

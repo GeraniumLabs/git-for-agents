@@ -1,5 +1,5 @@
 import { handleMcp } from "./mcp";
-import { USER_HEADER, handleAuth, isAdmin, sessionUser, type User } from "./auth";
+import { USER_HEADER, githubGrant, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
 import { projectOfWorkspace, pushOf } from "./events";
@@ -88,6 +88,8 @@ export default {
       if (user && !mayCreate(env, user)) return Response.json({ error: `${user.login} can't create projects on this server` }, { status: 403 });
       const body = await req.json<any>();
       if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
+      // An import without a token reads the person's repositories with the GitHub access they granted, if any.
+      if (body.import && !body.import.token && user) body.import.token = (await githubGrant(env, req, user)) ?? undefined;
       const jurisdiction = parseJurisdiction(env, body.jurisdiction);
       if (jurisdiction && typeof jurisdiction === "object") return Response.json({ error: jurisdiction.error }, { status: jurisdiction.status });
       // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
@@ -106,6 +108,12 @@ export default {
     // Turn away an oversized attachment before its bytes travel on to the coordinator.
     if (m && m[2] === "attachments" && req.method === "POST" && Number(req.headers.get("content-length") ?? 0) > MAX_ATTACHMENT_BYTES) {
       return Response.json({ error: tooBig(Number(req.headers.get("content-length"))).message }, { status: 413, headers: { connection: "close" } });
+    }
+    if (m && m[2] === "import/issues" && req.method === "POST") {
+      const user = await sessionUser(env, req);
+      const body = await req.json<any>().catch(() => ({}));
+      if (!body.token && user) body.token = (await githubGrant(env, req, user)) ?? undefined;
+      return forward(env, new Request(req, { body: JSON.stringify(body) }), m[1], m[2]);
     }
     if (m) return forward(env, req, m[1], m[2]);
 

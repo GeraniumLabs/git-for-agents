@@ -258,7 +258,7 @@ npx wrangler secret put ANTHROPIC_API_KEY  # optional: a server-wide Claude key 
 npx wrangler deploy
 ```
 
-For GitHub sign-in, open `https://<worker>/auth/setup`, enter the admin token once and click **Create Loom's GitHub app**: Loom asks GitHub to create a GitHub app for it (the manifest flow, no repository access), you approve it on GitHub, and Loom keeps the app's credentials sealed like project keys. Or register an OAuth app yourself (callback `https://<worker>/auth/github/callback`) and set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
+For GitHub sign-in, open `https://<worker>/auth/setup`, enter the admin token once and click **Create Loom's GitHub app**: Loom asks GitHub to create a GitHub app for it (the manifest flow; it asks for read-only *Contents* and *Issues*, used only when someone imports a private repository they can read), you approve it on GitHub, and Loom keeps the app's credentials sealed like project keys. An app created before imports existed needs *Contents: read* and *Issues: read* added under its permissions on GitHub, and the Setup URL `https://<worker>/auth/github/installed`. Or register an OAuth app yourself (callback `https://<worker>/auth/github/callback`) and set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
 
 Then sign in on the dashboard and use **New project**, or script it:
 
@@ -300,7 +300,7 @@ npx wrangler r2 bucket create loom-context-eu --jurisdiction eu
 
 A project can start from a repository you already have. In **+ New**, pick *A repository you already have* and paste the URL you'd `git clone`. Loom copies the branch you name (or the default branch) with its history, and it lands as `main`. From then on Loom is the repository's home: nothing is written back to the source. Other branches, tags and pull requests stay where they were.
 
-- **Private repositories:** add a token that can read it (for GitHub, a fine-grained token with *Contents: read*, plus *Issues: read* for issues). Loom uses it for the import and doesn't keep it.
+- **Private repositories:** if you signed in with GitHub, press *Use my GitHub access* when the import asks. GitHub asks you to confirm, and Loom keeps that grant in a sealed cookie in your browser for 15 minutes and never stores it. The first time, GitHub may also ask you to install Loom's GitHub app on the repository (*Install Loom on it*). Or add a token that can read it (for GitHub, a fine-grained token with *Contents: read*, plus *Issues: read* for issues). Loom uses it for the import and doesn't keep it.
 - **Issues:** for a GitHub repository, tick *Bring its open GitHub issues in as tasks*. Each open issue becomes a task with its text, labels and a link back. Pull requests are left out. Later, **Settings › Imported › Bring in new open issues** files any issues opened since, and skips the ones already here.
 - **From a script:** `POST /api/projects {name, import: {url, branch?, token?, issues?}}`, and `POST /api/projects/<project>/import/issues {url?, token?}` for owners.
 
