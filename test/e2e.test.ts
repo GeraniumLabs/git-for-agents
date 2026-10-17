@@ -733,3 +733,34 @@ test("with no reviewer around, Loom's review agent reviews the change: an approv
   assert.equal(still.status, "review");
   assert.equal(still.reviews.length, 0);
 });
+
+test("a change doesn't merge while an agent who took its review is still reviewing, and a merged change can't be reviewed", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-reviewhold");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "review hold", files: SEED, requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { reviewAgent: { enabled: false } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
+  const ivy = admin.as((await admin.addAgent("ivy", "reviewer")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\nexport const trim = (s) => s.trim();\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim"] });
+
+  await ivy.req("POST", `/changes/${ch.id}/reviewers/take`);
+  const approved = await rex.req("POST", `/changes/${ch.id}/reviews`, { verdict: "approve", body: "fine" });
+  assert.equal(approved.status, "review", "held while ivy is reviewing");
+  assert.match(approved.next, /ivy/);
+  assert.deepEqual((await admin.change(ch.id)).approval.reviewing, ["ivy"]);
+
+  await ivy.req("POST", `/changes/${ch.id}/reviews`, { verdict: "comment", body: "nothing to add" });
+  let c = await admin.change(ch.id);
+  for (let i = 0; i < 40 && c.status !== "merged"; i++) { await new Promise((r) => setTimeout(r, 500)); c = await admin.change(ch.id); }
+  assert.equal(c.status, "merged", "lands once ivy is done");
+
+  await assert.rejects(rex.req("POST", `/changes/${ch.id}/reviews`, { verdict: "request_changes", body: "too late" }), /merged/);
+  assert.equal((await admin.change(ch.id)).status, "merged", "a late review doesn't rewrite it");
+});

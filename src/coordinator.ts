@@ -175,6 +175,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
       "ALTER TABLE changes ADD COLUMN intent_check TEXT",
       "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
+      // Repair changes a late review flipped to "changes requested" after they landed or closed.
+      "UPDATE changes SET status = 'merged' WHERE status = 'changes_requested' AND merged_commit IS NOT NULL",
+      "UPDATE changes SET status = 'closed' WHERE status = 'changes_requested' AND EXISTS (SELECT 1 FROM events e WHERE e.type = 'change.closed' AND e.change_id = changes.id)",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -1683,6 +1686,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ch = this.change(id);
     if (!["approve", "request_changes", "comment"].includes(body.verdict)) throw new HttpError(400, "verdict must be approve, request_changes or comment");
     if (ch.agent_id === actor.id) throw new HttpError(403, "agents cannot review their own change");
+    // A review can't change what already happened; it used to flip merged and
+    // closed changes to "changes requested" (and cost the author a landed change).
+    if (["merged", "merging", "closed", "abandoned"].includes(ch.status)) {
+      throw new HttpError(409, `change ${id} is ${ch.status}, so a review can't change it${ch.status === "merged" ? "; if something in it needs fixing, create_task for the fix" : ""}`);
+    }
     const comments = (body.comments ?? []).filter((x) => x && x.path && x.body);
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       id, actor.id, body.verdict, body.body ?? "", JSON.stringify(comments), ch.head, Date.now());
@@ -1710,7 +1718,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const paths = body.comments?.length ? [...new Set(body.comments.map((x) => x.path))] : (ch.files as FileChange[]).map((f) => f.path);
         this.recordDecision("review", actor, { question: `Change #${id}: ${ch.title}`, decision: body.body, paths, task: ch.task_id, change: id });
       }
-    } else if (body.verdict === "approve" && ch.status === "review") {
+    } else if (ch.status === "review") {
+      // An approval, or the last reviewer still at it finishing with a comment.
       await this.maybeEnqueue(id);
     }
     const now = this.change(id);
@@ -1719,6 +1728,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       : now.status === "changes_requested" ? "Sent back to the author."
       : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
       : approval.humanNeeded ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).`
+      : approval.reviewing.length && approval.weight >= approval.needed ? `Approved; it merges once ${approval.reviewing.join(", ")} finish${approval.reviewing.length === 1 ? "es" : ""} reviewing (or their time runs out).`
       : approval.openThreads && approval.weight >= approval.needed ? `Approved, but ${approval.openThreads} review thread${approval.openThreads === 1 ? "" : "s"} must be resolved before it merges.`
       : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
     return { recorded: { change: id, verdict: body.verdict, atHead: ch.head }, id, status: now.status, approval, threads, next };
@@ -1776,7 +1786,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const guarded = this.guardedFiles(ch.files);
     const humanNeeded = guarded.length > 0 && !approvers.some((a) => a.human);
     const openThreads = this.threadsMustResolve ? this.openBlockingThreads(id) : 0;
-    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, ok: weight >= needed && !humanNeeded && !openThreads };
+    // An agent that said it's reviewing gets to finish (until its deadline):
+    // in gemma-4-kaggle a change merged a second after its first approval
+    // while three reviewers who would have caught its bug were still at it.
+    const reviewing = this.sql.exec(`SELECT r.reviewer FROM review_requests r JOIN agents a ON a.id = r.reviewer
+        WHERE r.change_id = ? AND r.status = 'accepted' AND a.role != 'human' AND r.deadline > ?`, id, Date.now()).toArray()
+      .map((r) => this.agentName(r.reviewer as string) ?? (r.reviewer as string));
+    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, reviewing, ok: weight >= needed && !humanNeeded && !openThreads && !reviewing.length };
   }
 
   /** A person-readable track record and the weight it earns. */
@@ -3459,6 +3475,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE review_requests SET status = 'declined', answered_at = ?, seen_at = COALESCE(seen_at, ?) WHERE change_id = ? AND reviewer = ?", now, now, id, actor.id);
       this.emit("review.declined", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { reason: body.reason ?? "" } });
       this.reroute(id, `${actor.name} declined${body.reason ? `: ${body.reason}` : ""}`);
+      if (r.status === "accepted") void this.maybeEnqueue(id);
     }
     return { requested: this.reviewRequests(id) };
   }
@@ -3613,6 +3630,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE review_requests SET status = 'expired' WHERE change_id = ? AND reviewer = ?", r.change_id, r.reviewer);
       const who = this.agentName(r.reviewer as string);
       this.reroute(r.change_id as number, r.status === "open" ? `${who} didn't answer` : `${who} accepted but didn't review in time`);
+      if (r.status === "accepted") void this.maybeEnqueue(r.change_id as number);
     }
     return this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
   }
