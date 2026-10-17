@@ -21,6 +21,7 @@ import { skill } from "./skill";
 import { buildBrief, fileStats, isTest } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
+import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
@@ -92,6 +93,14 @@ export interface LoomEvent {
   data: any;
 }
 
+/** A plain reason an import failed, from what git said. */
+function importError(url: string, e: any, withToken: boolean): string {
+  const msg = String(e?.message ?? e);
+  if (/401|403|auth/i.test(msg)) return withToken ? `the token can't read ${url}` : `${url} needs a token to read (is it private?)`;
+  if (/404|not found|Could not find/i.test(msg)) return `nothing to import at ${url}${withToken ? "" : "; if it's private, add a token"}, or the branch doesn't exist`;
+  return `couldn't import ${url}: ${msg.slice(0, 300)}`;
+}
+
 class HttpError extends Error {
   constructor(public status: number, message: string) {
     super(message);
@@ -153,6 +162,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE reviews ADD COLUMN vote INTEGER DEFAULT 0",
       "ALTER TABLE changes ADD COLUMN checks TEXT",
       "ALTER TABLE agents ADD COLUMN joined_via INTEGER",
+      "ALTER TABLE tasks ADD COLUMN source TEXT",
       "ALTER TABLE agents ADD COLUMN via TEXT",
       "ALTER TABLE threads ADD COLUMN head TEXT",
       "ALTER TABLE threads ADD COLUMN line_text TEXT",
@@ -683,6 +693,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }
       return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions });
     }
+    if (a === "import" && b === "issues" && m === "POST") {
+      ownerOnly("import issues");
+      return json(await this.importIssues(actor, body));
+    }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
 
@@ -759,13 +773,41 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
+    let from: string | null = null;
+    if (body.import) {
+      try {
+        from = sourceUrl(body.import.url ?? "");
+      } catch (e: any) {
+        throw new HttpError(400, e.message);
+      }
+    }
     // Before the first repo is made: the jurisdiction picks the Artifacts namespace and R2 bucket.
     if (body.jurisdiction === "eu") this.setMeta("jurisdiction", "eu");
     const repo = `${name}`;
     const created = await this.store.create(repo, body.description);
+    // Main: the imported branch with its history, or a README.
+    let commit: string;
+    let imported: { url: string; branch: string } | null = null;
+    try {
+      const w = await Workspace.open({ url: created.remote, token: created.token });
+      if (from) {
+        const src = await w.fetchSource(from, body.import!.branch || undefined, body.import!.token || undefined).catch((e: any) => {
+          throw new HttpError(400, importError(from!, e, !!body.import!.token));
+        });
+        commit = src.head;
+        imported = { url: from, branch: src.branch };
+      } else {
+        const files = body.files != null ? this.fileWrites(body.files) : { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
+        commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
+      }
+      await w.push({ url: created.remote, token: created.token }, commit);
+    } catch (e) {
+      await this.store.delete(repo).catch(() => {});
+      throw e;
+    }
     this.setMeta("project", name);
     this.setMeta("description", body.description ?? "");
     this.setMeta("main_repo", repo);
@@ -774,14 +816,46 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
     this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
     if (body.checks) this.setChecks(body.checks);
-    const files = body.files != null ? this.fileWrites(body.files) : { "README.md": `# ${name}\n\n${body.description ?? ""}\n` };
-    const w = await Workspace.open({ url: created.remote, token: created.token });
-    const commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
-    await w.push({ url: created.remote, token: created.token }, commit);
     this.setMeta("main_head", commit);
-    this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null, jurisdiction: this.jurisdiction } });
-    if (body.owner) await this.addPerson(body.owner.login, body.owner.id, true, null);
-    return { name, remote: created.remote, head: commit };
+    if (imported) this.setMeta("imported_from", JSON.stringify(imported));
+    this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null, jurisdiction: this.jurisdiction, importedFrom: imported } });
+    const ownerId = body.owner ? await this.addPerson(body.owner.login, body.owner.id, true, null) : null;
+    // Issues come in after the code: a failure here leaves a working project and says why.
+    let issues: { created: number; skipped: number; error?: string } | undefined;
+    if (imported && body.import!.issues) {
+      const actor: Agent = ownerId ? { id: ownerId, name: body.owner!.login, role: "human", owner: true } : { id: "admin", name: "admin", role: "human", owner: true };
+      issues = await this.importIssues(actor, { url: imported.url, token: body.import!.token }).catch((e: any) => ({ created: 0, skipped: 0, error: e.message }));
+    }
+    return { name, remote: created.remote, head: commit, importedFrom: imported ?? undefined, issues };
+  }
+
+  /**
+   * File a task for each open issue of the GitHub repository the project came
+   * from (or `url`). Issues already brought in are skipped, so it can run again
+   * to pick up new ones. The token is used for this call only.
+   */
+  private async importIssues(actor: Agent, body: { url?: string; token?: string; limit?: number }) {
+    const from = body.url ?? JSON.parse(this.meta("imported_from") ?? "null")?.url;
+    if (!from) throw new HttpError(400, "this project wasn't imported; pass the GitHub repository's url");
+    const gh = githubRepo(from);
+    if (!gh) throw new HttpError(400, "issues can only be imported from a GitHub repository (https://github.com/owner/repo)");
+    let list: Issue[];
+    try {
+      list = await openIssues(gh, { token: body.token || undefined, api: this.env.GITHUB_API_URL, limit: Math.min(Number(body.limit ?? 500), 500) });
+    } catch (e: any) {
+      throw new HttpError(502, e.message);
+    }
+    const have = new Set(this.sql.exec("SELECT source FROM tasks WHERE source IS NOT NULL").toArray().map((r) => r.source as string));
+    let created = 0, skipped = 0;
+    for (const issue of list) {
+      const t = issueTask(gh, issue);
+      if (have.has(t.source)) { skipped++; continue; }
+      const task = this.createTask(actor, { title: t.title, description: t.description });
+      this.sql.exec("UPDATE tasks SET source = ? WHERE id = ?", t.source, task.id);
+      created++;
+    }
+    this.emit("issues.imported", { actor: actor.id, data: { repo: `${gh.owner}/${gh.repo}`, created, skipped } });
+    return { repo: `${gh.owner}/${gh.repo}`, created, skipped };
   }
 
   private async addAgent(name: string, role: Role, by: string | null = null) {
@@ -1162,7 +1236,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const c of await w.log(head, limit)) {
       if (mainHead && (await w.isAncestor(c.oid, mainHead))) break;
       const parent = c.parents[0] ?? null;
-      const files = await w.changes(parent, c.oid);
+      // The oldest commit fetched may have its parent outside the history a workspace keeps.
+      const files = await w.changes(parent, c.oid).catch(() => [] as FileChange[]);
       const landed = byCommit.get(c.oid);
       const agent = agentByEmail(c.author.email);
       out.push({
@@ -2920,7 +2995,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -4068,7 +4143,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       text ? "(lower(t.title) LIKE ? OR t.id = ?)" : "1",
     ].join(" AND ");
     const args: SqlStorageValue[] = [...(statuses ?? []), ...(text ? [`%${text}%`, Number(text.replace(/^#/, "")) || -1] : [])];
-    const rows = this.sql.exec(`SELECT t.id, t.title, t.description, t.status, t.assignee, t.depends_on, t.parent, t.attempts, t.created_by, t.updated_at FROM tasks t WHERE ${where} ORDER BY t.id DESC LIMIT ?`,
+    const rows = this.sql.exec(`SELECT t.id, t.title, t.description, t.status, t.assignee, t.depends_on, t.parent, t.attempts, t.created_by, t.updated_at, t.source FROM tasks t WHERE ${where} ORDER BY t.id DESC LIMIT ?`,
       ...args, Math.min(200, Number(q.get("limit") ?? 50))).toArray();
     return rows.map((t) => {
       const intent = this.sql.exec("SELECT paths, description, released_at FROM intents WHERE task_id = ? ORDER BY id DESC LIMIT 1", t.id).toArray()[0];
@@ -4205,7 +4280,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, remote: this.remoteUrl(this.mainRepo) },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       agents, tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),

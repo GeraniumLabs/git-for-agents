@@ -856,17 +856,47 @@ function showNewProject() {
     <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. You'll be its owner, signed in as <b>${esc(user.login)}</b>.</p>
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
+    <h2>Start from</h2>
+    <label class="check"><input type="radio" name="np-from" value="new" checked> An empty repository with a README</label>
+    <label class="check"><input type="radio" name="np-from" value="import"> A repository you already have: Loom copies its history and becomes its home</label>
+    <div id="np-import" hidden>
+      <label>Git URL <input id="np-url" placeholder="https://github.com/owner/repo"></label>
+      <label>Branch <input id="np-branch" placeholder="its default branch"></label>
+      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="used once to read it, never stored"></label>
+      <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
+      <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
+    </div>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
     ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div class="row"><button id="np-create">Create project</button></div>`;
+  const importing = () => $('input[name="np-from"]:checked').value === "import";
+  for (const r of document.querySelectorAll('input[name="np-from"]')) r.onchange = () => { $("#np-import").hidden = !importing(); };
+  $("#np-url").oninput = () => {
+    // Suggest a name from the repository, and offer issues only for GitHub.
+    const m = $("#np-url").value.trim().match(/\/([A-Za-z0-9._-]+?)(?:\.git)?\/?$/);
+    if (m && !$("#np-name").dataset.typed) $("#np-name").value = m[1].toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+    $("#np-issues").disabled = !/^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
+  };
+  $("#np-name").oninput = () => { $("#np-name").dataset.typed = "1"; };
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}) }) });
+    const imp = importing() ? { url: $("#np-url").value.trim(), branch: $("#np-branch").value.trim() || undefined, token: $("#np-token").value.trim() || undefined, issues: !$("#np-issues").disabled && $("#np-issues").checked } : undefined;
+    if (imp && !imp.url) return toast("Paste the URL you'd git clone");
+    $("#np-create").disabled = true;
+    $("#np-create").textContent = imp ? "Importing…" : "Creating…";
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) return toast(data.error ?? `HTTP ${res.status}`);
+    if (!res.ok) {
+      $("#np-create").disabled = false;
+      $("#np-create").textContent = "Create project";
+      return toast(data.error ?? `HTTP ${res.status}`);
+    }
+    if (data.issues) {
+      try { sessionStorage.setItem("loom-toast", data.issues.error ? `The code is in, but the issues didn't come: ${data.issues.error}. Try again in Settings.` : `Imported ${data.issues.created} open issue${data.issues.created === 1 ? "" : "s"} as tasks`); } catch {}
+    }
     // Start with a join code, so the agents you connect each register as themselves.
     const code = await fetch(`/api/projects/${name}/join-codes`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "builder" }) }).then((r) => r.ok ? r.json() : null).catch(() => null);
     try { if (code) sessionStorage.setItem("loom-new-join", JSON.stringify({ project: name, code })); } catch {}
@@ -875,6 +905,7 @@ function showNewProject() {
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#np-open").onclick = () => showNewProject();
+try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
@@ -888,6 +919,9 @@ async function showSettings() {
     <h2>Visibility</h2>
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
+    ${state?.project?.importedFrom ? `<h2>Imported</h2>
+    <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Loom is its home: nothing is written back.</p>
+    ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="Token, if the repository is private"><button class="ghost" id="imp-issues">Bring in new open issues</button></div>` : ""}` : ""}
     <h2>Where the data lives</h2>
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
     <h2>Approvals</h2>
@@ -956,6 +990,13 @@ async function showSettings() {
     if (!await ask({ title: "Revoke this stand-in key?", body: "Your agent can no longer act for you or read what needs you here.", ok: "Revoke", danger: true })) return;
     try { await act("DELETE", `/standins/${b.dataset.siRevoke}`); } catch { return; }
     showSettings();
+  };
+  if ($("#imp-issues")) $("#imp-issues").onclick = async () => {
+    $("#imp-issues").disabled = true;
+    try {
+      const r = await act("POST", "/import/issues", { token: $("#imp-token").value.trim() || undefined });
+      toast(`${r.created} new task${r.created === 1 ? "" : "s"} from ${r.repo}${r.skipped ? `; ${r.skipped} already here` : ""}`);
+    } catch {} finally { $("#imp-issues").disabled = false; }
   };
   if ($("#vis-toggle")) $("#vis-toggle").onclick = async () => {
     const to = vis === "private" ? "public" : "private";
@@ -1180,7 +1221,8 @@ function describe(e) {
   const who = e.actor ? `<a class="who" data-agent="${esc(e.actor)}" style="color:${color(e.actor)}">${esc(name(e.actor))}</a>` : "<b>loom</b>";
   const to = e.to_agent ? `<a class="who" data-agent="${esc(e.to_agent)}" style="color:${color(e.to_agent)}">${esc(name(e.to_agent))}</a>` : "";
   switch (e.type) {
-    case "project.created": return ["", `Project created, main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>`];
+    case "project.created": return ["", d.importedFrom ? `Project imported from <span class="mono">${esc(d.importedFrom.url)}</span> (${esc(d.importedFrom.branch)}), main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>` : `Project created, main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>`];
+    case "issues.imported": return ["", `${who} brought in ${d.created} open issue${d.created === 1 ? "" : "s"} from ${esc(d.repo)} as tasks${d.skipped ? ` (${d.skipped} already here)` : ""}`];
     case "agent.joined": return ["", `${who} joined as ${d.role}${d.via ? ` under ${esc(name(d.via))}'s key` : ""}`];
     case "task.created": return ["", `${who} created task #${e.task_id} “${esc(d.title)}”`];
     case "task.claimed": return ["", `${who} ${d.resumed ? "took over" : "claimed"} task #${e.task_id} in workspace <span class="mono">${esc(d.workspace)}</span>`];
@@ -1676,7 +1718,7 @@ async function loadTask(id) {
     <div class="rv-top">
       <a class="button ghost mini" href="#">← ${esc(project)}</a>
       <h1>${esc(t.title)} <span class="meta">task #${t.id}</span> ${taskStatus(t.status)}</h1>
-      <div class="meta">${t.assignee ? t.status === "open" ? `Assigned to ${who(t.assignee)}, not taken yet` : `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago</div>
+      <div class="meta">${t.assignee ? t.status === "open" ? `Assigned to ${who(t.assignee)}, not taken yet` : `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${(() => { const m = (t.source ?? "").match(/^github:([^#]+)#(\d+)$/); return m ? ` · from <a href="https://github.com/${esc(m[1])}/issues/${m[2]}" target="_blank" rel="noopener">${esc(m[1])}#${m[2]}</a>` : ""; })()}</div>
       ${t.description ? `<p class="rv-summary">${esc(t.description)}</p>` : ""}
       <div class="row">${isHuman() && !t.attempts && !["merged", "closed"].includes(t.status) ? `<button class="ghost mini" id="task-assign">${t.assignee ? "Reassign…" : "Assign…"}</button>` : ""}${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}</div>
     </div>

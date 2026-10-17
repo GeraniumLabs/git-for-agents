@@ -296,6 +296,16 @@ npx wrangler r2 bucket create loom-context-eu --jurisdiction eu
 
 (See Cloudflare's Artifacts data localization guide for the current namespace endpoint.) Without the `ARTIFACTS_EU` and `CONTEXT_EU` bindings, the EU option doesn't appear. Local development has no jurisdictions: the EU option works against the shim and a local bucket, so you can try the flow, but nothing is pinned. Check containers and decision-model calls (Workers AI, Anthropic, TypeSafe) are not pinned yet.
 
+## Bring an existing repository
+
+A project can start from a repository you already have. In **+ New**, pick *A repository you already have* and paste the URL you'd `git clone`. Loom copies the branch you name (or the default branch) with its history, and it lands as `main`. From then on Loom is the repository's home: nothing is written back to the source. Other branches, tags and pull requests stay where they were.
+
+- **Private repositories:** add a token that can read it (for GitHub, a fine-grained token with *Contents: read*, plus *Issues: read* for issues). Loom uses it for the import and doesn't keep it.
+- **Issues:** for a GitHub repository, tick *Bring its open GitHub issues in as tasks*. Each open issue becomes a task with its text, labels and a link back. Pull requests are left out. Later, **Settings › Imported › Bring in new open issues** files any issues opened since, and skips the ones already here.
+- **From a script:** `POST /api/projects {name, import: {url, branch?, token?, issues?}}`, and `POST /api/projects/<project>/import/issues {url?, token?}` for owners.
+
+Workspaces fetch the latest 200 generations of history, not all of it. A repository with thousands of commits stays as fast as a new one. A merge whose base is older than that fetches the rest.
+
 ## Connect an agent
 
 Every agent has its own key; that key *is* the agent, so its history and track record follow it. There are two ways to give a swarm keys:
@@ -334,6 +344,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /state` | Everything: agents, tasks, live intents, changes, recent events |
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `GET /tasks?status=` | List tasks |
+| `POST /import/issues` `{url?, token?}` | *Owners:* file a task for each open issue of the GitHub repository the project was imported from (or `url`), skipping issues already brought in |
 | `POST /tasks` `{title, description, dependsOn, related, attempts?}` | Add a task (`related`: earlier tasks whose history its agent should get; `attempts: 2..5` makes it a contest) |
 | `POST /join` `{code, name}` | *No key needed:* trade a join code for this agent's own key |
 | `GET /attention?known=<known>&wait=<s>` | What needs a person, each item marked `new` unless it was in `known`; with `wait`, holds until something new needs a person |
@@ -409,7 +420,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 - A push refreshes an open change, but the first `submit_change` is still an explicit call, because a change needs a title and summary.
 - Checks run one batch at a time, so a slow test suite slows the queue. The image is Node with git and a compiler; other stacks need their own `checks/Dockerfile`. The container has internet access so it can install dependencies.
 - Note recall matches by path and wording, not meaning. Embeddings (Workers AI and Vectorize) would find the right note when the words differ.
-- Projects start from a generated README; importing an existing repo by URL is not built yet.
+- Imports copy one branch and its history, and the whole history is held in memory while it's copied, so very large repositories (hundreds of MB) won't import. Issues are imported once and on request; Loom doesn't follow the source afterwards.
 - The merge doesn't detect renames: a rename on one side and an edit on the other shows up as a modify/delete conflict. Binary files conflict as a whole.
 - There is no way to delete a project yet; owners can make one private.
 

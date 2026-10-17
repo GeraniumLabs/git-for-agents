@@ -23,6 +23,8 @@ export interface Env {
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
   TYPESAFE_API_KEY?: string;
+  /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */
+  GITHUB_API_URL?: string;
   TYPESAFE_URL?: string;
   PROJECT: DurableObjectNamespace<ProjectCoordinator>;
   /** Containers that run each project's checks. Absent in local development, where the shim runs them. */
