@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { parseReview, reviewPrompt } from "../src/reviewer";
+import { numberPatch, parseReview, reviewPrompt } from "../src/reviewer";
 
 const input = { title: "Trim titles", summary: "", task: { title: "Trim titles", description: "Strip spaces" }, intent: "trim (src/db.js)", files: ["src/db.js"], patch: "x".repeat(100), brief: [], project: "p" };
 
@@ -28,4 +28,14 @@ test("the prompt carries the task and says when the diff is cut off", () => {
   assert.match(p, /Strip spaces/);
   assert.match(p, /truncated, so don't approve/);
   assert.doesNotMatch(reviewPrompt(input, 1000), /truncated/);
+});
+
+test("diff lines carry their line number in the new file; removed lines don't", () => {
+  const patch = ["diff --git a/f.js b/f.js", "--- a/f.js", "+++ b/f.js", "@@ -3,3 +3,3 @@", " keep", "-old", "+new", " tail"].join("\n");
+  assert.deepEqual(numberPatch(patch).split("\n").slice(4), ["    3  keep", "      -old", "    4 +new", "    5  tail"]);
+});
+
+test("a summary that only repeats the verdict is replaced with a sentence", () => {
+  const r = parseReview({ verdict: "approve", summary: "approve", comments: [] }, [], false, "m");
+  assert.ok(r.ok && r.body === "Looks right for the task; approving.");
 });

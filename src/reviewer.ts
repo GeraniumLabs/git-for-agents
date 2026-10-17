@@ -79,9 +79,28 @@ const SCHEMA = {
   additionalProperties: false,
 } as const;
 
+/**
+ * Number each line of the diff by where it sits in the new file, so a line
+ * comment can point at it without the model counting hunk offsets (Llama
+ * on Workers AI got this wrong). Removed lines get no number.
+ */
+export function numberPatch(patch: string): string {
+  let n = 0;
+  let inHunk = false;
+  return patch.split("\n").map((l) => {
+    const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+    if (h) { n = Number(h[1]); inHunk = true; return l; }
+    if (!inHunk || /^(diff |index |--- |\+\+\+ )/.test(l)) { inHunk = inHunk && !l.startsWith("diff "); return l; }
+    if (l.startsWith("-")) return `      ${l}`;
+    if (l.startsWith("\\")) return l;
+    return `${String(n++).padStart(5)} ${l}`;
+  }).join("\n");
+}
+
 export function reviewPrompt(i: ReviewInput, limit: number): string {
   const truncated = i.patch.length > limit;
-  const patch = truncated ? `${i.patch.slice(0, limit)}\n… (the diff is cut off here: ${i.patch.length - limit} more characters)` : i.patch;
+  const cut = truncated ? `${i.patch.slice(0, limit)}\n… (the diff is cut off here: ${i.patch.length - limit} more characters)` : i.patch;
+  const patch = numberPatch(cut);
   return [
     `Project: ${i.project}`,
     `Task: ${i.task.title}${i.task.description ? `\n${i.task.description}` : ""}`,
@@ -89,7 +108,7 @@ export function reviewPrompt(i: ReviewInput, limit: number): string {
     `Declared intent: ${i.intent || "(none)"}`,
     i.brief.length ? `Loom's brief already notes:\n${i.brief.map((b) => `- ${b}`).join("\n")}` : "",
     truncated ? "The diff below is truncated, so don't approve: comment on what you saw and say the rest needs a look." : "",
-    `Diff:\n${patch}`,
+    `Diff (each line starts with its line number in the new file; removed lines have none):\n${patch}`,
   ].filter(Boolean).join("\n\n");
 }
 
@@ -107,7 +126,12 @@ export function parseReview(raw: unknown, files: string[], truncated: boolean, m
   // and a truncated diff is never approved.
   if (comments.some((c) => c.blocking)) verdict = "request_changes";
   else if (verdict === "approve" && truncated) verdict = "comment";
-  return { ok: true, verdict, body: String(r.summary ?? "").trim(), comments, model };
+  // Smaller models sometimes echo the verdict as the summary.
+  const said = String(r.summary ?? "").trim();
+  const body = said && !["approve", "request_changes", "comment"].includes(said.toLowerCase())
+    ? said
+    : verdict === "approve" ? "Looks right for the task; approving." : verdict === "request_changes" ? "Needs changes before it lands: see the line comments." : "Not sure this is ready: see the line comments.";
+  return { ok: true, verdict, body, comments, model };
 }
 
 export async function reviewChange(m: ReviewModel, i: ReviewInput): Promise<ReviewResult> {

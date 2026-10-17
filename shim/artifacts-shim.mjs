@@ -238,16 +238,13 @@ async function reviewStandIn(req, res) {
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const prompt = String(body.messages?.[0]?.content ?? "");
-  let file = null, line = 0, bug = null;
+  // Loom numbers each diff line by its line in the new file.
+  let file = null, bug = null;
   for (const l of prompt.split("\n")) {
     const f = l.match(/^\+\+\+ b\/(.+)$/);
-    const h = l.match(/^@@ -\d+(?:,\d+)? \+(\d+)/);
+    const n = l.match(/^\s*(\d+) [+ ]/);
     if (f) file = f[1];
-    else if (h) line = Number(h[1]) - 1;
-    else if (file && !l.startsWith("-")) {
-      line++;
-      if (!bug && l.includes("LOOM-TEST-BUG")) bug = { path: file, line, body: "This line is marked as a bug; fix it before it lands.", blocking: true };
-    }
+    else if (file && n && !bug && l.includes("LOOM-TEST-BUG")) bug = { path: file, line: Number(n[1]), body: "This line is marked as a bug; fix it before it lands.", blocking: true };
   }
   const review = bug ? { verdict: "request_changes", summary: "One blocking problem.", comments: [bug] } : { verdict: "approve", summary: "Does what the task asks.", comments: [] };
   send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
