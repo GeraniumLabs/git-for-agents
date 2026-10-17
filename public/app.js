@@ -862,8 +862,7 @@ function showNewProject(draft = null) {
     <div id="np-import" hidden>
       <label>Git URL <input id="np-url" placeholder="https://github.com/owner/repo"></label>
       <label>Branch <input id="np-branch" placeholder="its default branch"></label>
-      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "not needed: Loom reads it with your GitHub access" : "used once to read it, never stored"}"></label>
-      <div id="np-access" class="meta"></div>
+      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="${auth.github ? "not needed on GitHub: Loom asks GitHub for you" : "used once to read it, never stored"}"></label>
       <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
       <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
     </div>
@@ -871,6 +870,7 @@ function showNewProject(draft = null) {
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
     ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
+    <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
   const importing = () => $('input[name="np-from"]:checked').value === "import";
   if (draft) {
@@ -881,22 +881,24 @@ function showNewProject(draft = null) {
     $("#np-import").hidden = !importing();
   }
   const isGitHub = () => /^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
-  // When GitHub won't let Loom read the repository: first ask for the person's GitHub access, then for the app to be installed on it.
-  const offerAccess = () => {
-    if (!isGitHub() || !auth.github || $("#np-token").value.trim()) return;
-    if (!auth.repoAccess) {
-      $("#np-access").innerHTML = `Private? <button class="ghost mini" id="np-grant">Use my GitHub access</button> GitHub asks you to confirm, then you come back here.`;
-      $("#np-grant").onclick = () => {
-        const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch"].map((id) => [id, $(id).value]));
-        const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
-        try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked })); } catch {}
-        const back = new URLSearchParams(location.search);
-        back.set("new", "1");
-        location.href = `/auth/github?grant=repo&return=${encodeURIComponent(`${location.pathname}?${back}`)}`;
-      };
-    } else if (auth.githubInstall) {
-      $("#np-access").innerHTML = `Loom can't see this repository with your GitHub access yet. <a class="button ghost mini" href="${esc(auth.githubInstall)}" target="_blank" rel="noopener">Install Loom on it</a> Pick the repository on GitHub, then press Create again.`;
-    }
+  // A private GitHub repository: go to GitHub for what Loom needs (the person's OK, then Loom's app on the
+  // repository), and finish creating the project when GitHub sends them back.
+  const toGitHub = (step) => {
+    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch"].map((id) => [id, $(id).value]));
+    const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
+    try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked, resume: step })); } catch {}
+    const back = new URLSearchParams(location.search);
+    back.set("new", "1");
+    const ret = `${location.pathname}?${back}`;
+    $("#np-create").disabled = true;
+    $("#np-create").textContent = "Going to GitHub…";
+    location.href = step === "grant" ? `/auth/github?grant=repo&return=${encodeURIComponent(ret)}` : `${auth.githubInstall}?state=${encodeURIComponent(ret)}`;
+  };
+  const stuck = (html) => {
+    $("#np-access").innerHTML = html;
+    $("#np-access").hidden = false;
+    $("#np-create").disabled = false;
+    $("#np-create").textContent = "Create project";
   };
   for (const r of document.querySelectorAll('input[name="np-from"]')) r.onchange = () => { $("#np-import").hidden = !importing(); };
   $("#np-url").oninput = () => {
@@ -911,14 +913,31 @@ function showNewProject(draft = null) {
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
     const imp = importing() ? { url: $("#np-url").value.trim(), branch: $("#np-branch").value.trim() || undefined, token: $("#np-token").value.trim() || undefined, issues: !$("#np-issues").disabled && $("#np-issues").checked } : undefined;
     if (imp && !imp.url) return toast("Paste the URL you'd git clone");
+    // Only the first Create after coming back from GitHub counts as coming back.
+    const resumed = draft?.resume;
+    if (draft) draft.resume = null;
     $("#np-create").disabled = true;
+    $("#np-access").hidden = true;
+    if (imp && isGitHub() && !imp.token && auth.github) {
+      $("#np-create").textContent = "Checking access…";
+      const a = await fetch(`/auth/github/access?url=${encodeURIComponent(imp.url)}`).then((r) => r.json()).catch(() => ({}));
+      if (a.access === "grant" || a.access === "install") {
+        if (resumed !== a.access) return toGitHub(a.access);
+        // Back from GitHub and it still can't be read: say what to do instead of going round again.
+        stuck(a.access === "install"
+          ? `Loom still can't see <b>${esc(a.repo)}</b>. On GitHub, add it to the repositories Loom can read, or check the URL. <button class="ghost mini" id="np-again">Open GitHub</button>`
+          : `GitHub didn't give Loom your access. <button class="ghost mini" id="np-again">Try again</button>`);
+        $("#np-again").onclick = () => toGitHub(a.access);
+        return;
+      }
+      if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
+    }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
     const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;
       $("#np-create").textContent = "Create project";
-      if (imp) offerAccess();
       return toast(data.error ?? `HTTP ${res.status}`);
     }
     if (data.issues) {
@@ -930,6 +949,7 @@ function showNewProject(draft = null) {
     location.search = `?project=${name}`;
   };
   if (!$("#detail").open) $("#detail").showModal();
+  if (draft?.resume) $("#np-create").click();
 }
 $("#np-open").onclick = () => showNewProject();
 // Back from granting GitHub access for an import: reopen the form where it was.

@@ -7,6 +7,7 @@
 import type { Env } from "./env";
 import { regions } from "./residency";
 import { seal, unseal } from "./secrets";
+import { githubRepo, repoVisible, sourceUrl, type GitHubRepo } from "./importer";
 
 export interface User {
   /** Stable identity: "github:<lowercase login>". */
@@ -222,7 +223,27 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   }
 
   // After someone installs the app on their repositories, GitHub sends them here.
+  // Before an import: can Loom read this GitHub repository, and if not, what would let it?
+  if (path === "/auth/github/access") {
+    const me = await sessionUser(env, req);
+    if (!me) return Response.json({ error: "sign in first" }, { status: 401 });
+    let gh: GitHubRepo | null = null;
+    try { gh = githubRepo(sourceUrl(url.searchParams.get("url") ?? "")); } catch {}
+    if (!gh) return Response.json({ access: "unknown" });
+    const repo = `${gh.owner}/${gh.repo}`;
+    if ((await repoVisible(gh, { api: env.GITHUB_API_URL })) === "ok") return Response.json({ access: "ok", repo });
+    const token = await githubGrant(env, req, me);
+    if (!token) return Response.json({ access: "grant", repo });
+    const seen = await repoVisible(gh, { token, api: env.GITHUB_API_URL });
+    if (seen === "denied") return Response.json({ access: "grant", repo });
+    if (seen === "hidden") return Response.json({ access: installUrl(env, await githubApp(env, registry)) ? "install" : "missing", repo });
+    return Response.json({ access: seen === "ok" ? "ok" : "unknown", repo });
+  }
+
   if (path === "/auth/github/installed") {
+    // Installs started from the import form carry where to go back to, and the form picks up from there.
+    const back = url.searchParams.get("state");
+    if (back) return new Response(null, { status: 302, headers: { location: safeReturn(back) } });
     return page("Loom can read those repositories now", `<p>Go back to Loom and create the project again. The import uses your GitHub access, so you don't need a token.</p><p><a class="button" href="/">Back to Loom</a></p>`);
   }
 
