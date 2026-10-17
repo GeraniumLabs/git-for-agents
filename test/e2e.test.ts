@@ -563,3 +563,74 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
   assert.deepEqual(card.changes.map((x: any) => x.change).sort(), [...changes].sort());
   assert.ok(!attention.some((i: any) => i.kind === "brief" && changes.includes(i.change)), "no separate review card per attempt");
 });
+
+test("a project imported from a git URL keeps its history, lands its branch as main, and work merges on top", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
+  // The source: a private repository on another git server (the shim), with history on a branch called trunk.
+  const srcName = project("e2e-src");
+  const src = await fetch(`${shim}/repos`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: srcName }) }).then((r) => r.json());
+  const token = String(src.token).split("?expires=")[0];
+  const dir = await mkdtemp(join(tmpdir(), "loom-src-"));
+  const g = (...args: string[]) => run("git", ["-C", dir, "-c", "user.name=ann", "-c", "user.email=ann@example.com", ...args]);
+  await g("init", "-q", "-b", "trunk");
+  await run("sh", ["-c", `printf 'one\\n' > ${dir}/notes.txt`]);
+  await g("add", ".");
+  await g("commit", "-qm", "first");
+  await run("sh", ["-c", `printf 'two\\n' >> ${dir}/notes.txt`]);
+  await g("commit", "-qam", "second");
+  // main stays one commit behind, so importing trunk is visibly a choice of branch.
+  await g("push", "-q", src.remote.replace("://", `://x:${token}@`), "trunk:trunk", "trunk~1:refs/heads/main");
+
+  const name = project("e2e-import");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await assert.rejects(admin.createProject({ name, import: { url: src.remote, branch: "trunk" } }), /needs a token/, "a private source without a token says so");
+  const made = await admin.createProject({ name, import: { url: src.remote, branch: "trunk", token } });
+  assert.deepEqual(made.importedFrom, { url: src.remote, branch: "trunk" });
+  const history = await admin.req("GET", "/commits");
+  assert.deepEqual(history.commits.map((c: any) => c.message), ["second", "first"], "the history came along");
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Add a third line", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["notes.txt"], "append");
+  await ada.write(ws, { "notes.txt": (await ada.read("notes.txt", ws)) + "three\n" }, "third");
+  const ch = await ada.submit(t.id, "Third line", "append a line", { plan: ["append"], tested: ["read it back"] });
+  await admin.review(ch.id, "approve", "ok");
+  for (let i = 0; i < 60 && (await admin.change(ch.id)).status !== "merged"; i++) await new Promise((r) => setTimeout(r, 500));
+  assert.equal((await admin.change(ch.id)).status, "merged");
+  assert.equal(await admin.read("notes.txt"), "one\ntwo\nthree\n");
+});
+
+test("a merge whose base is older than the history a workspace fetches still finds it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Workspace, HISTORY } = await import("../src/gitops.ts");
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
+  const repo = await fetch(`${shim}/repos`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: project("e2e-deep") }) }).then((r) => r.json());
+  const dir = await mkdtemp(join(tmpdir(), "loom-deep-"));
+  const g = (...args: string[]) => run("git", ["-C", dir, "-c", "user.name=ann", "-c", "user.email=ann@example.com", ...args], { maxBuffer: 1 << 24 });
+  await g("init", "-q", "-b", "main");
+  await writeFile(join(dir, "log.txt"), "0\n");
+  await writeFile(join(dir, "other.txt"), "x\n");
+  await g("add", ".");
+  await g("commit", "-qm", "c0");
+  await g("branch", "old");
+  // main moves on by more than a workspace fetches.
+  for (let i = 1; i <= HISTORY + 30; i++) await g("commit", "-q", "--allow-empty", "-m", `c${i}`);
+  await g("checkout", "-q", "old");
+  await writeFile(join(dir, "other.txt"), "y\n");
+  await g("commit", "-qam", "edit other");
+  const remote = repo.remote.replace("://", `://x:${String(repo.token).split("?expires=")[0]}@`);
+  await g("push", "-q", remote, "main", "old");
+  const w = await Workspace.open({ url: repo.remote, token: repo.token });
+  const main = (await w.head())!;
+  const old = await w.fetchFrom("ws", { url: repo.remote, token: repo.token }, "old");
+  const merged = await w.merge(main, old);
+  assert.ok(merged.base, "the merge base was found by fetching further back");
+  assert.deepEqual(merged.conflicts, [], "a clean merge, not an add/add conflict from a missing base");
+});

@@ -48,12 +48,22 @@ export interface FileChange {
   status: "added" | "modified" | "deleted";
 }
 
+/**
+ * How many generations of history a workspace fetches. An imported
+ * repository can bring thousands of commits, and fetching and walking all of
+ * them made every commit and merge take seconds. Merges need history only back
+ * to the merge base; when that is further back, the workspace deepens.
+ */
+export const HISTORY = 200;
+
 function auth(token: string) {
   return () => ({ username: "x", password: tokenSecret(token) });
 }
 
 export class Workspace {
   fs = new MemoryFS();
+  /** What was fetched, shallow, so the workspace can deepen it when a merge base is further back. */
+  private fetched: { remote: string; ref: string; token: string }[] = [];
   private constructor() {}
 
   /** Clone the default branch of `origin` without a checkout. */
@@ -63,7 +73,8 @@ export class Workspace {
     await git.init({ fs: w.fs, dir: DIR, defaultBranch: branch });
     await git.addRemote({ fs: w.fs, dir: DIR, remote: "origin", url: origin.url });
     try {
-      await git.fetch({ fs: w.fs, http, dir: DIR, remote: "origin", ref: branch, singleBranch: true, tags: false, onAuth: auth(origin.token) });
+      await git.fetch({ fs: w.fs, http, dir: DIR, remote: "origin", ref: branch, singleBranch: true, tags: false, depth: HISTORY, onAuth: auth(origin.token) });
+      w.fetched.push({ remote: "origin", ref: branch, token: origin.token });
       const head = await git.resolveRef({ fs: w.fs, dir: DIR, ref: `refs/remotes/origin/${branch}` });
       await git.writeRef({ fs: w.fs, dir: DIR, ref: `refs/heads/${branch}`, value: head, force: true });
     } catch (e: any) {
@@ -84,8 +95,35 @@ export class Workspace {
   /** Fetch `branch` from another remote; returns the fetched commit. */
   async fetchFrom(name: string, remote: Remote, branch = "main"): Promise<string> {
     await git.addRemote({ fs: this.fs, dir: DIR, remote: name, url: remote.url, force: true });
-    await git.fetch({ fs: this.fs, http, dir: DIR, remote: name, ref: branch, singleBranch: true, tags: false, onAuth: auth(remote.token) });
+    await git.fetch({ fs: this.fs, http, dir: DIR, remote: name, ref: branch, singleBranch: true, tags: false, depth: HISTORY, onAuth: auth(remote.token) });
+    this.fetched = this.fetched.filter((f) => f.remote !== name).concat({ remote: name, ref: branch, token: remote.token });
     return git.resolveRef({ fs: this.fs, dir: DIR, ref: `refs/remotes/${name}/${branch}` });
+  }
+
+  /** Fetch the full history of everything fetched so far. Returns false when there was nothing more to get. */
+  private async deepen(): Promise<boolean> {
+    const shallow = await this.fs.readFile(`${DIR}/.git/shallow`, "utf8").catch(() => "");
+    if (!String(shallow).trim()) return false;
+    for (const f of this.fetched) {
+      await git.fetch({ fs: this.fs, http, dir: DIR, remote: f.remote, ref: f.ref, singleBranch: true, tags: false, depth: 2_000_000_000, onAuth: auth(f.token) });
+    }
+    return true;
+  }
+
+  /**
+   * Fetch one branch of an outside repository, with its history, for an
+   * import. Without `branch` it takes the remote's default branch. `token`
+   * is only for private repositories and is used for this fetch alone.
+   */
+  async fetchSource(url: string, branch?: string, token?: string): Promise<{ branch: string; head: string }> {
+    const onAuth = token ? () => ({ username: "x-access-token", password: token }) : undefined;
+    if (!branch) {
+      const refs = await git.listServerRefs({ http, url, onAuth, prefix: "HEAD", symrefs: true });
+      branch = (refs.find((r) => r.ref === "HEAD")?.target ?? "").replace(/^refs\/heads\//, "") || "main";
+    }
+    await git.addRemote({ fs: this.fs, dir: DIR, remote: "source", url, force: true });
+    await git.fetch({ fs: this.fs, http, dir: DIR, remote: "source", ref: branch, remoteRef: branch, singleBranch: true, tags: false, onAuth });
+    return { branch, head: await git.resolveRef({ fs: this.fs, dir: DIR, ref: `refs/remotes/source/${branch}` }) };
   }
 
   async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
@@ -95,7 +133,10 @@ export class Workspace {
 
   async mergeBase(a: string, b: string): Promise<string | null> {
     const bases = await git.findMergeBase({ fs: this.fs, dir: DIR, oids: [a, b] });
-    return bases[0] ?? null;
+    if (bases[0]) return bases[0];
+    // The base may be older than what was fetched.
+    if (!(await this.deepen())) return null;
+    return (await git.findMergeBase({ fs: this.fs, dir: DIR, oids: [a, b] }))[0] ?? null;
   }
 
   async flatten(commit: string | null): Promise<FlatTree> {
@@ -104,10 +145,14 @@ export class Workspace {
     return this.flattenTree(c.tree);
   }
 
+  /** Trees never change for an oid, and history walks read the same ones again and again. */
+  private trees = new Map<string, { path: string; oid: string; type: string; mode: string }[]>();
+
   async flattenTree(tree: string): Promise<FlatTree> {
     const out: FlatTree = new Map();
     const walk = async (treeOid: string, prefix: string) => {
-      const { tree } = await git.readTree({ fs: this.fs, dir: DIR, oid: treeOid });
+      let tree = this.trees.get(treeOid);
+      if (!tree) this.trees.set(treeOid, (tree = (await git.readTree({ fs: this.fs, dir: DIR, oid: treeOid })).tree));
       for (const e of tree) {
         const p = prefix + e.path;
         if (e.type === "tree") await walk(e.oid, p + "/");

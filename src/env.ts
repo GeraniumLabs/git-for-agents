@@ -12,6 +12,8 @@ export interface Env {
   /** GitHub OAuth app for people signing in. */
   GITHUB_CLIENT_ID?: string;
   GITHUB_CLIENT_SECRET?: string;
+  /** The GitHub app's name in its URL, for its install link, when the app came from secrets rather than /auth/setup. */
+  GITHUB_APP_SLUG?: string;
   /** GitHub logins (comma-separated) who own every project. */
   LOOM_OWNERS?: string;
   /** Comma-separated public projects to show first-time visitors, the first one opening by default. */
@@ -23,6 +25,8 @@ export interface Env {
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
   TYPESAFE_API_KEY?: string;
+  /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */
+  GITHUB_API_URL?: string;
   TYPESAFE_URL?: string;
   PROJECT: DurableObjectNamespace<ProjectCoordinator>;
   /** Containers that run each project's checks. Absent in local development, where the shim runs them. */

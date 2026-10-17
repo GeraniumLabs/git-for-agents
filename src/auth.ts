@@ -6,6 +6,7 @@
 
 import type { Env } from "./env";
 import { regions } from "./residency";
+import { seal, unseal } from "./secrets";
 
 export interface User {
   /** Stable identity: "github:<lowercase login>". */
@@ -17,6 +18,9 @@ export interface User {
 
 const SESSION = "loom_session";
 const STATE = "loom_oauth";
+/** A person's own GitHub token, sealed, kept briefly so an import can read their private repositories. */
+const GRANT = "loom_gh";
+const GRANT_MINUTES = 15;
 const SESSION_DAYS = 30;
 export const USER_HEADER = "x-loom-user";
 
@@ -74,6 +78,31 @@ function setCookie(req: Request, name: string, value: string, maxAge: number): s
   return `${name}=${encodeURIComponent(value)}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${secure}`;
 }
 
+/**
+ * The GitHub token a signed-in person granted for reading their repositories,
+ * if it is still fresh and theirs. Loom asks for it only when an import needs
+ * it, keeps it sealed in a short-lived cookie in their own browser, and never
+ * stores it.
+ */
+export async function githubGrant(env: Env, req: Request, user: User): Promise<string | null> {
+  const raw = cookie(req, GRANT);
+  if (!raw) return null;
+  try {
+    const row = JSON.parse(raw);
+    const plain = await unseal(env, "__github-grant", { ct: row.ct, iv: row.iv, sealed_by: row.by });
+    const g = plain ? JSON.parse(plain) : null;
+    return g && g.user === user.id && g.exp > Date.now() ? g.token : null;
+  } catch {
+    return null;
+  }
+}
+
+/** The Set-Cookie header that hands a person's GitHub token to their next imports, for a few minutes. */
+export async function grantCookie(env: Env, req: Request, user: User, token: string): Promise<string> {
+  const sealed = await seal(env, "__github-grant", JSON.stringify({ token, user: user.id, exp: Date.now() + GRANT_MINUTES * 60_000 }));
+  return setCookie(req, GRANT, JSON.stringify(sealed), GRANT_MINUTES * 60);
+}
+
 /** The signed-in person, if the request carries a valid session. */
 export async function sessionUser(env: Env, req: Request): Promise<User | null> {
   const s = await verified<User & { exp: number }>(env, cookie(req, SESSION));
@@ -84,6 +113,12 @@ export async function sessionUser(env: Env, req: Request): Promise<User | null> 
 export type Registry = (path: string, init?: RequestInit) => Promise<Response>;
 
 interface GitHubApp { client_id: string; client_secret: string; slug?: string; html_url?: string }
+
+/** Where a person installs Loom's GitHub app on their repositories, when Loom knows its name. */
+function installUrl(env: Env, app: GitHubApp | null): string | null {
+  const slug = env.GITHUB_APP_SLUG ?? app?.slug;
+  return slug ? `https://github.com/apps/${slug}/installations/new` : null;
+}
 let cachedApp: GitHubApp | null = null;
 
 /** GitHub sign-in credentials: from Worker secrets, or from the app Loom created for itself. */
@@ -117,7 +152,9 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (!path.startsWith("/auth/")) return null;
 
   if (path === "/auth/me") {
-    return Response.json({ user: await sessionUser(env, req), github: !!(await githubApp(env, registry)), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), regions: regions(env) }, { headers: { "cache-control": "no-store" } });
+    const app = await githubApp(env, registry);
+    const me = await sessionUser(env, req);
+    return Response.json({ user: me, github: !!app, githubInstall: installUrl(env, app), repoAccess: !!(me && (await githubGrant(env, req, me))), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), regions: regions(env) }, { headers: { "cache-control": "no-store" } });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {
@@ -125,6 +162,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     const headers = new Headers({ "cache-control": "no-store", "clear-site-data": '"cookies"' });
     headers.append("set-cookie", setCookie(req, SESSION, "", 0));
     headers.append("set-cookie", setCookie(req, STATE, "", 0));
+    headers.append("set-cookie", setCookie(req, GRANT, "", 0));
     return new Response(null, { status: 204, headers });
   }
 
@@ -144,7 +182,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     const existing = await githubApp(env, registry);
     if (existing) return page("GitHub sign-in is set up", `<p>Loom signs people in with ${existing.html_url ? `<a href="${escHtml(existing.html_url)}">its GitHub app</a>` : "GitHub"}.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
     if (req.method !== "POST") {
-      return page("Set up GitHub sign-in", `<p>Loom will ask GitHub to create a small GitHub app for this server. It requests no access to your repositories; it only lets people sign in. You'll approve it on GitHub, and that's it.</p>
+      return page("Set up GitHub sign-in", `<p>Loom will ask GitHub to create a small GitHub app for this server. It lets people sign in, and, on the repositories someone chooses to install it on, read code and issues so they can import them. You'll approve it on GitHub, and that's it.</p>
 <form method="post"><label>Admin token (one last time) <input name="token" type="password" autocomplete="off" required></label>
 <label>Create it under a GitHub organization (optional) <input name="org" placeholder="e.g. GeraniumLabs"></label>
 <p><button>Create Loom's GitHub app</button></p></form>`);
@@ -160,7 +198,10 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
       redirect_url: `${url.origin}/auth/github/setup-done`,
       callback_urls: [`${url.origin}/auth/github/callback`],
       public: true,
-      default_permissions: {},
+      // Read-only, and only on repositories people choose to install it on: so they can import their private repositories and issues.
+      default_permissions: { contents: "read", issues: "read" },
+      setup_url: `${url.origin}/auth/github/installed`,
+      setup_on_update: true,
     };
     const target = org ? `https://github.com/organizations/${org}/settings/apps/new` : "https://github.com/settings/apps/new";
     return page("Opening GitHub…", `<form id="go" method="post" action="${target}?state=${encodeURIComponent(state)}"><input type="hidden" name="manifest" value="${escHtml(JSON.stringify(manifest))}"><button>Continue to GitHub</button></form><script>document.getElementById("go").submit()</script>`);
@@ -180,15 +221,24 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     return page("GitHub sign-in is ready", `<p>Loom created <b>${escHtml(app.name ?? "its GitHub app")}</b>. People can now sign in with GitHub.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
   }
 
+  // After someone installs the app on their repositories, GitHub sends them here.
+  if (path === "/auth/github/installed") {
+    return page("Loom can read those repositories now", `<p>Go back to Loom and create the project again. The import uses your GitHub access, so you don't need a token.</p><p><a class="button" href="/">Back to Loom</a></p>`);
+  }
+
+  // Sign in (or, with ?grant=repo, let an import read the person's repositories as them).
   if (path === "/auth/github") {
     const gh = await githubApp(env, registry);
     if (!gh) return page("GitHub sign-in isn't set up yet", `<p><a class="button" href="/auth/setup">Set it up</a></p>`);
+    const grant = url.searchParams.get("grant") === "repo";
+    if (grant && !(await sessionUser(env, req))) return Response.json({ error: "sign in first" }, { status: 401 });
     const nonce = b64url(crypto.getRandomValues(new Uint8Array(16)));
-    const state = await signed(env, { nonce, to: safeReturn(url.searchParams.get("return")), exp: Date.now() + 10 * 60_000 });
+    const state = await signed(env, { nonce, to: safeReturn(url.searchParams.get("return")), grant, exp: Date.now() + 10 * 60_000 });
     const go = new URL("https://github.com/login/oauth/authorize");
     go.searchParams.set("client_id", gh.client_id);
     go.searchParams.set("redirect_uri", `${url.origin}/auth/github/callback`);
-    go.searchParams.set("scope", "read:user");
+    // A GitHub app ignores scopes and gets what it was installed with; an OAuth app needs "repo" to read private repositories.
+    go.searchParams.set("scope", grant ? "read:user repo" : "read:user");
     go.searchParams.set("state", nonce);
     go.searchParams.set("allow_signup", "true");
     return new Response(null, { status: 302, headers: { location: go.toString(), "set-cookie": setCookie(req, STATE, state, 600) } });
@@ -197,7 +247,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (path === "/auth/github/callback") {
     const gh = await githubApp(env, registry);
     if (!gh) return page("GitHub sign-in isn't set up yet", `<p><a class="button" href="/auth/setup">Set it up</a></p>`);
-    const state = await verified<{ nonce: string; to: string }>(env, cookie(req, STATE));
+    const state = await verified<{ nonce: string; to: string; grant?: boolean }>(env, cookie(req, STATE));
     const code = url.searchParams.get("code");
     if (!state || !code || url.searchParams.get("state") !== state.nonce) return Response.json({ error: "sign-in expired or was tampered with; try again" }, { status: 400 });
     const tok = await fetch("https://github.com/login/oauth/access_token", {
@@ -211,6 +261,15 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     }).then((r) => r.json<any>());
     if (!profile.login) return Response.json({ error: "couldn't read your GitHub profile" }, { status: 400 });
     const login = String(profile.login).toLowerCase();
+    if (state.grant) {
+      // Keep the token only for the person who is signed in, and only for a few minutes.
+      const me = await sessionUser(env, req);
+      if (!me || me.id !== `github:${login}`) return Response.json({ error: `you're signed in to Loom as ${me?.login ?? "nobody"} but to GitHub as ${profile.login}` }, { status: 400 });
+      const headers = new Headers({ location: state.to });
+      headers.append("set-cookie", await grantCookie(env, req, me, tok.access_token));
+      headers.append("set-cookie", setCookie(req, STATE, "", 0));
+      return new Response(null, { status: 302, headers });
+    }
     return startSession(env, req, { id: `github:${login}`, login: profile.login, name: profile.name || profile.login, avatar: profile.avatar_url ?? "" }, state.to);
   }
 
