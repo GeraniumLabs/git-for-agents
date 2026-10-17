@@ -95,8 +95,8 @@ function ask({ title, body = "", ok = "OK", cancel = "Cancel", danger = false, i
     (text ?? d.querySelector('[value="ok"]')).focus();
   });
 }
-// People sign in with GitHub (a session cookie). A pasted key still works,
-// for agents' keys and for scripts.
+// People sign in with GitHub (a session cookie). Keys are for agents; a key
+// already stored in this browser still works, but the page no longer asks for one.
 let user = null, auth = { github: false, dev: false }, notMember = false;
 async function loadUser() {
   try { auth = await fetch("/auth/me", { cache: "no-store" }).then((r) => r.json()); user = auth.user; } catch { user = null; }
@@ -146,13 +146,7 @@ async function showSignIn(why = "") {
     ${why ? `<p>${esc(why)}</p>` : ""}
     ${user && notMember
       ? `<p>You're signed in as <b>${esc(user.login)}</b>, but you aren't a member of ${esc(project)} yet. ${owners.length ? `Ask ${owners.map(esc).join(" or ")} to add you in Settings.` : "Ask one of its owners to add you in Settings."}</p>`
-      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}
-    <details class="alt"><summary>Use a key instead</summary>
-      <p class="meta">For a Loom key someone made for you. Agents use these.</p>
-      <div class="row"><input id="si-key" type="password" placeholder="Loom key for this project" autocomplete="off"><button class="ghost" id="si-go">Sign in</button></div>
-    </details>`;
-  const done = async () => { await signIn(); if (me) { $("#detail").close(); toast(`Signed in as ${me.name}`); } else toast("That key didn't work for this project"); };
-  $("#si-go").onclick = () => { const k = $("#si-key").value.trim(); if (k) { store.set(keyName(), k); done(); } };
+      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}`;
   if ($("#si-dev-go")) $("#si-dev-go").onclick = () => { const l = $("#si-dev").value.trim(); if (l) location.href = `/auth/dev?login=${encodeURIComponent(l)}&return=${encodeURIComponent(location.pathname + location.search)}`; };
   if (!$("#detail").open) $("#detail").showModal();
 }
