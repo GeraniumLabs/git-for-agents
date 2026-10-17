@@ -193,7 +193,7 @@ function renderTour(projects, showcase) {
   $("#tour").innerHTML = `
     <div class="tour-text">
       <b>Loom is a git platform for agent swarms, built on Cloudflare.</b>
-      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. The merge queue ran the tests before main moved. The Activity feed is live.
+      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. Where a project set a check command, the merge queue ran it before main moved. The Activity feed is live.
     </div>
     <div class="tour-projects">${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}"><b>${esc(n)}</b><span>${esc(desc(n))}</span></a>`).join("")}</div>
     <div class="tour-actions"><button id="tour-agent">Bring your own agent</button><button id="tour-close" class="ghost" title="Hide this">Hide</button></div>`;
@@ -287,7 +287,14 @@ function renderHealth() {
     <div class="tile" title="Changes that landed on main in the last hour"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
     ${h.people ? `<div class="tile" title="Questions agents asked people that are still open. This hour: ${h.people.askedLastHour} asked, ${h.people.answeredLastHour} answered by people, ${h.people.defaultedLastHour} went ahead on the agent's default. Limits are in Settings"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
     <div class="tile" title="Share of merge attempts in the last hour that hit a conflict. Over 20% shows red: look at Where the work is"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
-    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
+    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>
+    ${state.project.checks ? "" : `<div class="tile" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing"><b class="warn">no checks</b><span>main isn't tested before it moves${state.project.mainTests === 0 ? " · main has no tests, so changes aren't flagged for skipping them" : ""}${state.project.suggestedCheck && isOwner() ? ` · <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : " · set one in Settings"}</span></div>`}`;
+  const useCheck = $("#health [data-use-check]");
+  if (useCheck) useCheck.onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: state.project.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
+    toast("Checks on: the merge queue runs them before main moves");
+    render();
+  };
   for (const b of document.querySelectorAll("[data-state]")) b.onclick = () => showDirectory(b.dataset.state);
   for (const b of $("#health").querySelectorAll("[data-tasks]")) b.onclick = (e) => { e.preventDefault(); showTasks(b.dataset.tasks); };
 }
@@ -849,11 +856,34 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
-function showNewProject(draft = null) {
+/** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
+async function planHtml() {
+  const b = await fetch("/api/billing", { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
+  if (!b.enabled || !b.plan || b.plan === "unlimited") return "";
+  const p = b.plans[b.plan], pro = b.plans.pro;
+  const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  return b.plan === "pro"
+    ? `<p class="meta">You're on <b>${esc(p.name)}</b>: ${limits(p)}.${b.status && b.status !== "active" ? ` Payment status: <b>${esc(b.status)}</b>.` : ""}${b.renews ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}</p>${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`
+    : `<p class="meta">You're on the <b>free plan</b>: ${limits(p)}. <b>${esc(pro.name)}</b> (${esc(pro.price)}) gives you ${limits(pro)}.</p><div class="row"><button data-billing="checkout">Upgrade to ${esc(pro.name)}</button>${b.manage ? `<button class="ghost" data-billing="portal">Billing history</button>` : ""}</div>`;
+}
+
+function wireBilling(root) {
+  for (const btn of root.querySelectorAll("[data-billing]")) btn.onclick = async () => {
+    btn.disabled = true;
+    const res = await fetch(`/api/billing/${btn.dataset.billing}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ back: `${location.pathname}${location.search}` }) });
+    const d = await res.json().catch(() => ({}));
+    if (!res.ok || !d.url) { btn.disabled = false; return toast(d.error ?? `HTTP ${res.status}`); }
+    location.href = d.url;
+  };
+}
+
+async function showNewProject(draft = null) {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
+  const plan = await planHtml();
   $("#detail-body").innerHTML = `
     <h3>New project</h3>
     <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. You'll be its owner, signed in as <b>${esc(user.login)}</b>.</p>
+    ${plan}
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
     <h2>Start from</h2>
@@ -866,12 +896,14 @@ function showNewProject(draft = null) {
       <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
       <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
     </div>
+    <label>Check command, run on main with each change before main moves <input id="np-checks" class="mono" placeholder="e.g. npm ci && npm test; leave empty and Loom suggests one if it recognizes the repository"></label>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
     ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
     <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
+  wireBilling($("#detail-body"));
   const importing = () => $('input[name="np-from"]:checked').value === "import";
   if (draft) {
     // Back from GitHub: put the form back as it was.
@@ -884,7 +916,7 @@ function showNewProject(draft = null) {
   // A private GitHub repository: go to GitHub for what Loom needs (the person's OK, then Loom's app on the
   // repository), and finish creating the project when GitHub sends them back.
   const toGitHub = (step) => {
-    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch"].map((id) => [id, $(id).value]));
+    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch", "#np-checks"].map((id) => [id, $(id).value]));
     const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
     try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked, resume: step })); } catch {}
     const back = new URLSearchParams(location.search);
@@ -933,7 +965,7 @@ function showNewProject(draft = null) {
       if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;
@@ -961,13 +993,20 @@ if (new URLSearchParams(location.search).get("new") === "1") {
   history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`);
   loadUser().then(() => showNewProject(draft));
 }
+// Back from Stripe Checkout: the webhook may land a moment after the person does.
+if (new URLSearchParams(location.search).get("billing") === "done") {
+  const q = new URLSearchParams(location.search); q.delete("billing");
+  history.replaceState(null, "", `${location.pathname}${q.size ? `?${q}` : ""}${location.hash}`);
+  setTimeout(() => toast("Thanks: you're on Loom Pro"), 500);
+}
 try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  try { [s, people, si] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] }))]); } catch { return; }
+  let mail = null, plan = "";
+  try { [s, people, si, mail, plan] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? planHtml() : ""]); } catch { return; }
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
@@ -1003,6 +1042,10 @@ async function showSettings() {
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
+    ${plan ? `<h2>Your plan</h2>${plan}` : ""}
+    ${mail ? `<h2>Email me</h2>
+    <p class="meta">${mail.email ? `Loom emails <b>${esc(mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : `Get an email when something on ${esc(project)} needs you, with a link straight to it.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
+    <div class="row"><input id="mail-to" type="email" class="grow" placeholder="you@example.com" value="${esc(mail.email ?? "")}"><button class="ghost" id="mail-save">${mail.email ? "Save" : "Turn on"}</button>${mail.email ? `<button class="ghost" id="mail-off">Turn off</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : ""}</div>` : ""}
     <h2>Your agent</h2>
     <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
@@ -1101,6 +1144,20 @@ async function showSettings() {
     try { const r = await act("POST", "/settings", { reviewAgent: { enabled: $("#review-agent-on").checked, afterMinutes: Number($("#review-agent-after").value) } }); state.project.reviewAgent = { ...state.project.reviewAgent, ...r.reviewAgent }; } catch { return; }
     toast(state.project.reviewAgent.enabled ? "Review agent on" : "Review agent off");
     showSettings();
+  };
+  wireBilling($("#detail-body"));
+  if ($("#mail-save")) $("#mail-save").onclick = async () => {
+    try { await act("POST", "/me/email", { email: $("#mail-to").value }); } catch { return; }
+    toast($("#mail-to").value.trim() ? "Email on" : "Email off");
+    showSettings();
+  };
+  if ($("#mail-off")) $("#mail-off").onclick = async () => {
+    try { await act("POST", "/me/email", { email: null }); } catch { return; }
+    toast("Email off");
+    showSettings();
+  };
+  if ($("#mail-test")) $("#mail-test").onclick = async () => {
+    try { const r = await act("POST", "/me/email/test", {}); toast(`Sent to ${r.to}`); } catch { return; }
   };
   if ($("#q-save")) $("#q-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { questions: { maxOpen: Number($("#q-max").value), deadlineMinutes: Number($("#q-deadline").value) } }); state.project.questions = r.questions; } catch { return; }
@@ -1451,13 +1508,13 @@ function showTask(id) {
 
 /** The dashboard, or a change or contest on its own page, from the URL. */
 function route() {
-  const m = /^#(change|contest|task)\/(\d+)$/.exec(location.hash);
+  const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!m);
   $("#review").hidden = !m;
   if (!m) { review = null; $("#review").innerHTML = ""; return; }
   if ($("#detail").open) $("#detail").close();
   window.scrollTo(0, 0);
-  if (m[1] === "change") loadReview(Number(m[2])); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
+  if (m[1] === "change") loadReview(Number(m[2])).then(() => m[3] && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
 window.addEventListener("hashchange", route);
 
@@ -1474,6 +1531,17 @@ async function loadReview(id) {
     if (!review.inter.available) review.since = false;
   } else review.since = false;
   drawReview();
+}
+
+/** From an email's Approve link: the change is open, with Approve one press away. The link itself never approves. */
+function readyApprove() {
+  const b = $('#review [data-verdict="approve"]');
+  // Before sign-in finishes there's no button yet; the page draws again once it does.
+  if (!b) { if (isHuman()) toast("This change isn't waiting on an approval anymore"); return; }
+  b.scrollIntoView({ block: "center" });
+  b.classList.add("ready");
+  b.focus();
+  toast("Look it over, then press Approve");
 }
 
 function drawReview() {

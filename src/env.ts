@@ -20,6 +20,21 @@ export interface Env {
   LOOM_SHOWCASE?: string;
   /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
   LOOM_CREATORS?: string;
+  /** Projects one person (not an owner of the server) may create. Default 5; 0 means no limit. */
+  LOOM_PROJECTS_PER_PERSON?: string;
+  /** Agents one project may hold. Default 300; 0 means no limit. */
+  LOOM_MAX_AGENTS?: string;
+  /** Minutes of checks one project may run a day (UTC). Default 120; 0 means no limit. Past it, the merge queue waits for the next day. */
+  LOOM_CHECK_MINUTES_PER_DAY?: string;
+  /** Stripe: with both set, people get the free plan and can pay for Loom Pro (src/billing.ts). */
+  STRIPE_SECRET_KEY?: string;
+  STRIPE_WEBHOOK_SECRET?: string;
+  /** A Stripe price for Loom Pro; without one, Checkout uses $10 a month. */
+  STRIPE_PRICE_ID?: string;
+  /** A customer portal configuration for Loom, when the account's default isn't the one to show. */
+  STRIPE_PORTAL_CONFIGURATION?: string;
+  /** Tests point this at a stand-in. Defaults to https://api.stripe.com. */
+  STRIPE_API_URL?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
@@ -28,6 +43,10 @@ export interface Env {
   LOOM_AI_GATEWAY?: string;
   /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
   LOOM_REVIEW_MODEL_URL?: string;
+  /** Cloudflare Email Service: emails people when something needs them. Needs LOOM_EMAIL_FROM on a domain onboarded to Email Service. */
+  EMAIL?: SendEmail;
+  /** The address Loom sends from, e.g. loom@example.com. */
+  LOOM_EMAIL_FROM?: string;
   TYPESAFE_API_KEY?: string;
   /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */
   GITHUB_API_URL?: string;

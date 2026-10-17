@@ -733,3 +733,154 @@ test("with no reviewer around, Loom's review agent reviews the change: an approv
   assert.equal(still.status, "review");
   assert.equal(still.reviews.length, 0);
 });
+
+test("a change doesn't merge while an agent who took its review is still reviewing, and a merged change can't be reviewed", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-reviewhold");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "review hold", files: SEED, requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { reviewAgent: { enabled: false } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
+  const ivy = admin.as((await admin.addAgent("ivy", "reviewer")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\nexport const trim = (s) => s.trim();\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim"] });
+
+  await ivy.req("POST", `/changes/${ch.id}/reviewers/take`);
+  const approved = await rex.req("POST", `/changes/${ch.id}/reviews`, { verdict: "approve", body: "fine" });
+  assert.equal(approved.status, "review", "held while ivy is reviewing");
+  assert.match(approved.next, /ivy/);
+  assert.deepEqual((await admin.change(ch.id)).approval.reviewing, ["ivy"]);
+
+  await ivy.req("POST", `/changes/${ch.id}/reviews`, { verdict: "comment", body: "nothing to add" });
+  let c = await admin.change(ch.id);
+  for (let i = 0; i < 40 && c.status !== "merged"; i++) { await new Promise((r) => setTimeout(r, 500)); c = await admin.change(ch.id); }
+  assert.equal(c.status, "merged", "lands once ivy is done");
+
+  await assert.rejects(rex.req("POST", `/changes/${ch.id}/reviews`, { verdict: "request_changes", body: "too late" }), /merged/);
+  assert.equal((await admin.change(ch.id)).status, "merged", "a late review doesn't rewrite it");
+});
+
+test("a person who turns on email hears when something needs them, once, with a link to approve it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-email");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "email", files: SEED, requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { protectedPaths: ["src/db.js"], reviewAgent: { enabled: false } });
+  await admin.req("POST", "/members", { login: "mia" });
+  const signin = await fetch(`${url}/auth/dev?login=mia`, { redirect: "manual" });
+  const cookie = (signin.headers.get("set-cookie") ?? "").split(";")[0];
+  const mia = (method: string, path: string, body?: unknown) => fetch(`${url}/api/projects/${name}${path}`, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then(async (r) => ({ status: r.status, ...(await r.json()) }));
+
+  assert.equal((await admin.req("POST", "/me/email", { email: "a@b.co" }).catch((e: Error) => e.message)).toString().includes("403"), true);
+  assert.equal((await mia("POST", "/me/email", { email: "not an address" })).status, 400);
+  const on = await mia("POST", "/me/email", { email: "mia@example.com" });
+  assert.equal(on.email, "mia@example.com");
+  assert.equal(on.sending, true);
+  assert.equal((await mia("POST", "/me/email/test", {})).sent, true);
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim\n" }, "trim");
+  await ada.submit(t.id, t.title, "Trim", { plan: ["trim"], tested: ["by hand"] });
+  let sent = null;
+  for (let i = 0; i < 20 && !sent; i++) { await new Promise((r) => setTimeout(r, 500)); sent = (await mia("GET", "/me/email")).lastSent; }
+  assert.ok(sent, "an email went out for the protected change");
+
+  const off = await mia("POST", "/me/email", { email: null });
+  assert.equal(off.email, null);
+});
+
+test("a project created from a repository Loom recognizes gets a suggested check, and says once that main has no tests", { skip: !url, timeout: 60_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-nochecks");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "no checks", files: { "package.json": '{"scripts":{"test":"node --test"}}', "src/a.js": "export const a = 1;\n" }, requiredApprovals: 1 });
+  const ov = await admin.req("GET", "/overview");
+  assert.equal(ov.project.checks, null);
+  assert.equal(ov.project.suggestedCheck, "npm install && npm test");
+  assert.equal(ov.project.mainTests, 0);
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Add b", "export b from a.js");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/a.js"], "");
+  await ada.write(ws, { "src/a.js": "export const a = 1;\nexport const b = 2;\n" });
+  const ch = await ada.submit(t.id, t.title, "b", {});
+  const detail = await ada.change(ch.id);
+  assert.ok(!detail.brief.reasons.some((r: any) => r.kind === "tests"), "no per-change tests warning when main has none");
+  await admin.req("POST", "/settings", { checks: { command: "npm test" } });
+  assert.equal((await admin.req("GET", "/overview")).project.suggestedCheck, null);
+});
+
+test("creating projects is invite-only: others join the waitlist until the admin lets them in, and hidden projects aren't listed", { skip: !url, timeout: 60_000 }, async () => {
+  const login = `zed${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const create = (name: string) => fetch(`${url}/api/projects`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify({ name, description: "x" }) });
+  const admin = (method: string, path: string, body?: unknown) => fetch(`${url}/api/admin/${path}`, { method, headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json());
+  const name = project("e2e-invite");
+  const refused = await create(name);
+  assert.equal(refused.status, 403);
+  assert.match((await refused.json()).error, /waitlist/);
+  assert.ok((await admin("GET", "waitlist")).some((w: any) => w.login === login));
+  await admin("POST", "creators", { login });
+  assert.ok(!(await admin("GET", "waitlist")).some((w: any) => w.login === login));
+  assert.equal((await create(name)).status, 200);
+
+  const listed = async (auth: boolean) => (await fetch(`${url}/api/projects`, { headers: auth ? { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } : {} }).then((r) => r.json())).map((p: any) => p.name);
+  assert.ok((await listed(false)).includes(name));
+  await admin("PUT", `projects/${name}`, { hidden: true });
+  assert.ok(!(await listed(false)).includes(name));
+  assert.ok((await listed(true)).includes(name));
+  assert.equal((await fetch(`${url}/api/projects/${name}/overview`)).status, 200, "a hidden project still opens by name");
+  await admin("DELETE", `creators/${login}`);
+});
+
+test("anyone on the free plan gets one project; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
+  const { signStripe } = await import("../src/billing.ts");
+  const login = `pay${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const as = (method: string, path: string, body?: unknown) => fetch(`${url}${path}`, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  // This server is invite-only too: let them in first.
+  await fetch(`${url}/api/admin/creators`, { method: "POST", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ login }) });
+  const webhook = async (event: unknown) => {
+    const body = JSON.stringify(event), t = Math.floor(Date.now() / 1000);
+    return fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": `t=${t},v1=${await signStripe("whsec_local", t, body)}` }, body });
+  };
+
+  const b = await (await as("GET", "/api/billing")).json();
+  assert.equal(b.plan, "free");
+  const first = project("e2e-pay");
+  assert.equal((await as("POST", "/api/projects", { name: first, description: "x" })).status, 200);
+  const second = await as("POST", "/api/projects", { name: project("e2e-pay2"), description: "x" });
+  assert.equal(second.status, 403);
+  assert.match((await second.json()).error, /free plan has 1 project/);
+
+  const co = await (await as("POST", "/api/billing/checkout", { back: `/?project=${first}` })).json();
+  assert.match(co.url, /\/stripe\/pay\/cs_test_/);
+  assert.match(decodeURIComponent(co.url), new RegExp(`login=${login}.*billing=done`));
+
+  assert.equal((await fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": "t=1,v1=00" }, body: "{}" })).status, 400);
+  const created = Math.floor(Date.now() / 1000);
+  await webhook({ type: "checkout.session.completed", created, data: { object: { mode: "subscription", client_reference_id: login, metadata: { app: "loom", login }, customer: "cus_e2e", subscription: "sub_e2e" } } });
+  const pro = await (await as("GET", "/api/billing")).json();
+  assert.equal(pro.plan, "pro");
+  assert.equal(pro.manage, true);
+  assert.match((await (await as("POST", "/api/billing/portal", {})).json()).url, /\/stripe\/portal\/cus_e2e/);
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  const ov = await (await as("GET", `/api/projects/${first}/overview`)).json();
+  assert.equal(ov.project.limits.checkMinutes, 300, "the project they already had moved to Pro's limits");
+
+  // An older event arriving late doesn't undo a newer one; cancelling does end it.
+  await webhook({ type: "customer.subscription.updated", created: created - 10, data: { object: { id: "sub_e2e", status: "incomplete", customer: "cus_e2e", metadata: { app: "loom", login } } } });
+  assert.equal((await (await as("GET", "/api/billing")).json()).plan, "pro");
+  await webhook({ type: "customer.subscription.deleted", created: created + 10, data: { object: { id: "sub_e2e", status: "canceled", customer: "cus_e2e", metadata: { app: "loom", login } } } });
+  assert.equal((await (await as("GET", "/api/billing")).json()).plan, "free");
+  assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.checkMinutes, 30);
+});

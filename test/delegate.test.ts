@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { DEFAULT_DELEGATE, decideFlagged, type DelegateConfig } from "../src/delegate.ts";
+import { DEFAULT_DELEGATE, checkIntent, decideFlagged, type DelegateConfig } from "../src/delegate.ts";
 
 // A stand-in for the decision model: answers each yes/no question with the given probability.
 function judgeSaying(answers: Record<string, number>) {
@@ -52,4 +52,14 @@ test("the deputy doesn't judge flagged changes when off, not allowed, unguided o
   assert.deepEqual(reasons, ["deputy is off", "deputy isn't allowed to clear changes flagged for a person", "the humans haven't written guidance for deputy yet", "waiting for an agent review first"]);
   assert.equal(seen.length, 0);
   assert.equal((await decideFlagged(cfg({ requireAgentReview: false }), { ...change, agentApprovals: 0 }, judgeSaying({ allowed: 0.9, risky: 0, high_stakes: 0 }).judge)).act, true);
+});
+
+test("the intent check judges the diff against the task, and skips a bare file list", async () => {
+  const { judge, seen } = judgeSaying({ on_intent: 0.9 });
+  const c = { title: "Add b", summary: "", intent: "(no description) (src/a.js)", patch: "+b" };
+  assert.equal(await checkIntent(judge, c), null);
+  assert.equal(seen.length, 0);
+  assert.deepEqual(await checkIntent(judge, { ...c, task: "Export b from a.js" }), { score: 0.9, model: "Jev" });
+  assert.equal(seen[0].state.change.task, "Export b from a.js");
+  assert.ok(await checkIntent(judge, { ...c, intent: "export b (src/a.js)" }));
 });

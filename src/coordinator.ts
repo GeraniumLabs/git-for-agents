@@ -18,12 +18,14 @@ import { FilesShapeError, normalizeFiles } from "./files";
 import { runCheck, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
-import { buildBrief, fileStats, isTest } from "./brief";
+import { buildBrief, countTests, fileStats, isTest, suggestCheck } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
+import { needsYouEmail } from "./email";
+import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
@@ -36,6 +38,14 @@ const DELEGATE_ID = "delegate";
 const REVIEW_AGENT_ID = "loom-reviewer";
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
+/** The project's check minutes for the day are used up; the merge queue waits until `until`. */
+class CheckBudgetError extends Error {
+  constructor(readonly minutes: number, readonly until: number) {
+    super(`This project used its ${minutes} minutes of checks for today. The merge queue waits until ${new Date(until).toISOString().slice(0, 16).replace("T", " ")} UTC, or its owner's plan can be raised.`);
+  }
+}
+/** At most one "needs you" email per person this often. */
+const EMAIL_GAP = 10 * 60_000;
 /** An unacknowledged directive older than this shows under Stuck. */
 const DIRECTIVE_ACK_MS = 5 * 60_000;
 /** Shortest approach a contest attempt may explain itself with. */
@@ -48,7 +58,7 @@ const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev"
 /** Project-wide events every agent hears about, whatever it is working on. */
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
-const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
@@ -174,7 +184,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN default_answer TEXT",
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
       "ALTER TABLE changes ADD COLUMN intent_check TEXT",
+      "ALTER TABLE projects ADD COLUMN owner TEXT",
+      "ALTER TABLE projects ADD COLUMN hidden INTEGER DEFAULT 0",
+      "ALTER TABLE agents ADD COLUMN email TEXT",
+      "ALTER TABLE agents ADD COLUMN email_seen TEXT",
+      "ALTER TABLE agents ADD COLUMN emailed_at INTEGER",
       "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
+      // Repair changes a late review flipped to "changes requested" after they landed or closed.
+      "UPDATE changes SET status = 'merged' WHERE status = 'changes_requested' AND merged_commit IS NOT NULL",
+      "UPDATE changes SET status = 'closed' WHERE status = 'changes_requested' AND EXISTS (SELECT 1 FROM events e WHERE e.type = 'change.closed' AND e.change_id = changes.id)",
     ]) {
       try { this.sql.exec(ddl); } catch {}
     }
@@ -209,6 +227,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, actor TEXT,
         task_id INTEGER, change_id INTEGER, to_agent TEXT, data TEXT);
       CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, description TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
+      CREATE TABLE IF NOT EXISTS plans (login TEXT PRIMARY KEY, plan TEXT, status TEXT, customer TEXT, subscription TEXT, renews INTEGER, event_at INTEGER, updated_at INTEGER);
+      CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
       CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
         task_id INTEGER, change_id INTEGER, path TEXT, line INTEGER, title TEXT,
@@ -475,6 +496,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!row) {
       const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE via = ?", key.id).one().n as number;
       if (n >= MAX_UNDER_KEY) throw new HttpError(429, `${key.name}'s key already carries ${MAX_UNDER_KEY} named agents; reuse a name, or ask an owner for another key`);
+      this.assertAgentRoom();
       const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
       this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen, joined_via, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         id, name, key.role, hash, Date.now(), Date.now(), key.joined_via ?? null, key.id);
@@ -576,7 +598,52 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const r = this.sql.exec("SELECT jurisdiction FROM projects WHERE name = ?", url.searchParams.get("name")).toArray()[0];
         return json({ exists: !!r, jurisdiction: r?.jurisdiction ?? null });
       }
-      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private })));
+      // Who may create projects beyond LOOM_CREATORS, and who asked to.
+      if (b === "creators") {
+        if (m === "GET") return json(this.sql.exec("SELECT login, added_by, added_at FROM creators ORDER BY added_at").toArray());
+        const login = String(body.login ?? url.searchParams.get("login") ?? "").trim().toLowerCase();
+        if (!login) throw new HttpError(400, "give a GitHub login");
+        if (m === "DELETE") { this.sql.exec("DELETE FROM creators WHERE login = ?", login); return json({ ok: true }); }
+        this.sql.exec("INSERT OR REPLACE INTO creators (login, added_by, added_at) VALUES (?, ?, ?)", login, body.by ?? null, Date.now());
+        this.sql.exec("DELETE FROM waitlist WHERE login = ?", login);
+        return json({ ok: true });
+      }
+      if (b === "waitlist") {
+        if (m === "GET") return json(this.sql.exec("SELECT login, name, asked_at, asks FROM waitlist ORDER BY asked_at").toArray());
+        const login = String(body.login ?? "").trim().toLowerCase();
+        this.sql.exec("INSERT INTO waitlist (login, name, asked_at) VALUES (?, ?, ?) ON CONFLICT(login) DO UPDATE SET asks = asks + 1", login, body.name ?? login, Date.now());
+        return json({ ok: true });
+      }
+      if (m === "GET" && b === "creator") {
+        const login = (url.searchParams.get("login") ?? "").toLowerCase();
+        return json({
+          approved: !!this.sql.exec("SELECT 1 FROM creators WHERE login = ?", login).toArray().length,
+          owns: this.sql.exec("SELECT COUNT(*) AS n FROM projects WHERE owner = ?", login).one().n as number,
+        });
+      }
+      // People's plans (src/billing.ts), set from Stripe's webhooks.
+      if (b === "plan") {
+        if (m === "GET") {
+          const login = (url.searchParams.get("login") ?? "").toLowerCase();
+          const r = this.sql.exec("SELECT login, plan, status, customer, subscription, renews FROM plans WHERE login = ?", login).toArray()[0];
+          const owned = this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", login).toArray();
+          return json({ ...(r ?? { login, plan: "free", status: null, customer: null, subscription: null, renews: null }), owned });
+        }
+        const u = body as PlanRow & { at: number };
+        const r = this.sql.exec("SELECT event_at FROM plans WHERE login = ?", u.login).toArray()[0];
+        // Stripe doesn't promise order: an older event never undoes a newer one.
+        if (r && Number(r.event_at ?? 0) > u.at) return json({ applied: false });
+        this.sql.exec(`INSERT INTO plans (login, plan, status, customer, subscription, renews, event_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          ON CONFLICT(login) DO UPDATE SET plan = excluded.plan, status = excluded.status, customer = COALESCE(excluded.customer, plans.customer),
+          subscription = COALESCE(excluded.subscription, plans.subscription), renews = COALESCE(excluded.renews, plans.renews), event_at = excluded.event_at, updated_at = excluded.updated_at`,
+          u.login, u.plan, u.status, u.customer, u.subscription, u.renews, u.at, Date.now());
+        return json({ applied: true, owned: this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", u.login).toArray() });
+      }
+      if (b === "hidden") {
+        this.sql.exec("UPDATE projects SET hidden = ? WHERE name = ?", body.hidden ? 1 : 0, body.name);
+        return json({ ok: true });
+      }
+      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction, owner, hidden FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private, hidden: !!p.hidden })));
       if (b === "visibility") {
         this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
         return json({ ok: true });
@@ -585,11 +652,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.sql.exec("DELETE FROM projects WHERE name = ?", url.searchParams.get("name"));
         return json({ ok: true });
       }
-      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction) VALUES (?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null);
+      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction, owner) VALUES (?, ?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null, body.owner ? String(body.owner).toLowerCase() : null);
       return json({ ok: true });
     }
 
     if (a === "init" && m === "POST") return json(await this.init(body));
+    // From the Worker when the owner's plan changes; never routed from outside.
+    if (a === "plan" && m === "POST" && url.hostname === "do") {
+      this.setMeta("plan", String(body.plan));
+      return json({ plan: this.meta("plan"), limits: this.limits });
+    }
     // Deleted (or never made): nothing here answers.
     if (!this.meta("project")) throw new HttpError(404, "no such project");
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
@@ -686,6 +758,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     // A new key for the same agent: its id, history and track record stay.
     if (a === "me" && b === "key" && m === "POST") return json(await this.rotateKey(actor, actor.id));
+    if (a === "me" && b === "email") {
+      if (m === "GET") return json(this.emailView(actor));
+      if (m === "POST" && c === "test") return json(await this.testEmail(actor, url.origin));
+      if (m === "POST") return json(this.setEmail(actor, body.email));
+    }
     if (a === "agents" && b && c === "key" && m === "POST") {
       ownerOnly("replace another agent's key");
       return json(await this.rotateKey(actor, this.profile(b).agent.id));
@@ -803,7 +880,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; plan?: ProjectPlan; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     let from: string | null = null;
@@ -834,6 +911,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
         commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
       }
       await w.push({ url: created.remote, token: created.token }, commit);
+      const flat = await w.flatten(commit);
+      this.setMeta("main_tests", String(countTests(flat)));
+      const suggested = await suggestCheck(new Set(flat.keys()), async (p) => { const e = flat.get(p); return e ? w.readText(e.oid) : null; }).catch(() => null);
+      if (suggested) this.setMeta("suggested_check", suggested);
     } catch (e) {
       await this.store.delete(repo).catch(() => {});
       throw e;
@@ -846,6 +927,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.setMeta("required_approvals", String(body.requiredApprovals ?? 1));
     this.setMeta("visibility", body.visibility === "private" ? "private" : "public");
     if (body.checks) this.setChecks(body.checks);
+    if (body.plan) this.setMeta("plan", body.plan);
     this.setMeta("main_head", commit);
     if (imported) this.setMeta("imported_from", JSON.stringify(imported));
     this.emit("project.created", { data: { name, commit, owner: body.owner?.login ?? null, jurisdiction: this.jurisdiction, importedFrom: imported } });
@@ -890,6 +972,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async addAgent(name: string, role: Role, by: string | null = null) {
     if (!name?.trim()) throw new HttpError(400, "name is required");
+    this.assertAgentRoom();
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
     const key = `loom_${randomId(20)}`;
     this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", id, name, role, await sha256(key), Date.now(), Date.now());
@@ -964,6 +1047,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.emit("agent.key_rotated", { actor: actor.id, to: agentId, data: { by: actor.name } });
     return { id: row.id, name: row.name, role: row.role, key };
   }
+
+  /** A project holds at most LOOM_MAX_AGENTS agents (default 300), so one project can't grow without bound on the server's bill. */
+  private assertAgentRoom() {
+    const max = this.limits.agents;
+    if (!(max > 0)) return;
+    const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", DELEGATE_ID, REVIEW_AGENT_ID).one().n as number;
+    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most its plan allows; reuse an agent's key${this.meta("plan") === "free" ? ", or its owner can move to Loom Pro" : ", or ask whoever runs this server"}`);
+  }
+
+  /** What this project may use: from its owner's plan, or the server's limits. */
+  private get limits() { return projectLimits(this.env, this.meta("plan")); }
 
   // ── people: GitHub sign-in, owners and members ───────────────────────────
 
@@ -1612,7 +1706,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       author: this.agentName(ch.agent_id) ?? ch.agent_id,
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
-      checks: ch.checks, checksConfigured: !!this.checks,
+      checks: ch.checks, checksConfigured: !!this.checks, mainHasTests: this.mainTests !== 0,
       othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id)).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
@@ -1683,6 +1777,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ch = this.change(id);
     if (!["approve", "request_changes", "comment"].includes(body.verdict)) throw new HttpError(400, "verdict must be approve, request_changes or comment");
     if (ch.agent_id === actor.id) throw new HttpError(403, "agents cannot review their own change");
+    // A review can't change what already happened; it used to flip merged and
+    // closed changes to "changes requested" (and cost the author a landed change).
+    if (["merged", "merging", "closed", "abandoned"].includes(ch.status)) {
+      throw new HttpError(409, `change ${id} is ${ch.status}, so a review can't change it${ch.status === "merged" ? "; if something in it needs fixing, create_task for the fix" : ""}`);
+    }
     const comments = (body.comments ?? []).filter((x) => x && x.path && x.body);
     this.sql.exec("INSERT INTO reviews (change_id, reviewer, verdict, body, comments, head, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
       id, actor.id, body.verdict, body.body ?? "", JSON.stringify(comments), ch.head, Date.now());
@@ -1710,7 +1809,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const paths = body.comments?.length ? [...new Set(body.comments.map((x) => x.path))] : (ch.files as FileChange[]).map((f) => f.path);
         this.recordDecision("review", actor, { question: `Change #${id}: ${ch.title}`, decision: body.body, paths, task: ch.task_id, change: id });
       }
-    } else if (body.verdict === "approve" && ch.status === "review") {
+    } else if (ch.status === "review") {
+      // An approval, or the last reviewer still at it finishing with a comment.
       await this.maybeEnqueue(id);
     }
     const now = this.change(id);
@@ -1719,6 +1819,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       : now.status === "changes_requested" ? "Sent back to the author."
       : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
       : approval.humanNeeded ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).`
+      : approval.reviewing.length && approval.weight >= approval.needed ? `Approved; it merges once ${approval.reviewing.join(", ")} finish${approval.reviewing.length === 1 ? "es" : ""} reviewing (or their time runs out).`
       : approval.openThreads && approval.weight >= approval.needed ? `Approved, but ${approval.openThreads} review thread${approval.openThreads === 1 ? "" : "s"} must be resolved before it merges.`
       : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
     return { recorded: { change: id, verdict: body.verdict, atHead: ch.head }, id, status: now.status, approval, threads, next };
@@ -1776,7 +1877,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const guarded = this.guardedFiles(ch.files);
     const humanNeeded = guarded.length > 0 && !approvers.some((a) => a.human);
     const openThreads = this.threadsMustResolve ? this.openBlockingThreads(id) : 0;
-    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, ok: weight >= needed && !humanNeeded && !openThreads };
+    // An agent that said it's reviewing gets to finish (until its deadline):
+    // in gemma-4-kaggle a change merged a second after its first approval
+    // while three reviewers who would have caught its bug were still at it.
+    const reviewing = this.sql.exec(`SELECT r.reviewer FROM review_requests r JOIN agents a ON a.id = r.reviewer
+        WHERE r.change_id = ? AND r.status = 'accepted' AND a.role != 'human' AND r.deadline > ?`, id, Date.now()).toArray()
+      .map((r) => this.agentName(r.reviewer as string) ?? (r.reviewer as string));
+    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, reviewing, ok: weight >= needed && !humanNeeded && !openThreads && !reviewing.length };
   }
 
   /** A person-readable track record and the weight it earns. */
@@ -2089,6 +2196,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.setMeta("main_version", String(version));
       this.setMeta("main_head", commit);
       this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, batch: landed.length } });
+      if (files.some((f) => isTest(f.path))) this.mainTestsStale = true;
       this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
       await this.notesFromContext(ch).catch((e) => console.error("notes", e));
       this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", Date.now(), ch.id);
@@ -2116,7 +2224,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = new Map<string, { bytes: Uint8Array; mode: string }>();
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
     const { command, timeoutSec } = this.checks!;
-    return runCheck(this.env, this.project, files, command, timeoutSec);
+    const day = new Date().toISOString().slice(0, 10);
+    const budget = this.limits.checkMinutes * 60_000;
+    const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
+    if (budget > 0 && used >= budget) throw new CheckBudgetError(budget / 60_000, Date.parse(`${day}T00:00:00Z`) + 86_400_000);
+    const r = await runCheck(this.env, this.project, files, command, timeoutSec);
+    this.setMeta(`checks_ms:${day}`, String(used + r.ms));
+    return r;
   }
 
   /**
@@ -2190,7 +2304,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       commit = await w.commit(merged.tree, [main, head], "checks", MERGE_IDENTITY);
       note = "Ran on main with your workspace merged in: what would land.";
     } else if (merged) note = "Your workspace conflicts with main, so this ran on your workspace alone; sync_workspace before you submit.";
-    const r = await this.checkCommit(w, commit);
+    const r = await this.checkCommit(w, commit).catch((e) => { throw e instanceof CheckBudgetError ? new HttpError(429, e.message) : e; });
     this.emit("checks.ran", { actor: actor.id, task: taskId, data: { ok: r.ok, command: r.command, ms: r.ms } });
     return { ...r, note };
   }
@@ -2297,6 +2411,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async retryMerge(ids: number[], e: any) {
+    if (e instanceof CheckBudgetError) {
+      // Out of check minutes for today: hold the queue until tomorrow (UTC), and say so once.
+      for (const id of ids) this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", e.until, id);
+      if (this.meta("checks_budget_hit") !== String(e.until)) {
+        this.setMeta("checks_budget_hit", String(e.until));
+        this.emit("checks.budget", { data: { minutes: e.minutes, until: e.until, waiting: ids, advice: e.message } });
+      }
+      return;
+    }
     console.error("merge failed", e);
     for (const id of ids) {
       this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + 5000, id);
@@ -2911,11 +3034,31 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { items, known: items.map((i) => i.id).join("."), newCount: items.filter((i) => i.new).length };
   }
 
+  /**
+   * How many test files main has: null until counted. A project with none
+   * hears it once, on the project, instead of on every change's brief.
+   */
+  private mainTestsStale = false;
+  private countingTests = false;
+  private get mainTests(): number | null {
+    const v = this.meta("main_tests");
+    if ((v === null || this.mainTestsStale) && !this.countingTests && this.meta("main_head")) {
+      this.countingTests = true;
+      this.mainTestsStale = false;
+      this.ctx.waitUntil((async () => {
+        const w = await Workspace.open(this.remote(this.mainRepo, await this.token(this.mainRepo, "read")));
+        this.setMeta("main_tests", String(countTests(await w.flatten(this.meta("main_head")))));
+      })().catch((e) => console.error("count tests", e)).finally(() => { this.countingTests = false; }));
+    }
+    return v === null ? null : Number(v);
+  }
+
   private notifyPending = false;
   /** Check stand-in webhooks shortly, once for a burst of events. */
   private notifySoon() {
     if (this.notifyPending) return;
-    if (!this.sql.exec("SELECT 1 FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL LIMIT 1").toArray().length) return;
+    if (!this.sql.exec("SELECT 1 FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL LIMIT 1").toArray().length
+      && !(this.mailer && this.sql.exec("SELECT 1 FROM agents WHERE role = 'human' AND email IS NOT NULL LIMIT 1").toArray().length)) return;
     this.notifyPending = true;
     this.ctx.waitUntil(new Promise((r) => setTimeout(r, 1500))
       .then(() => { this.notifyPending = false; return this.notifyWatchers(); })
@@ -2925,7 +3068,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** POST what newly needs a person to each stand-in's webhook. Each item goes once while it stays open. */
   private async notifyWatchers() {
     const hooks = this.sql.exec("SELECT * FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL").toArray();
-    if (!hooks.length) return;
+    const emails = this.mailer ? this.sql.exec("SELECT id, name, email, email_seen, emailed_at FROM agents WHERE role = 'human' AND email IS NOT NULL").toArray() : [];
+    if (!hooks.length && !emails.length) return;
     const origin = this.meta("origin") ?? "";
     const all = this.attention(this.agentStates());
     for (const h of hooks) {
@@ -2937,6 +3081,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE standins SET seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), h.id);
       if (fresh.length) await this.deliver(h, fresh.map((i) => ({ ...i, new: true })), origin);
     }
+    for (const p of emails) await this.emailPerson(p, all, origin);
     // Stuck work needs no event to need a person, so look again in a while.
     await this.armAlarm(Date.now() + 5 * 60_000);
   }
@@ -2957,6 +3102,63 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     this.sql.exec("UPDATE standins SET last_delivery = ? WHERE id = ?", JSON.stringify({ ...result, items: items.length }), h.id);
     return result;
+  }
+
+  // ── email: tell a person when something needs them ──────────────────────
+
+  /** Cloudflare Email Service, when the Worker has a send_email binding and a from address. */
+  private get mailer() { return this.env.EMAIL && this.env.LOOM_EMAIL_FROM ? this.env.EMAIL : null; }
+
+  /** What needs this person: everything open for people, less reviews and tasks meant for someone else. */
+  private attentionFor(person: string, all: any[]) {
+    return all.filter((i) => i.kind === "review" ? i.reviewer === person : i.kind === "task" ? i.person === person : true);
+  }
+
+  private emailView(actor: Agent) {
+    const r = this.sql.exec("SELECT email, emailed_at FROM agents WHERE id = ?", actor.id).toArray()[0];
+    return { email: (r?.email as string) ?? null, lastSent: (r?.emailed_at as number) ?? null, sending: !!this.mailer };
+  }
+
+  private setEmail(actor: Agent, email: unknown) {
+    if (actor.role !== "human" || actor.standin || actor.id === "admin") throw new HttpError(403, "only people get email, and they set it for themselves");
+    const e = email == null ? "" : String(email).trim();
+    if (e && (e.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) throw new HttpError(400, "give an email address, e.g. you@example.com");
+    // What already waits counts as sent, so turning email on doesn't start with a flood.
+    const seen = this.attentionFor(actor.id, this.attention(this.agentStates())).map((i) => shortKey(itemKey(i)));
+    this.sql.exec("UPDATE agents SET email = ?, email_seen = ?, emailed_at = NULL WHERE id = ?", e || null, JSON.stringify(seen), actor.id);
+    this.emit(e ? "member.email_on" : "member.email_off", { actor: actor.id, to: actor.id, data: {} });
+    return this.emailView(actor);
+  }
+
+  /** One email for what newly needs a person, at most every EMAIL_GAP; each item goes once while it stays open. */
+  private async emailPerson(p: Record<string, SqlStorageValue>, all: any[], origin: string) {
+    const actor: Agent = { id: p.id as string, name: p.name as string, role: "human" };
+    const items = this.attentionFor(actor.id, all).map((i) => this.feedItem(i, actor, origin));
+    const seen = new Set(JSON.parse((p.email_seen as string) ?? "[]"));
+    const fresh = items.filter((i) => !seen.has(i.id));
+    // Closed items drop out of seen, so they'd go again if they come back.
+    if (!fresh.length) { this.sql.exec("UPDATE agents SET email_seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), actor.id); return; }
+    if (p.emailed_at && Date.now() - (p.emailed_at as number) < EMAIL_GAP) return; // the next sweep sends them
+    const mail = needsYouEmail(this.project, actor.name, fresh, items.length, origin);
+    try {
+      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to: p.email as string, ...mail });
+      this.sql.exec("UPDATE agents SET email_seen = ?, emailed_at = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), Date.now(), actor.id);
+    } catch (e: any) {
+      console.error("email", String(e?.message ?? e));
+    }
+  }
+
+  private async testEmail(actor: Agent, origin: string) {
+    const to = this.emailView(actor).email;
+    if (!to) throw new HttpError(400, "set your email first");
+    if (!this.mailer) throw new HttpError(503, "this server can't send email yet: it needs a send_email binding named EMAIL and LOOM_EMAIL_FROM");
+    const item = { id: "test", kind: "test", text: `Test from Loom: you'll hear here when something on ${this.project} needs you.`, url: `${origin}/?project=${this.project}`, youCan: null, detail: {} };
+    try {
+      const r = await this.mailer.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to, ...needsYouEmail(this.project, actor.name, [item], 1, origin) });
+      return { sent: true, to, messageId: (r as any)?.messageId ?? null };
+    } catch (e: any) {
+      throw new HttpError(502, `couldn't send: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
   }
 
   private async testStandin(actor: Agent, id: string, origin: string) {
@@ -3072,7 +3274,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -3386,7 +3588,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!this.modelOptions.intent) return;
     const ch = this.change(id);
     const intent = this.sql.exec("SELECT description, paths FROM intents WHERE task_id = ?", ch.task_id).toArray().map((i) => `${i.description || "(no description)"} (${JSON.parse(i.paths as string).join(", ")})`).join("; ");
-    const v = await checkIntent(await this.judge(), { title: ch.title, summary: ch.summary ?? "", intent, patch }).catch(() => null);
+    // Agents rarely describe their intents; the task says what the work is.
+    const t = ch.task_id ? this.sql.exec("SELECT title, description FROM tasks WHERE id = ?", ch.task_id).toArray()[0] : null;
+    const task = t ? `${t.title}${t.description ? `\n${String(t.description).slice(0, 4000)}` : ""}` : "";
+    const v = await checkIntent(await this.judge(), { title: ch.title, summary: ch.summary ?? "", task, intent, patch }).catch(() => null);
     if (!v) return;
     this.sql.exec("UPDATE changes SET intent_check = ? WHERE id = ?", JSON.stringify({ ...v, head: ch.head, at: Date.now() }), id);
     if (v.score < 0.5) this.emit("change.off_intent", { change: id, task: ch.task_id, to: ch.agent_id, data: { score: v.score, model: v.model, intent } });
@@ -3459,6 +3664,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE review_requests SET status = 'declined', answered_at = ?, seen_at = COALESCE(seen_at, ?) WHERE change_id = ? AND reviewer = ?", now, now, id, actor.id);
       this.emit("review.declined", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { reason: body.reason ?? "" } });
       this.reroute(id, `${actor.name} declined${body.reason ? `: ${body.reason}` : ""}`);
+      if (r.status === "accepted") void this.maybeEnqueue(id);
     }
     return { requested: this.reviewRequests(id) };
   }
@@ -3613,6 +3819,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE review_requests SET status = 'expired' WHERE change_id = ? AND reviewer = ?", r.change_id, r.reviewer);
       const who = this.agentName(r.reviewer as string);
       this.reroute(r.change_id as number, r.status === "open" ? `${who} didn't answer` : `${who} accepted but didn't review in time`);
+      if (r.status === "accepted") void this.maybeEnqueue(r.change_id as number);
     }
     return this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
   }

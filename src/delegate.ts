@@ -395,16 +395,18 @@ export async function rankReviewers(
 /** How likely a change's diff does what its agent declared it would, and nothing else. */
 export async function checkIntent(
   judge: Judge,
-  c: { title: string; summary: string; intent: string; patch: string },
+  c: { title: string; summary: string; task?: string; intent: string; patch: string },
 ): Promise<{ score: number; model: string } | null> {
-  if (!judge.provider || !c.intent.trim()) return null;
+  // Nothing to judge against but a list of files: the check would only say the diff does more than that.
+  const described = (c.task ?? "").trim() || c.intent.replace(/\(no description\)|\([^)]*\)/g, "").replace(/[;\s]/g, "");
+  if (!judge.provider || !c.intent.trim() || !described) return null;
   const res = await systemOne(judge, {
-    change: { title: c.title, summary: c.summary, intent: c.intent, diff: c.patch.slice(0, 12_000) },
+    change: { task: c.task ?? "", title: c.title, summary: c.summary, intent: c.intent, diff: c.patch.slice(0, 12_000) },
   }, {
     on_intent: {
       type: "noul",
-      instructions: "Does `change.diff` do what the agent declared in `change.intent`, and nothing beyond it?",
-      criteria: { true: "Every edit serves the declared intent", false: "The diff does something the intent doesn't describe, or doesn't do what it declared" },
+      instructions: "Does `change.diff` do the work `change.task` asks for, within what the agent declared in `change.intent` (a description and the files it would touch), and nothing beyond it? Edits that the task's work needs (wiring, imports, a test) serve it.",
+      criteria: { true: "Every edit serves the task and the declared intent", false: "The diff does something neither the task nor the intent covers, or doesn't do what they ask" },
     },
   });
   if (!res.ok) return null;

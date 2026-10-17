@@ -233,6 +233,23 @@ async function runCheck(req, res) {
 // A stand-in for the Messages API, for Loom's review agent in local
 // development: it approves, unless the diff contains LOOM-TEST-BUG, which it
 // asks to fix in a blocking comment on that line.
+// A stand-in for the two Stripe calls Loom makes (Checkout and the billing
+// portal). Tests then post signed webhooks to Loom themselves.
+async function stripeStandIn(req, res, url) {
+  const chunks = [];
+  for await (const c of req) chunks.push(c);
+  const params = new URLSearchParams(Buffer.concat(chunks).toString("utf8"));
+  if (!/^Bearer sk_test_/.test(req.headers.authorization ?? "")) return send(res, 401, { error: { message: "Invalid API Key provided" } });
+  const id = randomBytes(6).toString("hex");
+  if (url.pathname === "/stripe/v1/checkout/sessions") {
+    return send(res, 200, { id: `cs_test_${id}`, url: `${base()}/stripe/pay/cs_test_${id}?login=${encodeURIComponent(params.get("client_reference_id") ?? "")}&success=${encodeURIComponent(params.get("success_url") ?? "")}`, mode: params.get("mode") });
+  }
+  if (url.pathname === "/stripe/v1/billing_portal/sessions") {
+    return send(res, 200, { id: `bps_${id}`, url: `${base()}/stripe/portal/${params.get("customer")}?return=${encodeURIComponent(params.get("return_url") ?? "")}` });
+  }
+  send(res, 404, { error: { message: "no such Stripe route in the shim" } });
+}
+
 async function reviewStandIn(req, res) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -262,6 +279,7 @@ createServer((req, res) => {
     if (url.pathname.startsWith("/repos")) return api(req, res, url).catch(done);
     if (url.pathname === "/checks/run" && req.method === "POST") return runCheck(req, res).catch(done);
     if (url.pathname === "/anthropic/v1/messages" && req.method === "POST") return reviewStandIn(req, res).catch(done);
+    if (url.pathname.startsWith("/stripe/v1/") && req.method === "POST") return stripeStandIn(req, res, url).catch(done);
     send(res, 200, { service: "artifacts-shim", repos: REPOS });
   } catch (e) {
     done(e);
