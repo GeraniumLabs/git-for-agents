@@ -93,3 +93,21 @@ export async function openIssues(gh: GitHubRepo, opts: { token?: string; api?: s
   }
   return out;
 }
+
+/**
+ * Whether GitHub shows a repository to this token (or to anyone, without one).
+ * "hidden" is GitHub's 404 for a private repository it won't show, or one that
+ * doesn't exist; "denied" is a token GitHub no longer accepts.
+ */
+export async function repoVisible(gh: GitHubRepo, opts: { token?: string; api?: string } = {}): Promise<"ok" | "hidden" | "denied" | "unknown"> {
+  const api = (opts.api ?? "https://api.github.com").replace(/\/$/, "");
+  const headers: Record<string, string> = { accept: "application/vnd.github+json", "user-agent": "loom-import", "x-github-api-version": "2022-11-28" };
+  if (opts.token) headers.authorization = `Bearer ${opts.token}`;
+  const res = await fetch(`${api}/repos/${gh.owner}/${gh.repo}`, { headers }).catch(() => null);
+  if (!res) return "unknown";
+  await res.body?.cancel();
+  if (res.ok) return "ok";
+  if (res.status === 404) return "hidden";
+  if (res.status === 401) return "denied";
+  return "unknown";
+}

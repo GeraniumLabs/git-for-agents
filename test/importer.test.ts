@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createServer } from "node:http";
-import { githubRepo, issueTask, openIssues, sourceUrl } from "../src/importer";
+import { githubRepo, issueTask, openIssues, repoVisible, sourceUrl } from "../src/importer";
 
 test("import URLs: https only, no credentials, GitHub normalized to its clone URL", () => {
   assert.equal(sourceUrl("https://github.com/acme/widgets"), "https://github.com/acme/widgets.git");
@@ -41,6 +41,27 @@ test("open issues are paged, and pull requests are left out", async () => {
     assert.ok(all.every((i) => !i.title.startsWith("PR")));
     assert.match(seen[0], /\/repos\/a\/b\/issues\?state=open.*page=1 Bearer tok/);
     assert.equal((await openIssues({ owner: "a", repo: "b" }, { api, limit: 5 })).length, 5);
+  } finally {
+    server.close();
+  }
+});
+
+test("whether GitHub shows a repository: to anyone, to a token, or not at all", async () => {
+  const server = createServer((req, res) => {
+    const auth = req.headers.authorization;
+    const status = req.url === "/repos/a/open" ? 200 : auth === "Bearer stale" ? 401 : req.url === "/repos/a/secret" && auth === "Bearer good" ? 200 : req.url === "/repos/a/limited" ? 403 : 404;
+    res.writeHead(status, { "content-type": "application/json" });
+    res.end("{}");
+  });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const api = `http://127.0.0.1:${(server.address() as any).port}`;
+  try {
+    assert.equal(await repoVisible({ owner: "a", repo: "open" }, { api }), "ok");
+    assert.equal(await repoVisible({ owner: "a", repo: "secret" }, { api }), "hidden");
+    assert.equal(await repoVisible({ owner: "a", repo: "secret" }, { api, token: "good" }), "ok");
+    assert.equal(await repoVisible({ owner: "a", repo: "secret" }, { api, token: "other" }), "hidden");
+    assert.equal(await repoVisible({ owner: "a", repo: "secret" }, { api, token: "stale" }), "denied");
+    assert.equal(await repoVisible({ owner: "a", repo: "limited" }, { api }), "unknown");
   } finally {
     server.close();
   }
