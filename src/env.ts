@@ -31,6 +31,8 @@ export interface Env {
   STRIPE_WEBHOOK_SECRET?: string;
   /** A Stripe price for Loom Pro; without one, Checkout uses $10 a month. */
   STRIPE_PRICE_ID?: string;
+  /** A customer portal configuration for Loom, when the account's default isn't the one to show. */
+  STRIPE_PORTAL_CONFIGURATION?: string;
   /** Tests point this at a stand-in. Defaults to https://api.stripe.com. */
   STRIPE_API_URL?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */

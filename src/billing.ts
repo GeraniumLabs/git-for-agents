@@ -9,6 +9,13 @@
 import type { Env } from "./env";
 
 export type PlanName = "free" | "pro";
+
+/**
+ * Loom's mark on its Checkout sessions and subscriptions. A Stripe account
+ * can sell other things too, and its webhooks then carry their events as
+ * well; Loom acts only on events that carry this.
+ */
+export const APP = "loom";
 /** A project's plan: its creator's, or "unlimited" for the server's owners and the admin. */
 export type ProjectPlan = PlanName | "unlimited";
 
@@ -89,8 +96,8 @@ export async function checkoutSession(env: Env, login: string, customer: string 
     line_items: { 0: price },
     client_reference_id: login,
     ...(customer ? { customer } : {}),
-    metadata: { login },
-    subscription_data: { metadata: { login } },
+    metadata: { app: APP, login },
+    subscription_data: { metadata: { app: APP, login } },
     allow_promotion_codes: "true",
     success_url: `${origin}${back}${back.includes("?") ? "&" : "?"}billing=done`,
     cancel_url: `${origin}${back}`,
@@ -100,7 +107,7 @@ export async function checkoutSession(env: Env, login: string, customer: string 
 
 /** Stripe's own page for changing the card, seeing invoices or cancelling. */
 export async function portalSession(env: Env, customer: string, returnUrl: string): Promise<string> {
-  return (await stripe<{ url: string }>(env, "POST", "billing_portal/sessions", { customer, return_url: returnUrl })).url;
+  return (await stripe<{ url: string }>(env, "POST", "billing_portal/sessions", { customer, return_url: returnUrl, configuration: env.STRIPE_PORTAL_CONFIGURATION })).url;
 }
 
 const hex = (b: ArrayBuffer) => [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
@@ -130,11 +137,13 @@ export async function verifyStripe(secret: string, header: string | null, body: 
 export function planUpdate(event: any): (PlanRow & { at: number }) | null {
   const o = event?.data?.object ?? {};
   if (event?.type === "checkout.session.completed" && o.mode === "subscription") {
-    const login = String(o.client_reference_id ?? o.metadata?.login ?? "").toLowerCase();
+    if (o.metadata?.app !== APP) return null;
+    const login = String(o.metadata?.login ?? o.client_reference_id ?? "").toLowerCase();
     if (!login) return null;
     return { login, plan: "pro", status: "active", customer: o.customer ?? null, subscription: o.subscription ?? null, renews: null, at: Number(event.created ?? 0) };
   }
   if (["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"].includes(event?.type)) {
+    if (o.metadata?.app !== APP) return null;
     const login = String(o.metadata?.login ?? "").toLowerCase();
     if (!login) return null;
     const status = event.type === "customer.subscription.deleted" ? "canceled" : String(o.status ?? "");

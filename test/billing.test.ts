@@ -18,14 +18,17 @@ test("a webhook is accepted only with a fresh, matching signature", async () => 
 });
 
 test("checkout makes a person Pro; a subscription's status keeps or ends it", () => {
-  assert.deepEqual(planUpdate({ type: "checkout.session.completed", created: 5, data: { object: { mode: "subscription", client_reference_id: "Mia", customer: "cus_1", subscription: "sub_1" } } }),
+  assert.deepEqual(planUpdate({ type: "checkout.session.completed", created: 5, data: { object: { mode: "subscription", client_reference_id: "Mia", metadata: { app: "loom" }, customer: "cus_1", subscription: "sub_1" } } }),
     { login: "mia", plan: "pro", status: "active", customer: "cus_1", subscription: "sub_1", renews: null, at: 5 });
-  const sub = (type: string, status: string) => planUpdate({ type, created: 6, data: { object: { id: "sub_1", status, customer: "cus_1", metadata: { login: "mia" }, current_period_end: 100 } } });
+  const sub = (type: string, status: string) => planUpdate({ type, created: 6, data: { object: { id: "sub_1", status, customer: "cus_1", metadata: { app: "loom", login: "mia" }, current_period_end: 100 } } });
   assert.equal(sub("customer.subscription.updated", "past_due")!.plan, "pro");
   assert.equal(sub("customer.subscription.updated", "unpaid")!.plan, "free");
   assert.equal(sub("customer.subscription.deleted", "active")!.plan, "free");
   assert.equal(sub("customer.subscription.updated", "active")!.renews, 100_000);
   assert.equal(planUpdate({ type: "invoice.paid", data: { object: {} } }), null);
+  // Other products on the same Stripe account send their events too.
+  assert.equal(planUpdate({ type: "checkout.session.completed", data: { object: { mode: "subscription", client_reference_id: "uid123", customer: "cus_9" } } }), null);
+  assert.equal(planUpdate({ type: "customer.subscription.updated", data: { object: { id: "sub_9", status: "active", metadata: { login: "mia", app: "lifesheet" } } } }), null);
 });
 
 test("a project's limits come from its plan only when the server takes payments", () => {

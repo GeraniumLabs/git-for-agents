@@ -868,7 +868,7 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
 
   assert.equal((await fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": "t=1,v1=00" }, body: "{}" })).status, 400);
   const created = Math.floor(Date.now() / 1000);
-  await webhook({ type: "checkout.session.completed", created, data: { object: { mode: "subscription", client_reference_id: login, customer: "cus_e2e", subscription: "sub_e2e" } } });
+  await webhook({ type: "checkout.session.completed", created, data: { object: { mode: "subscription", client_reference_id: login, metadata: { app: "loom", login }, customer: "cus_e2e", subscription: "sub_e2e" } } });
   const pro = await (await as("GET", "/api/billing")).json();
   assert.equal(pro.plan, "pro");
   assert.equal(pro.manage, true);
@@ -878,9 +878,9 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   assert.equal(ov.project.limits.checkMinutes, 300, "the project they already had moved to Pro's limits");
 
   // An older event arriving late doesn't undo a newer one; cancelling does end it.
-  await webhook({ type: "customer.subscription.updated", created: created - 10, data: { object: { id: "sub_e2e", status: "incomplete", customer: "cus_e2e", metadata: { login } } } });
+  await webhook({ type: "customer.subscription.updated", created: created - 10, data: { object: { id: "sub_e2e", status: "incomplete", customer: "cus_e2e", metadata: { app: "loom", login } } } });
   assert.equal((await (await as("GET", "/api/billing")).json()).plan, "pro");
-  await webhook({ type: "customer.subscription.deleted", created: created + 10, data: { object: { id: "sub_e2e", status: "canceled", customer: "cus_e2e", metadata: { login } } } });
+  await webhook({ type: "customer.subscription.deleted", created: created + 10, data: { object: { id: "sub_e2e", status: "canceled", customer: "cus_e2e", metadata: { app: "loom", login } } } });
   assert.equal((await (await as("GET", "/api/billing")).json()).plan, "free");
   assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.checkMinutes, 30);
 });
