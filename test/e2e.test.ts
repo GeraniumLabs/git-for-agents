@@ -672,3 +672,17 @@ test("an owner deletes a project: its repositories, attachments and listing go, 
   assert.equal(fresh.tasks?.length ?? 0, 0);
   assert.equal((await repos()).length, 1);
 });
+
+test("a write with no message is committed under the task's title, not a generic one", { skip: !url, timeout: 60_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-commitmsg");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "commit messages", files: SEED });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Add a health route", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "health.txt": "ok" });
+  const log = await admin.req("GET", `/commits?workspace=${ws}&limit=1`);
+  assert.equal(log.commits[0].message.split("\n")[0], `Add a health route (task #${t.id})`);
+});

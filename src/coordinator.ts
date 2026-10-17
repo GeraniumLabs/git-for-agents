@@ -1155,7 +1155,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const remote = this.remote(name, await this.token(name, "write"));
     const w = await Workspace.open(remote);
     const parent = await w.head();
-    const commit = await w.commitFiles(parent, files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const task = ws.task_id ? this.sql.exec("SELECT title FROM tasks WHERE id = ?", ws.task_id).toArray()[0] : null;
+    const message = body.message?.trim() || (task ? `${task.title} (task #${ws.task_id})` : `Update ${Object.keys(files).slice(0, 3).join(", ")}${Object.keys(files).length > 3 ? ` and ${Object.keys(files).length - 3} more` : ""}`);
+    const commit = await w.commitFiles(parent, files, message, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
     this.setMeta(`pushed:${name}`, commit);
     await w.push(remote, commit);
     this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(files), message: body.message } });
@@ -3195,7 +3197,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const d = JSON.parse(e.data as string);
       items.push({ kind: "stuck", reason: "directive not acknowledged", detail: `“${d.body}”`, directive: e.seq, by: e.actor, agents: missing, since: e.ts });
     }
-    for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
+    // A task whose change waits on reviewers isn't held by its author: that change is listed above.
+    const waitingOnReview = (a: { task: { id: number; status: string | null } | null }) => a.task?.status === "in_review"
+      && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status = 'changes_requested' LIMIT 1", a.task.id).toArray().length;
+    for (const a of agents.filter((a) => (a.state === "quiet" || (a.state === "paused" && a.task)) && !waitingOnReview(a))) {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
@@ -3491,7 +3496,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ch = this.change(id);
     if (!["review", "changes_requested"].includes(ch.status)) return;
     const asked = new Set(this.reviewRequests(id).map((r) => r.reviewer as string));
-    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent)).sort((x, y) => Number(y.present) - Number(x.present) || y.score - x.score)[0];
+    // Only agents who are around: asking absent ones walks the whole roster one
+    // deadline at a time. With nobody around, the review stays an open task (and
+    // shows as stuck) until someone comes back and takes it.
+    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent) && c.present).sort((x, y) => y.score - x.score)[0];
     this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: next?.agent ?? null, toName: next?.name ?? null } });
     if (next) this.assignReviewer(id, next.agent, "loom", `${next.reasons[0]} (${why})`);
   }
