@@ -764,3 +764,36 @@ test("a change doesn't merge while an agent who took its review is still reviewi
   await assert.rejects(rex.req("POST", `/changes/${ch.id}/reviews`, { verdict: "request_changes", body: "too late" }), /merged/);
   assert.equal((await admin.change(ch.id)).status, "merged", "a late review doesn't rewrite it");
 });
+
+test("a person who turns on email hears when something needs them, once, with a link to approve it", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-email");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "email", files: SEED, requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { protectedPaths: ["src/db.js"], reviewAgent: { enabled: false } });
+  await admin.req("POST", "/members", { login: "mia" });
+  const signin = await fetch(`${url}/auth/dev?login=mia`, { redirect: "manual" });
+  const cookie = (signin.headers.get("set-cookie") ?? "").split(";")[0];
+  const mia = (method: string, path: string, body?: unknown) => fetch(`${url}/api/projects/${name}${path}`, { method, headers: { cookie, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then(async (r) => ({ status: r.status, ...(await r.json()) }));
+
+  assert.equal((await admin.req("POST", "/me/email", { email: "a@b.co" }).catch((e: Error) => e.message)).toString().includes("403"), true);
+  assert.equal((await mia("POST", "/me/email", { email: "not an address" })).status, 400);
+  const on = await mia("POST", "/me/email", { email: "mia@example.com" });
+  assert.equal(on.email, "mia@example.com");
+  assert.equal(on.sending, true);
+  assert.equal((await mia("POST", "/me/email/test", {})).sent, true);
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim\n" }, "trim");
+  await ada.submit(t.id, t.title, "Trim", { plan: ["trim"], tested: ["by hand"] });
+  let sent = null;
+  for (let i = 0; i < 20 && !sent; i++) { await new Promise((r) => setTimeout(r, 500)); sent = (await mia("GET", "/me/email")).lastSent; }
+  assert.ok(sent, "an email went out for the protected change");
+
+  const off = await mia("POST", "/me/email", { email: null });
+  assert.equal(off.email, null);
+});

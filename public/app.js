@@ -967,7 +967,8 @@ try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.re
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  try { [s, people, si] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] }))]); } catch { return; }
+  let mail = null;
+  try { [s, people, si, mail] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null]); } catch { return; }
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
@@ -1003,6 +1004,9 @@ async function showSettings() {
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
+    ${mail ? `<h2>Email me</h2>
+    <p class="meta">${mail.email ? `Loom emails <b>${esc(mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : `Get an email when something on ${esc(project)} needs you, with a link straight to it.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
+    <div class="row"><input id="mail-to" type="email" class="grow" placeholder="you@example.com" value="${esc(mail.email ?? "")}"><button class="ghost" id="mail-save">${mail.email ? "Save" : "Turn on"}</button>${mail.email ? `<button class="ghost" id="mail-off">Turn off</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : ""}</div>` : ""}
     <h2>Your agent</h2>
     <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
@@ -1101,6 +1105,19 @@ async function showSettings() {
     try { const r = await act("POST", "/settings", { reviewAgent: { enabled: $("#review-agent-on").checked, afterMinutes: Number($("#review-agent-after").value) } }); state.project.reviewAgent = { ...state.project.reviewAgent, ...r.reviewAgent }; } catch { return; }
     toast(state.project.reviewAgent.enabled ? "Review agent on" : "Review agent off");
     showSettings();
+  };
+  if ($("#mail-save")) $("#mail-save").onclick = async () => {
+    try { await act("POST", "/me/email", { email: $("#mail-to").value }); } catch { return; }
+    toast($("#mail-to").value.trim() ? "Email on" : "Email off");
+    showSettings();
+  };
+  if ($("#mail-off")) $("#mail-off").onclick = async () => {
+    try { await act("POST", "/me/email", { email: null }); } catch { return; }
+    toast("Email off");
+    showSettings();
+  };
+  if ($("#mail-test")) $("#mail-test").onclick = async () => {
+    try { const r = await act("POST", "/me/email/test", {}); toast(`Sent to ${r.to}`); } catch { return; }
   };
   if ($("#q-save")) $("#q-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { questions: { maxOpen: Number($("#q-max").value), deadlineMinutes: Number($("#q-deadline").value) } }); state.project.questions = r.questions; } catch { return; }
@@ -1451,13 +1468,13 @@ function showTask(id) {
 
 /** The dashboard, or a change or contest on its own page, from the URL. */
 function route() {
-  const m = /^#(change|contest|task)\/(\d+)$/.exec(location.hash);
+  const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!m);
   $("#review").hidden = !m;
   if (!m) { review = null; $("#review").innerHTML = ""; return; }
   if ($("#detail").open) $("#detail").close();
   window.scrollTo(0, 0);
-  if (m[1] === "change") loadReview(Number(m[2])); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
+  if (m[1] === "change") loadReview(Number(m[2])).then(() => m[3] && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
 window.addEventListener("hashchange", route);
 
@@ -1474,6 +1491,17 @@ async function loadReview(id) {
     if (!review.inter.available) review.since = false;
   } else review.since = false;
   drawReview();
+}
+
+/** From an email's Approve link: the change is open, with Approve one press away. The link itself never approves. */
+function readyApprove() {
+  const b = $('#review [data-verdict="approve"]');
+  // Before sign-in finishes there's no button yet; the page draws again once it does.
+  if (!b) { if (isHuman()) toast("This change isn't waiting on an approval anymore"); return; }
+  b.scrollIntoView({ block: "center" });
+  b.classList.add("ready");
+  b.focus();
+  toast("Look it over, then press Approve");
 }
 
 function drawReview() {

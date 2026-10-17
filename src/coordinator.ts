@@ -24,6 +24,7 @@ import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secr
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
+import { needsYouEmail } from "./email";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
@@ -36,6 +37,8 @@ const DELEGATE_ID = "delegate";
 const REVIEW_AGENT_ID = "loom-reviewer";
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
+/** At most one "needs you" email per person this often. */
+const EMAIL_GAP = 10 * 60_000;
 /** An unacknowledged directive older than this shows under Stuck. */
 const DIRECTIVE_ACK_MS = 5 * 60_000;
 /** Shortest approach a contest attempt may explain itself with. */
@@ -174,6 +177,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN default_answer TEXT",
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
       "ALTER TABLE changes ADD COLUMN intent_check TEXT",
+      "ALTER TABLE agents ADD COLUMN email TEXT",
+      "ALTER TABLE agents ADD COLUMN email_seen TEXT",
+      "ALTER TABLE agents ADD COLUMN emailed_at INTEGER",
       "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
       // Repair changes a late review flipped to "changes requested" after they landed or closed.
       "UPDATE changes SET status = 'merged' WHERE status = 'changes_requested' AND merged_commit IS NOT NULL",
@@ -689,6 +695,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     // A new key for the same agent: its id, history and track record stay.
     if (a === "me" && b === "key" && m === "POST") return json(await this.rotateKey(actor, actor.id));
+    if (a === "me" && b === "email") {
+      if (m === "GET") return json(this.emailView(actor));
+      if (m === "POST" && c === "test") return json(await this.testEmail(actor, url.origin));
+      if (m === "POST") return json(this.setEmail(actor, body.email));
+    }
     if (a === "agents" && b && c === "key" && m === "POST") {
       ownerOnly("replace another agent's key");
       return json(await this.rotateKey(actor, this.profile(b).agent.id));
@@ -2931,7 +2942,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** Check stand-in webhooks shortly, once for a burst of events. */
   private notifySoon() {
     if (this.notifyPending) return;
-    if (!this.sql.exec("SELECT 1 FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL LIMIT 1").toArray().length) return;
+    if (!this.sql.exec("SELECT 1 FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL LIMIT 1").toArray().length
+      && !(this.mailer && this.sql.exec("SELECT 1 FROM agents WHERE role = 'human' AND email IS NOT NULL LIMIT 1").toArray().length)) return;
     this.notifyPending = true;
     this.ctx.waitUntil(new Promise((r) => setTimeout(r, 1500))
       .then(() => { this.notifyPending = false; return this.notifyWatchers(); })
@@ -2941,7 +2953,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** POST what newly needs a person to each stand-in's webhook. Each item goes once while it stays open. */
   private async notifyWatchers() {
     const hooks = this.sql.exec("SELECT * FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL").toArray();
-    if (!hooks.length) return;
+    const emails = this.mailer ? this.sql.exec("SELECT id, name, email, email_seen, emailed_at FROM agents WHERE role = 'human' AND email IS NOT NULL").toArray() : [];
+    if (!hooks.length && !emails.length) return;
     const origin = this.meta("origin") ?? "";
     const all = this.attention(this.agentStates());
     for (const h of hooks) {
@@ -2953,6 +2966,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE standins SET seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), h.id);
       if (fresh.length) await this.deliver(h, fresh.map((i) => ({ ...i, new: true })), origin);
     }
+    for (const p of emails) await this.emailPerson(p, all, origin);
     // Stuck work needs no event to need a person, so look again in a while.
     await this.armAlarm(Date.now() + 5 * 60_000);
   }
@@ -2973,6 +2987,63 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     this.sql.exec("UPDATE standins SET last_delivery = ? WHERE id = ?", JSON.stringify({ ...result, items: items.length }), h.id);
     return result;
+  }
+
+  // ── email: tell a person when something needs them ──────────────────────
+
+  /** Cloudflare Email Service, when the Worker has a send_email binding and a from address. */
+  private get mailer() { return this.env.EMAIL && this.env.LOOM_EMAIL_FROM ? this.env.EMAIL : null; }
+
+  /** What needs this person: everything open for people, less reviews and tasks meant for someone else. */
+  private attentionFor(person: string, all: any[]) {
+    return all.filter((i) => i.kind === "review" ? i.reviewer === person : i.kind === "task" ? i.person === person : true);
+  }
+
+  private emailView(actor: Agent) {
+    const r = this.sql.exec("SELECT email, emailed_at FROM agents WHERE id = ?", actor.id).toArray()[0];
+    return { email: (r?.email as string) ?? null, lastSent: (r?.emailed_at as number) ?? null, sending: !!this.mailer };
+  }
+
+  private setEmail(actor: Agent, email: unknown) {
+    if (actor.role !== "human" || actor.standin || actor.id === "admin") throw new HttpError(403, "only people get email, and they set it for themselves");
+    const e = email == null ? "" : String(email).trim();
+    if (e && (e.length > 254 || !/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(e))) throw new HttpError(400, "give an email address, e.g. you@example.com");
+    // What already waits counts as sent, so turning email on doesn't start with a flood.
+    const seen = this.attentionFor(actor.id, this.attention(this.agentStates())).map((i) => shortKey(itemKey(i)));
+    this.sql.exec("UPDATE agents SET email = ?, email_seen = ?, emailed_at = NULL WHERE id = ?", e || null, JSON.stringify(seen), actor.id);
+    this.emit(e ? "member.email_on" : "member.email_off", { actor: actor.id, to: actor.id, data: {} });
+    return this.emailView(actor);
+  }
+
+  /** One email for what newly needs a person, at most every EMAIL_GAP; each item goes once while it stays open. */
+  private async emailPerson(p: Record<string, SqlStorageValue>, all: any[], origin: string) {
+    const actor: Agent = { id: p.id as string, name: p.name as string, role: "human" };
+    const items = this.attentionFor(actor.id, all).map((i) => this.feedItem(i, actor, origin));
+    const seen = new Set(JSON.parse((p.email_seen as string) ?? "[]"));
+    const fresh = items.filter((i) => !seen.has(i.id));
+    // Closed items drop out of seen, so they'd go again if they come back.
+    if (!fresh.length) { this.sql.exec("UPDATE agents SET email_seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), actor.id); return; }
+    if (p.emailed_at && Date.now() - (p.emailed_at as number) < EMAIL_GAP) return; // the next sweep sends them
+    const mail = needsYouEmail(this.project, actor.name, fresh, items.length, origin);
+    try {
+      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to: p.email as string, ...mail });
+      this.sql.exec("UPDATE agents SET email_seen = ?, emailed_at = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), Date.now(), actor.id);
+    } catch (e: any) {
+      console.error("email", String(e?.message ?? e));
+    }
+  }
+
+  private async testEmail(actor: Agent, origin: string) {
+    const to = this.emailView(actor).email;
+    if (!to) throw new HttpError(400, "set your email first");
+    if (!this.mailer) throw new HttpError(503, "this server can't send email yet: it needs a send_email binding named EMAIL and LOOM_EMAIL_FROM");
+    const item = { id: "test", kind: "test", text: `Test from Loom: you'll hear here when something on ${this.project} needs you.`, url: `${origin}/?project=${this.project}`, youCan: null, detail: {} };
+    try {
+      const r = await this.mailer.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to, ...needsYouEmail(this.project, actor.name, [item], 1, origin) });
+      return { sent: true, to, messageId: (r as any)?.messageId ?? null };
+    } catch (e: any) {
+      throw new HttpError(502, `couldn't send: ${String(e?.message ?? e).slice(0, 200)}`);
+    }
   }
 
   private async testStandin(actor: Agent, id: string, origin: string) {

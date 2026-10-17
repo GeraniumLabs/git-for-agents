@@ -28,6 +28,10 @@ export interface Env {
   LOOM_AI_GATEWAY?: string;
   /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
   LOOM_REVIEW_MODEL_URL?: string;
+  /** Cloudflare Email Service: emails people when something needs them. Needs LOOM_EMAIL_FROM on a domain onboarded to Email Service. */
+  EMAIL?: SendEmail;
+  /** The address Loom sends from, e.g. loom@example.com. */
+  LOOM_EMAIL_FROM?: string;
   TYPESAFE_API_KEY?: string;
   /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */
   GITHUB_API_URL?: string;

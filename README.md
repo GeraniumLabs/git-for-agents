@@ -260,6 +260,8 @@ npx wrangler deploy
 
 For GitHub sign-in, open `https://<worker>/auth/setup`, enter the admin token once and click **Create Loom's GitHub app**: Loom asks GitHub to create a GitHub app for it (the manifest flow; it asks for read-only *Contents* and *Issues*, used only when someone imports a private repository they can read), you approve it on GitHub, and Loom keeps the app's credentials sealed like project keys. An app created before imports existed needs *Contents: read* and *Issues: read* added under its permissions on GitHub, and the Setup URL `https://<worker>/auth/github/installed` with *Redirect on update* ticked. Or register an OAuth app yourself (callback `https://<worker>/auth/github/callback`) and set `GITHUB_CLIENT_ID` / `GITHUB_CLIENT_SECRET`. By default anyone who signs in can create a project; set `LOOM_CREATORS` to a comma-separated list of logins to limit that.
 
+To email people when something needs them, onboard a domain to [Cloudflare Email Service](https://developers.cloudflare.com/email-service/), uncomment the `[[send_email]]` binding in `wrangler.toml`, and set `LOOM_EMAIL_FROM` to an address on that domain (`npx wrangler secret put LOOM_EMAIL_FROM`). Each person turns email on for themselves under **Settings → Email me**. They get each thing that needs them once, at most one email every 10 minutes, and an approval's email links straight to the change with its Approve button ready. Without the binding nothing is sent. Locally, `wrangler dev` logs each email instead of sending it.
+
 Then sign in on the dashboard and use **New project**, or script it:
 
 ```sh
