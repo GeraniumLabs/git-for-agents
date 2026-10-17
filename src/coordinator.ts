@@ -37,6 +37,12 @@ const DELEGATE_ID = "delegate";
 const REVIEW_AGENT_ID = "loom-reviewer";
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
+/** The project's check minutes for the day are used up; the merge queue waits until `until`. */
+class CheckBudgetError extends Error {
+  constructor(readonly minutes: number, readonly until: number) {
+    super(`This project used its ${minutes} minutes of checks for today. The merge queue waits until ${new Date(until).toISOString().slice(0, 16).replace("T", " ")} UTC, or whoever runs this server can raise LOOM_CHECK_MINUTES_PER_DAY.`);
+  }
+}
 /** At most one "needs you" email per person this often. */
 const EMAIL_GAP = 10 * 60_000;
 /** An unacknowledged directive older than this shows under Stuck. */
@@ -51,7 +57,7 @@ const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev"
 /** Project-wide events every agent hears about, whatever it is working on. */
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
-const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
+const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
@@ -177,6 +183,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE threads ADD COLUMN default_answer TEXT",
       "ALTER TABLE threads ADD COLUMN deadline INTEGER",
       "ALTER TABLE changes ADD COLUMN intent_check TEXT",
+      "ALTER TABLE projects ADD COLUMN owner TEXT",
+      "ALTER TABLE projects ADD COLUMN hidden INTEGER DEFAULT 0",
       "ALTER TABLE agents ADD COLUMN email TEXT",
       "ALTER TABLE agents ADD COLUMN email_seen TEXT",
       "ALTER TABLE agents ADD COLUMN emailed_at INTEGER",
@@ -218,6 +226,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
         seq INTEGER PRIMARY KEY AUTOINCREMENT, ts INTEGER, type TEXT, actor TEXT,
         task_id INTEGER, change_id INTEGER, to_agent TEXT, data TEXT);
       CREATE TABLE IF NOT EXISTS projects (name TEXT PRIMARY KEY, description TEXT, created_at INTEGER);
+      CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
+      CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
       CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
         task_id INTEGER, change_id INTEGER, path TEXT, line INTEGER, title TEXT,
@@ -484,6 +494,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!row) {
       const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE via = ?", key.id).one().n as number;
       if (n >= MAX_UNDER_KEY) throw new HttpError(429, `${key.name}'s key already carries ${MAX_UNDER_KEY} named agents; reuse a name, or ask an owner for another key`);
+      this.assertAgentRoom();
       const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
       this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen, joined_via, via) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
         id, name, key.role, hash, Date.now(), Date.now(), key.joined_via ?? null, key.id);
@@ -585,7 +596,34 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const r = this.sql.exec("SELECT jurisdiction FROM projects WHERE name = ?", url.searchParams.get("name")).toArray()[0];
         return json({ exists: !!r, jurisdiction: r?.jurisdiction ?? null });
       }
-      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private })));
+      // Who may create projects beyond LOOM_CREATORS, and who asked to.
+      if (b === "creators") {
+        if (m === "GET") return json(this.sql.exec("SELECT login, added_by, added_at FROM creators ORDER BY added_at").toArray());
+        const login = String(body.login ?? url.searchParams.get("login") ?? "").trim().toLowerCase();
+        if (!login) throw new HttpError(400, "give a GitHub login");
+        if (m === "DELETE") { this.sql.exec("DELETE FROM creators WHERE login = ?", login); return json({ ok: true }); }
+        this.sql.exec("INSERT OR REPLACE INTO creators (login, added_by, added_at) VALUES (?, ?, ?)", login, body.by ?? null, Date.now());
+        this.sql.exec("DELETE FROM waitlist WHERE login = ?", login);
+        return json({ ok: true });
+      }
+      if (b === "waitlist") {
+        if (m === "GET") return json(this.sql.exec("SELECT login, name, asked_at, asks FROM waitlist ORDER BY asked_at").toArray());
+        const login = String(body.login ?? "").trim().toLowerCase();
+        this.sql.exec("INSERT INTO waitlist (login, name, asked_at) VALUES (?, ?, ?) ON CONFLICT(login) DO UPDATE SET asks = asks + 1", login, body.name ?? login, Date.now());
+        return json({ ok: true });
+      }
+      if (m === "GET" && b === "creator") {
+        const login = (url.searchParams.get("login") ?? "").toLowerCase();
+        return json({
+          approved: !!this.sql.exec("SELECT 1 FROM creators WHERE login = ?", login).toArray().length,
+          owns: this.sql.exec("SELECT COUNT(*) AS n FROM projects WHERE owner = ?", login).one().n as number,
+        });
+      }
+      if (b === "hidden") {
+        this.sql.exec("UPDATE projects SET hidden = ? WHERE name = ?", body.hidden ? 1 : 0, body.name);
+        return json({ ok: true });
+      }
+      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction, owner, hidden FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private, hidden: !!p.hidden })));
       if (b === "visibility") {
         this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
         return json({ ok: true });
@@ -594,7 +632,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.sql.exec("DELETE FROM projects WHERE name = ?", url.searchParams.get("name"));
         return json({ ok: true });
       }
-      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction) VALUES (?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null);
+      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction, owner) VALUES (?, ?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null, body.owner ? String(body.owner).toLowerCase() : null);
       return json({ ok: true });
     }
 
@@ -908,6 +946,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async addAgent(name: string, role: Role, by: string | null = null) {
     if (!name?.trim()) throw new HttpError(400, "name is required");
+    this.assertAgentRoom();
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
     const key = `loom_${randomId(20)}`;
     this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", id, name, role, await sha256(key), Date.now(), Date.now());
@@ -981,6 +1020,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("UPDATE agents SET key_hash = ? WHERE id = ?", await sha256(key), agentId);
     this.emit("agent.key_rotated", { actor: actor.id, to: agentId, data: { by: actor.name } });
     return { id: row.id, name: row.name, role: row.role, key };
+  }
+
+  /** A project holds at most LOOM_MAX_AGENTS agents (default 300), so one project can't grow without bound on the server's bill. */
+  private assertAgentRoom() {
+    const max = Number(this.env.LOOM_MAX_AGENTS ?? 300);
+    if (!(max > 0)) return;
+    const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", DELEGATE_ID, REVIEW_AGENT_ID).one().n as number;
+    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most this server allows; reuse an agent's key, or ask whoever runs this server`);
   }
 
   // ── people: GitHub sign-in, owners and members ───────────────────────────
@@ -2148,7 +2195,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = new Map<string, { bytes: Uint8Array; mode: string }>();
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
     const { command, timeoutSec } = this.checks!;
-    return runCheck(this.env, this.project, files, command, timeoutSec);
+    const day = new Date().toISOString().slice(0, 10);
+    const budget = Number(this.env.LOOM_CHECK_MINUTES_PER_DAY ?? 120) * 60_000;
+    const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
+    if (budget > 0 && used >= budget) throw new CheckBudgetError(budget / 60_000, Date.parse(`${day}T00:00:00Z`) + 86_400_000);
+    const r = await runCheck(this.env, this.project, files, command, timeoutSec);
+    this.setMeta(`checks_ms:${day}`, String(used + r.ms));
+    return r;
   }
 
   /**
@@ -2222,7 +2275,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       commit = await w.commit(merged.tree, [main, head], "checks", MERGE_IDENTITY);
       note = "Ran on main with your workspace merged in: what would land.";
     } else if (merged) note = "Your workspace conflicts with main, so this ran on your workspace alone; sync_workspace before you submit.";
-    const r = await this.checkCommit(w, commit);
+    const r = await this.checkCommit(w, commit).catch((e) => { throw e instanceof CheckBudgetError ? new HttpError(429, e.message) : e; });
     this.emit("checks.ran", { actor: actor.id, task: taskId, data: { ok: r.ok, command: r.command, ms: r.ms } });
     return { ...r, note };
   }
@@ -2329,6 +2382,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async retryMerge(ids: number[], e: any) {
+    if (e instanceof CheckBudgetError) {
+      // Out of check minutes for today: hold the queue until tomorrow (UTC), and say so once.
+      for (const id of ids) this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", e.until, id);
+      if (this.meta("checks_budget_hit") !== String(e.until)) {
+        this.setMeta("checks_budget_hit", String(e.until));
+        this.emit("checks.budget", { data: { minutes: e.minutes, until: e.until, waiting: ids, advice: e.message } });
+      }
+      return;
+    }
     console.error("merge failed", e);
     for (const id of ids) {
       this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + 5000, id);

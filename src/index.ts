@@ -54,10 +54,26 @@ async function forward(env: Env, req: Request, project: string, rest: string): P
   return (await coordinator(env, project)).fetch(out);
 }
 
-function mayCreate(env: Env, user: User): boolean {
-  const list = (env.LOOM_CREATORS ?? "*").split(",").map((l) => l.trim().toLowerCase()).filter(Boolean);
-  const owners = (env.LOOM_OWNERS ?? "").split(",").map((l) => l.trim().toLowerCase());
-  return list.includes("*") || list.includes(user.login.toLowerCase()) || owners.includes(user.login.toLowerCase());
+const logins = (v: string | undefined) => (v ?? "").split(",").map((l) => l.trim().toLowerCase()).filter(Boolean);
+
+/**
+ * Whether a person may create a project, and if not, why. LOOM_CREATORS
+ * (unset or "*": anyone) lists who may; the admin can let more people in from
+ * the waitlist, which everyone else joins by trying. Past the owners of the
+ * server, each person owns at most LOOM_PROJECTS_PER_PERSON projects.
+ */
+async function mayCreate(env: Env, user: User): Promise<{ ok: true } | { ok: false; error: string }> {
+  const login = user.login.toLowerCase();
+  if (logins(env.LOOM_OWNERS).includes(login)) return { ok: true };
+  const list = logins(env.LOOM_CREATORS ?? "*");
+  const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}`).then((r) => r.json<{ approved: boolean; owns: number }>());
+  if (!list.includes("*") && !list.includes(login) && !r.approved) {
+    await registry(env).fetch("https://do/registry/waitlist", { method: "POST", body: JSON.stringify({ login, name: user.name }) });
+    return { ok: false, error: `Loom is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
+  }
+  const cap = Number(env.LOOM_PROJECTS_PER_PERSON ?? 5);
+  if (cap > 0 && r.owns >= cap) return { ok: false, error: `You own ${r.owns} projects, the most this server allows each person. Delete one in its Settings to make room.` };
+  return { ok: true };
 }
 
 export default {
@@ -67,14 +83,38 @@ export default {
 
     if (path === "/api/projects" && req.method === "GET") {
       // Private projects are listed only to people (or keys) who can read them.
-      const all = await registry(env).fetch("https://do/registry").then((r) => r.json<{ name: string; private: boolean; jurisdiction: Jurisdiction | null }[]>());
-      for (const p of all) located.set(p.name, p.jurisdiction ?? null);
+      const listed = await registry(env).fetch("https://do/registry").then((r) => r.json<{ name: string; private: boolean; hidden: boolean; jurisdiction: Jurisdiction | null }[]>());
+      for (const p of listed) located.set(p.name, p.jurisdiction ?? null);
+      // Hidden projects (tests, demos) still open by name; they just aren't listed, except to the admin.
+      const admin = await isAdmin(env, req);
+      const all = listed.filter((p) => admin || !p.hidden).map(({ hidden, ...p }) => (admin ? { ...p, hidden } : p));
       const user = await sessionUser(env, req);
       const headers: Record<string, string> = {};
       if (req.headers.get("authorization")) headers.authorization = req.headers.get("authorization")!;
       if (user) headers[USER_HEADER] = JSON.stringify(user);
       const seen = await Promise.all(all.map(async (p) => !p.private || (await (await coordinator(env, p.name)).fetch("https://do/visible", { headers }).then((r) => r.json<{ visible: boolean }>()).catch(() => ({ visible: false }))).visible));
       return Response.json(all.filter((_, i) => seen[i]).map((p) => ({ ...p, jurisdiction: p.jurisdiction ?? null })));
+    }
+
+    // The admin: who may create projects, who's waiting, and which projects are listed.
+    const adm = path.match(/^\/api\/admin\/(waitlist|creators|projects)(?:\/([a-z0-9-]+))?$/);
+    if (adm) {
+      if (!(await isAdmin(env, req))) return Response.json({ error: "admin token required" }, { status: 401 });
+      const [, what, name] = adm;
+      if (what === "waitlist" && req.method === "GET") return registry(env).fetch("https://do/registry/waitlist");
+      if (what === "creators") {
+        if (req.method === "GET") return registry(env).fetch("https://do/registry/creators");
+        if (req.method === "POST" || req.method === "DELETE") {
+          const body = req.method === "POST" ? await req.json<{ login?: string }>() : { login: name };
+          return registry(env).fetch(`https://do/registry/creators?login=${encodeURIComponent(body.login ?? "")}`, { method: req.method, body: JSON.stringify({ login: body.login, by: "admin" }) });
+        }
+      }
+      if (what === "projects" && name && req.method === "PUT") {
+        const body = await req.json<{ hidden?: boolean }>();
+        if (!(await locate(env, name)).exists) return Response.json({ error: "no such project" }, { status: 404 });
+        return registry(env).fetch("https://do/registry/hidden", { method: "PUT", body: JSON.stringify({ name, hidden: !!body.hidden }) });
+      }
+      return Response.json({ error: "not found" }, { status: 404 });
     }
 
     const auth = await handleAuth(env, req, (p, init) => registry(env).fetch(`https://do${p}`, init));
@@ -85,7 +125,10 @@ export default {
       const admin = await isAdmin(env, req);
       const user = admin ? null : await sessionUser(env, req);
       if (!admin && !user) return Response.json({ error: "sign in with GitHub to create a project" }, { status: 401 });
-      if (user && !mayCreate(env, user)) return Response.json({ error: `${user.login} can't create projects on this server` }, { status: 403 });
+      if (user) {
+        const may = await mayCreate(env, user);
+        if (!may.ok) return Response.json({ error: may.error }, { status: 403 });
+      }
       const body = await req.json<any>();
       if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
       // An import without a token reads the person's repositories with the GitHub access they granted, if any.
@@ -97,7 +140,7 @@ export default {
       const ns = projectNamespace(env, jurisdiction);
       const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined }) });
       if (res.ok) {
-        await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction }) });
+        await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null }) });
         located.set(body.name, jurisdiction);
       }
       return res;

@@ -818,3 +818,26 @@ test("a project created from a repository Loom recognizes gets a suggested check
   await admin.req("POST", "/settings", { checks: { command: "npm test" } });
   assert.equal((await admin.req("GET", "/overview")).project.suggestedCheck, null);
 });
+
+test("creating projects is invite-only: others join the waitlist until the admin lets them in, and hidden projects aren't listed", { skip: !url, timeout: 60_000 }, async () => {
+  const login = `zed${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const create = (name: string) => fetch(`${url}/api/projects`, { method: "POST", headers: { cookie, "content-type": "application/json" }, body: JSON.stringify({ name, description: "x" }) });
+  const admin = (method: string, path: string, body?: unknown) => fetch(`${url}/api/admin/${path}`, { method, headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined }).then((r) => r.json());
+  const name = project("e2e-invite");
+  const refused = await create(name);
+  assert.equal(refused.status, 403);
+  assert.match((await refused.json()).error, /waitlist/);
+  assert.ok((await admin("GET", "waitlist")).some((w: any) => w.login === login));
+  await admin("POST", "creators", { login });
+  assert.ok(!(await admin("GET", "waitlist")).some((w: any) => w.login === login));
+  assert.equal((await create(name)).status, 200);
+
+  const listed = async (auth: boolean) => (await fetch(`${url}/api/projects`, { headers: auth ? { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } : {} }).then((r) => r.json())).map((p: any) => p.name);
+  assert.ok((await listed(false)).includes(name));
+  await admin("PUT", `projects/${name}`, { hidden: true });
+  assert.ok(!(await listed(false)).includes(name));
+  assert.ok((await listed(true)).includes(name));
+  assert.equal((await fetch(`${url}/api/projects/${name}/overview`)).status, 200, "a hidden project still opens by name");
+  await admin("DELETE", `creators/${login}`);
+});

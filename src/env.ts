@@ -20,6 +20,12 @@ export interface Env {
   LOOM_SHOWCASE?: string;
   /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
   LOOM_CREATORS?: string;
+  /** Projects one person (not an owner of the server) may create. Default 5; 0 means no limit. */
+  LOOM_PROJECTS_PER_PERSON?: string;
+  /** Agents one project may hold. Default 300; 0 means no limit. */
+  LOOM_MAX_AGENTS?: string;
+  /** Minutes of checks one project may run a day (UTC). Default 120; 0 means no limit. Past it, the merge queue waits for the next day. */
+  LOOM_CHECK_MINUTES_PER_DAY?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
