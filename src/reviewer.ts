@@ -52,7 +52,8 @@ Read the diff against what the task asked for and what the agent declared it wou
 - approve: it does what the task asked, nothing in it is wrong or risky, and it is ready to land as is.
 - request_changes: there is a bug, a security problem, data loss, broken behavior, or work clearly outside the task. Say exactly what and where.
 - comment: you can't tell (the diff is truncated, or it depends on code you can't see). Say what a person or agent should check.
-Line comments point at lines of the new file (the + side). Mark a comment blocking only when the change must not land without fixing it.
+A change that adds a document (a report, review, plan or notes) is judged as a document: is it accurate about the code, and is it what the task asked for? The problems a review or report describes are its findings, not defects of the change. Never block a document for the issues it reports.
+Line comments point at lines of the new file (each diff line starts with its number). Mark a comment blocking only when this change itself must not land without fixing it, and request changes only with at least one blocking comment.
 Be specific and brief. Don't comment on style or taste. Don't restate the diff.`;
 
 const SCHEMA = {
@@ -124,8 +125,10 @@ export function parseReview(raw: unknown, files: string[], truncated: boolean, m
   let verdict = r.verdict as "approve" | "request_changes" | "comment";
   // A blocking comment is a request for changes, whatever the verdict says;
   // and a truncated diff is never approved.
+  // A request for changes names what to fix; without a blocking comment it is a comment.
   if (comments.some((c) => c.blocking)) verdict = "request_changes";
-  else if (verdict === "approve" && truncated) verdict = "comment";
+  else if (verdict === "request_changes") verdict = "comment";
+  if (verdict === "approve" && truncated) verdict = "comment";
   // Smaller models sometimes echo the verdict as the summary.
   const said = String(r.summary ?? "").trim();
   const body = said && !["approve", "request_changes", "comment"].includes(said.toLowerCase())

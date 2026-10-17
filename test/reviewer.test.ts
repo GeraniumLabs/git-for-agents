@@ -39,3 +39,8 @@ test("a summary that only repeats the verdict is replaced with a sentence", () =
   const r = parseReview({ verdict: "approve", summary: "approve", comments: [] }, [], false, "m");
   assert.ok(r.ok && r.body === "Looks right for the task; approving.");
 });
+
+test("a request for changes with nothing blocking is only a comment", () => {
+  const r = parseReview({ verdict: "request_changes", summary: "various improvements", comments: [{ path: "src/db.js", line: 2, body: "maybe", blocking: false }] }, ["src/db.js"], false, "m");
+  assert.ok(r.ok && r.verdict === "comment");
+});
