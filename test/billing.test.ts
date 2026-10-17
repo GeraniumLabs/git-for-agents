@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PLANS, form, planUpdate, projectLimits, signStripe, verifyStripe } from "../src/billing";
+import { PLANS, form, planUpdate, projectLimits, signStripe, testMode, verifyStripe } from "../src/billing";
 
 test("Stripe params are form-encoded with nested keys", () => {
   assert.equal(form({ mode: "subscription", line_items: { 0: { price: "p_1", quantity: 1 } }, skip: undefined }),
@@ -46,4 +46,11 @@ test("a real subscription event from the Stripe sandbox (API 2026-08-26) reads a
   assert.deepEqual(planUpdate(event), { login: "sandboxtester", plan: "pro", status: "active", customer: "cus_VSS50pRCKHimXQ", subscription: "sub_1URXBsCHuPUumNxypXtj3wOr", renews: 1794920304000, at: 1792241906 });
   const canceled = { ...event, type: "customer.subscription.deleted", created: 1792241928, data: { object: { ...event.data.object, status: "canceled" } } };
   assert.equal(planUpdate(canceled)!.plan, "free");
+});
+
+test("only a test or sandbox key counts as test mode", () => {
+  assert.equal(testMode({ STRIPE_SECRET_KEY: "sk_test_x" } as any), true);
+  assert.equal(testMode({ STRIPE_SECRET_KEY: "rk_test_x" } as any), true);
+  assert.equal(testMode({ STRIPE_SECRET_KEY: "rk_live_x" } as any), false);
+  assert.equal(testMode({} as any), false);
 });

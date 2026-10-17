@@ -95,8 +95,8 @@ function ask({ title, body = "", ok = "OK", cancel = "Cancel", danger = false, i
     (text ?? d.querySelector('[value="ok"]')).focus();
   });
 }
-// People sign in with GitHub (a session cookie). A pasted key still works,
-// for agents' keys and for scripts.
+// People sign in with GitHub (a session cookie). Keys are for agents; a key
+// already stored in this browser still works, but the page no longer asks for one.
 let user = null, auth = { github: false, dev: false }, notMember = false;
 async function loadUser() {
   try { auth = await fetch("/auth/me", { cache: "no-store" }).then((r) => r.json()); user = auth.user; } catch { user = null; }
@@ -146,13 +146,7 @@ async function showSignIn(why = "") {
     ${why ? `<p>${esc(why)}</p>` : ""}
     ${user && notMember
       ? `<p>You're signed in as <b>${esc(user.login)}</b>, but you aren't a member of ${esc(project)} yet. ${owners.length ? `Ask ${owners.map(esc).join(" or ")} to add you in Settings.` : "Ask one of its owners to add you in Settings."}</p>`
-      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}
-    <details class="alt"><summary>Use a key instead</summary>
-      <p class="meta">For a Loom key someone made for you. Agents use these.</p>
-      <div class="row"><input id="si-key" type="password" placeholder="Loom key for this project" autocomplete="off"><button class="ghost" id="si-go">Sign in</button></div>
-    </details>`;
-  const done = async () => { await signIn(); if (me) { $("#detail").close(); toast(`Signed in as ${me.name}`); } else toast("That key didn't work for this project"); };
-  $("#si-go").onclick = () => { const k = $("#si-key").value.trim(); if (k) { store.set(keyName(), k); done(); } };
+      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}`;
   if ($("#si-dev-go")) $("#si-dev-go").onclick = () => { const l = $("#si-dev").value.trim(); if (l) location.href = `/auth/dev?login=${encodeURIComponent(l)}&return=${encodeURIComponent(location.pathname + location.search)}`; };
   if (!$("#detail").open) $("#detail").showModal();
 }
@@ -859,9 +853,15 @@ function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) 
 /** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
 async function planHtml() {
   const b = await fetch("/api/billing", { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
-  if (!b.enabled || !b.plan || b.plan === "unlimited") return "";
-  const p = b.plans[b.plan], pro = b.plans.pro;
+  if (!b.enabled || !b.plan) return "";
+  const pro = b.plans.pro;
   const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  if (b.plan === "unlimited") {
+    // An owner of the server: no limits. With a test key they can still walk through Checkout.
+    const tryIt = b.test && b.paid !== "pro" ? `<div class="row"><button class="ghost" data-billing="checkout">Try ${esc(pro.name)} checkout (test mode)</button></div>` : "";
+    return `<p class="meta">You run this server, so no limits apply to you. Everyone else starts on the free plan and can upgrade to <b>${esc(pro.name)}</b> (${esc(pro.price)}).${b.test ? ` Stripe is in test mode: pay with card 4242 4242 4242 4242.` : ""}${b.paid === "pro" ? ` Your test subscription is active.` : ""}</p>${tryIt}${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`;
+  }
+  const p = b.plans[b.plan];
   return b.plan === "pro"
     ? `<p class="meta">You're on <b>${esc(p.name)}</b>: ${limits(p)}.${b.status && b.status !== "active" ? ` Payment status: <b>${esc(b.status)}</b>.` : ""}${b.renews ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}</p>${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`
     : `<p class="meta">You're on the <b>free plan</b>: ${limits(p)}. <b>${esc(pro.name)}</b> (${esc(pro.price)}) gives you ${limits(pro)}.</p><div class="row"><button data-billing="checkout">Upgrade to ${esc(pro.name)}</button>${b.manage ? `<button class="ghost" data-billing="portal">Billing history</button>` : ""}</div>`;
