@@ -193,7 +193,7 @@ function renderTour(projects, showcase) {
   $("#tour").innerHTML = `
     <div class="tour-text">
       <b>Loom is a git platform for agent swarms, built on Cloudflare.</b>
-      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. The merge queue ran the tests before main moved. The Activity feed is live.
+      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. Where a project set a check command, the merge queue ran it before main moved. The Activity feed is live.
     </div>
     <div class="tour-projects">${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}"><b>${esc(n)}</b><span>${esc(desc(n))}</span></a>`).join("")}</div>
     <div class="tour-actions"><button id="tour-agent">Bring your own agent</button><button id="tour-close" class="ghost" title="Hide this">Hide</button></div>`;
@@ -287,7 +287,14 @@ function renderHealth() {
     <div class="tile" title="Changes that landed on main in the last hour"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
     ${h.people ? `<div class="tile" title="Questions agents asked people that are still open. This hour: ${h.people.askedLastHour} asked, ${h.people.answeredLastHour} answered by people, ${h.people.defaultedLastHour} went ahead on the agent's default. Limits are in Settings"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
     <div class="tile" title="Share of merge attempts in the last hour that hit a conflict. Over 20% shows red: look at Where the work is"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
-    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>`;
+    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>
+    ${state.project.checks ? "" : `<div class="tile" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing"><b class="warn">no checks</b><span>main isn't tested before it moves${state.project.mainTests === 0 ? " · main has no tests, so changes aren't flagged for skipping them" : ""}${state.project.suggestedCheck && isOwner() ? ` · <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : " · set one in Settings"}</span></div>`}`;
+  const useCheck = $("#health [data-use-check]");
+  if (useCheck) useCheck.onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: state.project.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
+    toast("Checks on: the merge queue runs them before main moves");
+    render();
+  };
   for (const b of document.querySelectorAll("[data-state]")) b.onclick = () => showDirectory(b.dataset.state);
   for (const b of $("#health").querySelectorAll("[data-tasks]")) b.onclick = (e) => { e.preventDefault(); showTasks(b.dataset.tasks); };
 }
@@ -866,6 +873,7 @@ function showNewProject(draft = null) {
       <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
       <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
     </div>
+    <label>Check command, run on main with each change before main moves <input id="np-checks" class="mono" placeholder="e.g. npm ci && npm test; leave empty and Loom suggests one if it recognizes the repository"></label>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
@@ -884,7 +892,7 @@ function showNewProject(draft = null) {
   // A private GitHub repository: go to GitHub for what Loom needs (the person's OK, then Loom's app on the
   // repository), and finish creating the project when GitHub sends them back.
   const toGitHub = (step) => {
-    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch"].map((id) => [id, $(id).value]));
+    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch", "#np-checks"].map((id) => [id, $(id).value]));
     const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
     try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked, resume: step })); } catch {}
     const back = new URLSearchParams(location.search);
@@ -933,7 +941,7 @@ function showNewProject(draft = null) {
       if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;

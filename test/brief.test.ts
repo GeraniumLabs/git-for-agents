@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildBrief, fileStats, type BriefInput } from "../src/brief.ts";
+import { buildBrief, fileStats, suggestCheck, type BriefInput } from "../src/brief.ts";
 import { unifiedDiff } from "../src/gitops.ts";
 
 const base: BriefInput = {
@@ -42,4 +42,21 @@ test("an author who already wrote a file isn't new to it", () => {
 test("line counts per file come from the patch, including added and deleted files", () => {
   const patch = unifiedDiff("a.js", "one\ntwo\n", "one\nTWO\nthree\n") + unifiedDiff("new.js", null, "x\n") + unifiedDiff("gone.js", "y\nz\n", null);
   assert.deepEqual(fileStats(patch), [{ path: "a.js", added: 2, removed: 1 }, { path: "new.js", added: 1, removed: 0 }, { path: "gone.js", added: 0, removed: 2 }]);
+});
+
+test("when main has no tests, a change without tests isn't flagged for it", () => {
+  const files = [f("src/a.ts"), f("src/b.ts")];
+  assert.ok(buildBrief({ ...base, files }).reasons.some((r) => r.kind === "tests"));
+  const b = buildBrief({ ...base, files, mainHasTests: false });
+  assert.ok(!b.reasons.some((r) => r.kind === "tests"));
+  assert.equal(b.score, 0);
+});
+
+test("a check command is suggested only for what the checks image runs as is", async () => {
+  const repo = (files: Record<string, string>) => [new Set(Object.keys(files)), async (p: string) => files[p] ?? null] as const;
+  assert.equal(await suggestCheck(...repo({ "package.json": '{"scripts":{"test":"node --test"}}', "package-lock.json": "{}" })), "npm ci && npm test");
+  assert.equal(await suggestCheck(...repo({ "package.json": '{"scripts":{"test":"vitest"}}' })), "npm install && npm test");
+  assert.equal(await suggestCheck(...repo({ "package.json": '{"scripts":{"test":"echo \\"Error: no test specified\\" && exit 1"}}' })), null);
+  assert.equal(await suggestCheck(...repo({ "Makefile": "build:\n\tcc x.c\ntest: build\n\t./t\n" })), "make test");
+  assert.equal(await suggestCheck(...repo({ "pyproject.toml": "" })), null);
 });

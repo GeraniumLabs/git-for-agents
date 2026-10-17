@@ -797,3 +797,24 @@ test("a person who turns on email hears when something needs them, once, with a 
   const off = await mia("POST", "/me/email", { email: null });
   assert.equal(off.email, null);
 });
+
+test("a project created from a repository Loom recognizes gets a suggested check, and says once that main has no tests", { skip: !url, timeout: 60_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-nochecks");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "no checks", files: { "package.json": '{"scripts":{"test":"node --test"}}', "src/a.js": "export const a = 1;\n" }, requiredApprovals: 1 });
+  const ov = await admin.req("GET", "/overview");
+  assert.equal(ov.project.checks, null);
+  assert.equal(ov.project.suggestedCheck, "npm install && npm test");
+  assert.equal(ov.project.mainTests, 0);
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Add b", "export b from a.js");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/a.js"], "");
+  await ada.write(ws, { "src/a.js": "export const a = 1;\nexport const b = 2;\n" });
+  const ch = await ada.submit(t.id, t.title, "b", {});
+  const detail = await ada.change(ch.id);
+  assert.ok(!detail.brief.reasons.some((r: any) => r.kind === "tests"), "no per-change tests warning when main has none");
+  await admin.req("POST", "/settings", { checks: { command: "npm test" } });
+  assert.equal((await admin.req("GET", "/overview")).project.suggestedCheck, null);
+});

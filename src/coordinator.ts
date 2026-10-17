@@ -18,7 +18,7 @@ import { FilesShapeError, normalizeFiles } from "./files";
 import { runCheck, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
-import { buildBrief, fileStats, isTest } from "./brief";
+import { buildBrief, countTests, fileStats, isTest, suggestCheck } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
@@ -848,6 +848,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
         commit = await w.commitFiles(null, files, "Initial commit", MERGE_IDENTITY);
       }
       await w.push({ url: created.remote, token: created.token }, commit);
+      const flat = await w.flatten(commit);
+      this.setMeta("main_tests", String(countTests(flat)));
+      const suggested = await suggestCheck(new Set(flat.keys()), async (p) => { const e = flat.get(p); return e ? w.readText(e.oid) : null; }).catch(() => null);
+      if (suggested) this.setMeta("suggested_check", suggested);
     } catch (e) {
       await this.store.delete(repo).catch(() => {});
       throw e;
@@ -1626,7 +1630,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       author: this.agentName(ch.agent_id) ?? ch.agent_id,
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
-      checks: ch.checks, checksConfigured: !!this.checks,
+      checks: ch.checks, checksConfigured: !!this.checks, mainHasTests: this.mainTests !== 0,
       othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id)).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
@@ -2116,6 +2120,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.setMeta("main_version", String(version));
       this.setMeta("main_head", commit);
       this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, batch: landed.length } });
+      if (files.some((f) => isTest(f.path))) this.mainTestsStale = true;
       this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
       await this.notesFromContext(ch).catch((e) => console.error("notes", e));
       this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", Date.now(), ch.id);
@@ -2938,6 +2943,25 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { items, known: items.map((i) => i.id).join("."), newCount: items.filter((i) => i.new).length };
   }
 
+  /**
+   * How many test files main has: null until counted. A project with none
+   * hears it once, on the project, instead of on every change's brief.
+   */
+  private mainTestsStale = false;
+  private countingTests = false;
+  private get mainTests(): number | null {
+    const v = this.meta("main_tests");
+    if ((v === null || this.mainTestsStale) && !this.countingTests && this.meta("main_head")) {
+      this.countingTests = true;
+      this.mainTestsStale = false;
+      this.ctx.waitUntil((async () => {
+        const w = await Workspace.open(this.remote(this.mainRepo, await this.token(this.mainRepo, "read")));
+        this.setMeta("main_tests", String(countTests(await w.flatten(this.meta("main_head")))));
+      })().catch((e) => console.error("count tests", e)).finally(() => { this.countingTests = false; }));
+    }
+    return v === null ? null : Number(v);
+  }
+
   private notifyPending = false;
   /** Check stand-in webhooks shortly, once for a burst of events. */
   private notifySoon() {
@@ -3159,7 +3183,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -3473,7 +3497,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!this.modelOptions.intent) return;
     const ch = this.change(id);
     const intent = this.sql.exec("SELECT description, paths FROM intents WHERE task_id = ?", ch.task_id).toArray().map((i) => `${i.description || "(no description)"} (${JSON.parse(i.paths as string).join(", ")})`).join("; ");
-    const v = await checkIntent(await this.judge(), { title: ch.title, summary: ch.summary ?? "", intent, patch }).catch(() => null);
+    // Agents rarely describe their intents; the task says what the work is.
+    const t = ch.task_id ? this.sql.exec("SELECT title, description FROM tasks WHERE id = ?", ch.task_id).toArray()[0] : null;
+    const task = t ? `${t.title}${t.description ? `\n${String(t.description).slice(0, 4000)}` : ""}` : "";
+    const v = await checkIntent(await this.judge(), { title: ch.title, summary: ch.summary ?? "", task, intent, patch }).catch(() => null);
     if (!v) return;
     this.sql.exec("UPDATE changes SET intent_check = ? WHERE id = ?", JSON.stringify({ ...v, head: ch.head, at: Date.now() }), id);
     if (v.score < 0.5) this.emit("change.off_intent", { change: id, task: ch.task_id, to: ch.agent_id, data: { score: v.score, model: v.model, intent } });

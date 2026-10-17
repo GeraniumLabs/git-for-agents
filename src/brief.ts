@@ -19,6 +19,8 @@ export interface BriefInput {
   guarded: string[];
   checks: { ok: boolean } | null;
   checksConfigured: boolean;
+  /** Whether main has any tests. Without them, a change without tests is the norm, said once on the project instead. */
+  mainHasTests?: boolean;
   /** Live intents of other agents: their paths and who holds them. */
   othersIntents: { paths: string[]; agent: string }[];
   /** path -> agents (other than the author) who wrote it before. */
@@ -50,6 +52,7 @@ const TEST = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[a-z]+$/i;
 const NOT_CODE = /\.(md|txt|json|ya?ml|toml|lock|png|jpe?g|gif|svg|css|html?)$/i;
 export const isTest = (p: string) => TEST.test(p);
 export const isCode = (p: string) => !isTest(p) && !NOT_CODE.test(p);
+export const countTests = (paths: Iterable<string> | Map<string, unknown>) => [...(paths instanceof Map ? paths.keys() : paths)].filter(isTest).length;
 
 /** Lines added and removed per file, from a unified diff. */
 export function fileStats(patch: string): FileStat[] {
@@ -99,7 +102,7 @@ export function buildBrief(i: BriefInput): Brief {
   else if (i.checks?.ok) reasons.push({ kind: "ok", text: "Checks pass" });
   if (i.undeclared.length) reasons.push({ kind: "outside", text: `${i.undeclared.length} file${i.undeclared.length === 1 ? "" : "s"} outside the declared intent`, files: i.undeclared });
   const code = i.files.filter((f) => isCode(f.path)), tests = i.files.filter((f) => isTest(f.path));
-  if (code.length && !tests.length) { score += 2; reasons.push({ kind: "tests", text: "Changes code without changing any tests" }); }
+  if (code.length && !tests.length && i.mainHasTests !== false) { score += 2; reasons.push({ kind: "tests", text: "Changes code without changing any tests" }); }
   else if (tests.length) reasons.push({ kind: "ok", text: `Changes ${tests.length} test file${tests.length === 1 ? "" : "s"}` });
   const contested = of("contested");
   if (contested.length) reasons.push({ kind: "contested", text: "Other agents are working on the same files", files: contested });
@@ -120,4 +123,22 @@ export function buildBrief(i: BriefInput): Brief {
     ? `Needs a person${top.length ? `: ${top.join("; ")}` : ""}.`
     : top.length ? `Agents can review this; worth a look: ${top.join("; ")}.` : "Agents can review this. Nothing stands out.";
   return { needsPerson, verdict, score, reasons, files };
+}
+
+/**
+ * A check command to suggest for a repository, from what's in it. Only ones
+ * the checks image can run as is (Node and make); anything else is left to
+ * the person.
+ */
+export async function suggestCheck(paths: Set<string>, read: (path: string) => Promise<string | null>): Promise<string | null> {
+  if (paths.has("package.json")) {
+    try {
+      const test = JSON.parse((await read("package.json")) ?? "{}")?.scripts?.test;
+      if (typeof test === "string" && test.trim() && !/no test specified/.test(test)) return paths.has("package-lock.json") ? "npm ci && npm test" : "npm install && npm test";
+    } catch {}
+  }
+  for (const m of ["Makefile", "makefile"]) {
+    if (paths.has(m) && /^test\s*:/m.test((await read(m)) ?? "")) return "make test";
+  }
+  return null;
 }
