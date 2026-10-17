@@ -1,0 +1,5 @@
+{"id":"evt_1URXBvCHuPUumNxyeEmlRFSk","object":"event","api_version":"2026-08-26.dahlia","created":1792241906,"type":"customer.subscription.created","livemode":false,
+ "data":{"object":{"id":"sub_1URXBsCHuPUumNxypXtj3wOr","object":"subscription","customer":"cus_VSS50pRCKHimXQ","status":"active","cancel_at_period_end":false,
+  "items":{"object":"list","data":[{"id":"si_VSS6qSdfA1ZmEM","object":"subscription_item","current_period_end":1794920304,"current_period_start":1792241904,
+   "price":{"id":"price_1URXB1CHuPUumNxybqmKDB1V","object":"price","product":"prod_VSS5wF45CisyRk","unit_amount":1000,"currency":"usd","recurring":{"interval":"month","interval_count":1},"metadata":{"app":"loom"}},"quantity":1}]},
+  "metadata":{"app":"loom","login":"sandboxtester"}}}}

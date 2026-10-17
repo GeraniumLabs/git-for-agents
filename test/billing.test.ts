@@ -39,3 +39,11 @@ test("a project's limits come from its plan only when the server takes payments"
   assert.equal(projectLimits(paid, null).agents, 300, "projects from before plans keep the server's limits");
   assert.equal(projectLimits({ LOOM_MAX_AGENTS: "7" } as any, "free").agents, 7, "no Stripe, no plans");
 });
+
+test("a real subscription event from the Stripe sandbox (API 2026-08-26) reads as Pro, with its renewal date from the item", async () => {
+  const { readFileSync } = await import("node:fs");
+  const event = JSON.parse(readFileSync(new URL("./fixtures/stripe-subscription-created.json", import.meta.url), "utf8"));
+  assert.deepEqual(planUpdate(event), { login: "sandboxtester", plan: "pro", status: "active", customer: "cus_VSS50pRCKHimXQ", subscription: "sub_1URXBsCHuPUumNxypXtj3wOr", renews: 1794920304000, at: 1792241906 });
+  const canceled = { ...event, type: "customer.subscription.deleted", created: 1792241928, data: { object: { ...event.data.object, status: "canceled" } } };
+  assert.equal(planUpdate(canceled)!.plan, "free");
+});

@@ -129,6 +129,12 @@ export async function verifyStripe(secret: string, header: string | null, body: 
   return sigs.some((s) => s.length === want.length && [...s].reduce((d, c, i) => d | (c.charCodeAt(0) ^ want.charCodeAt(i)), 0) === 0);
 }
 
+/** When the subscription renews. Newer API versions keep the period on each item, not the subscription. */
+function periodEnd(o: any): number | null {
+  const t = o.current_period_end ?? o.items?.data?.[0]?.current_period_end;
+  return typeof t === "number" ? t * 1000 : null;
+}
+
 /**
  * What a webhook event means for a person's plan, or null for events Loom
  * ignores. Checkout completing makes them Pro; a subscription changing or
@@ -147,7 +153,7 @@ export function planUpdate(event: any): (PlanRow & { at: number }) | null {
     const login = String(o.metadata?.login ?? "").toLowerCase();
     if (!login) return null;
     const status = event.type === "customer.subscription.deleted" ? "canceled" : String(o.status ?? "");
-    return { login, plan: PAID.has(status) ? "pro" : "free", status, customer: o.customer ?? null, subscription: o.id ?? null, renews: o.current_period_end ? o.current_period_end * 1000 : null, at: Number(event.created ?? 0) };
+    return { login, plan: PAID.has(status) ? "pro" : "free", status, customer: o.customer ?? null, subscription: o.id ?? null, renews: periodEnd(o), at: Number(event.created ?? 0) };
   }
   return null;
 }
