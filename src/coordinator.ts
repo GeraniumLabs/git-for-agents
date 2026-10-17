@@ -23,6 +23,7 @@ import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
+import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
 const TOKEN_TTL = 6 * 3600;
@@ -31,6 +32,8 @@ export const AGENT_HEADER = "x-loom-agent";
 /** How many named agents one key may carry. */
 const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
+/** Loom's own review agent, which reviews a change nobody else is around to (src/reviewer.ts). */
+const REVIEW_AGENT_ID = "loom-reviewer";
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 /** An unacknowledged directive older than this shows under Stuck. */
@@ -47,7 +50,7 @@ const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.pr
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
   "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
-  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted"];
+  "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
 const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made", "task.assigned"]);
 /** Most queued changes merged together in one pass of the queue. */
@@ -346,6 +349,22 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private get modelOptions(): { reviewers: boolean; intent: boolean } {
     const o = JSON.parse(this.meta("model_options") ?? "{}");
     return { reviewers: !!o.reviewers, intent: !!o.intent };
+  }
+
+  private get reviewAgent(): ReviewAgentConfig {
+    return { ...DEFAULT_REVIEW_AGENT, ...JSON.parse(this.meta("review_agent") ?? "{}") };
+  }
+
+  private setReviewAgent(body: Partial<ReviewAgentConfig>) {
+    const cfg = this.reviewAgent;
+    if (body.enabled !== undefined) cfg.enabled = !!body.enabled;
+    if (body.afterMinutes !== undefined) {
+      const n = Number(body.afterMinutes);
+      if (!Number.isFinite(n) || n < 0 || n > 10080) throw new HttpError(400, "reviewAgent.afterMinutes is 0 to 10080");
+      cfg.afterMinutes = n;
+    }
+    this.setMeta("review_agent", JSON.stringify(cfg));
+    if (cfg.enabled) void this.armAlarm(Date.now() + 1000);
   }
 
   private get questionRules(): { maxOpen: number; deadlineMinutes: number } {
@@ -696,12 +715,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
+      if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
       if (body.model !== undefined) this.setMeta("model_options", JSON.stringify({ ...this.modelOptions, ...Object.fromEntries(Object.entries(body.model ?? {}).filter(([k]) => k === "reviewers" || k === "intent").map(([k, v]) => [k, !!v])) }));
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -1155,7 +1175,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const remote = this.remote(name, await this.token(name, "write"));
     const w = await Workspace.open(remote);
     const parent = await w.head();
-    const commit = await w.commitFiles(parent, files, body.message || "Update files", { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const task = ws.task_id ? this.sql.exec("SELECT title FROM tasks WHERE id = ?", ws.task_id).toArray()[0] : null;
+    const message = body.message?.trim() || (task ? `${task.title} (task #${ws.task_id})` : `Update ${Object.keys(files).slice(0, 3).join(", ")}${Object.keys(files).length > 3 ? ` and ${Object.keys(files).length - 3} more` : ""}`);
+    const commit = await w.commitFiles(parent, files, message, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
     this.setMeta(`pushed:${name}`, commit);
     await w.push(remote, commit);
     this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(files), message: body.message } });
@@ -1463,7 +1485,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private requestReview(id: number, author: string) {
-    const reviewers = this.sql.exec("SELECT id FROM agents WHERE role = 'reviewer' AND id != ?", author).toArray();
+    const reviewers = this.sql.exec("SELECT id FROM agents WHERE role = 'reviewer' AND id NOT IN (?, ?)", author, REVIEW_AGENT_ID).toArray();
+    // If nobody takes it in time, Loom's review agent will.
+    if (this.reviewAgent.enabled) void this.armAlarm(Date.now() + this.reviewAgent.afterMinutes * 60_000 + 1000);
     this.emit("review.requested", { actor: author, change: id, task: this.change(id).task_id, data: { reviewers: reviewers.map((r) => r.id) } });
     const ch = this.change(id);
     const guarded = this.guardedFiles(ch.files);
@@ -1955,7 +1979,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
-    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity);
+    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
     // Work that stopped moving needs no event to need a person.
@@ -1984,7 +2008,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
     const done = this.sql.exec("SELECT MIN(done_at) AS t FROM workspaces WHERE status IN ('merged','closed') AND done_at IS NOT NULL").one().t as number | null;
     const asked = this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
-    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
+    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, this.agentReviewDue() ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
     if (next < Infinity) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 100));
   }
 
@@ -3048,7 +3072,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -3176,7 +3200,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const age = now - t.since;
       const base = { kind: "stuck", detail: `#${t.change} ${t.title.replace(/^Review #\d+: /, "")}`, agent: t.author, change: t.change, since: t.since };
       if (!left.length && t.status === "open") {
-        const others = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", t.author, DELEGATE_ID).one().n as number;
+        const others = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?, ?)", t.author, DELEGATE_ID, REVIEW_AGENT_ID).one().n as number;
         items.push({ ...base, reason: others ? "no agent left to review it" : "no other agent to review it", action: "review" });
       } else if (t.status === "open" && age > 5 * 60_000) {
         items.push({ ...base, reason: left.some((a) => a.present) ? "review task nobody has taken" : "review task nobody has taken, no reviewer around", action: "review" });
@@ -3195,7 +3219,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const d = JSON.parse(e.data as string);
       items.push({ kind: "stuck", reason: "directive not acknowledged", detail: `“${d.body}”`, directive: e.seq, by: e.actor, agents: missing, since: e.ts });
     }
-    for (const a of agents.filter((a) => a.state === "quiet" || (a.state === "paused" && a.task))) {
+    // A task whose change waits on reviewers isn't held by its author: that change is listed above.
+    const waitingOnReview = (a: { task: { id: number; status: string | null } | null }) => a.task?.status === "in_review"
+      && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status = 'changes_requested' LIMIT 1", a.task.id).toArray().length;
+    for (const a of agents.filter((a) => (a.state === "quiet" || (a.state === "paused" && a.task)) && !waitingOnReview(a))) {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
@@ -3286,7 +3313,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const scores = new Map<string, { score: number; reasons: { w: number; text: string }[] }>();
     const add = (agent: string, w: number, text: string) => {
-      if (agent === ch.agent_id || reviewed.has(agent)) return;
+      if (agent === ch.agent_id || agent === REVIEW_AGENT_ID || reviewed.has(agent)) return;
       const s = scores.get(agent) ?? { score: 0, reasons: [] };
       s.score += w;
       s.reasons.push({ w, text });
@@ -3326,7 +3353,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     out.sort((x, y) => y.score - x.score);
     if (out.length < limit) {
       for (const a of people.values()) {
-        if (a.role !== "reviewer" || a.paused || a.id === ch.agent_id || reviewed.has(a.id as string) || out.some((c) => c.agent === a.id)) continue;
+        if (a.role !== "reviewer" || a.paused || a.id === ch.agent_id || a.id === REVIEW_AGENT_ID || reviewed.has(a.id as string) || out.some((c) => c.agent === a.id)) continue;
         const open = load.get(a.id as string) ?? 0;
         out.push({ agent: a.id as string, name: a.name as string, role: "reviewer", score: 0, reasons: [`on the reviewer rota, ${open} open review${open === 1 ? "" : "s"}`], openReviews: open, present: present(a) });
       }
@@ -3469,10 +3496,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private reviewersLeft(id: number) {
     const ch = this.change(id);
     const now = Date.now();
-    return this.sql.exec(`SELECT id, last_seen FROM agents a WHERE a.role != 'human' AND a.id NOT IN (?, ?) AND (a.paused IS NULL OR a.paused = '')
+    return this.sql.exec(`SELECT id, last_seen FROM agents a WHERE a.role != 'human' AND a.id NOT IN (?, ?, ?) AND (a.paused IS NULL OR a.paused = '')
         AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = ? AND v.reviewer = a.id AND v.head = ?)
         AND NOT EXISTS (SELECT 1 FROM review_requests r WHERE r.change_id = ? AND r.reviewer = a.id AND r.status IN ('declined','expired'))`,
-      ch.agent_id, DELEGATE_ID, id, ch.head, id).toArray()
+      ch.agent_id, DELEGATE_ID, REVIEW_AGENT_ID, id, ch.head, id).toArray()
       .map((a) => ({ id: a.id as string, present: now - ((a.last_seen as number) ?? 0) < PRESENT_MS }));
   }
 
@@ -3486,14 +3513,97 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { taken: id, requested: this.reviewRequests(id), next: "get_change (start with its brief), then review_change" };
   }
 
+  // ── Loom's own review agent ───────────────────────────────────────────────
+
+  /** Changes waiting on review that nobody around is reviewing, and when each is due for Loom's review agent. */
+  private agentReviewQueue() {
+    if (!this.reviewAgent.enabled) return [];
+    const after = this.reviewAgent.afterMinutes * 60_000;
+    const present = Date.now() - PRESENT_MS;
+    return this.sql.exec(`SELECT c.id, c.head, c.task_id, c.updated_at FROM changes c WHERE c.status = 'review'
+        AND NOT EXISTS (SELECT 1 FROM reviews v WHERE v.change_id = c.id AND v.head = c.head AND v.reviewer = ?)
+        AND NOT EXISTS (SELECT 1 FROM review_requests r JOIN agents a ON a.id = r.reviewer
+                        WHERE r.change_id = c.id AND r.status IN ('open','accepted') AND a.role != 'human' AND a.last_seen > ?)`, REVIEW_AGENT_ID, present).toArray()
+      .filter((c) => this.meta(`agent_review:${c.id}`) !== c.head && !this.openContest(c.task_id as number))
+      .map((c) => ({ id: c.id as number, head: c.head as string, due: (c.updated_at as number) + after }));
+  }
+
+  private agentReviewDue(): number | null {
+    const now = Date.now();
+    const due = this.agentReviewQueue().map((c) => c.due).filter((t) => t > now);
+    return due.length ? Math.min(...due) : null;
+  }
+
+  /** Start Loom's review agent on every change that has waited long enough; returns when the next one is due. */
+  private sweepAgentReviews(): number | null {
+    const now = Date.now();
+    for (const c of this.agentReviewQueue().filter((c) => c.due <= now)) {
+      // One try per head: a failure shows as stuck, it doesn't loop.
+      this.setMeta(`agent_review:${c.id}`, c.head);
+      this.ctx.waitUntil(this.runAgentReview(c.id, c.head).catch((e) => this.emit("review.agent_failed", { change: c.id, data: { reason: String(e?.message ?? e).slice(0, 200) } })));
+    }
+    return this.agentReviewDue();
+  }
+
+  private get aiGateway() {
+    return this.env.LOOM_AI_GATEWAY || "default";
+  }
+
+  /** What Loom's review agent reviews with: Claude with an Anthropic key, otherwise Workers AI; both through AI Gateway. */
+  private async reviewModel(): Promise<ReviewModel | null> {
+    if (this.env.LOOM_REVIEW_MODEL_URL) return { kind: "claude", apiKey: (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY ?? "dev", baseURL: this.env.LOOM_REVIEW_MODEL_URL };
+    const key = (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY;
+    if (key) return { kind: "claude", apiKey: key, baseURL: this.env.AI ? await this.env.AI.gateway(this.aiGateway).getUrl("anthropic") : undefined };
+    if (this.env.AI) return { kind: "workers-ai", ai: this.env.AI, gateway: this.aiGateway };
+    return null;
+  }
+
+  /** Where the review agent's model comes from, without decrypting anything. */
+  private reviewAgentSource(): string | null {
+    const saved = this.sql.exec("SELECT 1 FROM project_keys WHERE kind = 'anthropic'").toArray().length;
+    if (this.env.LOOM_REVIEW_MODEL_URL) return "Claude, through a local stand-in";
+    if (saved) return "Claude, with the project's Anthropic key, through AI Gateway";
+    if (this.env.ANTHROPIC_API_KEY) return "Claude, with the server's Anthropic key, through AI Gateway";
+    if (this.env.AI) return "Llama 4 Scout on Workers AI, through AI Gateway (no key needed)";
+    return null;
+  }
+
+  private async runAgentReview(id: number, head: string) {
+    const model = await this.reviewModel();
+    if (!model) return this.emit("review.agent_failed", { change: id, data: { reason: "no model connected: set an Anthropic key in Settings, or bind Workers AI" } });
+    this.sql.exec("INSERT OR IGNORE INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, 'reviewer', ?, ?, 0)",
+      REVIEW_AGENT_ID, REVIEW_AGENT_ID, `reviewer:${randomId(16)}`, Date.now());
+    const detail = await this.changeDetail(id);
+    const r = await reviewChange(model, {
+      title: detail.title, summary: detail.summary ?? "",
+      task: { title: detail.task?.title ?? "", description: detail.task?.description ?? "" },
+      intent: detail.intents.map((i: any) => `${i.description || "(no description)"} (${i.paths.join(", ")})`).join("; "),
+      files: (detail.files as FileChange[]).map((f) => f.path),
+      patch: (await (await this.context.get(`${this.project}/changes/${id}/patch.diff`))?.text()) ?? detail.patch ?? "",
+      brief: detail.brief.reasons.filter((x: any) => x.kind !== "ok").map((x: any) => x.text),
+      project: [this.project, this.meta("description")].filter(Boolean).join(": "),
+    });
+    const now = this.change(id);
+    if (now.head !== head || now.status !== "review") return; // it moved on while the model read it
+    if (!r.ok) return this.emit("review.agent_failed", { change: id, task: now.task_id, data: { reason: r.reason } });
+    const agent: Agent = { id: REVIEW_AGENT_ID, name: REVIEW_AGENT_ID, role: "reviewer" };
+    await this.review(agent, id, { verdict: r.verdict, body: `${r.body}
+
+(Loom's review agent, ${r.model} through AI Gateway. Nobody else was around to review this.)`, comments: r.comments });
+  }
+
   /** Ask the next best-placed agent, preferring ones who are around now. */
   private reroute(id: number, why: string) {
     const ch = this.change(id);
     if (!["review", "changes_requested"].includes(ch.status)) return;
     const asked = new Set(this.reviewRequests(id).map((r) => r.reviewer as string));
-    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent)).sort((x, y) => Number(y.present) - Number(x.present) || y.score - x.score)[0];
+    // Only agents who are around: asking absent ones walks the whole roster one
+    // deadline at a time. With nobody around, the review stays an open task (and
+    // shows as stuck) until someone comes back and takes it.
+    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent) && c.present).sort((x, y) => y.score - x.score)[0];
     this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: next?.agent ?? null, toName: next?.name ?? null } });
     if (next) this.assignReviewer(id, next.agent, "loom", `${next.reasons[0]} (${why})`);
+    else if (this.reviewAgent.enabled) void this.armAlarm(Date.now() + 1000);
   }
 
   /** Requests nobody accepted in time, or accepted and never delivered, go to someone else. */

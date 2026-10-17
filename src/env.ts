@@ -24,6 +24,10 @@ export interface Env {
   LOOM_DEV_LOGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
+  /** The AI Gateway that Loom's review agent calls models through. Default "default". */
+  LOOM_AI_GATEWAY?: string;
+  /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
+  LOOM_REVIEW_MODEL_URL?: string;
   TYPESAFE_API_KEY?: string;
   /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */
   GITHUB_API_URL?: string;

@@ -71,7 +71,7 @@ LOOM_SHOWCASE = "todo-swarm,contest-and-votes,checks-in-the-queue,code-review"
 # Local development: no Artifacts binding. The Worker talks to the
 # Artifacts shim (shim/artifacts-shim.mjs), which serves real git over HTTP.
 [env.local]
-vars = { ARTIFACTS_SHIM_URL = "http://127.0.0.1:8790", LOOM_ADMIN_TOKEN = "dev-admin", LOOM_DEV_LOGIN = "1", LOOM_OWNERS = "jonathanherr" }
+vars = { ARTIFACTS_SHIM_URL = "http://127.0.0.1:8790", LOOM_ADMIN_TOKEN = "dev-admin", LOOM_DEV_LOGIN = "1", LOOM_OWNERS = "jonathanherr", LOOM_REVIEW_MODEL_URL = "http://127.0.0.1:8790/anthropic" }
 
 [[env.local.durable_objects.bindings]]
 name = "PROJECT"
