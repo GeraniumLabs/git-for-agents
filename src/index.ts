@@ -6,7 +6,7 @@ import { projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
 import { AGENT_HEADER, DIRECTIVES_HEADER } from "./coordinator";
-import { PLANS, billingOn, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
+import { PLANS, billingOn, testMode, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
@@ -132,7 +132,7 @@ export default {
         if (!user) return Response.json({ enabled: true, plans: PLANS });
         const p = await planOf(env, user.login);
         const unlimited = logins(env.LOOM_OWNERS).includes(user.login.toLowerCase());
-        return Response.json({ enabled: true, plans: PLANS, plan: unlimited ? "unlimited" : p.plan, status: p.status, renews: p.renews, projects: p.owned.length, manage: !!p.customer });
+        return Response.json({ enabled: true, test: testMode(env), plans: PLANS, plan: unlimited ? "unlimited" : p.plan, paid: p.plan, status: p.status, renews: p.renews, projects: p.owned.length, manage: !!p.customer });
       }
       if (!billingOn(env)) return Response.json({ error: "this server takes no payments" }, { status: 404 });
       if (!user) return Response.json({ error: "sign in with GitHub first" }, { status: 401 });
@@ -142,6 +142,7 @@ export default {
       try {
         if (path === "/api/billing/checkout" && req.method === "POST") {
           if (p.plan === "pro") return Response.json({ error: "you're already on Loom Pro" }, { status: 409 });
+          if (logins(env.LOOM_OWNERS).includes(user.login.toLowerCase()) && !testMode(env)) return Response.json({ error: "you run this server, so no limits apply to you" }, { status: 409 });
           return Response.json({ url: await checkoutSession(env, user.login.toLowerCase(), p.customer, url.origin, ret) });
         }
         if (path === "/api/billing/portal" && req.method === "POST") {

@@ -48,6 +48,9 @@ export function projectLimits(env: Env, plan: string | null): Limits {
 
 export const billingOn = (env: Env) => !!(env.STRIPE_SECRET_KEY && env.STRIPE_WEBHOOK_SECRET);
 
+/** A Stripe test or sandbox key: no real money moves, so owners may try Checkout too. */
+export const testMode = (env: Env) => /^(sk|rk)_test_/.test(env.STRIPE_SECRET_KEY ?? "");
+
 /** A person's plan as the registry keeps it. */
 export interface PlanRow {
   login: string;

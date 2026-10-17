@@ -859,9 +859,15 @@ function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) 
 /** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
 async function planHtml() {
   const b = await fetch("/api/billing", { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
-  if (!b.enabled || !b.plan || b.plan === "unlimited") return "";
-  const p = b.plans[b.plan], pro = b.plans.pro;
+  if (!b.enabled || !b.plan) return "";
+  const pro = b.plans.pro;
   const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  if (b.plan === "unlimited") {
+    // An owner of the server: no limits. With a test key they can still walk through Checkout.
+    const tryIt = b.test && b.paid !== "pro" ? `<div class="row"><button class="ghost" data-billing="checkout">Try ${esc(pro.name)} checkout (test mode)</button></div>` : "";
+    return `<p class="meta">You run this server, so no limits apply to you. Everyone else starts on the free plan and can upgrade to <b>${esc(pro.name)}</b> (${esc(pro.price)}).${b.test ? ` Stripe is in test mode: pay with card 4242 4242 4242 4242.` : ""}${b.paid === "pro" ? ` Your test subscription is active.` : ""}</p>${tryIt}${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`;
+  }
+  const p = b.plans[b.plan];
   return b.plan === "pro"
     ? `<p class="meta">You're on <b>${esc(p.name)}</b>: ${limits(p)}.${b.status && b.status !== "active" ? ` Payment status: <b>${esc(b.status)}</b>.` : ""}${b.renews ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}</p>${b.manage ? `<div class="row"><button class="ghost" data-billing="portal">Manage billing</button></div>` : ""}`
     : `<p class="meta">You're on the <b>free plan</b>: ${limits(p)}. <b>${esc(pro.name)}</b> (${esc(pro.price)}) gives you ${limits(pro)}.</p><div class="row"><button data-billing="checkout">Upgrade to ${esc(pro.name)}</button>${b.manage ? `<button class="ghost" data-billing="portal">Billing history</button>` : ""}</div>`;
