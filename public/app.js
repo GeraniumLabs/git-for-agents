@@ -19,7 +19,7 @@ const color = (id) => {
   return PALETTE[h % PALETTE.length];
 };
 const name = (id) => names[id] ?? (id ? String(id).replace(/-[0-9a-f]{4}$/, "") : "loom");
-const who = (id) => `<a class="who" data-agent="${esc(id)}" style="color:${color(id)}">${esc(name(id))}</a>`;
+const who = (id) => `<a class="who" data-agent="${esc(id)}">${esc(name(id))}</a>`;
 const ago = (ts) => {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
   return s < 60 ? `${s}s` : s < 3600 ? `${Math.round(s / 60)}m` : s < 86400 ? `${Math.round(s / 3600)}h` : `${Math.round(s / 86400)}d`;
@@ -171,6 +171,7 @@ async function boot() {
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
     $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
+    $("#more").hidden = true;
     $("#np-empty").onclick = () => showNewProject();
     renderMe();
     if (location.hash) route();
@@ -179,6 +180,7 @@ async function boot() {
   // A private project answers 404 to anyone who can't read it.
   const probe = await fetch(`/api/projects/${project}/delegate`, { headers: keyHeader() });
   if (probe.status === 404) {
+    $("#more").hidden = true;
     $("main").innerHTML = `<p class="empty">${esc(project)} doesn't exist, or it's private. ${user ? "Ask one of its owners to add you." : `<button id="private-signin">Sign in</button>`}</p>`;
     if ($("#private-signin")) $("#private-signin").onclick = () => showSignIn("Private projects are visible only to their members.");
     renderMe();
@@ -197,12 +199,9 @@ function renderTour(projects, showcase) {
   if (dismissed || user || store.get(keyName()) || !showcase.length) return;
   const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
   $("#tour").innerHTML = `
-    <div class="tour-text">
-      <b>Loom is a git platform for agent swarms, built on Cloudflare.</b>
-      The projects below were built by agents working at the same time through Loom. Each declared what it would touch before writing code. Conflicts went to the agent that caused them. Where a project set a check command, the merge queue ran it before main moved. The Activity feed is live.
-    </div>
-    <div class="tour-projects">${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}"><b>${esc(n)}</b><span>${esc(desc(n))}</span></a>`).join("")}</div>
-    <div class="tour-actions"><button id="tour-agent">Bring your own agent</button><button id="tour-close" class="ghost" title="Hide this">Hide</button></div>`;
+    <span class="tour-text"><b>Loom is a git platform for agent swarms, built on Cloudflare.</b> These projects were built by agents working at the same time:</span>
+    ${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}" title="${esc(desc(n))}">${esc(n)}</a>`).join("")}
+    <button id="tour-agent" class="mini">Bring your own agent</button><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
   $("#tour").hidden = false;
   $("#tour-agent").onclick = () => showSkill();
   $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
@@ -255,7 +254,34 @@ function render() {
   renderNotes();
   renderAttachments();
   renderFeed();
+  renderQuiet();
 }
+
+/** Panels with nothing to show aren't drawn; one line says what's quiet. The tabs say what they hold. */
+function renderQuiet() {
+  const quiet = [];
+  for (const p of document.querySelectorAll("main .panel[data-quiet]")) {
+    const body = p.querySelector(".panel-body");
+    const empty = !!body && body.children.length === 1 && body.firstElementChild.classList.contains("empty");
+    p.hidden = empty;
+    if (empty) quiet.push(p.dataset.quiet);
+  }
+  $("#quiet").hidden = !quiet.length;
+  $("#quiet").textContent = quiet.length ? `All quiet: ${quiet.join(", ")}.` : "";
+  const n = (x) => (x ? String(x) : "");
+  $("#tab-work").textContent = n(state.queue?.length);
+  $("#tab-memory").textContent = n((state.decisions?.length ?? 0) + (state.notes?.length ?? 0));
+  $("#tab-files").textContent = n(state.attachments?.length);
+}
+
+// The reference tabs under the dashboard; the one you last opened stays open.
+function showTab(tab) {
+  for (const b of document.querySelectorAll(".more-tabs [data-tab]")) b.classList.toggle("on", b.dataset.tab === tab);
+  for (const d of document.querySelectorAll(".more-body")) d.hidden = d.dataset.tab !== tab;
+  try { localStorage.setItem("loom-tab", tab); } catch {}
+}
+for (const b of document.querySelectorAll(".more-tabs [data-tab]")) b.onclick = () => showTab(b.dataset.tab);
+try { const t = localStorage.getItem("loom-tab"); if (t && document.querySelector(`.more-body[data-tab="${t}"]`)) showTab(t); } catch {}
 
 // ── health: is the work moving? ─────────────────────────────────────────
 const STATES = [
@@ -278,23 +304,26 @@ function renderHealth() {
   const total = open + active + review + merged || 1;
   const STAGE_OF = { ok: "landed", info: "review", warn: "active", muted: "open" };
   const seg = (n, cls, label) => n ? `<span class="seg-${cls}" style="flex:${n}" title="${n} ${label}" data-tasks="${STAGE_OF[cls]}"></span>` : "";
+  const inReview = (h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0);
+  // Problems show as warnings beside the numbers, not as tiles of their own.
+  const warnings = [
+    state.project.frozen ? `<span class="warning bad" title="Nothing lands on main until someone unfreezes it">main is frozen</span>` : "",
+    h.conflictRate > 0.2 ? `<span class="warning bad" title="Share of merge attempts in the last hour that hit a conflict. Look at Where the work is, under Work">${Math.round(h.conflictRate * 100)}% of merges conflicted this hour</span>` : "",
+    state.project.checks ? "" : `<span class="warning" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing">No checks: main isn't tested before it moves${state.project.mainTests === 0 ? ", and has no tests" : ""}${state.project.suggestedCheck && isOwner() ? ` <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : isOwner() ? " · set one in Settings" : ""}</span>`,
+  ].filter(Boolean).join("");
   $("#health").innerHTML = `
-    <div class="tile wide" title="Agents in this project, by what they're doing now. Click a state to list those agents">
+    <div class="tile" title="Agents in this project, by what they're doing now. Click a state to list those agents">
       <b>${h.agents.total}</b><span>agents</span>
       <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}" title="${STATE_HELP[k] ?? ""}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
     </div>
-    <div class="tile wide" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage. Click to list the tasks">
+    <div class="tile" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage. Click to list the tasks">
       <a class="tile-link" data-tasks="" href="#tasks"><b>${merged}<small>/${total === 1 && !merged ? 0 : total}</small></b><span>tasks landed</span></a>
       <div class="bar">${seg(merged, "ok", "landed")}${seg(review, "info", "in review or queued")}${seg(active, "warn", "in progress")}${seg(open, "muted", "open")}</div>
-      <div class="meta"><a data-tasks="open" href="#tasks">${open} open</a> · <a data-tasks="active" href="#tasks">${active} in progress</a> · <a data-tasks="review" href="#tasks">${review} in review or queued</a></div>
+      <div class="meta"><a data-tasks="open" href="#tasks">${open} open</a> · <a data-tasks="active" href="#tasks">${active} in progress</a></div>
     </div>
-    <div class="tile" title="Changes waiting for review. Each is a task any agent can take (take_review); untaken ones are offered to agents who know the code"><b>${(h.reviewTasks?.open ?? 0) + (h.reviewTasks?.assigned ?? 0) + (h.reviewTasks?.in_progress ?? 0)}</b><span>review tasks · ${h.reviewTasks?.open ?? 0} untaken · ${h.reviewTasks?.in_progress ?? 0} being reviewed</span></div>
-    <div class="tile" title="Approved changes waiting to land on main. They land one batch at a time, after the project's checks pass"><b>${h.queue.depth}</b><span>in the merge queue${h.queue.depth ? ` · oldest ${dur(h.queue.oldestWaitMs)}` : ""}</span></div>
-    <div class="tile" title="Changes that landed on main in the last hour"><b>${h.mergedLastHour}</b><span>merged in the last hour</span></div>
-    ${h.people ? `<div class="tile" title="Questions agents asked people that are still open. This hour: ${h.people.askedLastHour} asked, ${h.people.answeredLastHour} answered by people, ${h.people.defaultedLastHour} went ahead on the agent's default. Limits are in Settings"><b class="${h.people.waiting > 5 ? "warn" : ""}">${h.people.waiting}</b><span>questions for people${h.people.waiting ? ` · oldest ${dur(h.people.oldestMs)}` : ""} · ${h.people.askedLastHour} asked this hour${h.people.defaultedLastHour ? `, ${h.people.defaultedLastHour} went ahead on a default` : ""}</span></div>` : ""}
-    <div class="tile" title="Share of merge attempts in the last hour that hit a conflict. Over 20% shows red: look at Where the work is"><b class="${h.conflictRate > 0.2 ? "bad" : ""}">${Math.round(h.conflictRate * 100)}%</b><span>conflict rate · ${h.conflictsLastHour} this hour</span></div>
-    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}${state.project.frozen ? ` · <b class="bad">frozen</b>` : ""}</span></div>
-    ${state.project.checks ? "" : `<div class="tile" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing"><b class="warn">no checks</b><span>main isn't tested before it moves${state.project.mainTests === 0 ? " · main has no tests, so changes aren't flagged for skipping them" : ""}${state.project.suggestedCheck && isOwner() ? ` · <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : " · set one in Settings"}</span></div>`}`;
+    <div class="tile" title="Changes waiting for review (each is a task any agent can take), and approved changes waiting to land on main. ${h.mergedLastHour} landed in the last hour"><b>${inReview} <small>in review</small> · ${h.queue.depth} <small>queued</small></b><span>${h.reviewTasks?.open ? `${h.reviewTasks.open} nobody has taken · ` : ""}${h.mergedLastHour} landed in the last hour</span></div>
+    <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}</span></div>
+    ${warnings ? `<div class="warnings">${warnings}</div>` : ""}`;
   const useCheck = $("#health [data-use-check]");
   if (useCheck) useCheck.onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: state.project.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
@@ -347,6 +376,10 @@ function renderAttention() {
     return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("approve")}`, "q");
   }).join("") || `<p class="empty">Nothing needs a person right now.</p>`;
   wire($("#attention"));
+  // Long questions show two lines; a click shows the rest.
+  for (const q of $("#attention").querySelectorAll(".q")) {
+    if (q.scrollHeight > q.clientHeight + 2) { q.classList.add("more"); q.title = "Show all of it"; q.onclick = (e) => { if (e.target.closest("a, button")) return; q.classList.toggle("open"); }; }
+  }
   for (const b of $("#attention").querySelectorAll("[data-take-task]")) b.onclick = async () => {
     const r = await act("POST", `/tasks/${b.dataset.takeTask}/claim`);
     showWork(`<div class="card"><b>Task #${r.task.id} is yours.</b>${pushInfo(r)}</div>`);
