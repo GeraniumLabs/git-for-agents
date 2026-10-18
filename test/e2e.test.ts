@@ -884,3 +884,85 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   assert.equal((await (await as("GET", "/api/billing")).json()).plan, "free");
   assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.checkMinutes, 30);
 });
+
+test("an organization: people invited once are members of all its projects, its owners own them, and it has its own plan", { skip: !url, timeout: 90_000 }, async () => {
+  const { signStripe } = await import("../src/billing.ts");
+  const tag = Date.now().toString(36).slice(-5);
+  const [alice, bob, carol] = [`ali${tag}`, `bob${tag}`, `car${tag}`];
+  const signIn = async (login: string) => ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const cookies: Record<string, string> = { [alice]: await signIn(alice), [bob]: await signIn(bob), [carol]: await signIn(carol) };
+  const as = (who: string) => (method: string, path: string, body?: unknown) => fetch(`${url}${path}`, { method, headers: { cookie: cookies[who], "content-type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const [A, B, C] = [as(alice), as(bob), as(carol)];
+  await fetch(`${url}/api/admin/creators`, { method: "POST", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ login: alice }) });
+  const meIn = async (who: typeof A, p: string) => { const r = await who("GET", `/api/projects/${p}/me`); return r.ok ? (await r.json()).agent : null; };
+
+  const slug = `acme-${tag}`;
+  assert.equal((await A("POST", "/api/orgs", { slug, name: "Acme" })).status, 200);
+  assert.equal((await A("POST", "/api/orgs", { slug, name: "Again" })).status, 409, "a slug is taken once");
+  const mine = project("e2e-own");
+  assert.equal((await A("POST", "/api/projects", { name: mine, description: "x", visibility: "private" })).status, 200);
+  const shared = project("e2e-org");
+  const made = await A("POST", "/api/projects", { name: shared, description: "x", visibility: "private", org: slug });
+  assert.equal(made.status, 200, await made.clone().text());
+  assert.equal((await B("POST", "/api/projects", { name: project("e2e-x"), org: slug })).status, 403, "only the org's owners create projects in it");
+  assert.equal(await meIn(B, shared), null, "bob isn't in yet");
+  const outside = await (await B("GET", `/api/orgs/${slug}`)).json();
+  assert.equal(outside.role, null);
+  assert.equal(outside.members, undefined, "people outside an org don't see who's in it or what it owns");
+
+  // Added by login: a member of the org's project, not an owner, and not of alice's own project.
+  assert.equal((await A("POST", `/api/orgs/${slug}/members`, { login: bob })).status, 200);
+  assert.equal((await meIn(B, shared))?.owner, false);
+  assert.equal(await meIn(B, mine), null);
+  assert.equal((await B("POST", `/api/orgs/${slug}/members`, { login: carol })).status, 403, "members don't add people");
+
+  // An invite link: anyone can see what it's for; carol joins with it.
+  const inv = await (await A("POST", `/api/orgs/${slug}/invites`, { role: "member" })).json();
+  assert.match(inv.url, /\?invite=[a-f0-9]+$/);
+  assert.equal((await (await fetch(`${url}/api/invites/${inv.code}`)).json()).name, "Acme");
+  const joined = await (await C("POST", `/api/invites/${inv.code}/accept`, {})).json();
+  assert.equal(joined.joined, true);
+  assert.ok(await meIn(C, shared), "carol is a member of the org's project");
+  const acct = await (await C("GET", "/api/account")).json();
+  assert.equal(acct.orgs[0].slug, slug);
+
+  // Owners of the org own its projects; leaving the org takes people out of them.
+  await A("POST", `/api/orgs/${slug}/members`, { login: bob, role: "owner" });
+  assert.equal((await meIn(B, shared))?.owner, true);
+  assert.equal((await C("DELETE", `/api/orgs/${slug}/members/${carol}`, {})).status, 200, "anyone can leave");
+  assert.equal(await meIn(C, shared), null);
+  await A("DELETE", `/api/orgs/${slug}/invites/${inv.code}`, {});
+  assert.equal((await fetch(`${url}/api/invites/${inv.code}`)).status, 404, "a withdrawn link stops working");
+  assert.equal((await A("DELETE", `/api/orgs/${slug}/members/${alice}`, {})).status, 200, "alice can leave while bob owns it too");
+  assert.equal((await B("DELETE", `/api/orgs/${slug}/members/${bob}`, {})).status, 409, "the last owner can't leave");
+  await B("POST", `/api/orgs/${slug}/members`, { login: alice, role: "owner" });
+
+  // Moving alice's own project in brings the org's people; moving it out takes them away again.
+  assert.equal((await A("POST", `/api/projects/${mine}/org`, { org: slug })).status, 200);
+  assert.equal((await meIn(B, mine))?.owner, true);
+  assert.equal((await (await A("GET", `/api/projects/${mine}/overview`)).json()).project.org, slug);
+  assert.equal((await A("POST", `/api/projects/${mine}/org`, { org: null })).status, 200);
+  assert.equal(await meIn(B, mine), null);
+
+  // The org's own plan: free has one project (it has one), and paying lifts its projects' limits.
+  const capped = await A("POST", "/api/projects", { name: project("e2e-org2"), org: slug });
+  assert.equal(capped.status, 403);
+  assert.match((await capped.json()).error, new RegExp(`${slug} has 1`));
+  const b = await (await A("GET", `/api/billing?org=${slug}`)).json();
+  assert.equal(b.plan, "free");
+  assert.equal(b.role, "owner");
+  const co = await (await A("POST", "/api/billing/checkout", { org: slug, back: "/" })).json();
+  assert.match(co.url, /\/stripe\/pay\/cs_test_/);
+  const body = JSON.stringify({ type: "checkout.session.completed", created: Math.floor(Date.now() / 1000), data: { object: { mode: "subscription", metadata: { app: "loom", login: alice, account: `org:${slug}` }, customer: "cus_org", subscription: "sub_org" } } });
+  const t = Math.floor(Date.now() / 1000);
+  await fetch(`${url}/api/stripe/webhook`, { method: "POST", headers: { "stripe-signature": `t=${t},v1=${await signStripe("whsec_local", t, body)}` }, body });
+  assert.equal((await (await A("GET", `/api/billing?org=${slug}`)).json()).plan, "pro");
+  assert.equal((await (await A("GET", "/api/billing")).json()).plan, "free", "alice's own plan is untouched");
+  assert.equal((await (await A("GET", `/api/projects/${shared}/overview`)).json()).project.limits.checkMinutes, 300);
+  assert.equal((await A("POST", "/api/projects", { name: project("e2e-org3"), org: slug })).status, 200);
+
+  // Where Loom emails a person lives on their account.
+  assert.equal((await B("POST", "/api/account/email", { email: "bob@example.com" })).status, 200);
+  assert.equal((await (await B("GET", "/api/account")).json()).email, "bob@example.com");
+  assert.equal((await B("POST", "/api/account/email", { email: "nope" })).status, 400);
+});

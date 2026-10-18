@@ -53,6 +53,14 @@ $("#theme").onclick = () => {
   store.set("loom-theme", next === "auto" ? null : next);
   applyTheme(next);
 };
+/** A call to Loom's site-wide API (accounts, orgs, invites), toasting what goes wrong. */
+async function site(method, path, body) {
+  const res = await fetch(`/api${path}`, { method, headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) { toast(data.error ?? `HTTP ${res.status}`); throw new Error(data.error); }
+  return data;
+}
+
 async function act(method, path, body) {
   const res = await fetch(`/api/projects/${project}${path}`, {
     method,
@@ -121,9 +129,9 @@ const githubUrl = () => `/auth/github?return=${encodeURIComponent(location.pathn
 function renderMe() {
   const face = user?.avatar ? `<img class="avatar" src="${esc(user.avatar)}" alt="">` : "";
   $("#me").innerHTML = me
-    ? `<span class="who-me">${face}${esc(me.name)} <span class="role">${me.owner ? "owner" : me.role === "human" ? "member" : me.role}</span></span><button id="signout" class="ghost">Sign out</button>`
+    ? `${user ? `<a class="who-me" href="#account" title="Your account, plan and organizations">` : `<span class="who-me">`}${face}${esc(me.name)} <span class="role">${me.owner ? "owner" : me.role === "human" ? "member" : me.role}</span>${user ? "</a>" : "</span>"}<button id="signout" class="ghost">Sign out</button>`
     : user
-      ? `<span class="who-me">${face}${esc(user.login)} <span class="role">not a member</span></span><button id="signout" class="ghost">Sign out</button>`
+      ? `<a class="who-me" href="#account" title="Your account, plan and organizations">${face}${esc(user.login)} <span class="role">not a member</span></a><button id="signout" class="ghost">Sign out</button>`
       : `<button id="signin">Sign in</button>`;
   if ($("#signout")) $("#signout").onclick = async () => {
     // Sign out everywhere on this site: the GitHub session and any key pasted for any project.
@@ -153,6 +161,8 @@ async function showSignIn(why = "") {
 
 async function boot() {
   await loadUser();
+  const invite = new URLSearchParams(location.search).get("invite");
+  if (invite) showInvite(invite);
   const projects = await fetch("/api/projects").then((r) => r.json());
   const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
   if (!project) project = showcase[0] ?? projects.at(-1)?.name;
@@ -163,6 +173,7 @@ async function boot() {
     $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
     $("#np-empty").onclick = () => showNewProject();
     renderMe();
+    if (location.hash) route();
     return;
   }
   // A private project answers 404 to anyone who can't read it.
@@ -171,6 +182,7 @@ async function boot() {
     $("main").innerHTML = `<p class="empty">${esc(project)} doesn't exist, or it's private. ${user ? "Ask one of its owners to add you." : `<button id="private-signin">Sign in</button>`}</p>`;
     if ($("#private-signin")) $("#private-signin").onclick = () => showSignIn("Private projects are visible only to their members.");
     renderMe();
+    if (location.hash) route();
     return;
   }
   connect();
@@ -851,9 +863,20 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
 /** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
-async function planHtml() {
-  const b = await fetch("/api/billing", { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
+async function planHtml(org = null) {
+  const b = await fetch(`/api/billing${org ? `?org=${encodeURIComponent(org)}` : ""}`, { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
   if (!b.enabled || !b.plan) return "";
+  const o = org ? ` data-org="${esc(org)}"` : "";
+  if (org) {
+    // An org's plan: its owners change it; its members see it.
+    const p = b.plan === "unlimited" ? null : b.plans[b.plan], pro = b.plans.pro;
+    const lim = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+    const what = !p ? `${esc(org)} is run by this server's owners, so no limits apply.` : `${esc(org)} is on <b>${esc(p.name)}</b>: ${lim(p)}.${b.renews && b.paid === "pro" ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}`;
+    const owner = b.role === "owner";
+    const buy = owner && b.paid !== "pro" && (p || b.test) ? `<button data-billing="checkout"${o}>${p ? `Upgrade ${esc(org)} to ${esc(pro.name)} (${esc(pro.price)})` : `Try ${esc(pro.name)} checkout (test mode)`}</button>` : "";
+    const manage = b.manage ? `<button class="ghost" data-billing="portal"${o}>Manage billing</button>` : "";
+    return `<p class="meta">${what}${b.test && owner ? " Stripe is in test mode: pay with card 4242 4242 4242 4242." : ""}${!owner ? ` Its owners manage the plan.` : ""}</p>${buy || manage ? `<div class="row">${buy}${manage}</div>` : ""}`;
+  }
   const pro = b.plans.pro;
   const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
   if (b.plan === "unlimited") {
@@ -870,20 +893,25 @@ async function planHtml() {
 function wireBilling(root) {
   for (const btn of root.querySelectorAll("[data-billing]")) btn.onclick = async () => {
     btn.disabled = true;
-    const res = await fetch(`/api/billing/${btn.dataset.billing}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ back: `${location.pathname}${location.search}` }) });
+    const res = await fetch(`/api/billing/${btn.dataset.billing}`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ back: `${location.pathname}${location.search}${location.hash}`, org: btn.dataset.org || undefined }) });
     const d = await res.json().catch(() => ({}));
     if (!res.ok || !d.url) { btn.disabled = false; return toast(d.error ?? `HTTP ${res.status}`); }
     location.href = d.url;
   };
 }
 
-async function showNewProject(draft = null) {
+/** The New project dialog; org preselects who owns it. */
+async function showNewProject(draft = null, org = "") {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
-  const plan = await planHtml();
+  const account = await site("GET", "/account").catch(() => ({ orgs: [] }));
+  const ownOrgs = (account.orgs ?? []).filter((o) => o.role === "owner");
+  org = draft?.fields?.["#np-org"] ?? org;
+  const plan = await planHtml(org || null);
   $("#detail-body").innerHTML = `
     <h3>New project</h3>
     <p class="meta">A project is one repository with its own agents, people, tasks and merge queue. You'll be its owner, signed in as <b>${esc(user.login)}</b>.</p>
-    ${plan}
+    ${ownOrgs.length ? `<label>Owner <select id="np-org"><option value="">You (${esc(user.login)})</option>${ownOrgs.map((o) => `<option value="${esc(o.slug)}" ${o.slug === org ? "selected" : ""}>${esc(o.name)}: everyone in it is a member</option>`).join("")}</select></label>` : ""}
+    <div id="np-plan">${plan}</div>
     <label>Name <input id="np-name" placeholder="lowercase-with-dashes" pattern="[a-z0-9-]+"></label>
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
     <h2>Start from</h2>
@@ -904,6 +932,7 @@ async function showNewProject(draft = null) {
     <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
   wireBilling($("#detail-body"));
+  if ($("#np-org")) $("#np-org").onchange = async () => { $("#np-plan").innerHTML = await planHtml($("#np-org").value || null); wireBilling($("#np-plan")); };
   const importing = () => $('input[name="np-from"]:checked').value === "import";
   if (draft) {
     // Back from GitHub: put the form back as it was.
@@ -916,7 +945,7 @@ async function showNewProject(draft = null) {
   // A private GitHub repository: go to GitHub for what Loom needs (the person's OK, then Loom's app on the
   // repository), and finish creating the project when GitHub sends them back.
   const toGitHub = (step) => {
-    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch", "#np-checks"].map((id) => [id, $(id).value]));
+    const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch", "#np-checks", "#np-org"].filter((id) => $(id)).map((id) => [id, $(id).value]));
     const checked = [...document.querySelectorAll("#detail-body input[type=checkbox]:checked, #detail-body input[type=radio]:checked")].map((e) => e.id ? `#${e.id}` : `input[name="${e.name}"][value="${e.value}"]`);
     try { sessionStorage.setItem("loom-np-draft", JSON.stringify({ fields, checked, resume: step })); } catch {}
     const back = new URLSearchParams(location.search);
@@ -965,7 +994,7 @@ async function showNewProject(draft = null) {
       if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;
@@ -1001,12 +1030,139 @@ if (new URLSearchParams(location.search).get("billing") === "done") {
 }
 try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
+// ── your account, organizations and invites ─────────────────────────────
+function openDetail(html) {
+  $("#detail-body").innerHTML = html;
+  if (!$("#detail").open) $("#detail").showModal();
+}
+const projectLink = (n) => `<a href="/?project=${encodeURIComponent(n)}">${esc(n)}</a>`;
+
+/** What belongs to a person rather than a project: where Loom emails them, their plan, their orgs. */
+async function showAccount() {
+  if (!user) return showSignIn("Sign in with GitHub to see your account.");
+  let a;
+  try { a = await site("GET", "/account"); } catch { return; }
+  const plan = await planHtml();
+  openDetail(`
+    <h3>Your account</h3>
+    <p class="meta">Signed in with GitHub as <b>${esc(a.login)}</b>.</p>
+    <h2>Email</h2>
+    <p class="meta">Where Loom emails you when something needs you. Each project emails you only once you turn it on in that project's Settings.</p>
+    <div class="row"><input id="acct-email" type="email" class="grow" placeholder="you@example.com" value="${esc(a.email ?? "")}"><button class="ghost" id="acct-email-save">Save</button></div>
+    ${plan ? `<h2>Your plan</h2><p class="meta">For projects you own yourself. An organization's projects run on its own plan.</p>${plan}` : ""}
+    <h2>Organizations</h2>
+    <p class="meta">An organization owns projects. Everyone you invite to it is a member of all of them, and its owners own them, so you add people once instead of project by project.</p>
+    ${a.orgs.length ? a.orgs.map((o) => `<div class="qrow"><a class="grow" href="#org/${esc(o.slug)}">${esc(o.name)}</a><span class="role">${esc(o.role)}</span><span class="meta">${o.projects} project${o.projects === 1 ? "" : "s"}</span></div>`).join("") : `<p class="meta">You aren't in one yet.</p>`}
+    <div class="row"><input id="org-name" class="grow" placeholder="New organization's name, e.g. Acme"><input id="org-slug" placeholder="its link: acme" pattern="[a-z0-9-]+"><button class="ghost" id="org-create">Create</button></div>
+    <h2>Your projects</h2>
+    ${a.projects.length ? `<p>${a.projects.map(projectLink).join(" · ")}</p>` : `<p class="meta">None of your own yet.</p>`}
+    <div class="row"><button class="ghost" id="acct-new">New project</button></div>`);
+  wireBilling($("#detail-body"));
+  const slugOf = (t) => t.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 39);
+  let typed = false;
+  $("#org-slug").oninput = () => { typed = true; };
+  $("#org-name").oninput = () => { if (!typed) $("#org-slug").value = slugOf($("#org-name").value); };
+  $("#org-create").onclick = async () => {
+    const slug = $("#org-slug").value.trim() || slugOf($("#org-name").value);
+    if (!slug) return toast("Give it a name");
+    try { await site("POST", "/orgs", { slug, name: $("#org-name").value.trim() || slug }); } catch { return; }
+    location.hash = `org/${slug}`;
+  };
+  $("#acct-email-save").onclick = async () => {
+    try { await site("POST", "/account/email", { email: $("#acct-email").value.trim() || null }); } catch { return; }
+    toast($("#acct-email").value.trim() ? "Saved" : "Email address removed");
+  };
+  $("#acct-new").onclick = () => showNewProject();
+}
+
+/** An organization: its people, invite links, projects and plan. */
+async function showOrg(slug) {
+  if (!user) return showSignIn(`Sign in with GitHub to see ${slug}.`);
+  let o;
+  try { o = await site("GET", `/orgs/${slug}`); } catch { return; }
+  if (!o.role) return openDetail(`<h3>${esc(o.name)}</h3><p>You aren't in ${esc(o.name)}. Ask one of its owners for an invite link.</p>`);
+  const owner = o.role === "owner";
+  const me_ = user.login.toLowerCase();
+  const plan = await planHtml(slug);
+  openDetail(`
+    <h3>${esc(o.name)}</h3>
+    <p class="meta">Organization <b>${esc(o.slug)}</b>. You're ${owner ? "an owner" : "a member"}. <a href="#account">Your account</a></p>
+    <h2>People</h2>
+    <p class="meta">Members are members of every project ${esc(o.name)} owns; owners own them all and manage people, invites and the plan.</p>
+    ${o.members.map((m) => `<div class="qrow"><span class="grow">${esc(m.login)}${m.login === me_ ? " (you)" : ""}</span><span class="role">${esc(m.role)}</span>${owner && m.login !== me_ ? `<button class="ghost mini" data-org-role="${esc(m.login)}" data-to="${m.role === "owner" ? "member" : "owner"}">Make ${m.role === "owner" ? "member" : "owner"}</button><button class="ghost mini" data-org-remove="${esc(m.login)}">Remove</button>` : ""}</div>`).join("")}
+    ${owner ? `<div class="row"><input id="om-login" class="grow" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="om-owner" type="checkbox"> Owner</label><button class="ghost" id="om-add">Add</button></div>` : ""}
+    ${owner ? `<h2>Invite links</h2>
+    <p class="meta">Anyone who opens a link and signs in with GitHub joins ${esc(o.name)}. Links last 14 days; withdraw one to stop it.</p>
+    ${o.invites.map((i) => `<div class="qrow"><span class="grow mono">…${esc(i.code.slice(-6))}</span><span class="role">${esc(i.role)}</span><span class="meta">${i.uses} joined · until ${new Date(i.expires_at).toLocaleDateString()}</span><button class="ghost mini" data-copy="${esc(`${location.origin}/?invite=${i.code}`)}">Copy link</button><button class="ghost mini" data-invite-revoke="${esc(i.code)}">Withdraw</button></div>`).join("")}
+    <div class="row"><button class="ghost" id="oi-member">New member link</button><button class="ghost" id="oi-owner">New owner link</button></div>` : ""}
+    <h2>Projects</h2>
+    ${o.projects.length ? `<p>${o.projects.map((p) => projectLink(p.name)).join(" · ")}</p>` : `<p class="meta">None yet. Create one here, or move one you own in from its Settings.</p>`}
+    ${owner ? `<div class="row"><button class="ghost" id="org-new">New project in ${esc(o.name)}</button></div>` : ""}
+    ${plan ? `<h2>Plan</h2>${plan}` : ""}
+    <h2>Leave or delete</h2>
+    <div class="row"><button class="ghost" id="org-leave">Leave ${esc(o.name)}</button>${owner ? `<button class="ghost" id="org-delete" ${o.projects.length ? "disabled title=\"Move or delete its projects first\"" : ""}>Delete ${esc(o.name)}</button>` : ""}</div>`);
+  wireBilling($("#detail-body"));
+  wireCopy($("#detail-body"));
+  const again = () => showOrg(slug);
+  for (const b of document.querySelectorAll("[data-org-role]")) b.onclick = async () => { try { await site("POST", `/orgs/${slug}/members`, { login: b.dataset.orgRole, role: b.dataset.to }); } catch { return; } again(); };
+  for (const b of document.querySelectorAll("[data-org-remove]")) b.onclick = async () => { try { await site("DELETE", `/orgs/${slug}/members/${b.dataset.orgRemove}`, {}); } catch { return; } toast(`Removed ${b.dataset.orgRemove}`); again(); };
+  for (const b of document.querySelectorAll("[data-invite-revoke]")) b.onclick = async () => { try { await site("DELETE", `/orgs/${slug}/invites/${b.dataset.inviteRevoke}`, {}); } catch { return; } toast("Link withdrawn"); again(); };
+  if ($("#om-add")) $("#om-add").onclick = async () => {
+    const login = $("#om-login").value.trim().replace(/^@/, "");
+    if (!login) return;
+    try { await site("POST", `/orgs/${slug}/members`, { login, role: $("#om-owner").checked ? "owner" : "member" }); } catch { return; }
+    toast(`Added ${login}: they're in once they sign in with GitHub`);
+    again();
+  };
+  const invite = (role) => async () => {
+    let i;
+    try { i = await site("POST", `/orgs/${slug}/invites`, { role }); } catch { return; }
+    await navigator.clipboard?.writeText(i.url).catch(() => {});
+    toast("Invite link copied");
+    again();
+  };
+  if ($("#oi-member")) { $("#oi-member").onclick = invite("member"); $("#oi-owner").onclick = invite("owner"); }
+  if ($("#org-new")) $("#org-new").onclick = () => showNewProject(null, slug);
+  $("#org-leave").onclick = async () => {
+    try { await site("DELETE", `/orgs/${slug}/members/${me_}`, {}); } catch { return; }
+    toast(`You left ${o.name}`);
+    location.hash = "account";
+  };
+  if ($("#org-delete")) $("#org-delete").onclick = async () => {
+    if (!(await ask({ title: `Delete ${o.name}?`, body: "It owns no projects, so only the organization and its invite links go.", ok: "Delete", danger: true }))) return;
+    try { await site("DELETE", `/orgs/${slug}`, {}); } catch { return; }
+    toast(`Deleted ${o.name}`);
+    location.hash = "account";
+  };
+}
+
+/** Someone opened an invite link: say what it's for, and let them join once signed in. */
+async function showInvite(code) {
+  const i = await fetch(`/api/invites/${encodeURIComponent(code)}`).then((r) => r.json()).catch(() => ({ error: "couldn't read the invite" }));
+  const drop = () => { const q = new URLSearchParams(location.search); q.delete("invite"); history.replaceState(null, "", `${location.pathname}${q.size ? `?${q}` : ""}${location.hash}`); };
+  if (i.error) { drop(); return openDetail(`<h3>Invite</h3><p>${esc(i.error)}</p>`); }
+  openDetail(`
+    <h3>Join ${esc(i.name)}</h3>
+    <p>You're invited to the organization <b>${esc(i.name)}</b> as ${i.role === "owner" ? "an owner" : "a member"}. You'll be a member of every project it owns${i.role === "owner" ? ", and an owner of each" : ""}.</p>
+    <div class="row">${user ? `<button id="inv-join">Join as ${esc(user.login)}</button>` : auth.github ? `<a class="button" href="${githubUrl()}">Sign in with GitHub to join</a>` : `<p class="meta">GitHub sign-in isn't set up on this server.</p>`}</div>`);
+  if ($("#inv-join")) $("#inv-join").onclick = async () => {
+    let r;
+    try { r = await site("POST", `/invites/${encodeURIComponent(code)}/accept`, {}); } catch { return; }
+    drop();
+    toast(r.joined ? `You're in ${r.name}` : `You were already in ${r.name}`);
+    if (project) signIn(); // they may now be a member of the project on screen
+    location.hash = `org/${r.org}`;
+  };
+}
+
 // ── settings: keys people bring for this project ────────────────────────
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null, plan = "";
-  try { [s, people, si, mail, plan] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? planHtml() : ""]); } catch { return; }
+  let mail = null, account = null;
+  try { [s, people, si, mail, account] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null]); } catch { return; }
+  const org = state?.project?.org ?? null;
+  const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
@@ -1042,10 +1198,13 @@ async function showSettings() {
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
-    ${plan ? `<h2>Your plan</h2>${plan}` : ""}
+    <h2>Organization</h2>
+    <p class="meta">${org ? `${esc(project)} belongs to <a href="#org/${esc(org)}">${esc(org)}</a>: everyone in it is a member here, its owners own it, and it runs on ${esc(org)}'s plan.` : `${esc(project)} isn't in an organization: its people are the ones above${account ? `, and it runs on its creator's plan. Yours is on <a href="#account">your account page</a>` : ""}.`}</p>
+    ${isOwner() && user && (moveTo.length || org) ? `<div class="row"><select id="org-move">${org ? `<option value="">Make it mine, outside ${esc(org)}</option>` : ""}${moveTo.map((o) => `<option value="${esc(o.slug)}">Move it into ${esc(o.name)}</option>`).join("")}</select><button class="ghost" id="org-move-go">Move</button></div>` : ""}
+    ${isOwner() && user && !moveTo.length && !org ? `<p class="meta">To share it with a team, <a href="#account">create an organization</a>, then move it in here.</p>` : ""}
     ${mail ? `<h2>Email me</h2>
-    <p class="meta">${mail.email ? `Loom emails <b>${esc(mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : `Get an email when something on ${esc(project)} needs you, with a link straight to it.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
-    <div class="row"><input id="mail-to" type="email" class="grow" placeholder="you@example.com" value="${esc(mail.email ?? "")}"><button class="ghost" id="mail-save">${mail.email ? "Save" : "Turn on"}</button>${mail.email ? `<button class="ghost" id="mail-off">Turn off</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : ""}</div>` : ""}
+    <p class="meta">${mail.email ? `Loom emails you at <b>${esc(account?.email ?? mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : account?.email ? `Get an email at <b>${esc(account.email)}</b> when something on ${esc(project)} needs you, with a link straight to it.` : `Get an email when something on ${esc(project)} needs you. First set your address on <a href="#account">your account page</a>.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
+    ${mail.email || account?.email ? `<div class="row">${mail.email ? `<button class="ghost" id="mail-off">Stop emailing me about ${esc(project)}</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : `<button class="ghost" id="mail-on" data-to="${esc(account.email)}">Email me about ${esc(project)}</button>`}</div>` : ""}` : ""}
     <h2>Your agent</h2>
     <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
@@ -1146,9 +1305,16 @@ async function showSettings() {
     showSettings();
   };
   wireBilling($("#detail-body"));
-  if ($("#mail-save")) $("#mail-save").onclick = async () => {
-    try { await act("POST", "/me/email", { email: $("#mail-to").value }); } catch { return; }
-    toast($("#mail-to").value.trim() ? "Email on" : "Email off");
+  if ($("#mail-on")) $("#mail-on").onclick = async () => {
+    try { await act("POST", "/me/email", { email: $("#mail-on").dataset.to }); } catch { return; }
+    toast("Email on");
+    showSettings();
+  };
+  if ($("#org-move-go")) $("#org-move-go").onclick = async () => {
+    const to = $("#org-move").value || null;
+    try { await site("POST", `/projects/${project}/org`, { org: to }); } catch { return; }
+    toast(to ? `Moved into ${to}` : "It's yours now");
+    if (state) state.project.org = to;
     showSettings();
   };
   if ($("#mail-off")) $("#mail-off").onclick = async () => {
@@ -1508,6 +1674,8 @@ function showTask(id) {
 
 /** The dashboard, or a change or contest on its own page, from the URL. */
 function route() {
+  const page = /^#(?:account|org\/([a-z0-9-]+))$/.exec(location.hash);
+  if (page) { page[1] ? showOrg(page[1]) : showAccount(); return; }
   const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!m);
   $("#review").hidden = !m;
@@ -1517,6 +1685,8 @@ function route() {
   if (m[1] === "change") loadReview(Number(m[2])).then(() => m[3] && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
 window.addEventListener("hashchange", route);
+// Closing the account or an org page leaves its link, so the same link opens it again.
+$("#detail").addEventListener("close", () => { if (/^#(account|org\/)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
 async function loadReview(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
