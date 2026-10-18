@@ -25,6 +25,7 @@ import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type I
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
+import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 
@@ -189,6 +190,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE agents ADD COLUMN email TEXT",
       "ALTER TABLE agents ADD COLUMN email_seen TEXT",
       "ALTER TABLE agents ADD COLUMN emailed_at INTEGER",
+      "ALTER TABLE projects ADD COLUMN org TEXT",
+      "ALTER TABLE agents ADD COLUMN via_org INTEGER DEFAULT 0",
       "UPDATE agents SET name = 'deputy' WHERE id = 'delegate' AND name = 'jev'",
       // Repair changes a late review flipped to "changes requested" after they landed or closed.
       "UPDATE changes SET status = 'merged' WHERE status = 'changes_requested' AND merged_commit IS NOT NULL",
@@ -230,6 +233,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
       CREATE TABLE IF NOT EXISTS plans (login TEXT PRIMARY KEY, plan TEXT, status TEXT, customer TEXT, subscription TEXT, renews INTEGER, event_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
+      ${ORG_TABLES}
       CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
         task_id INTEGER, change_id INTEGER, path TEXT, line INTEGER, title TEXT,
@@ -448,6 +452,41 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return r ? (r.name as string) : id;
   }
 
+  /** The registry's projects under an account: a person's own (outside any org), or an org's (org:<slug>). */
+  private ownedBy(account: string) {
+    return account.startsWith("org:")
+      ? this.sql.exec("SELECT name, jurisdiction FROM projects WHERE org = ?", account.slice(4)).toArray()
+      : this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ? AND org IS NULL", account.toLowerCase()).toArray();
+  }
+
+  /**
+   * Copy an org's people into this project: its members become members, its
+   * owners owners. People added through the org leave with it; people added to
+   * the project directly stay, though an org owner is made an owner here too.
+   */
+  private async syncOrg(body: { org: string | null; members: { login: string; role: OrgRole }[] }) {
+    if (body.org) this.setMeta("org", body.org); else this.sql.exec("DELETE FROM meta WHERE key = 'org'");
+    const want = new Map((body.org ? body.members : []).map((p) => [`github:${p.login.toLowerCase()}`, p]));
+    const rows = this.sql.exec("SELECT id, name, identity, owner, via_org FROM agents WHERE role = 'human' AND identity IS NOT NULL").toArray();
+    for (const r of rows) {
+      const p = want.get(r.identity as string);
+      if (p) {
+        want.delete(r.identity as string);
+        if (r.via_org) this.sql.exec("UPDATE agents SET owner = ? WHERE id = ?", p.role === "owner" ? 1 : 0, r.id);
+        else if (p.role === "owner" && !r.owner) this.sql.exec("UPDATE agents SET owner = 1 WHERE id = ?", r.id);
+      } else if (r.via_org) {
+        this.sql.exec("UPDATE agents SET identity = NULL, owner = 0, via_org = 0, paused = 'left the organization' WHERE id = ?", r.id);
+        this.sql.exec("UPDATE standins SET revoked_at = ? WHERE person = ? AND revoked_at IS NULL", Date.now(), r.id);
+        this.emit("member.removed", { to: r.id as string, data: { login: r.name, org: true } });
+      }
+    }
+    for (const [identity, p] of want) {
+      const id = await this.addPerson(p.login, identity, p.role === "owner", null);
+      this.sql.exec("UPDATE agents SET via_org = 1 WHERE id = ?", id);
+    }
+    return { org: this.meta("org"), members: this.members() };
+  }
+
   /** Server-wide owners (LOOM_OWNERS, GitHub logins) own every project. */
   private siteOwner(identity: string): boolean {
     return (this.env.LOOM_OWNERS ?? "").split(",").map((l) => `github:${l.trim().toLowerCase()}`).includes(identity);
@@ -618,15 +657,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const login = (url.searchParams.get("login") ?? "").toLowerCase();
         return json({
           approved: !!this.sql.exec("SELECT 1 FROM creators WHERE login = ?", login).toArray().length,
-          owns: this.sql.exec("SELECT COUNT(*) AS n FROM projects WHERE owner = ?", login).one().n as number,
+          owns: this.ownedBy(url.searchParams.get("account") ?? login).length,
         });
       }
-      // People's plans (src/billing.ts), set from Stripe's webhooks.
+      // Organizations, their people and invites, and people's own settings (src/orgs.ts).
+      if (b && ["orgs", "org", "members", "invites", "invite", "project-org", "person"].includes(b)) {
+        try { return json(orgRegistry(this.sql, m, b, url, body)); } catch (e) { if (e instanceof OrgError) throw new HttpError(e.status, e.message); throw e; }
+      }
+      // Plans (src/billing.ts), set from Stripe's webhooks: a person's under their login, an org's as org:<slug>.
       if (b === "plan") {
         if (m === "GET") {
           const login = (url.searchParams.get("login") ?? "").toLowerCase();
           const r = this.sql.exec("SELECT login, plan, status, customer, subscription, renews FROM plans WHERE login = ?", login).toArray()[0];
-          const owned = this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", login).toArray();
+          const owned = this.ownedBy(login);
           return json({ ...(r ?? { login, plan: "free", status: null, customer: null, subscription: null, renews: null }), owned });
         }
         const u = body as PlanRow & { at: number };
@@ -637,13 +680,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
           ON CONFLICT(login) DO UPDATE SET plan = excluded.plan, status = excluded.status, customer = COALESCE(excluded.customer, plans.customer),
           subscription = COALESCE(excluded.subscription, plans.subscription), renews = COALESCE(excluded.renews, plans.renews), event_at = excluded.event_at, updated_at = excluded.updated_at`,
           u.login, u.plan, u.status, u.customer, u.subscription, u.renews, u.at, Date.now());
-        return json({ applied: true, owned: this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ?", u.login).toArray() });
+        return json({ applied: true, owned: this.ownedBy(u.login) });
       }
       if (b === "hidden") {
         this.sql.exec("UPDATE projects SET hidden = ? WHERE name = ?", body.hidden ? 1 : 0, body.name);
         return json({ ok: true });
       }
-      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction, owner, hidden FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private, hidden: !!p.hidden })));
+      if (m === "GET") return json(this.sql.exec("SELECT name, description, created_at, private, jurisdiction, owner, hidden, org FROM projects ORDER BY created_at").toArray().map((p) => ({ ...p, private: !!p.private, hidden: !!p.hidden })));
       if (b === "visibility") {
         this.sql.exec("UPDATE projects SET private = ? WHERE name = ?", body.private ? 1 : 0, body.name);
         return json({ ok: true });
@@ -652,7 +695,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.sql.exec("DELETE FROM projects WHERE name = ?", url.searchParams.get("name"));
         return json({ ok: true });
       }
-      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction, owner) VALUES (?, ?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null, body.owner ? String(body.owner).toLowerCase() : null);
+      this.sql.exec("INSERT OR REPLACE INTO projects (name, description, created_at, private, jurisdiction, owner, org) VALUES (?, ?, ?, ?, ?, ?, ?)", body.name, body.description ?? "", Date.now(), body.private ? 1 : 0, body.jurisdiction ?? null, body.owner ? String(body.owner).toLowerCase() : null, body.org ?? null);
       return json({ ok: true });
     }
 
@@ -662,6 +705,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.setMeta("plan", String(body.plan));
       return json({ plan: this.meta("plan"), limits: this.limits });
     }
+    // From the Worker when the project's org or its people change; never routed from outside.
+    if (a === "org-sync" && m === "POST" && url.hostname === "do") return json(await this.syncOrg(body));
     // Deleted (or never made): nothing here answers.
     if (!this.meta("project")) throw new HttpError(404, "no such project");
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
@@ -3068,7 +3113,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** POST what newly needs a person to each stand-in's webhook. Each item goes once while it stays open. */
   private async notifyWatchers() {
     const hooks = this.sql.exec("SELECT * FROM standins WHERE webhook IS NOT NULL AND revoked_at IS NULL").toArray();
-    const emails = this.mailer ? this.sql.exec("SELECT id, name, email, email_seen, emailed_at FROM agents WHERE role = 'human' AND email IS NOT NULL").toArray() : [];
+    const emails = this.mailer ? this.sql.exec("SELECT id, name, identity, email, email_seen, emailed_at FROM agents WHERE role = 'human' AND email IS NOT NULL").toArray() : [];
     if (!hooks.length && !emails.length) return;
     const origin = this.meta("origin") ?? "";
     const all = this.attention(this.agentStates());
@@ -3119,6 +3164,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { email: (r?.email as string) ?? null, lastSent: (r?.emailed_at as number) ?? null, sending: !!this.mailer };
   }
 
+  /** Where to email a person: the address on their Loom account, else the one they gave this project. */
+  private async addressOf(identity: string | null, fallback: string): Promise<string> {
+    const login = identity?.startsWith("github:") ? identity.slice(7) : null;
+    if (!login) return fallback;
+    const r = await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch(`https://do/registry/person?login=${encodeURIComponent(login)}`)
+      .then((r) => r.json<{ email: string | null }>()).catch(() => ({ email: null }));
+    return r.email ?? fallback;
+  }
+
   private setEmail(actor: Agent, email: unknown) {
     if (actor.role !== "human" || actor.standin || actor.id === "admin") throw new HttpError(403, "only people get email, and they set it for themselves");
     const e = email == null ? "" : String(email).trim();
@@ -3141,7 +3195,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (p.emailed_at && Date.now() - (p.emailed_at as number) < EMAIL_GAP) return; // the next sweep sends them
     const mail = needsYouEmail(this.project, actor.name, fresh, items.length, origin);
     try {
-      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to: p.email as string, ...mail });
+      const to = await this.addressOf((p.identity as string) ?? null, p.email as string);
+      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to, ...mail });
       this.sql.exec("UPDATE agents SET email_seen = ?, emailed_at = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), Date.now(), actor.id);
     } catch (e: any) {
       console.error("email", String(e?.message ?? e));
@@ -3149,8 +3204,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async testEmail(actor: Agent, origin: string) {
-    const to = this.emailView(actor).email;
-    if (!to) throw new HttpError(400, "set your email first");
+    const own = this.emailView(actor).email;
+    if (!own) throw new HttpError(400, "set your email first");
+    const to = await this.addressOf(actor.identity ?? null, own);
     if (!this.mailer) throw new HttpError(503, "this server can't send email yet: it needs a send_email binding named EMAIL and LOOM_EMAIL_FROM");
     const item = { id: "test", kind: "test", text: `Test from Loom: you'll hear here when something on ${this.project} needs you.`, url: `${origin}/?project=${this.project}`, youCan: null, detail: {} };
     try {
@@ -3274,7 +3330,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },

@@ -51,7 +51,7 @@ export const billingOn = (env: Env) => !!(env.STRIPE_SECRET_KEY && env.STRIPE_WE
 /** A Stripe test or sandbox key: no real money moves, so owners may try Checkout too. */
 export const testMode = (env: Env) => /^(sk|rk)_test_/.test(env.STRIPE_SECRET_KEY ?? "");
 
-/** A person's plan as the registry keeps it. */
+/** A plan as the registry keeps it, under a person's login or an org's org:<slug>. */
 export interface PlanRow {
   login: string;
   plan: PlanName;
@@ -89,8 +89,11 @@ export async function stripe<T = any>(env: Env, method: "GET" | "POST", path: st
   return data as T;
 }
 
-/** A Checkout page for Loom Pro. The login rides along so the webhook knows whose plan it is. */
-export async function checkoutSession(env: Env, login: string, customer: string | null, origin: string, back: string): Promise<string> {
+/**
+ * A Checkout page for Loom Pro. The account rides along so the webhook knows
+ * whose plan it is: the person's login, or org:<slug> for an organization.
+ */
+export async function checkoutSession(env: Env, login: string, account: string, customer: string | null, origin: string, back: string): Promise<string> {
   const price = env.STRIPE_PRICE_ID
     ? { price: env.STRIPE_PRICE_ID, quantity: 1 }
     : { price_data: { currency: "usd", unit_amount: 1000, recurring: { interval: "month" }, product_data: { name: "Loom Pro" } }, quantity: 1 };
@@ -99,8 +102,8 @@ export async function checkoutSession(env: Env, login: string, customer: string 
     line_items: { 0: price },
     client_reference_id: login,
     ...(customer ? { customer } : {}),
-    metadata: { app: APP, login },
-    subscription_data: { metadata: { app: APP, login } },
+    metadata: { app: APP, login, account },
+    subscription_data: { metadata: { app: APP, login, account } },
     allow_promotion_codes: "true",
     success_url: `${origin}${back}${back.includes("?") ? "&" : "?"}billing=done`,
     cancel_url: `${origin}${back}`,
@@ -147,13 +150,13 @@ export function planUpdate(event: any): (PlanRow & { at: number }) | null {
   const o = event?.data?.object ?? {};
   if (event?.type === "checkout.session.completed" && o.mode === "subscription") {
     if (o.metadata?.app !== APP) return null;
-    const login = String(o.metadata?.login ?? o.client_reference_id ?? "").toLowerCase();
+    const login = String(o.metadata?.account ?? o.metadata?.login ?? o.client_reference_id ?? "").toLowerCase();
     if (!login) return null;
     return { login, plan: "pro", status: "active", customer: o.customer ?? null, subscription: o.subscription ?? null, renews: null, at: Number(event.created ?? 0) };
   }
   if (["customer.subscription.created", "customer.subscription.updated", "customer.subscription.deleted"].includes(event?.type)) {
     if (o.metadata?.app !== APP) return null;
-    const login = String(o.metadata?.login ?? "").toLowerCase();
+    const login = String(o.metadata?.account ?? o.metadata?.login ?? "").toLowerCase();
     if (!login) return null;
     const status = event.type === "customer.subscription.deleted" ? "canceled" : String(o.status ?? "");
     return { login, plan: PAID.has(status) ? "pro" : "free", status, customer: o.customer ?? null, subscription: o.id ?? null, renews: periodEnd(o), at: Number(event.created ?? 0) };
