@@ -598,3 +598,10 @@ main.home { padding-bottom: 20px; }
   .health { grid-template-columns: 1fr 1fr; }
   .health .tile b, .health .tile .n { white-space: nowrap; }
 }
+/* Phones: the project and Sign in stay in view; the page's buttons scroll sideways under them. */
+@media (max-width: 700px) {
+  header .proj { order: 4; flex: 1 1 100%; flex-wrap: nowrap; overflow: visible; }
+  header .proj select { flex: 1 1 auto; min-width: 0; max-width: none; }
+  header .theme { display: none; }
+  header .nav { order: 5; flex: 1 1 100%; }
+}
