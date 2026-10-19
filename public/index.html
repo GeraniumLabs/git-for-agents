@@ -49,35 +49,48 @@
 
 <section class="health" id="health"></section>
 
-<main>
+<main class="home">
   <section class="col">
     <section class="panel attn" id="attention-panel">
       <div class="panel-head"><h2 data-help="attention">Needs a person</h2><small id="attention-count"></small></div>
       <div id="attention" class="panel-body"></div>
     </section>
-    <section class="panel">
+    <section class="panel" data-quiet="nothing stuck">
       <div class="panel-head"><h2 data-help="stuck">Stuck</h2><small>work that isn't moving and nobody asked about</small></div>
       <div id="stuck" class="panel-body"></div>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><h2 data-help="discussions">Discussions &amp; contracts</h2></div>
-      <div id="discussions" class="panel-body"></div>
-    </section>
-  </section>
-
-  <section class="col">
-    <section class="panel">
-      <div class="panel-head"><h2 data-help="contrib">Contributions</h2></div>
-      <div id="contrib" class="card contrib-card"></div>
-    </section>
-    <section class="panel">
-      <div class="panel-head"><h2 data-help="flow">Flow</h2><small>last 30 minutes</small></div>
-      <div id="flow" class="card"></div>
     </section>
     <section class="panel" id="contests-wrap" hidden>
       <div class="panel-head"><h2 data-help="contests">Contests</h2><small>several attempts, the best one lands</small></div>
       <div id="contests" class="panel-body"></div>
     </section>
+    <section class="panel" data-quiet="no open discussions">
+      <div class="panel-head"><h2 data-help="discussions">Discussions &amp; contracts</h2></div>
+      <div id="discussions" class="panel-body"></div>
+    </section>
+    <p id="quiet" class="quiet" hidden></p>
+  </section>
+
+  <section class="col">
+    <section class="panel">
+      <div class="panel-head"><h2 data-help="activity">Activity</h2>
+        <span class="seg" role="tablist">
+          <button id="feed-notable" class="on" role="tab" title="What a person would want to see: landings, conflicts, questions, reviews, rulings">Notable</button><button id="feed-all" role="tab" title="Every event, including routine agent traffic">Everything</button>
+        </span>
+      </div>
+      <div class="panel-tools"><input id="feed-filter" placeholder="Filter by agent, file, #change…" class="feed-filter"></div>
+      <ol id="feed" class="feed"></ol>
+    </section>
+  </section>
+</main>
+
+<!-- What you look up rather than watch: one tab at a time. -->
+<section class="more" id="more">
+  <div class="more-tabs" role="tablist">
+    <button role="tab" data-tab="work" class="on" title="The merge queue, where agents are working, and the project's history">Work <small id="tab-work"></small></button>
+    <button role="tab" data-tab="memory" title="Decisions people made and notes agents left; agents get them when they work on the same files">Memory <small id="tab-memory"></small></button>
+    <button role="tab" data-tab="files" title="Screenshots, builds, logs and documents agents attached">Files <small id="tab-files"></small></button>
+  </div>
+  <div class="more-body" data-tab="work">
     <section class="panel">
       <div class="panel-head"><h2 data-help="queue">Merge queue</h2><small id="queue-count"></small></div>
       <div id="queue" class="panel-body"></div>
@@ -86,9 +99,16 @@
       <div class="panel-head"><h2 data-help="areas">Where the work is</h2></div>
       <div id="areas" class="card"></div>
     </section>
-  </section>
-
-  <section class="col">
+    <section class="panel">
+      <div class="panel-head"><h2 data-help="contrib">Contributions</h2></div>
+      <div id="contrib" class="card contrib-card"></div>
+    </section>
+    <section class="panel">
+      <div class="panel-head"><h2 data-help="flow">Flow</h2><small>last 30 minutes</small></div>
+      <div id="flow" class="card"></div>
+    </section>
+  </div>
+  <div class="more-body" data-tab="memory" hidden>
     <section class="panel">
       <div class="panel-head"><h2 data-help="decisions">Decisions</h2><small id="decisions-count"></small></div>
       <div id="decision-add" class="card" hidden>
@@ -101,21 +121,14 @@
       <div class="panel-head"><h2 data-help="notes">Notes agents left</h2><small id="notes-count"></small></div>
       <ul id="notes" class="list decisions panel-body"></ul>
     </section>
+  </div>
+  <div class="more-body" data-tab="files" hidden>
     <section class="panel">
       <div class="panel-head"><h2 data-help="attachments">Attachments</h2><small id="attachments-count"></small></div>
       <div id="attachments" class="panel-body"></div>
     </section>
-    <section class="panel">
-      <div class="panel-head"><h2 data-help="activity">Activity</h2>
-        <span class="seg" role="tablist">
-          <button id="feed-notable" class="on" role="tab" title="What a person would want to see: landings, conflicts, questions, reviews, rulings">Notable</button><button id="feed-all" role="tab" title="Every event, including routine agent traffic">Everything</button>
-        </span>
-      </div>
-      <div class="panel-tools"><input id="feed-filter" placeholder="Filter by agent, file, #change…" class="feed-filter"></div>
-      <ol id="feed" class="feed"></ol>
-    </section>
-  </section>
-</main>
+  </div>
+</section>
 
 <section id="review" class="rv-page" hidden></section>
 

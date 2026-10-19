@@ -533,3 +533,75 @@ button.ready { outline: 3px solid var(--accent, #1f6feb); outline-offset: 2px; }
 
 a.who-me { color: inherit; text-decoration: none; }
 a.who-me:hover { text-decoration: underline; }
+
+/* ── the dashboard: what needs a person and the live feed up top; reference material in tabs below ── */
+main.home { grid-template-columns: minmax(0, 1.6fr) minmax(300px, 1fr); }
+@media (max-width: 1000px) { main.home { grid-template-columns: 1fr; } }
+.health { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+@media (max-width: 700px) { .health { grid-template-columns: 1fr 1fr; padding: 12px 12px 0; gap: 8px; } }
+.health .warnings { grid-column: 1 / -1; display: flex; flex-wrap: wrap; gap: 8px; }
+.warning { font-size: 12.5px; padding: 5px 10px; border-radius: 6px; border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.warning.bad { border-color: color-mix(in srgb, var(--bad) 45%, transparent); background: color-mix(in srgb, var(--bad) 10%, transparent); }
+.warning .mini { margin-left: 6px; }
+.quiet { margin: 0; color: var(--muted); font-size: 13px; padding: 2px 4px; }
+.quiet[hidden] { display: none; }
+
+/* Questions: two lines until clicked. */
+.inbox .q { font-weight: 550; }
+.inbox .q { display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden; }
+.inbox .q.more { cursor: pointer; }
+.inbox .q.open { display: block; overflow: visible; }
+
+/* One color for agents' names; the name is what matters. */
+a.who { color: var(--info); }
+
+/* Panel help shows when you're at the panel, not all the time. */
+.panel-head .help-dot { opacity: 0; transition: opacity .15s; }
+.panel-head:hover .help-dot, .panel-head .help-dot:focus-visible { opacity: 1; }
+@media (hover: none) { .panel-head .help-dot { opacity: .6; } }
+
+/* Work, Memory and Files: one tab at a time. */
+.more { padding: 0 20px 40px; }
+.more[hidden] { display: none; }
+.more-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin-bottom: 16px; }
+.more-tabs button { background: transparent; border: 0; border-bottom: 2px solid transparent; border-radius: 0; padding: 8px 12px; color: var(--muted); font-weight: 600; }
+.more-tabs button.on { color: var(--ink); border-bottom-color: var(--accent); }
+.more-tabs small { color: var(--muted); font-weight: 400; margin-left: 2px; }
+.more-body { display: grid; grid-template-columns: repeat(auto-fit, minmax(340px, 1fr)); gap: 20px; align-items: start; }
+.more-body[hidden] { display: none; }
+main.home { padding-bottom: 20px; }
+
+/* The tour: one line, not a panel. */
+.tour { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 10px; padding: 10px 14px; }
+.tour .tour-text { flex: 1 1 360px; }
+.tour > a { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink); text-decoration: none; font-size: 12.5px; }
+.tour > a:hover, .tour > a.on { border-color: var(--accent); }
+
+/* Phones: the header is one row of essentials, with the rest scrolling sideways under it. */
+@media (max-width: 700px) {
+  header { padding: 10px 12px; gap: 8px; }
+  header .brand .tag { display: none; }
+  header .finder { order: 3; flex-basis: 100%; max-width: none; }
+  header .nav, header .proj { order: 4; border-left: 0; padding-left: 0; overflow-x: auto; flex-wrap: nowrap; white-space: nowrap; }
+  header .nav { flex: 1 1 100%; }
+  header .proj { flex: 1 1 100%; gap: 6px; }
+  header .proj select { max-width: 45vw; }
+  main.home, .more { padding-left: 12px; padding-right: 12px; }
+  .tour { margin: 12px 12px 0; }
+  .tour .tour-text { flex-basis: 100%; }
+}
+.inbox .q:not(.open) { max-height: 2.9em; white-space: normal; }
+@media (max-width: 700px) {
+  header .nav { flex: 0 0 auto; }
+  header .proj { flex: 1 1 0; min-width: 0; overflow-x: auto; }
+  header .live { flex: none; }
+  .health { grid-template-columns: 1fr 1fr; }
+  .health .tile b, .health .tile .n { white-space: nowrap; }
+}
+/* Phones: the project and Sign in stay in view; the page's buttons scroll sideways under them. */
+@media (max-width: 700px) {
+  header .proj { order: 4; flex: 1 1 100%; flex-wrap: nowrap; overflow: visible; }
+  header .proj select { flex: 1 1 auto; min-width: 0; max-width: none; }
+  header .theme { display: none; }
+  header .nav { order: 5; flex: 1 1 100%; }
+}
