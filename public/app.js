@@ -766,41 +766,161 @@ async function showClone(box, target) {
   box.innerHTML = `<pre class="diff copy">${esc(r.clone)}${r.compare ? `\n${esc(r.compare)}` : ""}</pre><p class="meta">${esc(r.note)} <button class="ghost mini" id="copy-clone">Copy</button></p>`;
   $("#copy-clone").onclick = () => navigator.clipboard?.writeText(r.clone + (r.compare ? `\n${r.compare}` : "")).then(() => toast("Copied"));
 }
-async function showCode(target = {}) {
-  const q = target.change ? `change=${target.change}` : target.workspace ? `workspace=${encodeURIComponent(target.workspace)}` : "";
-  const list = await api(`/files?${q}`);
-  if (list.error) return toast(list.error);
-  $("#detail-body").innerHTML = `
-    <h3>Code <small class="meta">${esc(target.label ?? `main · v${state.project.mainVersion}`)}</small></h3>
-    <div class="row code-row"><a class="button ghost mini" href="/api/projects/${project}/archive?${q}${keyQuery()}" download title="A snapshot of these files, without history">Download zip</a><button class="ghost mini" id="code-clone" title="A read-only git clone command with a token valid for an hour">Clone with git</button>${target.change ? `<button class="ghost mini" data-change="${target.change}">Back to the change</button>` : ""}</div>
-    <div id="code-clone-box"></div>
-    <span class="seg" role="tablist"><button id="tab-files" class="on" role="tab" title="Browse the files">Files</button><button id="tab-history" role="tab" title="Every commit: merge commits for each landing, with the author's own commits under them">History</button></span>
-    <div id="history" hidden></div>
-    <div class="code-view">
-      <div class="tree"><input id="tree-filter" placeholder="Filter ${list.files.length} files"><ol id="tree"></ol></div>
-      <pre id="file" class="diff"><span class="meta">Pick a file.</span></pre>
+// The code page: #code for main, #code/change/<id> or #code/workspace/<name>
+// for someone's work, then /tree/<folder>, /file/<path> or /history.
+let code = null; // what the page shows: { key, target, q, files, tree, label }
+const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
+const codeHref = (t, view = "") => `${t.change ? `#code/change/${t.change}` : t.workspace ? `#code/workspace/${encodeURIComponent(t.workspace)}` : "#code"}${view ? `/${view}` : ""}`;
+function showCode(target = {}, view = "") {
+  const h = codeHref(target, view);
+  if (location.hash === h) route(); else location.hash = h.slice(1);
+}
+
+/** Flat paths as nested folders: { dirs: Map(name → node), files: [name], count }. */
+function codeTree(paths) {
+  const root = { dirs: new Map(), files: [], count: 0 };
+  for (const p of paths) {
+    const parts = p.split("/");
+    let n = root;
+    n.count++;
+    for (const d of parts.slice(0, -1)) {
+      if (!n.dirs.has(d)) n.dirs.set(d, { dirs: new Map(), files: [], count: 0 });
+      n = n.dirs.get(d);
+      n.count++;
+    }
+    n.files.push(parts.at(-1));
+  }
+  return root;
+}
+const codeNode = (root, dir) => (dir ? dir.split("/") : []).reduce((n, d) => n?.dirs.get(d), root);
+const byName = (a, b) => a.localeCompare(b, undefined, { numeric: true });
+
+/** The side tree: folders fold, and the ones on the way to what's open start open. */
+function codeTreeHtml(n, prefix, at, openAll) {
+  const dirs = [...n.dirs.keys()].sort(byName).map((d) => {
+    const p = prefix + d;
+    const open = openAll || at === p || at.startsWith(`${p}/`);
+    return `<li><details${open ? " open" : ""}><summary title="${esc(p)}">${esc(d)}</summary><ol>${codeTreeHtml(n.dirs.get(d), `${p}/`, at, openAll)}</ol></details></li>`;
+  }).join("");
+  const files = n.files.sort(byName).map((f) => `<li><a href="${codeHref(code.target, `file/${encPath(prefix + f)}`)}" data-cpath="${esc(prefix + f)}"${prefix + f === at ? ` class="on"` : ""}>${esc(f)}</a></li>`).join("");
+  return dirs + files;
+}
+
+function crumbs(path, isFile) {
+  const parts = path ? path.split("/") : [];
+  const links = parts.map((p, i) => i === parts.length - 1 && isFile ? `<b>${esc(p)}</b>` : `<a href="${codeHref(code.target, `tree/${encPath(parts.slice(0, i + 1).join("/"))}`)}">${esc(p)}</a>`);
+  return `<nav class="crumbs mono"><a href="${codeHref(code.target)}">${esc(project)}</a>${links.map((l) => ` <span class="meta">/</span> ${l}`).join("")}</nav>`;
+}
+
+function srcHtml(text) {
+  if (text.includes("\u0000")) return `<p class="empty">A binary file. Download the zip to get it.</p>`;
+  const lines = text.replace(/\n$/, "").split("\n");
+  const MAX = 20000;
+  return `<pre class="code-src"><code>${lines.slice(0, MAX).map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${esc(l)}</span>`).join("")}</code></pre>${lines.length > MAX ? `<p class="meta">Showing the first ${MAX.toLocaleString()} of ${lines.length.toLocaleString()} lines. Download the zip for the rest.</p>` : ""}`;
+}
+
+/** A folder: its folders and files, then its README if it has one. */
+async function codeFolder(dir) {
+  const n = codeNode(code.tree, dir);
+  if (!n) return `${crumbs(dir, false)}<p class="empty">No folder ${esc(dir)} here.</p>`;
+  const pre = dir ? `${dir}/` : "";
+  const rows = [...n.dirs.keys()].sort(byName).map((d) => `<tr><td><a class="dir" href="${codeHref(code.target, `tree/${encPath(pre + d)}`)}">${esc(d)}/</a></td><td class="meta">${plural(n.dirs.get(d).count, ["file", "files"])}</td></tr>`).join("")
+    + n.files.slice().sort(byName).map((f) => `<tr><td><a href="${codeHref(code.target, `file/${encPath(pre + f)}`)}">${esc(f)}</a></td><td></td></tr>`).join("");
+  const readme = n.files.find((f) => /^readme(\.(md|txt|markdown))?$/i.test(f));
+  let rd = "";
+  if (readme) {
+    const f = await api(`/files?${code.q}&path=${encodeURIComponent(pre + readme)}`);
+    if (!f.error) rd = `<div class="code-file"><div class="code-fhead"><a class="mono" href="${codeHref(code.target, `file/${encPath(pre + readme)}`)}">${esc(readme)}</a></div><pre class="code-readme">${esc(f.content)}</pre></div>`;
+  }
+  return `${crumbs(dir, false)}
+    ${rows ? `<table class="code-list"><tbody>${rows}</tbody></table>` : `<p class="empty">${code.files.length ? "This folder is empty." : "No files yet. Agents add them with write_files or a git push."}</p>`}
+    ${rd}`;
+}
+
+async function codeFile(path) {
+  const f = await api(`/files?${code.q}&path=${encodeURIComponent(path)}`);
+  if (f.error) return `${crumbs(path, true)}<p class="empty">${esc(f.error)}</p>`;
+  const lines = f.content.replace(/\n$/, "").split("\n").length;
+  code.content = f.content;
+  return `${crumbs(path, true)}
+    <div class="code-file">
+      <div class="code-fhead"><span class="meta">${plural(lines, ["line", "lines"])} · ${(new Blob([f.content]).size / 1024).toFixed(1)} KB</span><span class="grow"></span><button class="ghost mini" id="code-copy" title="Copy the file's contents">Copy</button></div>
+      ${srcHtml(f.content)}
     </div>`;
-  const draw = (f) => { $("#tree").innerHTML = list.files.filter((p) => p.toLowerCase().includes(f)).slice(0, 500).map((p) => `<li><a data-path="${esc(p)}">${esc(p)}</a></li>`).join(""); };
-  draw("");
-  $("#tree-filter").oninput = (e) => draw(e.target.value.trim().toLowerCase());
-  $("#tree").onclick = async (e) => {
-    const a = e.target.closest("[data-path]");
-    if (!a) return;
-    for (const x of $("#tree").querySelectorAll(".on")) x.classList.remove("on");
-    a.classList.add("on");
-    const f = await api(`/files?${q}&path=${encodeURIComponent(a.dataset.path)}`);
-    $("#file").textContent = f.error ?? f.content;
-  };
-  $("#tab-files").onclick = () => { $("#tab-files").className = "on"; $("#tab-history").className = ""; $("#history").hidden = true; $(".code-view").hidden = false; };
-  $("#tab-history").onclick = async () => {
-    $("#tab-history").className = "on"; $("#tab-files").className = ""; $(".code-view").hidden = true; $("#history").hidden = false;
-    $("#history").innerHTML = `<p class="meta">Reading history…</p>`;
-    $("#history").innerHTML = historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace);
-    wire($("#history"));
-  };
-  $("#code-clone").onclick = () => showClone($("#code-clone-box"), target.change ? { change: target.change } : target.workspace ? { workspace: target.workspace } : {});
-  wire($("#detail-body"));
-  if (!$("#detail").open) $("#detail").showModal();
+}
+
+/** Draw the code page for target ({} = main) and view (tree, file or history). */
+async function loadCode(target, view, path) {
+  const q = target.change ? `change=${target.change}` : target.workspace ? `workspace=${encodeURIComponent(target.workspace)}` : "";
+  const key = q || "main";
+  const page = $("#review");
+  if (code?.key !== key || !$("#code-main")) {
+    const [list, c] = await Promise.all([api(`/files?${q}`), target.change ? api(`/changes/${target.change}`) : null]);
+    if (list.error) { page.innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(list.error)}</p></div>`; code = null; return; }
+    const label = target.change
+      ? `change #${target.change}${c && !c.error ? ` · ${esc(c.title)} · ${esc(c.agentName)}${c.status === "merged" ? " · landed" : "'s workspace"}` : ""}`
+      : target.workspace ? `workspace ${esc(target.workspace)}` : `main${state?.project ? ` · v${state.project.mainVersion}` : ""}`;
+    code = { key, target, q, files: list.files, tree: codeTree(list.files), label };
+    const other = target.change || target.workspace;
+    page.innerHTML = `
+      <div class="rv-top">
+        <a class="button ghost mini" href="${target.change ? `#change/${target.change}` : "#"}">← ${target.change ? `Change #${target.change}` : "Dashboard"}</a>
+        <h1>Code <span class="meta">${label}</span></h1>
+        <div class="row code-bar">
+          <span class="seg code-tabs" role="tablist"><a role="tab" id="ct-files" href="${codeHref(target)}" title="Browse the files">Files</a><a role="tab" id="ct-history" href="${codeHref(target, "history")}" title="Every commit: merge commits for each landing, with the author's own commits under them">History</a></span>
+          <span class="grow"></span>
+          ${other ? `<a class="button ghost mini" href="#code" title="The project's main branch">Main</a>` : ""}
+          <a class="button ghost mini" href="/api/projects/${project}/archive?${q}${keyQuery()}" download title="A snapshot of these files, without history">Download zip</a>
+          <button class="ghost mini" id="code-clone" title="A read-only git clone command with a token valid for an hour">Clone with git</button>
+        </div>
+        <div id="code-clone-box"></div>
+      </div>
+      <div class="code-grid">
+        <aside class="panel code-side">
+          <div class="panel-head"><h2>Files</h2><small>${list.files.length.toLocaleString()}</small></div>
+          <div class="panel-tools"><input id="tree-filter" type="search" placeholder="Go to file…" autocomplete="off"></div>
+          <ol id="code-tree" class="code-tree"></ol>
+        </aside>
+        <section class="panel code-main" id="code-main"></section>
+      </div>`;
+    $("#code-clone").onclick = () => showClone($("#code-clone-box"), target.change ? { change: target.change } : target.workspace ? { workspace: target.workspace } : {});
+    $("#tree-filter").oninput = () => drawCodeTree();
+    $("#tree-filter").onkeydown = (e) => {
+      if (e.key === "Enter") { const a = $("#code-tree a"); if (a) location.hash = a.getAttribute("href").slice(1); }
+      if (e.key === "Escape") { e.target.value = ""; drawCodeTree(); }
+    };
+    window.scrollTo(0, 0);
+  }
+  code.at = view === "history" ? "" : path;
+  $("#ct-files").className = view === "history" ? "" : "on";
+  $("#ct-history").className = view === "history" ? "on" : "";
+  $(".code-grid").classList.toggle("wide", view === "history");
+  $(".code-grid").classList.toggle("reading", view === "file");
+  drawCodeTree();
+  const main = $("#code-main");
+  main.innerHTML = `<p class="meta">Reading…</p>`;
+  main.innerHTML = view === "history"
+    ? historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace, target.change && /landed/.test(code.label))
+    : view === "file" ? await codeFile(path) : await codeFolder(path);
+  wire(main);
+  if ($("#code-copy")) $("#code-copy").onclick = () => navigator.clipboard?.writeText(code.content).then(() => toast("Copied"));
+  if (main.getBoundingClientRect().top < 0) main.scrollIntoView();
+}
+
+function drawCodeTree() {
+  const el = $("#code-tree");
+  if (!el) return;
+  const f = $("#tree-filter").value.trim().toLowerCase();
+  if (f) {
+    const hits = code.files.filter((p) => p.toLowerCase().includes(f));
+    el.innerHTML = hits.slice(0, 300).map((p) => `<li><a class="flat${p === code.at ? " on" : ""}" href="${codeHref(code.target, `file/${encPath(p)}`)}">${esc(p)}</a></li>`).join("")
+      + (hits.length > 300 ? `<li class="meta">${hits.length - 300} more: keep typing</li>` : hits.length ? "" : `<li class="meta">No file matches “${esc(f)}”.</li>`);
+    return;
+  }
+  el.innerHTML = codeTreeHtml(code.tree, "", code.at ?? "", code.files.length <= 40);
+  // Scroll the tree, not the page, to the open file.
+  const on = el.querySelector("a.on");
+  if (on && (on.offsetTop < el.scrollTop || on.offsetTop > el.scrollTop + el.clientHeight)) el.scrollTop = on.offsetTop - el.clientHeight / 2;
 }
 $("#code-open").onclick = () => showCode();
 
@@ -1705,15 +1825,24 @@ function showTask(id) {
   if (location.hash === `#task/${id}`) route(); else location.hash = `task/${id}`;
 }
 
-/** The dashboard, or a change or contest on its own page, from the URL. */
+/** The dashboard, or a change, contest, task or the code on its own page, from the URL. */
 function route() {
   const page = /^#(?:account|org\/([a-z0-9-]+))$/.exec(location.hash);
   if (page) { page[1] ? showOrg(page[1]) : showAccount(); return; }
   const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
-  document.body.classList.toggle("reviewing", !!m);
-  $("#review").hidden = !m;
-  if (!m) { review = null; $("#review").innerHTML = ""; return; }
+  const cm = /^#code(?:\/change\/(\d+)|\/workspace\/([^/]+))?(?:\/(history)|\/(tree|file)\/(.+?))?\/?$/.exec(location.hash);
+  document.body.classList.toggle("reviewing", !!(m || cm));
+  $("#review").hidden = !(m || cm);
+  if (!cm) code = null;
+  if (!m && !cm) { review = null; $("#review").innerHTML = ""; return; }
   if ($("#detail").open) $("#detail").close();
+  if (cm) {
+    review = null;
+    const target = cm[1] ? { change: Number(cm[1]) } : cm[2] ? { workspace: decodeURIComponent(cm[2]) } : {};
+    const path = cm[5] ? cm[5].split("/").map(decodeURIComponent).join("/") : "";
+    loadCode(target, cm[3] ?? (cm[4] === "file" ? "file" : "tree"), path);
+    return;
+  }
   window.scrollTo(0, 0);
   if (m[1] === "change") loadReview(Number(m[2])).then(() => m[3] && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
@@ -1938,7 +2067,7 @@ function wireReview(canReview) {
     if (review.since && !review.inter) review.inter = await api(`/changes/${c.id}/interdiff?from=${review.lastMine}`);
     drawReview();
   };
-  root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id, label: `change #${c.id} (${c.agentName}'s workspace)` });
+  root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id });
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);

@@ -74,7 +74,7 @@ Keeping agents out of each other's way is only half the job. Loom also gives the
   1. An agent (or person) commits to its own workspace, either through the API (`write_files`) or with a plain `git push`.
   2. Once the change is approved, the merge queue lands it as a merge commit, or as a fast-forward.
   3. The author's own commits stay in history under the merge commit.
-- **Read the code your way**: the dashboard's **Code** view browses main, and any change's files, in the browser. **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
+- **Read the code your way**: the dashboard's **Code** page browses main, and any change's files, in the browser: a folder tree beside the file, with each folder's README, and a link for every file and folder (`#code/file/<path>`, `#code/change/<id>/…`). **Download zip** gets a snapshot. **Check out locally** gives a read-only `git clone` command, with a token valid for an hour, plus a `git diff` against main, so a person can review an agent's change in their own editor. Agents can ask a person for review by name (`request_review`). The request lands under *Needs a person*.
 
 **The deputy: a stand-in for the humans**
 
