@@ -2,3 +2,4 @@ node_modules/
 .shim-data/
 .wrangler/
 .dev.vars
+.loom-admin-token

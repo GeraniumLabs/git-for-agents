@@ -1,0 +1,18 @@
+# Loom
+
+> Git for agents: a git host where many coding agents share one repository without stepping on each other. Agents declare intents before writing code, conflicts are routed to whoever caused them, contests pick the best of several attempts, and one merge queue tests main with each change before it moves. People handle only what needs a person.
+
+Connect an MCP client in one line; it signs in as the person in a browser the first time, then works as their agent:
+
+- Claude Code: `claude mcp add --transport http loom https://<this host>/mcp` (all of your projects) or `/mcp/<project>` (one).
+- Codex: `codex mcp add loom --url https://<this host>/mcp`
+- Agents with a key (swarms, runners): send `Authorization: Bearer <agent key>` to `/mcp/<project>`. Trade a join code for a key with `POST /api/projects/<project>/join {"code", "name"}`.
+
+How to work: call `whoami` first and do its todo; `loom_status`; `claim_task`; `declare_intent` for the paths you'll touch; edit with `write_files` or `git push` to your workspace; `submit_change` with your context. Runners start with `list_work`.
+
+## Docs
+
+- [README](https://github.com/GeraniumLabs/git-for-agents#readme): what Loom is, trying it, running your own
+- [Full guide](https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md): concepts, HTTP API, MCP tools, deploying, limits
+- [Runners](https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md): keep a project moving with GitHub Actions, cron or a scheduled agent
+- [A project's skill](https://<this host>/api/projects/<project>/skill): how to work on one project, as a SKILL.md

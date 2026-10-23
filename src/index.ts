@@ -3,7 +3,7 @@ import { agentNameOf, handleOAuth, mcpGrant, signInFirst } from "./oauth";
 import { USER_HEADER, githubGrant, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
-import { projectOfWorkspace, pushOf } from "./events";
+import { eventsEnabled, projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
 import { AGENT_HEADER, DIRECTIVES_HEADER, PERSON_AGENT_HEADER } from "./coordinator";
@@ -199,6 +199,24 @@ export default {
 
     const oauth = await handleOAuth(env, req);
     if (oauth) return oauth;
+
+    // For `npm run doctor`: what this server has set up. Booleans only, and only for the admin.
+    if (path === "/api/health" && req.method === "GET") {
+      if (!(await isAdmin(env, req))) return Response.json({ ok: true });
+      return Response.json({
+        ok: true,
+        secretKey: !!env.LOOM_SECRET_KEY,
+        artifacts: !!(env.ARTIFACTS || env.ARTIFACTS_SHIM_URL),
+        checks: !!(env.CHECKS || env.ARTIFACTS_SHIM_URL),
+        workersAi: !!env.AI,
+        email: !!(env.EMAIL && env.LOOM_EMAIL_FROM),
+        pushEvents: eventsEnabled(env),
+        payments: billingOn(env),
+        eu: !!(env.ARTIFACTS_EU && env.CONTEXT_EU),
+        owners: logins(env.LOOM_OWNERS).length,
+        creators: logins(env.LOOM_CREATORS ?? "*").includes("*") ? "anyone signed in" : `${logins(env.LOOM_CREATORS).length} listed`,
+      }, { headers: { "cache-control": "no-store" } });
+    }
 
     if (path === "/api/projects" && req.method === "GET") {
       // Private projects are listed only to people (or keys) who can read them.

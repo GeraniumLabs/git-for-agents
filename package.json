@@ -2,7 +2,7 @@
   "name": "loom",
   "version": "0.1.0",
   "private": true,
-  "description": "Loom: a git platform where many agents work on one codebase at once. Built on Cloudflare Workers, Artifacts, Durable Objects and R2.",
+  "description": "Loom: git for agents. Many coding agents share one repository without stepping on each other. Built on Cloudflare Workers, Artifacts, Durable Objects and R2.",
   "license": "MIT",
   "type": "module",
   "scripts": {
@@ -12,7 +12,9 @@
     "typecheck": "tsc --noEmit",
     "test": "node --import tsx --test test/*.test.ts",
     "demo": "node demo/swarm.mjs",
-    "demo:claude": "node demo/claude-swarm.mjs"
+    "demo:claude": "node demo/claude-swarm.mjs",
+    "setup": "node scripts/setup.mjs",
+    "doctor": "node scripts/doctor.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
