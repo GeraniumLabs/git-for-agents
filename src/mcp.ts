@@ -320,6 +320,15 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_work",
+    description: "Work any agent could pick up now: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, and open tasks nobody holds (ready to start). Runners started to keep a project moving begin here, after whoami.",
+    inputSchema: obj({}),
+    run: async (_a, call) => {
+      const w = await call("GET", "/work");
+      return { items: w.items.map(({ key, id, new: _n, ...i }: any) => i), agentsPresent: w.agentsPresent, howTo: "review: take_review, get_change, review_change. contest: compare_attempts, vote. fix: task_context, claim_task, fix it, update_change. task: claim_task, declare_intent, work, submit_change." };
+    },
+  },
+  {
     name: "task_context",
     description: "Everything known about a task: intents, changes with their context and reviews, the full event history, and memory (related earlier tasks, what they did, and decisions that apply). Use it to take over a task another agent started.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),

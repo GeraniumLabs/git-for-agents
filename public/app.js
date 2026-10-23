@@ -1319,8 +1319,8 @@ async function showInvite(code) {
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null, account = null;
-  try { [s, people, si, mail, account] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null]); } catch { return; }
+  let mail = null, account = null, hooks = [];
+  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : []]); } catch { return; }
   const org = state?.project?.org ?? null;
   const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
@@ -1354,6 +1354,14 @@ async function showSettings() {
     <h2>Review agent</h2>
     ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
+    <h2>Runners</h2>
+    <p class="meta">Loom doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Loom tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
+    ${isOwner() ? `${hooks.map((h) => `<div class="qrow"><span class="grow"><span class="mono">${esc(h.url)}</span> <span class="meta">${esc(h.events.join(", "))}${h.github ? " · GitHub dispatch" : ""}${h.lastDelivery ? ` · last ${h.lastDelivery.status && h.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(h.lastDelivery.error || String(h.lastDelivery.status))}`} ${ago(h.lastDelivery.at)}` : " · nothing sent yet"}</span></span><button class="ghost mini" data-hook-test="${esc(h.id)}">Test</button><button class="ghost mini" data-hook-delete="${esc(h.id)}">Delete</button></div>`).join("")}
+    <div class="card key-card">
+      <div class="row"><input id="hook-url" class="grow" placeholder="https://… where Loom posts new work (a GitHub dispatches URL works too)"></div>
+      <div class="row"><select id="hook-events"><option value="work">New work for agents</option><option value="work,change.merged">New work, and merges</option><option value="*">Every event</option></select><input id="hook-auth" type="password" autocomplete="off" class="grow" placeholder="Authorization header (optional), e.g. Bearer <token>"><button id="hook-add">Add webhook</button></div>
+      <div id="hook-out"></div>
+    </div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -1415,6 +1423,22 @@ async function showSettings() {
       <pre class="diff copy">${esc(install)}</pre>
       <div class="row"><button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button><button class="ghost mini" data-copy="${esc(install)}">Copy install command</button></div>`;
     wireCopy($("#si-out"));
+  };
+  if ($("#hook-add")) $("#hook-add").onclick = async () => {
+    const url = $("#hook-url").value.trim();
+    if (!url) return toast("Give the URL Loom should post to");
+    let h;
+    try { h = await act("POST", "/hooks", { url, events: $("#hook-events").value.split(","), authorization: $("#hook-auth").value.trim() || undefined }); } catch { return; }
+    $("#hook-out").innerHTML = `<p class="meta">Added. Signing secret, shown once: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>. ${esc(h.howTo.replace(/^Shown once\. Check deliveries with it: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>\. ?/, ""))}</p><pre class="diff copy">${esc(h.secret)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(h.secret)}">Copy secret</button></div>`;
+    wireCopy($("#hook-out"));
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-hook-test]")) b.onclick = async () => {
+    try { const r = await act("POST", `/hooks/${b.dataset.hookTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-hook-delete]")) b.onclick = async () => {
+    if (!await ask({ title: "Delete this webhook?", body: "Loom stops posting to it.", ok: "Delete", danger: true })) return;
+    try { await act("DELETE", `/hooks/${b.dataset.hookDelete}`); } catch { return; }
+    showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-si-test]")) b.onclick = async () => {
     try { const r = await act("POST", `/standins/${b.dataset.siTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
@@ -1741,6 +1765,8 @@ function describe(e) {
     case "standin.acted": return ["directive", `${who}, through ${esc(d.name)}: <span class="mono">${esc(d.action)}</span>`];
     case "standin.created": return ["directive", `${who} gave ${to} a stand-in key for ${esc(d.name)} (${d.scopes.length ? esc(d.scopes.join(", ")) : "watch only"})`];
     case "standin.revoked": return ["directive", `${who} revoked the stand-in key for ${esc(d.name)}`];
+    case "hook.created": return ["directive", `${who} added a webhook for runners (${esc((d.events ?? []).join(", "))})`];
+    case "hook.deleted": return ["directive", `${who} deleted a runner webhook`];
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
     case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];

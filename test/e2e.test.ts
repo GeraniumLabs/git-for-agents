@@ -1044,3 +1044,71 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
   assert.ok(again.access_token);
   await fetch(`${url}/api/admin/creators/${login}`, { method: "DELETE", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } });
 });
+
+test("runners: the work list shows what any agent could pick up, long-polls for more, and webhooks hear new work once", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { createServer } = await import("node:http");
+  const { createHmac } = await import("node:crypto");
+  const name = project("e2e-runners");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "runners", files: SEED, requiredApprovals: 1 });
+  const got: { body: any; raw: string; sig: string; kind: string }[] = [];
+  const server = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { got.push({ raw: b, body: JSON.parse(b), sig: String(req.headers["x-loom-signature"] ?? ""), kind: String(req.headers["x-loom-event"] ?? "") }); res.end("ok"); }); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as any).port;
+  const work = (q = "") => fetch(`${url}/api/projects/${name}/work${q}`).then((r) => r.json());
+  const until = async (what: () => boolean, ms = 8000) => { const end = Date.now() + ms; while (!what() && Date.now() < end) await sleep(200); return what(); };
+  try {
+    await assert.rejects(admin.req("POST", "/hooks", { url: "https://api.github.com/repos/o/r/dispatches" }), /needs a token/);
+    await assert.rejects(admin.req("POST", "/hooks", { url: `http://127.0.0.1:${port}/`, events: ["nonsense"] }), /unknown events/);
+    const hook = await admin.req("POST", "/hooks", { url: `http://127.0.0.1:${port}/hook`, events: ["work", "change.merged"] });
+    assert.ok(hook.secret.startsWith("whsec_"));
+    assert.equal((await admin.req("POST", `/hooks/${hook.id}/test`)).status, 200);
+    got.length = 0;
+
+    const empty = await work();
+    assert.deepEqual(empty.items, []);
+    assert.match(empty.prompt, /list_work/);
+    // A long poll returns as soon as there's new work.
+    const polling = work(`?known=${empty.known}&wait=20`);
+    const started = Date.now();
+    const t = await admin.createTask("Add a due date to todos", "");
+    const polled = await polling;
+    assert.ok(Date.now() - started < 15_000);
+    assert.deepEqual(polled.items.map((i: any) => [i.kind, i.task, i.new]), [["task", t.id, true]]);
+
+    // The webhook hears it once, signed.
+    assert.ok(await until(() => got.some((g) => g.kind === "work")), "webhook got the new task");
+    const first = got.find((g) => g.kind === "work")!;
+    assert.equal(first.sig, `sha256=${createHmac("sha256", hook.secret).update(first.raw).digest("hex")}`);
+    assert.deepEqual(first.body.work.map((i: any) => i.kind), ["task"]);
+    assert.equal(first.body.project, name);
+
+    // An agent takes it: the task leaves the list, and its change waits for a review nobody is on.
+    const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, ["src/db.js"], "due dates");
+    await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// due dates\n" }, "due dates");
+    const ch = await ada.submit(t.id, t.title, "Due dates", { plan: ["add due"], tested: ["by hand"] });
+    const after = await work();
+    assert.deepEqual(after.items.map((i: any) => [i.kind, i.change ?? i.task]), [["review", ch.id]]);
+    assert.ok(await until(() => got.filter((g) => g.kind === "work").length >= 2));
+    assert.equal(got.filter((g) => g.kind === "work").length, 2, "each item goes once");
+
+    // Agents see the same list over MCP.
+    const listed = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_work", arguments: {} } }) })).json();
+    assert.equal(JSON.parse(listed.result.content.at(-1).text).items[0].kind, "review");
+
+    // A review lands it; the webhook asked for merges too.
+    const rev = admin.as((await admin.addAgent("rex", "reviewer")).key);
+    await rev.review(ch.id, "approve", "looks right");
+    assert.ok(await until(() => got.some((g) => g.kind === "events" && g.body.events.some((e: any) => e.type === "change.merged")), 15_000), "webhook heard the merge");
+    assert.deepEqual((await work()).items, []);
+
+    await admin.req("DELETE", `/hooks/${hook.id}`);
+    assert.deepEqual(await admin.req("GET", "/hooks"), []);
+  } finally {
+    server.close();
+  }
+});
