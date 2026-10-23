@@ -609,6 +609,9 @@ main.home { padding-bottom: 20px; }
 .tour .tour-text { flex: 1 1 360px; }
 .tour > a { padding: 3px 9px; border: 1px solid var(--line); border-radius: 999px; color: var(--ink); text-decoration: none; font-size: 12.5px; }
 .tour > a:hover, .tour > a.on { border-color: var(--accent); }
+.tour .tour-import { display: flex; gap: 6px; flex: 1 1 340px; margin: 0; }
+.tour .tour-import input { flex: 1; min-width: 0; }
+main > .empty form { max-width: 560px; margin: 10px auto; }
 
 /* Phones: the header is one row of essentials, with the rest scrolling sideways under it. */
 @media (max-width: 700px) {

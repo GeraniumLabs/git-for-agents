@@ -159,10 +159,31 @@ async function showSignIn(why = "") {
   if (!$("#detail").open) $("#detail").showModal();
 }
 
+/**
+ * Bring a repository: the New project form with the import filled in. Signed
+ * out, sign in first and come back to it (?import=<url> also works as a link).
+ */
+function startImport(url) {
+  if (!url) return toast("Paste the URL you'd git clone");
+  if (!user) {
+    const back = new URLSearchParams(location.search);
+    back.set("import", url);
+    history.replaceState(null, "", `${location.pathname}?${back}${location.hash}`);
+    return showSignIn("Sign in with GitHub to bring your repository. You'll own the project.");
+  }
+  showNewProject(null, "", url);
+}
+
 async function boot() {
   await loadUser();
   const invite = new URLSearchParams(location.search).get("invite");
   if (invite) showInvite(invite);
+  const importing = new URLSearchParams(location.search).get("import");
+  if (importing) {
+    const rest = new URLSearchParams(location.search);
+    if (user) { rest.delete("import"); history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`); }
+    startImport(importing);
+  }
   const projects = await fetch("/api/projects").then((r) => r.json());
   const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
   if (!project) project = showcase[0] ?? projects.at(-1)?.name;
@@ -170,9 +191,12 @@ async function boot() {
   $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
-    $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
+    $("main").innerHTML = `<div class="empty"><p>No projects yet. Bring a repository you already have, and connect your agents to it in one line.</p>
+      <form id="empty-import" class="row"><input id="empty-url" class="grow" placeholder="https://github.com/owner/repo"><button>Bring it to Loom</button></form>
+      <p class="meta">Or <a href="#" id="np-empty">start an empty project</a>.</p></div>`;
     $("#more").hidden = true;
-    $("#np-empty").onclick = () => showNewProject();
+    $("#np-empty").onclick = (e) => { e.preventDefault(); showNewProject(); };
+    $("#empty-import").onsubmit = (e) => { e.preventDefault(); startImport($("#empty-url").value.trim()); };
     renderMe();
     if (location.hash) route();
     return;
@@ -199,11 +223,11 @@ function renderTour(projects, showcase) {
   if (dismissed || user || store.get(keyName()) || !showcase.length) return;
   const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
   $("#tour").innerHTML = `
-    <span class="tour-text"><b>Loom is a git platform for agent swarms, built on Cloudflare.</b> These projects were built by agents working at the same time:</span>
+    <span class="tour-text"><b>Loom is git for agents:</b> many coding agents share one repository without stepping on each other. These projects were built by agents working at the same time:</span>
     ${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}" title="${esc(desc(n))}">${esc(n)}</a>`).join("")}
-    <button id="tour-agent" class="mini">Bring your own agent</button><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
+    <form id="tour-import" class="tour-import"><input id="tour-url" placeholder="Paste a git URL to bring your own repository" aria-label="Git URL"><button class="mini">Bring it to Loom</button></form><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
   $("#tour").hidden = false;
-  $("#tour-agent").onclick = () => showSkill();
+  $("#tour-import").onsubmit = (e) => { e.preventDefault(); startImport($("#tour-url").value.trim()); };
   $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
 }
 
@@ -929,11 +953,11 @@ $("#code-open").onclick = () => showCode();
 function showNewJoinCode() {
   let fresh = null;
   try { fresh = JSON.parse(sessionStorage.getItem("loom-new-join") ?? "null"); sessionStorage.removeItem("loom-new-join"); } catch {}
-  if (fresh?.project === project && fresh.code) showSkill(fresh.code);
+  if (fresh?.project === project && fresh.code) showSkill(fresh.code, true);
 }
 // Whether a skill without a join code was copied, so a code made afterwards says to copy again.
 let copiedPlainSkill = false;
-async function showSkill(joinCode) {
+async function showSkill(joinCode, fresh = false) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   // A pasted code is checked by the server, which only puts a live join code into the skill.
   if (joinCode?.pasted && !text.includes(joinCode.code)) { toast(`That join code isn't valid for ${project}: it may have expired, been used up or revoked`); return showSkill(); }
@@ -950,9 +974,15 @@ async function showSkill(joinCode) {
       <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   const mcpUrl = `${location.origin}/mcp/${project}`;
+  const firstAsk = `Use the loom MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Loom's merge queue.`;
   const oneLine = [`claude mcp add --transport http loom ${mcpUrl}`, `codex mcp add loom --url ${mcpUrl}`];
+  const p = state?.project ?? (fresh ? (await api("/overview").catch(() => ({}))).project ?? {} : {});
+  const ready = fresh ? `<div class="card fresh"><b>${esc(project)} is ready${p.importedFrom ? `, with the history of <span class="mono">${esc(p.importedFrom.url)}</span>` : ""}.</b>
+    <p class="meta">Three steps to the first change landing: connect your agent below; ${p.checks ? `checks are on (<span class="mono">${esc(p.checks.command)}</span>);` : p.suggestedCheck ? `turn on checks so main is tested before it moves <button class="ghost mini" id="fresh-check">Use <span class="mono">${esc(p.suggestedCheck)}</span></button>;` : `set a check command in Settings so main is tested before it moves;`} then ask your agent:</p>
+    <pre class="diff copy">${esc(firstAsk)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(firstAsk)}">Copy</button></div></div>` : "";
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
+    ${ready}
     <h2>Your own agent, in one line</h2>
     <p class="meta">Run one of these where your agent runs. It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Sub-agents pass their own name as <span class="mono">as</span>. Any other MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once.</p>
     ${oneLine.map((c) => `<div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
@@ -1010,6 +1040,11 @@ async function showSkill(joinCode) {
   if ($("#jc-signin")) $("#jc-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to make a join code for ${project}.`); };
   if ($("#jc-new-project")) $("#jc-new-project").onclick = (e) => { e.preventDefault(); showNewProject(); };
   if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
+  if ($("#fresh-check")) $("#fresh-check").onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: p.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
+    toast("Checks on: the merge queue runs them before main moves");
+    showSkill(joinCode, true);
+  };
   wireCopy($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
 }
@@ -1061,7 +1096,7 @@ function wireBilling(root) {
 }
 
 /** The New project dialog; org preselects who owns it. */
-async function showNewProject(draft = null, org = "") {
+async function showNewProject(draft = null, org = "", importUrl = "") {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
   const account = await site("GET", "/account").catch(() => ({ orgs: [] }));
   const ownOrgs = (account.orgs ?? []).filter((o) => o.role === "owner");
@@ -1094,6 +1129,11 @@ async function showNewProject(draft = null, org = "") {
   wireBilling($("#detail-body"));
   if ($("#np-org")) $("#np-org").onchange = async () => { $("#np-plan").innerHTML = await planHtml($("#np-org").value || null); wireBilling($("#np-plan")); };
   const importing = () => $('input[name="np-from"]:checked').value === "import";
+  if (importUrl && !draft) {
+    $('input[name="np-from"][value="import"]').checked = true;
+    $("#np-import").hidden = false;
+    $("#np-url").value = importUrl;
+  }
   if (draft) {
     // Back from GitHub: put the form back as it was.
     for (const [id, v] of Object.entries(draft.fields)) if ($(id)) $(id).value = v;
@@ -1129,6 +1169,7 @@ async function showNewProject(draft = null, org = "") {
     $("#np-issues").disabled = !/^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
   };
   $("#np-name").oninput = () => { $("#np-name").dataset.typed = "1"; };
+  if (importUrl && !draft) $("#np-url").oninput();
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
