@@ -32,6 +32,8 @@ import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, sign
 const TOKEN_TTL = 6 * 3600;
 /** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
 export const AGENT_HEADER = "x-loom-agent";
+/** Set by the Worker (never by a client) beside x-loom-user: a person's MCP client acting as their agent, by this name. */
+export const PERSON_AGENT_HEADER = "x-loom-person-agent";
 /** How many named agents one key may carry. */
 const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
@@ -509,6 +511,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const key = header.replace(/^Bearer\s+/i, "");
     if (!key) {
       const user = req.headers.get(USER_HEADER);
+      const agent = req.headers.get(PERSON_AGENT_HEADER)?.trim();
+      if (user && agent) {
+        // A person's own agent: a builder grouped under them, as sub-agents are under a key.
+        const person = await this.member(JSON.parse(user));
+        return this.underKey({ id: person.id, name: person.name, role: "builder", paused: person.paused ?? null, joined_via: null }, agent);
+      }
       if (user) return this.member(JSON.parse(user));
       throw new HttpError(401, "sign in, or send an agent key as a bearer token");
     }

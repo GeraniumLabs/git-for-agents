@@ -949,8 +949,14 @@ async function showSkill(joinCode) {
     : `<h2>1. Let agents register themselves</h2>
       <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
+  const mcpUrl = `${location.origin}/mcp/${project}`;
+  const oneLine = [`claude mcp add --transport http loom ${mcpUrl}`, `codex mcp add loom --url ${mcpUrl}`];
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
+    <h2>Your own agent, in one line</h2>
+    <p class="meta">Run one of these where your agent runs. It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Sub-agents pass their own name as <span class="mono">as</span>. Any other MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once.</p>
+    ${oneLine.map((c) => `<div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
+    <p class="meta">For agents you won't sign in for, such as a swarm or a runner on a server, use a join code:</p>
     ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
       : `<h2>1. Get a join code</h2>
       <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Loom shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
@@ -1004,6 +1010,7 @@ async function showSkill(joinCode) {
   if ($("#jc-signin")) $("#jc-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to make a join code for ${project}.`); };
   if ($("#jc-new-project")) $("#jc-new-project").onclick = (e) => { e.preventDefault(); showNewProject(); };
   if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
+  wireCopy($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#skill-open").onclick = () => showSkill();

@@ -41,24 +41,26 @@ export async function isAdmin(env: Env, req: Request): Promise<boolean> {
   return sameSecret((req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, ""), env.LOOM_ADMIN_TOKEN);
 }
 
-function signingSecret(env: Env): string | undefined {
+export function signingSecret(env: Env): string | undefined {
   return env.LOOM_SECRET_KEY ?? env.LOOM_ADMIN_TOKEN;
 }
 
-async function hmac(env: Env, data: string): Promise<string> {
-  const key = await crypto.subtle.importKey("raw", enc.encode(`loom-session:${signingSecret(env)}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+// The purpose keys the signature, so a token made for one use (a session, an MCP sign-in) never passes as another.
+async function hmac(env: Env, data: string, purpose = "loom-session"): Promise<string> {
+  const key = await crypto.subtle.importKey("raw", enc.encode(`${purpose}:${signingSecret(env)}`), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
   return b64url(new Uint8Array(await crypto.subtle.sign("HMAC", key, enc.encode(data))));
 }
 
-async function signed(env: Env, payload: object): Promise<string> {
+export async function signed(env: Env, payload: object, purpose?: string): Promise<string> {
   const body = b64url(enc.encode(JSON.stringify(payload)));
-  return `${body}.${await hmac(env, body)}`;
+  return `${body}.${await hmac(env, body, purpose)}`;
 }
 
-async function verified<T>(env: Env, token: string | undefined): Promise<T | null> {
+/** A token's payload, if it was signed here for this purpose and hasn't expired. */
+export async function verified<T>(env: Env, token: string | undefined, purpose?: string): Promise<T | null> {
   if (!token || !signingSecret(env)) return null;
   const [body, sig] = token.split(".");
-  if (!body || !sig || (await hmac(env, body)) !== sig) return null;
+  if (!body || !sig || (await hmac(env, body, purpose)) !== sig) return null;
   try {
     const data = JSON.parse(new TextDecoder().decode(unb64url(body)));
     return data.exp && data.exp > Date.now() ? (data as T) : null;
@@ -131,12 +133,12 @@ async function githubApp(env: Env, registry: Registry): Promise<GitHubApp | null
   return cachedApp;
 }
 
-const page = (title: string, body: string) => new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
+export const page = (title: string, body: string) => new Response(`<!doctype html><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>${title}</title>
 <link rel="stylesheet" href="/style.css"><body class="setup"><main class="setup-card"><h3>${title}</h3>${body}</main></body>`, { headers: { "content-type": "text/html; charset=utf-8" } });
-const escHtml = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
-const devLogin = (env: Env) => env.LOOM_DEV_LOGIN === "1";
+export const escHtml = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
+export const devLogin = (env: Env) => env.LOOM_DEV_LOGIN === "1";
 
-const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
+export const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
 
 async function startSession(env: Env, req: Request, user: User, to: string): Promise<Response> {
   const token = await signed(env, { ...user, exp: Date.now() + SESSION_DAYS * 86400_000 });

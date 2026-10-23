@@ -966,3 +966,81 @@ test("an organization: people invited once are members of all its projects, its 
   assert.equal((await (await B("GET", "/api/account")).json()).email, "bob@example.com");
   assert.equal((await B("POST", "/api/account/email", { email: "nope" })).status, 400);
 });
+
+test("one line connects an MCP client: it signs in as a person through OAuth, then works as their agent in their projects", { skip: !url, timeout: 90_000 }, async () => {
+  const login = `mcp${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  await fetch(`${url}/api/admin/creators`, { method: "POST", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ login }) });
+
+  // Before signing in, /mcp says where to learn how.
+  const first = await fetch(`${url}/mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) });
+  assert.equal(first.status, 401);
+  const meta = first.headers.get("www-authenticate")!.match(/resource_metadata="([^"]+)"/)![1];
+  const resource = await (await fetch(meta)).json();
+  assert.equal(resource.resource, `${url}/mcp`);
+  const as = await (await fetch(`${resource.authorization_servers[0]}/.well-known/oauth-authorization-server`)).json();
+  assert.deepEqual(as.code_challenge_methods_supported, ["S256"]);
+
+  // Register, sign in, allow, and trade the code (PKCE) for a token.
+  const redirect = "http://localhost:4567/callback";
+  const reg = await (await fetch(as.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "Claude Code", redirect_uris: [redirect] }) })).json();
+  assert.equal((await fetch(as.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["http://evil.example/cb"] }) })).status, 400);
+  const verifier = "v".repeat(20) + Date.now();
+  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
+  const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "s1" });
+  const signedOut = await (await fetch(`${as.authorization_endpoint}?${q}`)).text();
+  assert.match(signedOut, /Sign in with GitHub/);
+  const consent = await (await fetch(`${as.authorization_endpoint}?${q}`, { headers: { cookie } })).text();
+  assert.match(consent, /Claude Code/);
+  const ask = consent.match(/name="ask" value="([^"]+)"/)![1];
+  const allowed = await fetch(as.authorization_endpoint, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ ask, allow: "1" }) });
+  const back = new URL(allowed.headers.get("location")!);
+  assert.equal(back.origin + back.pathname, redirect);
+  assert.equal(back.searchParams.get("state"), "s1");
+  const code = back.searchParams.get("code")!;
+  const wrong = await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: "nope", client_id: reg.client_id, redirect_uri: redirect }) });
+  assert.equal(wrong.status, 400);
+  const tok = await (await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: reg.client_id, redirect_uri: redirect }) })).json();
+  assert.ok(tok.access_token && tok.refresh_token);
+  // A session cookie isn't an MCP token, and an MCP token isn't a session.
+  assert.equal((await fetch(`${url}/mcp`, { method: "POST", headers: { authorization: `Bearer ${cookie.split("=")[1]}` }, body: "{}" })).status, 401);
+  assert.equal((await (await fetch(`${url}/auth/me`, { headers: { cookie: `loom_session=${tok.access_token}` } })).json()).user, null);
+
+  let id = 1;
+  const mcp = async (method: string, params?: unknown, path = "/mcp") => (await fetch(`${url}${path}`, { method: "POST", headers: { authorization: `Bearer ${tok.access_token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: id++, method, params }) })).json();
+  const tool = async (name: string, args: unknown = {}, path?: string) => {
+    const r = await mcp("tools/call", { name, arguments: args }, path);
+    const text = r.result.content.at(-1).text;
+    if (r.result.isError) throw new Error(text);
+    return JSON.parse(text);
+  };
+  const tools = (await mcp("tools/list")).result.tools.map((t: any) => t.name);
+  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("loom_tool") && tools.includes("claim_task"));
+  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through loom_tool");
+
+  const name = project("e2e-mcp");
+  await tool("create_project", { name, description: "made over MCP" });
+  assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
+  await assert.rejects(tool("loom_status"), /say which project/);
+  const task = await tool("create_task", { project: name, title: "Write a hello file" });
+  await tool("claim_task", { project: name, taskId: task.id });
+  const who = await tool("whoami", { project: name });
+  assert.equal(who.agent.name, "Claude Code");
+  assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
+  const sub = await tool("loom_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
+  assert.ok(sub);
+  const state = await (await fetch(`${url}/api/projects/${name}/state`)).json();
+  assert.ok(state.agents.some((a: any) => a.name === "helper-1"));
+
+  // The project's own URL works with the same sign-in, and a project they aren't in refuses.
+  assert.equal((await tool("whoami", {}, `/mcp/${name}`)).agent.name, "Claude Code");
+  const other = project("e2e-mcp-other");
+  const admin = new (await import("../demo/client.mjs")).Loom(url, other, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name: other, description: "not theirs" });
+  await assert.rejects(tool("whoami", { project: other }), /isn't a member/);
+
+  // Refreshing gives a new token for the same person.
+  const again = await (await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tok.refresh_token }) })).json();
+  assert.ok(again.access_token);
+  await fetch(`${url}/api/admin/creators/${login}`, { method: "DELETE", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } });
+});
