@@ -352,6 +352,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async setVisibility(actor: Agent, visibility: string) {
     if (visibility !== "public" && visibility !== "private") throw new HttpError(400, "visibility is public or private");
     if (visibility === (this.isPrivate ? "private" : "public")) return;
+    const cap = this.limits.privateProjects;
+    if (visibility === "private" && cap > 0) {
+      const r = await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch(`https://do/registry/private-count?name=${encodeURIComponent(this.project)}`).then((r) => r.json<{ count: number }>());
+      if (r.count >= cap) throw new HttpError(403, `the ${this.meta("plan") === "free" ? "free plan" : "plan"} has ${cap} private project${cap === 1 ? "" : "s"}, and its owner has ${r.count}. Loom Pro has no limit on private projects.`);
+    }
     this.setMeta("visibility", visibility);
     await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch("https://do/registry/visibility", { method: "PUT", body: JSON.stringify({ name: this.project, private: visibility === "private" }) });
     this.emit("project.visibility", { actor: actor.id, data: { visibility } });
@@ -462,8 +467,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** The registry's projects under an account: a person's own (outside any org), or an org's (org:<slug>). */
   private ownedBy(account: string) {
     return account.startsWith("org:")
-      ? this.sql.exec("SELECT name, jurisdiction FROM projects WHERE org = ?", account.slice(4)).toArray()
-      : this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ? AND org IS NULL", account.toLowerCase()).toArray();
+      ? this.sql.exec("SELECT name, jurisdiction, private FROM projects WHERE org = ?", account.slice(4)).toArray()
+      : this.sql.exec("SELECT name, jurisdiction, private FROM projects WHERE owner = ? AND org IS NULL", account.toLowerCase()).toArray();
   }
 
   /**
@@ -671,7 +676,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
         return json({
           approved: !!this.sql.exec("SELECT 1 FROM creators WHERE login = ?", login).toArray().length,
           owns: this.ownedBy(url.searchParams.get("account") ?? login).length,
+          ownsPrivate: this.ownedBy(url.searchParams.get("account") ?? login).filter((p) => p.private).length,
         });
+      }
+      // How many private projects the account that owns this one has, for its plan's limit.
+      if (m === "GET" && b === "private-count") {
+        const p = this.sql.exec("SELECT owner, org FROM projects WHERE name = ?", url.searchParams.get("name")).toArray()[0];
+        return json({ count: p ? this.ownedBy(p.org ? `org:${p.org}` : String(p.owner ?? "")).filter((x) => x.private).length : 0 });
       }
       // Organizations, their people and invites, and people's own settings (src/orgs.ts).
       if (b && ["orgs", "org", "members", "invites", "invite", "project-org", "person"].includes(b)) {

@@ -1057,6 +1057,9 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
+/** What a plan gives, in a phrase. 0 is no limit. */
+const planLimits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"} (${x.privateProjects ? `${x.privateProjects} private` : "any of them private"}), ${x.agents ? `${x.agents} agents` : "as many agents as you like"} and ${x.checkMinutes} minutes of checks a day per project`;
+
 /** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
 async function planHtml(org = null) {
   const b = await fetch(`/api/billing${org ? `?org=${encodeURIComponent(org)}` : ""}`, { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
@@ -1065,7 +1068,7 @@ async function planHtml(org = null) {
   if (org) {
     // An org's plan: its owners change it; its members see it.
     const p = b.plan === "unlimited" ? null : b.plans[b.plan], pro = b.plans.pro;
-    const lim = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+    const lim = planLimits;
     const what = !p ? `${esc(org)} is run by this server's owners, so no limits apply.` : `${esc(org)} is on <b>${esc(p.name)}</b>: ${lim(p)}.${b.renews && b.paid === "pro" ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}`;
     const owner = b.role === "owner";
     const buy = owner && b.paid !== "pro" && (p || b.test) ? `<button data-billing="checkout"${o}>${p ? `Upgrade ${esc(org)} to ${esc(pro.name)} (${esc(pro.price)})` : `Try ${esc(pro.name)} checkout (test mode)`}</button>` : "";
@@ -1073,7 +1076,7 @@ async function planHtml(org = null) {
     return `<p class="meta">${what}${b.test && owner ? " Stripe is in test mode: pay with card 4242 4242 4242 4242." : ""}${!owner ? ` Its owners manage the plan.` : ""}</p>${buy || manage ? `<div class="row">${buy}${manage}</div>` : ""}`;
   }
   const pro = b.plans.pro;
-  const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  const limits = planLimits;
   if (b.plan === "unlimited") {
     // An owner of the server: no limits. With a test key they can still walk through Checkout.
     const tryIt = b.test && b.paid !== "pro" ? `<div class="row"><button class="ghost" data-billing="checkout">Try ${esc(pro.name)} checkout (test mode)</button></div>` : "";

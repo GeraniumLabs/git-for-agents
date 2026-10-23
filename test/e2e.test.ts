@@ -842,7 +842,7 @@ test("creating projects is invite-only: others join the waitlist until the admin
   await admin("DELETE", `creators/${login}`);
 });
 
-test("anyone on the free plan gets one project; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
+test("the free plan has three projects, one of them private, and unlimited agents; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
   const { signStripe } = await import("../src/billing.ts");
   const login = `pay${Date.now().toString(36).slice(-5)}`;
   const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
@@ -857,10 +857,19 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   const b = await (await as("GET", "/api/billing")).json();
   assert.equal(b.plan, "free");
   const first = project("e2e-pay");
-  assert.equal((await as("POST", "/api/projects", { name: first, description: "x" })).status, 200);
-  const second = await as("POST", "/api/projects", { name: project("e2e-pay2"), description: "x" });
-  assert.equal(second.status, 403);
-  assert.match((await second.json()).error, /free plan has 1 project/);
+  assert.equal((await as("POST", "/api/projects", { name: first, description: "x", visibility: "private" })).status, 200);
+  const secret = await as("POST", "/api/projects", { name: project("e2e-payp"), description: "x", visibility: "private" });
+  assert.equal(secret.status, 403);
+  assert.match((await secret.json()).error, /free plan has 1 private project/);
+  const pub = project("e2e-pay2");
+  assert.equal((await as("POST", "/api/projects", { name: pub, description: "x" })).status, 200);
+  const flip = await as("POST", `/api/projects/${pub}/settings`, { visibility: "private" });
+  assert.equal(flip.status, 403, "making a second project private counts too");
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  const fourth = await as("POST", "/api/projects", { name: project("e2e-pay4"), description: "x" });
+  assert.equal(fourth.status, 403);
+  assert.match((await fourth.json()).error, /free plan has 3 projects/);
+  assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.agents, 0, "no limit on agents");
 
   const co = await (await as("POST", "/api/billing/checkout", { back: `/?project=${first}` })).json();
   assert.match(co.url, /\/stripe\/pay\/cs_test_/);
@@ -873,7 +882,7 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   assert.equal(pro.plan, "pro");
   assert.equal(pro.manage, true);
   assert.match((await (await as("POST", "/api/billing/portal", {})).json()).url, /\/stripe\/portal\/cus_e2e/);
-  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay5"), description: "x", visibility: "private" })).status, 200);
   const ov = await (await as("GET", `/api/projects/${first}/overview`)).json();
   assert.equal(ov.project.limits.checkMinutes, 300, "the project they already had moved to Pro's limits");
 
@@ -944,10 +953,11 @@ test("an organization: people invited once are members of all its projects, its 
   assert.equal((await A("POST", `/api/projects/${mine}/org`, { org: null })).status, 200);
   assert.equal(await meIn(B, mine), null);
 
-  // The org's own plan: free has one project (it has one), and paying lifts its projects' limits.
+  // The org's own plan: free has three projects (it fills them), and paying lifts its projects' limits.
+  for (const n of ["e2e-org2a", "e2e-org2b"]) assert.equal((await A("POST", "/api/projects", { name: project(n), org: slug })).status, 200);
   const capped = await A("POST", "/api/projects", { name: project("e2e-org2"), org: slug });
   assert.equal(capped.status, 403);
-  assert.match((await capped.json()).error, new RegExp(`${slug} has 1`));
+  assert.match((await capped.json()).error, new RegExp(`${slug} has 3`));
   const b = await (await A("GET", `/api/billing?org=${slug}`)).json();
   assert.equal(b.plan, "free");
   assert.equal(b.role, "owner");

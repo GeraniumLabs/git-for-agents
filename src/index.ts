@@ -103,7 +103,7 @@ const logins = (v: string | undefined) => (v ?? "").split(",").map((l) => l.trim
  * the waitlist, which everyone else joins by trying. Past the owners of the
  * server, each person owns at most LOOM_PROJECTS_PER_PERSON projects.
  */
-async function mayCreate(env: Env, user: User, org: string | null = null): Promise<{ ok: true; plan: ProjectPlan } | { ok: false; error: string }> {
+async function mayCreate(env: Env, user: User, org: string | null = null, wantsPrivate = false): Promise<{ ok: true; plan: ProjectPlan } | { ok: false; error: string }> {
   const login = user.login.toLowerCase();
   if (org) {
     const o = await registry(env).fetch(`https://do/registry/org?slug=${encodeURIComponent(org)}&login=${encodeURIComponent(login)}`).then((r) => r.json<{ role: OrgRole | null; error?: string }>());
@@ -114,7 +114,7 @@ async function mayCreate(env: Env, user: User, org: string | null = null): Promi
   const unlimited = (await accountPlan(env, account)) === "unlimited";
   if (logins(env.LOOM_OWNERS).includes(login) && (!org || unlimited)) return { ok: true, plan: "unlimited" };
   const list = logins(env.LOOM_CREATORS ?? "*");
-  const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}&account=${encodeURIComponent(account)}`).then((r) => r.json<{ approved: boolean; owns: number }>());
+  const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}&account=${encodeURIComponent(account)}`).then((r) => r.json<{ approved: boolean; owns: number; ownsPrivate: number }>());
   if (!list.includes("*") && !list.includes(login) && !r.approved) {
     await registry(env).fetch("https://do/registry/waitlist", { method: "POST", body: JSON.stringify({ login, name: user.name }) });
     return { ok: false, error: `Loom is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
@@ -128,6 +128,8 @@ async function mayCreate(env: Env, user: User, org: string | null = null): Promi
   const plan = (await planOf(env, account)).plan;
   const cap = PLANS[plan].projects;
   const whose = org ? `${org} has` : "you have";
+  const privateCap = PLANS[plan].privateProjects;
+  if (wantsPrivate && privateCap > 0 && r.ownsPrivate >= privateCap) return { ok: false, error: `The ${PLANS[plan].name === "Free" ? "free plan" : PLANS[plan].name} has ${privateCap} private project${privateCap === 1 ? "" : "s"}, and ${whose} ${r.ownsPrivate}. Make this one public, or upgrade to ${PLANS.pro.name} (${PLANS.pro.price}) for as many private projects as you like.` };
   if (r.owns >= cap) return { ok: false, error: plan === "free"
     ? `The free plan has ${cap} project${cap === 1 ? "" : "s"}, and ${whose} ${r.owns}. Loom Pro (${PLANS.pro.price}) gives ${PLANS.pro.projects}: upgrade on ${org ? `${org}'s page` : "your account page"}, or delete one in its Settings.`
     : `${org ? `${org} owns` : "You own"} ${r.owns} projects, the most Loom Pro allows. Delete one in its Settings to make room.` };
@@ -140,7 +142,7 @@ async function createProject(env: Env, user: User | null, body: any): Promise<Re
   if (org && !ORG_SLUG.test(org)) return Response.json({ error: "no such organization" }, { status: 404 });
   let plan: ProjectPlan = "unlimited";
   if (user) {
-    const may = await mayCreate(env, user, org);
+    const may = await mayCreate(env, user, org, body.visibility === "private");
     if (!may.ok) return Response.json({ error: may.error }, { status: 403 });
     plan = may.plan;
   }
