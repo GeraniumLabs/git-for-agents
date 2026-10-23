@@ -28,10 +28,13 @@ import { needsYouEmail } from "./email";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
+import { hookBody, isGitHubDispatch, runnerPrompt, validHookEvents } from "./runners";
 
 const TOKEN_TTL = 6 * 3600;
 /** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
 export const AGENT_HEADER = "x-loom-agent";
+/** Set by the Worker (never by a client) beside x-loom-user: a person's MCP client acting as their agent, by this name. */
+export const PERSON_AGENT_HEADER = "x-loom-person-agent";
 /** How many named agents one key may carry. */
 const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
@@ -271,6 +274,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS runner_hooks (
+        id TEXT PRIMARY KEY, url TEXT NOT NULL, events TEXT NOT NULL, secret TEXT, auth TEXT, seen TEXT DEFAULT '[]', last_seq INTEGER DEFAULT 0,
+        last_delivery TEXT, created_by TEXT, created_at INTEGER, revoked_at INTEGER);
       CREATE TABLE IF NOT EXISTS attachments (
         id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, content_type TEXT NOT NULL, size INTEGER NOT NULL, sha256 TEXT,
         caption TEXT, agent_id TEXT, task_id INTEGER, change_id INTEGER, created_at INTEGER);
@@ -346,6 +352,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async setVisibility(actor: Agent, visibility: string) {
     if (visibility !== "public" && visibility !== "private") throw new HttpError(400, "visibility is public or private");
     if (visibility === (this.isPrivate ? "private" : "public")) return;
+    const cap = this.limits.privateProjects;
+    if (visibility === "private" && cap > 0) {
+      const r = await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch(`https://do/registry/private-count?name=${encodeURIComponent(this.project)}`).then((r) => r.json<{ count: number }>());
+      if (r.count >= cap) throw new HttpError(403, `the ${this.meta("plan") === "free" ? "free plan" : "plan"} has ${cap} private project${cap === 1 ? "" : "s"}, and its owner has ${r.count}. Loom Pro has no limit on private projects.`);
+    }
     this.setMeta("visibility", visibility);
     await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch("https://do/registry/visibility", { method: "PUT", body: JSON.stringify({ name: this.project, private: visibility === "private" }) });
     this.emit("project.visibility", { actor: actor.id, data: { visibility } });
@@ -438,6 +449,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // Stand-ins hear about it after the deputy had its chance to handle it.
       this.ctx.waitUntil(this.delegateOn(event).catch((err) => console.error("delegate", err)).finally(() => NEEDS_PERSON.has(type) && this.notifySoon()));
     } else if (NEEDS_PERSON.has(type)) this.notifySoon();
+    this.hooksSoon();
     return event;
   }
 
@@ -455,8 +467,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** The registry's projects under an account: a person's own (outside any org), or an org's (org:<slug>). */
   private ownedBy(account: string) {
     return account.startsWith("org:")
-      ? this.sql.exec("SELECT name, jurisdiction FROM projects WHERE org = ?", account.slice(4)).toArray()
-      : this.sql.exec("SELECT name, jurisdiction FROM projects WHERE owner = ? AND org IS NULL", account.toLowerCase()).toArray();
+      ? this.sql.exec("SELECT name, jurisdiction, private FROM projects WHERE org = ?", account.slice(4)).toArray()
+      : this.sql.exec("SELECT name, jurisdiction, private FROM projects WHERE owner = ? AND org IS NULL", account.toLowerCase()).toArray();
   }
 
   /**
@@ -509,6 +521,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const key = header.replace(/^Bearer\s+/i, "");
     if (!key) {
       const user = req.headers.get(USER_HEADER);
+      const agent = req.headers.get(PERSON_AGENT_HEADER)?.trim();
+      if (user && agent) {
+        // A person's own agent: a builder grouped under them, as sub-agents are under a key.
+        const person = await this.member(JSON.parse(user));
+        return this.underKey({ id: person.id, name: person.name, role: "builder", paused: person.paused ?? null, joined_via: null }, agent);
+      }
       if (user) return this.member(JSON.parse(user));
       throw new HttpError(401, "sign in, or send an agent key as a bearer token");
     }
@@ -658,7 +676,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
         return json({
           approved: !!this.sql.exec("SELECT 1 FROM creators WHERE login = ?", login).toArray().length,
           owns: this.ownedBy(url.searchParams.get("account") ?? login).length,
+          ownsPrivate: this.ownedBy(url.searchParams.get("account") ?? login).filter((p) => p.private).length,
         });
+      }
+      // How many private projects the account that owns this one has, for its plan's limit.
+      if (m === "GET" && b === "private-count") {
+        const p = this.sql.exec("SELECT owner, org FROM projects WHERE name = ?", url.searchParams.get("name")).toArray()[0];
+        return json({ count: p ? this.ownedBy(p.org ? `org:${p.org}` : String(p.owner ?? "")).filter((x) => x.private).length : 0 });
       }
       // Organizations, their people and invites, and people's own settings (src/orgs.ts).
       if (b && ["orgs", "org", "members", "invites", "invite", "project-org", "person"].includes(b)) {
@@ -723,6 +747,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Reads are open so the dashboard can render without a key.
     if (m === "GET") {
       if (a === "state") return json(this.state());
+      if (a === "work") return json(await this.workFeed(url.searchParams.get("known"), Number(url.searchParams.get("wait") ?? 0), url.origin));
       if (a === "overview") return json(this.overview());
       if (a === "search") return json(this.search(url.searchParams));
       if (a === "agents" && b && c === "trust") return json(this.trustOf(this.profile(b).agent.id));
@@ -795,6 +820,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (m === "DELETE" && b) return json(this.revokeStandin(actor, b));
     }
 
+    if (a === "hooks") {
+      ownerOnly("manage webhooks");
+      if (m === "GET" && !b) return json(this.hookRows());
+      if (m === "POST" && !b) return json(await this.createHook(actor, body));
+      if (m === "POST" && b && c === "test") return json(await this.testHook(b, url.origin));
+      if (m === "DELETE" && b) return json(this.revokeHook(actor, b));
+    }
     if (a === "join-codes") {
       ownerOnly("manage join codes");
       if (m === "GET") return json(this.joinCodes());
@@ -2134,8 +2166,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
-    // Work that stopped moving needs no event to need a person.
+    // Work that stopped moving needs no event to need a person, or a runner.
     this.notifySoon();
+    this.hooksSoon();
     if (this.merging || this.meta("frozen")) return;
     this.merging = true;
     try {
@@ -3146,6 +3179,182 @@ export class ProjectCoordinator extends DurableObject<Env> {
       result = { at: Date.now(), status: null, error: String(e?.message ?? e).slice(0, 200) };
     }
     this.sql.exec("UPDATE standins SET last_delivery = ? WHERE id = ?", JSON.stringify({ ...result, items: items.length }), h.id);
+    return result;
+  }
+
+  // ── runners: say when there's work an agent could pick up ──────────────
+
+  /**
+   * Work an agent could pick up now, whoever starts it: reviews nobody is on,
+   * contests ready to judge, changes sent back to an author who has gone, and
+   * open tasks nobody holds. Loom doesn't start agents; runners read this.
+   */
+  private work(origin: string) {
+    const now = Date.now();
+    const present = new Set(this.sql.exec("SELECT id FROM agents WHERE role != 'human' AND last_seen > ?", now - PRESENT_MS).toArray().map((r) => r.id as string));
+    const items: { key: string; kind: string; text: string; since: number; url: string; change?: number; task?: number }[] = [];
+    const link = (hash = "") => `${origin}/?project=${this.project}${hash}`;
+    for (const t of this.reviewTasks()) {
+      if (t.needsPerson || t.status === "in_progress" || t.reviewers.some((r) => present.has(r.agent))) continue;
+      items.push({ key: `review:${t.change}`, kind: "review", change: t.change, text: `${t.title} (by ${t.authorName}, ${t.approval} approvals)`, since: t.since, url: link(`#change/${t.change}`) });
+    }
+    for (const c of this.sql.exec(`SELECT p.id, p.title, p.updated_at, (SELECT COUNT(*) FROM changes c JOIN tasks t ON t.id = c.task_id WHERE t.parent = p.id AND c.status IN ('review','changes_requested')) AS ready
+        FROM tasks p WHERE p.contest_status = 'open'`).toArray()) {
+      if ((c.ready as number) < 2) continue;
+      items.push({ key: `contest:${c.id}`, kind: "contest", task: c.id as number, text: `Contest #${c.id} "${c.title}": ${c.ready} attempts to compare and vote on`, since: c.updated_at as number, url: link(`#task/${c.id}`) });
+    }
+    for (const c of this.sql.exec("SELECT id, task_id, title, agent_id, status, updated_at FROM changes WHERE status IN ('conflict','changes_requested','checks_failed')").toArray()) {
+      if (present.has(c.agent_id as string)) continue;
+      items.push({ key: `fix:${c.id}:${c.status}`, kind: "fix", change: c.id as number, task: c.task_id as number, text: `Change #${c.id} "${c.title}" is ${String(c.status).replace("_", " ")} and ${this.agentName(c.agent_id as string)} is away`, since: c.updated_at as number, url: link(`#change/${c.id}`) });
+    }
+    const merged = new Set(this.sql.exec("SELECT id FROM tasks WHERE status = 'merged'").toArray().map((r) => r.id as number));
+    for (const t of this.sql.exec("SELECT id, title, depends_on, contest_status, updated_at FROM tasks WHERE status = 'open' AND assignee IS NULL AND COALESCE(attempt, 0) = 0 ORDER BY id LIMIT 100").toArray()) {
+      if ((JSON.parse(t.depends_on as string) as number[]).some((d) => !merged.has(d))) continue;
+      items.push({ key: `task:${t.id}`, kind: "task", task: t.id as number, text: `Task #${t.id} "${t.title}"${t.contest_status === "open" ? " (a contest: claiming it gives you an attempt)" : ""}`, since: t.updated_at as number, url: link(`#task/${t.id}`) });
+    }
+    return { items, agentsPresent: present.size };
+  }
+
+  /** The work list for runners. known is the last answer's known; with wait (up to 25s), holds until there's something new. */
+  private async workFeed(known: string | null, wait: number, origin: string) {
+    const seen = new Set((known ?? "").split(/[.,\s]/).filter(Boolean));
+    const read = () => {
+      const w = this.work(origin);
+      return { ...w, items: w.items.map((i) => ({ ...i, id: shortKey(i.key), new: !seen.has(shortKey(i.key)) })) };
+    };
+    let w = read();
+    const until = Date.now() + Math.min(Math.max(wait, 0), 25) * 1000;
+    while (known !== null && !w.items.some((i) => i.new) && Date.now() < until) {
+      await new Promise<void>((done) => {
+        const waiter = { wants: (e: LoomEvent) => !e.type.startsWith("agent.") && !CHATTER.has(e.type), wake: () => { clearTimeout(t); setTimeout(done, 300); } };
+        const t = setTimeout(() => { this.waiters.delete(waiter); done(); }, until - Date.now());
+        this.waiters.add(waiter);
+      });
+      w = read();
+    }
+    return {
+      project: this.project, ...w, known: w.items.map((i) => i.id).join("."), newCount: w.items.filter((i) => i.new).length,
+      mcp: `${origin}/mcp/${this.project}`, prompt: runnerPrompt(origin, this.project),
+    };
+  }
+
+  private hookView(r: Record<string, SqlStorageValue>) {
+    return { id: r.id, url: r.url, events: JSON.parse(r.events as string), github: isGitHubDispatch(r.url as string), signed: !!r.secret, authorization: !!r.auth,
+      lastDelivery: r.last_delivery ? JSON.parse(r.last_delivery as string) : null, createdBy: this.agentName(r.created_by as string), createdAt: r.created_at };
+  }
+
+  private hookRows() {
+    return this.sql.exec("SELECT * FROM runner_hooks WHERE revoked_at IS NULL ORDER BY created_at").toArray().map((r) => this.hookView(r));
+  }
+
+  /**
+   * A webhook for runners: Loom POSTs new work (and any event types asked for)
+   * to it. authorization is sent as that header, sealed at rest, so a hook can
+   * call an API that needs a token, such as GitHub's repository_dispatch.
+   */
+  private async createHook(actor: Agent, body: { url?: unknown; events?: unknown; authorization?: unknown }) {
+    const url = this.webhookUrl(body.url);
+    if (!url) throw new HttpError(400, "send url: where Loom should POST");
+    let events: string[];
+    try { events = validHookEvents(body.events); } catch (e: any) { throw new HttpError(400, e.message); }
+    if (this.sql.exec("SELECT COUNT(*) AS n FROM runner_hooks WHERE revoked_at IS NULL").one().n as number >= 10) throw new HttpError(429, "a project has at most 10 webhooks; delete one first");
+    const auth = typeof body.authorization === "string" && body.authorization.trim() ? body.authorization.trim() : null;
+    if (auth && (auth.length > 2000 || /[\r\n]/.test(auth))) throw new HttpError(400, "authorization is one header value, e.g. \"Bearer <token>\"");
+    if (isGitHubDispatch(url) && !auth) throw new HttpError(400, "GitHub's dispatch API needs a token: send authorization \"Bearer <a token with contents:write on the repository>\"");
+    const hook = await this.sealWebhookSecret();
+    const sealedAuth = auth ? await seal(this.env, this.project, auth) : null;
+    const id = `hook_${randomId(6)}`;
+    // What's already waiting counts as sent, and events start from now, so a new hook doesn't start with a flood.
+    const seen = this.work(this.meta("origin") ?? "").items.map((i) => shortKey(i.key));
+    const last = (this.sql.exec("SELECT MAX(seq) AS s FROM events").one().s as number) ?? 0;
+    this.sql.exec("INSERT INTO runner_hooks (id, url, events, secret, auth, seen, last_seq, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+      id, url, JSON.stringify(events), hook.sealed, sealedAuth ? JSON.stringify({ ct: sealedAuth.ct, iv: sealedAuth.iv, sealed_by: sealedAuth.by }) : null, JSON.stringify(seen), last, actor.id, Date.now());
+    this.hasHooks = null;
+    this.emit("hook.created", { actor: actor.id, data: { id, events, github: isGitHubDispatch(url) } });
+    return { ...this.hookView(this.sql.exec("SELECT * FROM runner_hooks WHERE id = ?", id).one()), secret: hook.secret,
+      howTo: `Shown once. Check deliveries with it: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>. ${seen.length ? `${seen.length} item${seen.length === 1 ? " is" : "s are"} already waiting and won't be sent; GET /work lists them.` : ""}`.trim() };
+  }
+
+  private revokeHook(actor: Agent, id: string) {
+    const r = this.sql.exec("UPDATE runner_hooks SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL RETURNING id", Date.now(), id).toArray()[0];
+    if (!r) throw new HttpError(404, `no webhook ${id}`);
+    this.hasHooks = null;
+    this.emit("hook.deleted", { actor: actor.id, data: { id } });
+    return { id, deleted: true };
+  }
+
+  private async testHook(id: string, origin: string) {
+    const h = this.sql.exec("SELECT * FROM runner_hooks WHERE id = ? AND revoked_at IS NULL", id).toArray()[0];
+    if (!h) throw new HttpError(404, `no webhook ${id}`);
+    return this.deliverHook(h, "work", { work: [{ key: "test", id: shortKey("test"), kind: "test", text: `Test from Loom: runners for ${this.project} will hear here when there's work.`, since: Date.now(), url: `${origin}/?project=${this.project}` }] }, origin);
+  }
+
+  /** Whether any webhook is live: cached, since every event asks. */
+  private hasHooks: boolean | null = null;
+  private hooksPending = false;
+  /** Check webhooks shortly, once for a burst of events. */
+  private hooksSoon() {
+    if (this.hasHooks === null) this.hasHooks = !!this.sql.exec("SELECT 1 FROM runner_hooks WHERE revoked_at IS NULL LIMIT 1").toArray().length;
+    if (!this.hasHooks || this.hooksPending) return;
+    this.hooksPending = true;
+    this.ctx.waitUntil(new Promise((r) => setTimeout(r, 1500))
+      .then(() => { this.hooksPending = false; return this.notifyHooks(); })
+      .catch((err) => console.error("runner webhook", err)));
+  }
+
+  /** POST new work, and new events of the types asked for, to each webhook. */
+  private async notifyHooks() {
+    const hooks = this.sql.exec("SELECT * FROM runner_hooks WHERE revoked_at IS NULL").toArray();
+    if (!hooks.length) return;
+    const origin = this.meta("origin") ?? "";
+    let work: ReturnType<ProjectCoordinator["work"]> | null = null;
+    let fresh = false;
+    for (const h of hooks) {
+      const events = JSON.parse(h.events as string) as string[];
+      if (events.includes("work")) {
+        work ??= this.work(origin);
+        const items = work.items.map((i) => ({ ...i, id: shortKey(i.key) }));
+        const seen = new Set(JSON.parse((h.seen as string) ?? "[]"));
+        const newer = items.filter((i) => !seen.has(i.id));
+        // Closed items drop out of seen, so they'd go again if they come back.
+        this.sql.exec("UPDATE runner_hooks SET seen = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), h.id);
+        if (newer.length) { fresh = true; await this.deliverHook(h, "work", { work: newer }, origin); }
+      }
+      const types = events.filter((e) => e !== "work");
+      if (types.length) {
+        const all = types.includes("*");
+        const rows = this.rowsToEvents(this.sql.exec("SELECT * FROM events WHERE seq > ? AND type NOT LIKE 'hook.%' ORDER BY seq LIMIT 200", h.last_seq ?? 0).toArray());
+        if (!rows.length) continue;
+        this.sql.exec("UPDATE runner_hooks SET last_seq = ? WHERE id = ?", rows[rows.length - 1].seq, h.id);
+        const wanted = rows.filter((e) => all || types.includes(e.type));
+        if (wanted.length) await this.deliverHook(h, "events", { events: wanted }, origin);
+      }
+    }
+    // A change sent back becomes work once its author has been away a while, with no event to say so.
+    if (work?.items.length || fresh) await this.armAlarm(Date.now() + PRESENT_MS + 60_000);
+  }
+
+  private async deliverHook(h: Record<string, SqlStorageValue>, kind: "work" | "events", what: { work?: unknown[]; events?: unknown[] }, origin: string) {
+    const secret = h.secret ? await unseal(this.env, this.project, JSON.parse(h.secret as string)) : null;
+    const auth = h.auth ? await unseal(this.env, this.project, JSON.parse(h.auth as string)) : null;
+    const body = JSON.stringify(hookBody(h.url as string, kind, { project: this.project, dashboard: `${origin}/?project=${this.project}`, mcp: `${origin}/mcp/${this.project}`, ...what }));
+    let result: { at: number; status: number | null; error?: string };
+    try {
+      const res = await fetch(h.url as string, {
+        method: "POST", signal: AbortSignal.timeout(10_000),
+        headers: {
+          "content-type": "application/json", "user-agent": "loom", "x-loom-event": kind,
+          ...(isGitHubDispatch(h.url as string) ? { accept: "application/vnd.github+json" } : {}),
+          ...(secret ? { "x-loom-signature": `sha256=${await signBody(secret, body)}` } : {}),
+          ...(auth ? { authorization: auth } : {}),
+        },
+        body,
+      });
+      result = { at: Date.now(), status: res.status, ...(res.ok ? {} : { error: (await res.text().catch(() => "")).slice(0, 200) }) };
+    } catch (e: any) {
+      result = { at: Date.now(), status: null, error: String(e?.message ?? e).slice(0, 200) };
+    }
+    this.sql.exec("UPDATE runner_hooks SET last_delivery = ? WHERE id = ?", JSON.stringify({ ...result, kind, items: (what.work ?? what.events ?? []).length }), h.id);
     return result;
   }
 

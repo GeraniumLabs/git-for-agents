@@ -159,10 +159,31 @@ async function showSignIn(why = "") {
   if (!$("#detail").open) $("#detail").showModal();
 }
 
+/**
+ * Bring a repository: the New project form with the import filled in. Signed
+ * out, sign in first and come back to it (?import=<url> also works as a link).
+ */
+function startImport(url) {
+  if (!url) return toast("Paste the URL you'd git clone");
+  if (!user) {
+    const back = new URLSearchParams(location.search);
+    back.set("import", url);
+    history.replaceState(null, "", `${location.pathname}?${back}${location.hash}`);
+    return showSignIn("Sign in with GitHub to bring your repository. You'll own the project.");
+  }
+  showNewProject(null, "", url);
+}
+
 async function boot() {
   await loadUser();
   const invite = new URLSearchParams(location.search).get("invite");
   if (invite) showInvite(invite);
+  const importing = new URLSearchParams(location.search).get("import");
+  if (importing) {
+    const rest = new URLSearchParams(location.search);
+    if (user) { rest.delete("import"); history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`); }
+    startImport(importing);
+  }
   const projects = await fetch("/api/projects").then((r) => r.json());
   const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
   if (!project) project = showcase[0] ?? projects.at(-1)?.name;
@@ -170,9 +191,12 @@ async function boot() {
   $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
-    $("main").innerHTML = `<p class="empty">No projects yet. <button id="np-empty">Create a project</button></p>`;
+    $("main").innerHTML = `<div class="empty"><p>No projects yet. Bring a repository you already have, and connect your agents to it in one line.</p>
+      <form id="empty-import" class="row"><input id="empty-url" class="grow" placeholder="https://github.com/owner/repo"><button>Bring it to Loom</button></form>
+      <p class="meta">Or <a href="#" id="np-empty">start an empty project</a>.</p></div>`;
     $("#more").hidden = true;
-    $("#np-empty").onclick = () => showNewProject();
+    $("#np-empty").onclick = (e) => { e.preventDefault(); showNewProject(); };
+    $("#empty-import").onsubmit = (e) => { e.preventDefault(); startImport($("#empty-url").value.trim()); };
     renderMe();
     if (location.hash) route();
     return;
@@ -199,11 +223,11 @@ function renderTour(projects, showcase) {
   if (dismissed || user || store.get(keyName()) || !showcase.length) return;
   const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
   $("#tour").innerHTML = `
-    <span class="tour-text"><b>Loom is a git platform for agent swarms, built on Cloudflare.</b> These projects were built by agents working at the same time:</span>
+    <span class="tour-text"><b>Loom is git for agents:</b> many coding agents share one repository without stepping on each other. These projects were built by agents working at the same time:</span>
     ${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}" title="${esc(desc(n))}">${esc(n)}</a>`).join("")}
-    <button id="tour-agent" class="mini">Bring your own agent</button><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
+    <form id="tour-import" class="tour-import"><input id="tour-url" placeholder="Paste a git URL to bring your own repository" aria-label="Git URL"><button class="mini">Bring it to Loom</button></form><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
   $("#tour").hidden = false;
-  $("#tour-agent").onclick = () => showSkill();
+  $("#tour-import").onsubmit = (e) => { e.preventDefault(); startImport($("#tour-url").value.trim()); };
   $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
 }
 
@@ -929,11 +953,11 @@ $("#code-open").onclick = () => showCode();
 function showNewJoinCode() {
   let fresh = null;
   try { fresh = JSON.parse(sessionStorage.getItem("loom-new-join") ?? "null"); sessionStorage.removeItem("loom-new-join"); } catch {}
-  if (fresh?.project === project && fresh.code) showSkill(fresh.code);
+  if (fresh?.project === project && fresh.code) showSkill(fresh.code, true);
 }
 // Whether a skill without a join code was copied, so a code made afterwards says to copy again.
 let copiedPlainSkill = false;
-async function showSkill(joinCode) {
+async function showSkill(joinCode, fresh = false) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   // A pasted code is checked by the server, which only puts a live join code into the skill.
   if (joinCode?.pasted && !text.includes(joinCode.code)) { toast(`That join code isn't valid for ${project}: it may have expired, been used up or revoked`); return showSkill(); }
@@ -949,8 +973,20 @@ async function showSkill(joinCode) {
     : `<h2>1. Let agents register themselves</h2>
       <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
+  const mcpUrl = `${location.origin}/mcp/${project}`;
+  const firstAsk = `Use the loom MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Loom's merge queue.`;
+  const oneLine = [`claude mcp add --transport http loom ${mcpUrl}`, `codex mcp add loom --url ${mcpUrl}`];
+  const p = state?.project ?? (fresh ? (await api("/overview").catch(() => ({}))).project ?? {} : {});
+  const ready = fresh ? `<div class="card fresh"><b>${esc(project)} is ready${p.importedFrom ? `, with the history of <span class="mono">${esc(p.importedFrom.url)}</span>` : ""}.</b>
+    <p class="meta">Three steps to the first change landing: connect your agent below; ${p.checks ? `checks are on (<span class="mono">${esc(p.checks.command)}</span>);` : p.suggestedCheck ? `turn on checks so main is tested before it moves <button class="ghost mini" id="fresh-check">Use <span class="mono">${esc(p.suggestedCheck)}</span></button>;` : `set a check command in Settings so main is tested before it moves;`} then ask your agent:</p>
+    <pre class="diff copy">${esc(firstAsk)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(firstAsk)}">Copy</button></div></div>` : "";
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
+    ${ready}
+    <h2>Your own agent, in one line</h2>
+    <p class="meta">Run one of these where your agent runs. It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Sub-agents pass their own name as <span class="mono">as</span>. Any other MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once.</p>
+    ${oneLine.map((c) => `<div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
+    <p class="meta">For agents you won't sign in for, such as a swarm or a runner on a server, use a join code:</p>
     ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
       : `<h2>1. Get a join code</h2>
       <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Loom shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
@@ -1004,6 +1040,12 @@ async function showSkill(joinCode) {
   if ($("#jc-signin")) $("#jc-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to make a join code for ${project}.`); };
   if ($("#jc-new-project")) $("#jc-new-project").onclick = (e) => { e.preventDefault(); showNewProject(); };
   if ($("#jc-another")) $("#jc-another").onclick = (e) => { e.preventDefault(); showSkill(); };
+  if ($("#fresh-check")) $("#fresh-check").onclick = async () => {
+    try { const r = await act("POST", "/settings", { checks: { command: p.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
+    toast("Checks on: the merge queue runs them before main moves");
+    showSkill(joinCode, true);
+  };
+  wireCopy($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#skill-open").onclick = () => showSkill();
@@ -1015,6 +1057,9 @@ const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <sp
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
+/** What a plan gives, in a phrase. 0 is no limit. */
+const planLimits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"} (${x.privateProjects ? `${x.privateProjects} private` : "any of them private"}), ${x.agents ? `${x.agents} agents` : "as many agents as you like"} and ${x.checkMinutes} minutes of checks a day per project`;
+
 /** The signed-in person's plan, and the buttons to change it. Empty when the server takes no payments. */
 async function planHtml(org = null) {
   const b = await fetch(`/api/billing${org ? `?org=${encodeURIComponent(org)}` : ""}`, { cache: "no-store" }).then((r) => r.json()).catch(() => ({ enabled: false }));
@@ -1023,7 +1068,7 @@ async function planHtml(org = null) {
   if (org) {
     // An org's plan: its owners change it; its members see it.
     const p = b.plan === "unlimited" ? null : b.plans[b.plan], pro = b.plans.pro;
-    const lim = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+    const lim = planLimits;
     const what = !p ? `${esc(org)} is run by this server's owners, so no limits apply.` : `${esc(org)} is on <b>${esc(p.name)}</b>: ${lim(p)}.${b.renews && b.paid === "pro" ? ` Renews ${new Date(b.renews).toLocaleDateString()}.` : ""}`;
     const owner = b.role === "owner";
     const buy = owner && b.paid !== "pro" && (p || b.test) ? `<button data-billing="checkout"${o}>${p ? `Upgrade ${esc(org)} to ${esc(pro.name)} (${esc(pro.price)})` : `Try ${esc(pro.name)} checkout (test mode)`}</button>` : "";
@@ -1031,7 +1076,7 @@ async function planHtml(org = null) {
     return `<p class="meta">${what}${b.test && owner ? " Stripe is in test mode: pay with card 4242 4242 4242 4242." : ""}${!owner ? ` Its owners manage the plan.` : ""}</p>${buy || manage ? `<div class="row">${buy}${manage}</div>` : ""}`;
   }
   const pro = b.plans.pro;
-  const limits = (x) => `${x.projects} project${x.projects === 1 ? "" : "s"}, ${x.agents} agents and ${x.checkMinutes} minutes of checks a day per project`;
+  const limits = planLimits;
   if (b.plan === "unlimited") {
     // An owner of the server: no limits. With a test key they can still walk through Checkout.
     const tryIt = b.test && b.paid !== "pro" ? `<div class="row"><button class="ghost" data-billing="checkout">Try ${esc(pro.name)} checkout (test mode)</button></div>` : "";
@@ -1054,7 +1099,7 @@ function wireBilling(root) {
 }
 
 /** The New project dialog; org preselects who owns it. */
-async function showNewProject(draft = null, org = "") {
+async function showNewProject(draft = null, org = "", importUrl = "") {
   if (!user) return showSignIn("Sign in with GitHub to create a project. You'll own it.");
   const account = await site("GET", "/account").catch(() => ({ orgs: [] }));
   const ownOrgs = (account.orgs ?? []).filter((o) => o.role === "owner");
@@ -1087,6 +1132,11 @@ async function showNewProject(draft = null, org = "") {
   wireBilling($("#detail-body"));
   if ($("#np-org")) $("#np-org").onchange = async () => { $("#np-plan").innerHTML = await planHtml($("#np-org").value || null); wireBilling($("#np-plan")); };
   const importing = () => $('input[name="np-from"]:checked').value === "import";
+  if (importUrl && !draft) {
+    $('input[name="np-from"][value="import"]').checked = true;
+    $("#np-import").hidden = false;
+    $("#np-url").value = importUrl;
+  }
   if (draft) {
     // Back from GitHub: put the form back as it was.
     for (const [id, v] of Object.entries(draft.fields)) if ($(id)) $(id).value = v;
@@ -1122,6 +1172,7 @@ async function showNewProject(draft = null, org = "") {
     $("#np-issues").disabled = !/^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
   };
   $("#np-name").oninput = () => { $("#np-name").dataset.typed = "1"; };
+  if (importUrl && !draft) $("#np-url").oninput();
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
     if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
@@ -1312,8 +1363,8 @@ async function showInvite(code) {
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null, account = null;
-  try { [s, people, si, mail, account] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null]); } catch { return; }
+  let mail = null, account = null, hooks = [];
+  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : []]); } catch { return; }
   const org = state?.project?.org ?? null;
   const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
@@ -1347,6 +1398,14 @@ async function showSettings() {
     <h2>Review agent</h2>
     ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
+    <h2>Runners</h2>
+    <p class="meta">Loom doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Loom tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
+    ${isOwner() ? `${hooks.map((h) => `<div class="qrow"><span class="grow"><span class="mono">${esc(h.url)}</span> <span class="meta">${esc(h.events.join(", "))}${h.github ? " · GitHub dispatch" : ""}${h.lastDelivery ? ` · last ${h.lastDelivery.status && h.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(h.lastDelivery.error || String(h.lastDelivery.status))}`} ${ago(h.lastDelivery.at)}` : " · nothing sent yet"}</span></span><button class="ghost mini" data-hook-test="${esc(h.id)}">Test</button><button class="ghost mini" data-hook-delete="${esc(h.id)}">Delete</button></div>`).join("")}
+    <div class="card key-card">
+      <div class="row"><input id="hook-url" class="grow" placeholder="https://… where Loom posts new work (a GitHub dispatches URL works too)"></div>
+      <div class="row"><select id="hook-events"><option value="work">New work for agents</option><option value="work,change.merged">New work, and merges</option><option value="*">Every event</option></select><input id="hook-auth" type="password" autocomplete="off" class="grow" placeholder="Authorization header (optional), e.g. Bearer <token>"><button id="hook-add">Add webhook</button></div>
+      <div id="hook-out"></div>
+    </div>` : ""}
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -1408,6 +1467,22 @@ async function showSettings() {
       <pre class="diff copy">${esc(install)}</pre>
       <div class="row"><button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button><button class="ghost mini" data-copy="${esc(install)}">Copy install command</button></div>`;
     wireCopy($("#si-out"));
+  };
+  if ($("#hook-add")) $("#hook-add").onclick = async () => {
+    const url = $("#hook-url").value.trim();
+    if (!url) return toast("Give the URL Loom should post to");
+    let h;
+    try { h = await act("POST", "/hooks", { url, events: $("#hook-events").value.split(","), authorization: $("#hook-auth").value.trim() || undefined }); } catch { return; }
+    $("#hook-out").innerHTML = `<p class="meta">Added. Signing secret, shown once: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>. ${esc(h.howTo.replace(/^Shown once\. Check deliveries with it: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>\. ?/, ""))}</p><pre class="diff copy">${esc(h.secret)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(h.secret)}">Copy secret</button></div>`;
+    wireCopy($("#hook-out"));
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-hook-test]")) b.onclick = async () => {
+    try { const r = await act("POST", `/hooks/${b.dataset.hookTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
+  };
+  for (const b of $("#detail-body").querySelectorAll("[data-hook-delete]")) b.onclick = async () => {
+    if (!await ask({ title: "Delete this webhook?", body: "Loom stops posting to it.", ok: "Delete", danger: true })) return;
+    try { await act("DELETE", `/hooks/${b.dataset.hookDelete}`); } catch { return; }
+    showSettings();
   };
   for (const b of $("#detail-body").querySelectorAll("[data-si-test]")) b.onclick = async () => {
     try { const r = await act("POST", `/standins/${b.dataset.siTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
@@ -1734,6 +1809,8 @@ function describe(e) {
     case "standin.acted": return ["directive", `${who}, through ${esc(d.name)}: <span class="mono">${esc(d.action)}</span>`];
     case "standin.created": return ["directive", `${who} gave ${to} a stand-in key for ${esc(d.name)} (${d.scopes.length ? esc(d.scopes.join(", ")) : "watch only"})`];
     case "standin.revoked": return ["directive", `${who} revoked the stand-in key for ${esc(d.name)}`];
+    case "hook.created": return ["directive", `${who} added a webhook for runners (${esc((d.events ?? []).join(", "))})`];
+    case "hook.deleted": return ["directive", `${who} deleted a runner webhook`];
     case "settings.key_saved": return ["directive", `${who} saved a ${esc(d.label)} key for the project (…${esc(d.last4)})`];
     case "settings.key_removed": return ["directive", `${who} removed the project's ${esc(d.label)} key`];
     case "delegate.configured": return ["directive", `${who} ${d.enabled ? `set ${esc(d.name)}'s brief: may ${[d.questions?.enabled && "answer questions", d.approvals?.enabled && `approve ${(d.approvals.paths ?? []).map(esc).join(", ") || "nothing"}`].filter(Boolean).join(" and ") || "do nothing yet"}` : `turned ${esc(d.name)} off`}`];

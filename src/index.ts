@@ -1,11 +1,12 @@
-import { handleMcp } from "./mcp";
+import { handleMcp, type Account } from "./mcp";
+import { agentNameOf, handleOAuth, mcpGrant, signInFirst } from "./oauth";
 import { USER_HEADER, githubGrant, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
 import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
-import { projectOfWorkspace, pushOf } from "./events";
+import { eventsEnabled, projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
-import { AGENT_HEADER, DIRECTIVES_HEADER } from "./coordinator";
+import { AGENT_HEADER, DIRECTIVES_HEADER, PERSON_AGENT_HEADER } from "./coordinator";
 import { PLANS, billingOn, testMode, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
 import { ORG_SLUG, orgAccount, type OrgPeople, type OrgRole } from "./orgs";
 export { ProjectCoordinator } from "./coordinator";
@@ -88,6 +89,7 @@ async function forward(env: Env, req: Request, project: string, rest: string): P
   url.pathname = "/" + rest;
   const out = new Request(url, req);
   out.headers.delete(USER_HEADER);
+  out.headers.delete(PERSON_AGENT_HEADER);
   const user = await sessionUser(env, req);
   if (user) out.headers.set(USER_HEADER, JSON.stringify(user));
   return (await coordinator(env, project)).fetch(out);
@@ -101,7 +103,7 @@ const logins = (v: string | undefined) => (v ?? "").split(",").map((l) => l.trim
  * the waitlist, which everyone else joins by trying. Past the owners of the
  * server, each person owns at most LOOM_PROJECTS_PER_PERSON projects.
  */
-async function mayCreate(env: Env, user: User, org: string | null = null): Promise<{ ok: true; plan: ProjectPlan } | { ok: false; error: string }> {
+async function mayCreate(env: Env, user: User, org: string | null = null, wantsPrivate = false): Promise<{ ok: true; plan: ProjectPlan } | { ok: false; error: string }> {
   const login = user.login.toLowerCase();
   if (org) {
     const o = await registry(env).fetch(`https://do/registry/org?slug=${encodeURIComponent(org)}&login=${encodeURIComponent(login)}`).then((r) => r.json<{ role: OrgRole | null; error?: string }>());
@@ -112,7 +114,7 @@ async function mayCreate(env: Env, user: User, org: string | null = null): Promi
   const unlimited = (await accountPlan(env, account)) === "unlimited";
   if (logins(env.LOOM_OWNERS).includes(login) && (!org || unlimited)) return { ok: true, plan: "unlimited" };
   const list = logins(env.LOOM_CREATORS ?? "*");
-  const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}&account=${encodeURIComponent(account)}`).then((r) => r.json<{ approved: boolean; owns: number }>());
+  const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}&account=${encodeURIComponent(account)}`).then((r) => r.json<{ approved: boolean; owns: number; ownsPrivate: number }>());
   if (!list.includes("*") && !list.includes(login) && !r.approved) {
     await registry(env).fetch("https://do/registry/waitlist", { method: "POST", body: JSON.stringify({ login, name: user.name }) });
     return { ok: false, error: `Loom is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
@@ -126,16 +128,95 @@ async function mayCreate(env: Env, user: User, org: string | null = null): Promi
   const plan = (await planOf(env, account)).plan;
   const cap = PLANS[plan].projects;
   const whose = org ? `${org} has` : "you have";
+  const privateCap = PLANS[plan].privateProjects;
+  if (wantsPrivate && privateCap > 0 && r.ownsPrivate >= privateCap) return { ok: false, error: `The ${PLANS[plan].name === "Free" ? "free plan" : PLANS[plan].name} has ${privateCap} private project${privateCap === 1 ? "" : "s"}, and ${whose} ${r.ownsPrivate}. Make this one public, or upgrade to ${PLANS.pro.name} (${PLANS.pro.price}) for as many private projects as you like.` };
   if (r.owns >= cap) return { ok: false, error: plan === "free"
     ? `The free plan has ${cap} project${cap === 1 ? "" : "s"}, and ${whose} ${r.owns}. Loom Pro (${PLANS.pro.price}) gives ${PLANS.pro.projects}: upgrade on ${org ? `${org}'s page` : "your account page"}, or delete one in its Settings.`
     : `${org ? `${org} owns` : "You own"} ${r.owns} projects, the most Loom Pro allows. Delete one in its Settings to make room.` };
   return { ok: true, plan };
 }
 
+/** Create a project: for a signed-in person, who owns it (within their plan), or for the admin (user null). */
+async function createProject(env: Env, user: User | null, body: any): Promise<Response> {
+  const org = body.org ? String(body.org).toLowerCase() : null;
+  if (org && !ORG_SLUG.test(org)) return Response.json({ error: "no such organization" }, { status: 404 });
+  let plan: ProjectPlan = "unlimited";
+  if (user) {
+    const may = await mayCreate(env, user, org, body.visibility === "private");
+    if (!may.ok) return Response.json({ error: may.error }, { status: 403 });
+    plan = may.plan;
+  }
+  if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
+  const jurisdiction = parseJurisdiction(env, body.jurisdiction);
+  if (jurisdiction && typeof jurisdiction === "object") return Response.json({ error: jurisdiction.error }, { status: jurisdiction.status });
+  // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
+  if ((await locate(env, body.name)).exists) return Response.json({ error: "project already exists" }, { status: 409 });
+  const ns = projectNamespace(env, jurisdiction);
+  const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined, plan }) });
+  if (res.ok) {
+    await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null, org: user ? org : null }) });
+    located.set(body.name, jurisdiction);
+    if (user && org) {
+      const o = await orgCall(env, "GET", "org", {}, `slug=${org}`).then((r) => r.json<OrgPeople>());
+      await syncProjects(env, org, o.members, [{ name: body.name }]);
+    }
+  }
+  return res;
+}
+
+/** What a signed-in MCP client can do outside any one project: list the person's projects, and create one. */
+function mcpAccount(env: Env, user: User): Account {
+  return {
+    async projects() {
+      const listed = await registry(env).fetch("https://do/registry").then((r) => r.json<{ name: string; description?: string | null; private: boolean; jurisdiction: Jurisdiction | null }[]>());
+      const headers = { [USER_HEADER]: JSON.stringify(user) };
+      const mine = await Promise.all(listed.map(async (p) => {
+        located.set(p.name, p.jurisdiction ?? null);
+        const me = await (await coordinator(env, p.name)).fetch("https://do/me", { headers }).then((r) => (r.ok ? r.json<{ agent?: { owner?: boolean } }>() : null)).catch(() => null);
+        return me?.agent ? { name: p.name, description: p.description ?? null, private: !!p.private, owner: !!me.agent.owner } : null;
+      }));
+      return mine.filter((p) => p !== null);
+    },
+    async create(a) {
+      const body = {
+        name: String(a.name ?? "").toLowerCase(), description: a.description ?? "", requiredApprovals: 1,
+        visibility: a.private ? "private" : "public",
+        ...(a.check ? { checks: { command: a.check } } : {}),
+        ...(a.importUrl ? { import: { url: a.importUrl, branch: a.branch, token: a.token } } : {}),
+      };
+      const res = await createProject(env, user, body);
+      const data = await res.json<any>();
+      if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+      return { ...data, next: `Pass project "${body.name}" to the other tools: loom_status, then create_task or claim_task.` };
+    },
+  };
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+
+    const oauth = await handleOAuth(env, req);
+    if (oauth) return oauth;
+
+    // For `npm run doctor`: what this server has set up. Booleans only, and only for the admin.
+    if (path === "/api/health" && req.method === "GET") {
+      if (!(await isAdmin(env, req))) return Response.json({ ok: true });
+      return Response.json({
+        ok: true,
+        secretKey: !!env.LOOM_SECRET_KEY,
+        artifacts: !!(env.ARTIFACTS || env.ARTIFACTS_SHIM_URL),
+        checks: !!(env.CHECKS || env.ARTIFACTS_SHIM_URL),
+        workersAi: !!env.AI,
+        email: !!(env.EMAIL && env.LOOM_EMAIL_FROM),
+        pushEvents: eventsEnabled(env),
+        payments: billingOn(env),
+        eu: !!(env.ARTIFACTS_EU && env.CONTEXT_EU),
+        owners: logins(env.LOOM_OWNERS).length,
+        creators: logins(env.LOOM_CREATORS ?? "*").includes("*") ? "anyone signed in" : `${logins(env.LOOM_CREATORS).length} listed`,
+      }, { headers: { "cache-control": "no-store" } });
+    }
 
     if (path === "/api/projects" && req.method === "GET") {
       // Private projects are listed only to people (or keys) who can read them.
@@ -301,32 +382,9 @@ export default {
       const user = admin ? null : await sessionUser(env, req);
       if (!admin && !user) return Response.json({ error: "sign in with GitHub to create a project" }, { status: 401 });
       const body = await req.json<any>();
-      const org = body.org ? String(body.org).toLowerCase() : null;
-      if (org && !ORG_SLUG.test(org)) return Response.json({ error: "no such organization" }, { status: 404 });
-      let plan: ProjectPlan = "unlimited";
-      if (user) {
-        const may = await mayCreate(env, user, org);
-        if (!may.ok) return Response.json({ error: may.error }, { status: 403 });
-        plan = may.plan;
-      }
-      if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
       // An import without a token reads the person's repositories with the GitHub access they granted, if any.
       if (body.import && !body.import.token && user) body.import.token = (await githubGrant(env, req, user)) ?? undefined;
-      const jurisdiction = parseJurisdiction(env, body.jurisdiction);
-      if (jurisdiction && typeof jurisdiction === "object") return Response.json({ error: jurisdiction.error }, { status: jurisdiction.status });
-      // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
-      if ((await locate(env, body.name)).exists) return Response.json({ error: "project already exists" }, { status: 409 });
-      const ns = projectNamespace(env, jurisdiction);
-      const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined, plan }) });
-      if (res.ok) {
-        await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null, org: user ? org : null }) });
-        located.set(body.name, jurisdiction);
-        if (user && org) {
-          const o = await orgCall(env, "GET", "org", {}, `slug=${org}`).then((r) => r.json<OrgPeople>());
-          await syncProjects(env, org, o.members, [{ name: body.name }]);
-        }
-      }
-      return res;
+      return createProject(env, user, body);
     }
 
     // Deleting a project: its coordinator removes everything it holds, then this isolate forgets where it lived.
@@ -352,22 +410,33 @@ export default {
     }
     if (m) return forward(env, req, m[1], m[2]);
 
-    m = path.match(/^\/mcp\/([a-z0-9-]+)$/);
+    m = path.match(/^\/mcp(?:\/([a-z0-9-]+))?$/);
     if (m) {
-      const project = m[1];
+      const fixed = m[1] ?? null;
       const auth = req.headers.get("authorization") ?? "";
+      // Signed in through OAuth: the person's own agent, named after the client unless it says otherwise.
+      const grant = await mcpGrant(env, req);
+      // /mcp is for signed-in clients; a project's own URL also takes an agent key. Without either, the 401 starts sign-in.
+      if (!grant && (!fixed || !auth)) return signInFirst(req);
       // Which agent under the key: per tool call (as), else per connection (header or ?as=).
       const named = req.headers.get(AGENT_HEADER) ?? url.searchParams.get("as");
-      return handleMcp(req, (as) => {
+      const tools = url.searchParams.get("tools") === "all" ? "all" : url.searchParams.get("tools") === "core" || (!fixed && grant) ? "core" : "all";
+      return handleMcp(req, (as, chosen) => {
         // The last response's unacknowledged directives, shown with the tool's result.
         let directives: { seq: number; from: string; body: string }[] = [];
+        const project = fixed ?? chosen!;
         const call = async (method: string, p: string, body?: unknown) => {
           const who = as ?? named;
-          const res = await (await coordinator(env, project)).fetch(`https://do${p}`, {
-            method,
-            headers: { authorization: auth, "content-type": "application/json", ...(who ? { [AGENT_HEADER]: who } : {}) },
-            body: body === undefined ? undefined : JSON.stringify(body),
-          });
+          if (!PROJECT_NAME.test(project) || !(await locate(env, project)).exists) throw new Error(`no project ${project}${grant ? "; list_projects shows yours" : ""}`);
+          const headers: Record<string, string> = { "content-type": "application/json" };
+          if (grant) {
+            headers[USER_HEADER] = JSON.stringify(grant.user);
+            headers[PERSON_AGENT_HEADER] = who ?? agentNameOf(grant.client);
+          } else {
+            headers.authorization = auth;
+            if (who) headers[AGENT_HEADER] = who;
+          }
+          const res = await (await coordinator(env, project)).fetch(`https://do${p}`, { method, headers, body: body === undefined ? undefined : JSON.stringify(body) });
           const pending = res.headers.get(DIRECTIVES_HEADER);
           directives = pending ? JSON.parse(decodeURIComponent(pending)) : [];
           const data = await res.json<any>();
@@ -375,7 +444,7 @@ export default {
           return data;
         };
         return Object.assign(call, { directives: () => directives });
-      });
+      }, { tools, account: grant && !fixed ? mcpAccount(env, grant.user) : undefined, defaultProject: url.searchParams.get("project") });
     }
 
     // Local development: the Artifacts shim posts push events here, shaped like the queue's messages.

@@ -1,5 +1,6 @@
 // Plans, and paying for one with Stripe. Anyone signed in gets the free plan;
-// Loom Pro lifts its limits. A plan belongs to a person (their GitHub login),
+// Loom Pro lifts its limits. Plans charge for hosting (projects, private
+// projects, check minutes), never for agents: more agents is the point. A plan belongs to a person (their GitHub login),
 // and a project takes the plan of the person who created it. Without Stripe
 // configured there are no plans: the LOOM_* limits apply to everyone.
 //
@@ -22,6 +23,8 @@ export type ProjectPlan = PlanName | "unlimited";
 export interface Limits {
   /** Projects one person may own. */
   projects: number;
+  /** How many of those may be private. */
+  privateProjects: number;
   /** Agents one project may hold. */
   agents: number;
   /** Minutes of checks one project may run a day (UTC). */
@@ -29,20 +32,21 @@ export interface Limits {
 }
 
 export const PLANS: Record<PlanName, Limits & { name: string; price: string }> = {
-  free: { name: "Free", price: "$0", projects: 1, agents: 25, checkMinutes: 30 },
-  pro: { name: "Loom Pro", price: "$10 a month", projects: 10, agents: 300, checkMinutes: 300 },
+  // 0 is no limit, as everywhere here.
+  free: { name: "Free", price: "$0", projects: 3, privateProjects: 1, agents: 0, checkMinutes: 30 },
+  pro: { name: "Loom Pro", price: "$10 a month", projects: 25, privateProjects: 0, agents: 0, checkMinutes: 300 },
 };
 
 /** The limits when the server takes no payments: LOOM_* settings, 0 meaning no limit. */
 export function serverLimits(env: Env): Limits {
   const n = (v: string | undefined, d: number) => (v === undefined || v === "" ? d : Number(v));
-  return { projects: n(env.LOOM_PROJECTS_PER_PERSON, 5), agents: n(env.LOOM_MAX_AGENTS, 300), checkMinutes: n(env.LOOM_CHECK_MINUTES_PER_DAY, 120) };
+  return { projects: n(env.LOOM_PROJECTS_PER_PERSON, 5), privateProjects: 0, agents: n(env.LOOM_MAX_AGENTS, 300), checkMinutes: n(env.LOOM_CHECK_MINUTES_PER_DAY, 120) };
 }
 
 /** A project's limits: from its plan when the server takes payments, else the server's. Projects made before plans keep the server's. */
 export function projectLimits(env: Env, plan: string | null): Limits {
   if (!billingOn(env) || !plan) return serverLimits(env);
-  if (plan === "unlimited") return { projects: 0, agents: 0, checkMinutes: 0 };
+  if (plan === "unlimited") return { projects: 0, privateProjects: 0, agents: 0, checkMinutes: 0 };
   return PLANS[plan as PlanName] ?? PLANS.free;
 }
 

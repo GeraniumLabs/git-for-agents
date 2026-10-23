@@ -842,7 +842,7 @@ test("creating projects is invite-only: others join the waitlist until the admin
   await admin("DELETE", `creators/${login}`);
 });
 
-test("anyone on the free plan gets one project; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
+test("the free plan has three projects, one of them private, and unlimited agents; paying through Stripe lifts the limits on their projects", { skip: !url, timeout: 60_000 }, async () => {
   const { signStripe } = await import("../src/billing.ts");
   const login = `pay${Date.now().toString(36).slice(-5)}`;
   const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
@@ -857,10 +857,19 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   const b = await (await as("GET", "/api/billing")).json();
   assert.equal(b.plan, "free");
   const first = project("e2e-pay");
-  assert.equal((await as("POST", "/api/projects", { name: first, description: "x" })).status, 200);
-  const second = await as("POST", "/api/projects", { name: project("e2e-pay2"), description: "x" });
-  assert.equal(second.status, 403);
-  assert.match((await second.json()).error, /free plan has 1 project/);
+  assert.equal((await as("POST", "/api/projects", { name: first, description: "x", visibility: "private" })).status, 200);
+  const secret = await as("POST", "/api/projects", { name: project("e2e-payp"), description: "x", visibility: "private" });
+  assert.equal(secret.status, 403);
+  assert.match((await secret.json()).error, /free plan has 1 private project/);
+  const pub = project("e2e-pay2");
+  assert.equal((await as("POST", "/api/projects", { name: pub, description: "x" })).status, 200);
+  const flip = await as("POST", `/api/projects/${pub}/settings`, { visibility: "private" });
+  assert.equal(flip.status, 403, "making a second project private counts too");
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  const fourth = await as("POST", "/api/projects", { name: project("e2e-pay4"), description: "x" });
+  assert.equal(fourth.status, 403);
+  assert.match((await fourth.json()).error, /free plan has 3 projects/);
+  assert.equal((await (await as("GET", `/api/projects/${first}/overview`)).json()).project.limits.agents, 0, "no limit on agents");
 
   const co = await (await as("POST", "/api/billing/checkout", { back: `/?project=${first}` })).json();
   assert.match(co.url, /\/stripe\/pay\/cs_test_/);
@@ -873,7 +882,7 @@ test("anyone on the free plan gets one project; paying through Stripe lifts the 
   assert.equal(pro.plan, "pro");
   assert.equal(pro.manage, true);
   assert.match((await (await as("POST", "/api/billing/portal", {})).json()).url, /\/stripe\/portal\/cus_e2e/);
-  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay3"), description: "x" })).status, 200);
+  assert.equal((await as("POST", "/api/projects", { name: project("e2e-pay5"), description: "x", visibility: "private" })).status, 200);
   const ov = await (await as("GET", `/api/projects/${first}/overview`)).json();
   assert.equal(ov.project.limits.checkMinutes, 300, "the project they already had moved to Pro's limits");
 
@@ -944,10 +953,11 @@ test("an organization: people invited once are members of all its projects, its 
   assert.equal((await A("POST", `/api/projects/${mine}/org`, { org: null })).status, 200);
   assert.equal(await meIn(B, mine), null);
 
-  // The org's own plan: free has one project (it has one), and paying lifts its projects' limits.
+  // The org's own plan: free has three projects (it fills them), and paying lifts its projects' limits.
+  for (const n of ["e2e-org2a", "e2e-org2b"]) assert.equal((await A("POST", "/api/projects", { name: project(n), org: slug })).status, 200);
   const capped = await A("POST", "/api/projects", { name: project("e2e-org2"), org: slug });
   assert.equal(capped.status, 403);
-  assert.match((await capped.json()).error, new RegExp(`${slug} has 1`));
+  assert.match((await capped.json()).error, new RegExp(`${slug} has 3`));
   const b = await (await A("GET", `/api/billing?org=${slug}`)).json();
   assert.equal(b.plan, "free");
   assert.equal(b.role, "owner");
@@ -965,4 +975,150 @@ test("an organization: people invited once are members of all its projects, its 
   assert.equal((await B("POST", "/api/account/email", { email: "bob@example.com" })).status, 200);
   assert.equal((await (await B("GET", "/api/account")).json()).email, "bob@example.com");
   assert.equal((await B("POST", "/api/account/email", { email: "nope" })).status, 400);
+});
+
+test("one line connects an MCP client: it signs in as a person through OAuth, then works as their agent in their projects", { skip: !url, timeout: 90_000 }, async () => {
+  const login = `mcp${Date.now().toString(36).slice(-5)}`;
+  const cookie = ((await fetch(`${url}/auth/dev?login=${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  await fetch(`${url}/api/admin/creators`, { method: "POST", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}`, "content-type": "application/json" }, body: JSON.stringify({ login }) });
+
+  // Before signing in, /mcp says where to learn how.
+  const first = await fetch(`${url}/mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "initialize" }) });
+  assert.equal(first.status, 401);
+  const meta = first.headers.get("www-authenticate")!.match(/resource_metadata="([^"]+)"/)![1];
+  const resource = await (await fetch(meta)).json();
+  assert.equal(resource.resource, `${url}/mcp`);
+  const as = await (await fetch(`${resource.authorization_servers[0]}/.well-known/oauth-authorization-server`)).json();
+  assert.deepEqual(as.code_challenge_methods_supported, ["S256"]);
+
+  // Register, sign in, allow, and trade the code (PKCE) for a token.
+  const redirect = "http://localhost:4567/callback";
+  const reg = await (await fetch(as.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ client_name: "Claude Code", redirect_uris: [redirect] }) })).json();
+  assert.equal((await fetch(as.registration_endpoint, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ redirect_uris: ["http://evil.example/cb"] }) })).status, 400);
+  const verifier = "v".repeat(20) + Date.now();
+  const challenge = Buffer.from(await crypto.subtle.digest("SHA-256", new TextEncoder().encode(verifier))).toString("base64url");
+  const q = new URLSearchParams({ response_type: "code", client_id: reg.client_id, redirect_uri: redirect, code_challenge: challenge, code_challenge_method: "S256", state: "s1" });
+  const signedOut = await (await fetch(`${as.authorization_endpoint}?${q}`)).text();
+  assert.match(signedOut, /Sign in with GitHub/);
+  const consent = await (await fetch(`${as.authorization_endpoint}?${q}`, { headers: { cookie } })).text();
+  assert.match(consent, /Claude Code/);
+  const ask = consent.match(/name="ask" value="([^"]+)"/)![1];
+  const allowed = await fetch(as.authorization_endpoint, { method: "POST", redirect: "manual", headers: { cookie, "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ ask, allow: "1" }) });
+  const back = new URL(allowed.headers.get("location")!);
+  assert.equal(back.origin + back.pathname, redirect);
+  assert.equal(back.searchParams.get("state"), "s1");
+  const code = back.searchParams.get("code")!;
+  const wrong = await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: "nope", client_id: reg.client_id, redirect_uri: redirect }) });
+  assert.equal(wrong.status, 400);
+  const tok = await (await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "authorization_code", code, code_verifier: verifier, client_id: reg.client_id, redirect_uri: redirect }) })).json();
+  assert.ok(tok.access_token && tok.refresh_token);
+  // A session cookie isn't an MCP token, and an MCP token isn't a session.
+  assert.equal((await fetch(`${url}/mcp`, { method: "POST", headers: { authorization: `Bearer ${cookie.split("=")[1]}` }, body: "{}" })).status, 401);
+  assert.equal((await (await fetch(`${url}/auth/me`, { headers: { cookie: `loom_session=${tok.access_token}` } })).json()).user, null);
+
+  let id = 1;
+  const mcp = async (method: string, params?: unknown, path = "/mcp") => (await fetch(`${url}${path}`, { method: "POST", headers: { authorization: `Bearer ${tok.access_token}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: id++, method, params }) })).json();
+  const tool = async (name: string, args: unknown = {}, path?: string) => {
+    const r = await mcp("tools/call", { name, arguments: args }, path);
+    const text = r.result.content.at(-1).text;
+    if (r.result.isError) throw new Error(text);
+    return JSON.parse(text);
+  };
+  const tools = (await mcp("tools/list")).result.tools.map((t: any) => t.name);
+  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("loom_tool") && tools.includes("claim_task"));
+  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through loom_tool");
+
+  const name = project("e2e-mcp");
+  await tool("create_project", { name, description: "made over MCP" });
+  assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
+  await assert.rejects(tool("loom_status"), /say which project/);
+  const task = await tool("create_task", { project: name, title: "Write a hello file" });
+  await tool("claim_task", { project: name, taskId: task.id });
+  const who = await tool("whoami", { project: name });
+  assert.equal(who.agent.name, "Claude Code");
+  assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
+  const sub = await tool("loom_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
+  assert.ok(sub);
+  const state = await (await fetch(`${url}/api/projects/${name}/state`)).json();
+  assert.ok(state.agents.some((a: any) => a.name === "helper-1"));
+
+  // The project's own URL works with the same sign-in, and a project they aren't in refuses.
+  assert.equal((await tool("whoami", {}, `/mcp/${name}`)).agent.name, "Claude Code");
+  const other = project("e2e-mcp-other");
+  const admin = new (await import("../demo/client.mjs")).Loom(url, other, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name: other, description: "not theirs" });
+  await assert.rejects(tool("whoami", { project: other }), /isn't a member/);
+
+  // Refreshing gives a new token for the same person.
+  const again = await (await fetch(as.token_endpoint, { method: "POST", headers: { "content-type": "application/x-www-form-urlencoded" }, body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: tok.refresh_token }) })).json();
+  assert.ok(again.access_token);
+  await fetch(`${url}/api/admin/creators/${login}`, { method: "DELETE", headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } });
+});
+
+test("runners: the work list shows what any agent could pick up, long-polls for more, and webhooks hear new work once", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { createServer } = await import("node:http");
+  const { createHmac } = await import("node:crypto");
+  const name = project("e2e-runners");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "runners", files: SEED, requiredApprovals: 1 });
+  const got: { body: any; raw: string; sig: string; kind: string }[] = [];
+  const server = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { got.push({ raw: b, body: JSON.parse(b), sig: String(req.headers["x-loom-signature"] ?? ""), kind: String(req.headers["x-loom-event"] ?? "") }); res.end("ok"); }); });
+  await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+  const port = (server.address() as any).port;
+  const work = (q = "") => fetch(`${url}/api/projects/${name}/work${q}`).then((r) => r.json());
+  const until = async (what: () => boolean, ms = 8000) => { const end = Date.now() + ms; while (!what() && Date.now() < end) await sleep(200); return what(); };
+  try {
+    await assert.rejects(admin.req("POST", "/hooks", { url: "https://api.github.com/repos/o/r/dispatches" }), /needs a token/);
+    await assert.rejects(admin.req("POST", "/hooks", { url: `http://127.0.0.1:${port}/`, events: ["nonsense"] }), /unknown events/);
+    const hook = await admin.req("POST", "/hooks", { url: `http://127.0.0.1:${port}/hook`, events: ["work", "change.merged"] });
+    assert.ok(hook.secret.startsWith("whsec_"));
+    assert.equal((await admin.req("POST", `/hooks/${hook.id}/test`)).status, 200);
+    got.length = 0;
+
+    const empty = await work();
+    assert.deepEqual(empty.items, []);
+    assert.match(empty.prompt, /list_work/);
+    // A long poll returns as soon as there's new work.
+    const polling = work(`?known=${empty.known}&wait=20`);
+    const started = Date.now();
+    const t = await admin.createTask("Add a due date to todos", "");
+    const polled = await polling;
+    assert.ok(Date.now() - started < 15_000);
+    assert.deepEqual(polled.items.map((i: any) => [i.kind, i.task, i.new]), [["task", t.id, true]]);
+
+    // The webhook hears it once, signed.
+    assert.ok(await until(() => got.some((g) => g.kind === "work")), "webhook got the new task");
+    const first = got.find((g) => g.kind === "work")!;
+    assert.equal(first.sig, `sha256=${createHmac("sha256", hook.secret).update(first.raw).digest("hex")}`);
+    assert.deepEqual(first.body.work.map((i: any) => i.kind), ["task"]);
+    assert.equal(first.body.project, name);
+
+    // An agent takes it: the task leaves the list, and its change waits for a review nobody is on.
+    const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, ["src/db.js"], "due dates");
+    await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// due dates\n" }, "due dates");
+    const ch = await ada.submit(t.id, t.title, "Due dates", { plan: ["add due"], tested: ["by hand"] });
+    const after = await work();
+    assert.deepEqual(after.items.map((i: any) => [i.kind, i.change ?? i.task]), [["review", ch.id]]);
+    assert.ok(await until(() => got.filter((g) => g.kind === "work").length >= 2));
+    assert.equal(got.filter((g) => g.kind === "work").length, 2, "each item goes once");
+
+    // Agents see the same list over MCP.
+    const listed = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "list_work", arguments: {} } }) })).json();
+    assert.equal(JSON.parse(listed.result.content.at(-1).text).items[0].kind, "review");
+
+    // A review lands it; the webhook asked for merges too.
+    const rev = admin.as((await admin.addAgent("rex", "reviewer")).key);
+    await rev.review(ch.id, "approve", "looks right");
+    assert.ok(await until(() => got.some((g) => g.kind === "events" && g.body.events.some((e: any) => e.type === "change.merged")), 15_000), "webhook heard the merge");
+    assert.deepEqual((await work()).items, []);
+
+    await admin.req("DELETE", `/hooks/${hook.id}`);
+    assert.deepEqual(await admin.req("GET", "/hooks"), []);
+  } finally {
+    server.close();
+  }
 });

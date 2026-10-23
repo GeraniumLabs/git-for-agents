@@ -1,13 +1,29 @@
 // A Model Context Protocol endpoint, so any MCP-capable agent can join a
-// project with one URL and its agent key: POST /mcp/<project>.
+// project with one URL and its agent key: POST /mcp/<project>. Or, signed in
+// as a person (src/oauth.ts), with one URL for all their projects: POST /mcp,
+// where every tool also takes `project`.
 // Each tool is a thin call into the project's coordinator.
 
 type Call = ((method: string, path: string, body?: unknown) => Promise<any>) & {
   /** Directives the agent hasn't acknowledged, from the last response (Loom sends them on every one). */
   directives?: () => { seq: number; from: string; body: string }[];
 };
-/** The coordinator, called as the named agent under the key (or as the key's own agent). */
-type CallAs = (as: string | null) => Call;
+/** The coordinator of a project (the endpoint's own, or the one a tool call names), called as the named agent under the key (or as the key's own agent). */
+type CallAs = (as: string | null, project: string | null) => Call;
+
+/** What only the signed-in endpoint (/mcp) offers: the person's projects, and making one. */
+export interface Account {
+  projects: () => Promise<{ name: string; description?: string | null; private: boolean; owner: boolean }[]>;
+  create: (args: { name: string; description?: string; importUrl?: string; branch?: string; token?: string; private?: boolean; check?: string }) => Promise<any>;
+}
+
+export interface McpOptions {
+  /** Set on /mcp: the person's account, and the project to use when a call names none. */
+  account?: Account;
+  defaultProject?: string | null;
+  /** "core": the tools most work needs, with the rest one call away through loom_tool. */
+  tools?: "all" | "core";
+}
 
 interface Tool {
   name: string;
@@ -304,6 +320,15 @@ const TOOLS: Tool[] = [
     },
   },
   {
+    name: "list_work",
+    description: "Work any agent could pick up now: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, and open tasks nobody holds (ready to start). Runners started to keep a project moving begin here, after whoami.",
+    inputSchema: obj({}),
+    run: async (_a, call) => {
+      const w = await call("GET", "/work");
+      return { items: w.items.map(({ key, id, new: _n, ...i }: any) => i), agentsPresent: w.agentsPresent, howTo: "review: take_review, get_change, review_change. contest: compare_attempts, vote. fix: task_context, claim_task, fix it, update_change. task: claim_task, declare_intent, work, submit_change." };
+    },
+  },
+  {
     name: "task_context",
     description: "Everything known about a task: intents, changes with their context and reviews, the full event history, and memory (related earlier tasks, what they did, and decisions that apply). Use it to take over a task another agent started.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),
@@ -343,40 +368,113 @@ const AS = {
 };
 const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
 
-export async function handleMcp(req: Request, call: CallAs): Promise<Response> {
+/** The tools most work needs. The rest stay one call away (loom_tool), so a small model isn't handed 45 at once. */
+const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
+
+const PROJECT = { type: "string", description: "The project to act in (list_projects shows yours)." };
+
+/** Tools only the signed-in endpoint has: they act on the person's account, not inside one project. */
+const ACCOUNT_TOOLS: (Omit<Tool, "run"> & { run: (args: any, account: Account) => Promise<any> })[] = [
+  {
+    name: "list_projects",
+    description: "The Loom projects you can work in: the ones you own or were added to. Pass a name as `project` to every other tool.",
+    inputSchema: obj({}),
+    run: (_a, account) => account.projects(),
+  },
+  {
+    name: "create_project",
+    description: "Create a Loom project for the person you work for, optionally starting from a git repository they already have (any URL you'd git clone; Loom copies the branch with its history, and it becomes main). Loom becomes the code's home: nothing is written back. Give a check command (e.g. `npm test`) so the merge queue runs it before main moves; for a repository it recognizes, Loom suggests one.",
+    inputSchema: obj({
+      name: str("Lowercase letters, digits and dashes, e.g. the repository's name"),
+      description: str("One line on what the project is"),
+      importUrl: str("A git URL to start from (optional)"),
+      branch: str("The branch to import (default: the repository's default branch)"),
+      token: str("A token that can read a private repository (optional)"),
+      private: { type: "boolean", description: "Only members can see it (default: public)" },
+      check: str("The command the merge queue runs before main moves, e.g. `npm ci && npm test`"),
+    }, ["name"]),
+    run: (a, account) => account.create(a),
+  },
+];
+
+const LOOM_TOOL = {
+  name: "loom_tool",
+  inputSchema: obj({ name: str("The tool's name"), arguments: { type: "object", description: "Its arguments, as that tool takes them" } }, ["name"]),
+};
+
+export async function handleMcp(req: Request, call: CallAs, opts: McpOptions = {}): Promise<Response> {
   if (req.method !== "POST") return new Response("MCP endpoint: POST JSON-RPC here", { status: 405, headers: { allow: "POST" } });
   const msg = await req.json<any>().catch(() => null);
   if (!msg) return Response.json({ jsonrpc: "2.0", id: null, error: { code: -32700, message: "parse error" } });
   const batch = Array.isArray(msg) ? msg : [msg];
-  const out = (await Promise.all(batch.map((m) => handleOne(m, call)))).filter(Boolean);
+  const out = (await Promise.all(batch.map((m) => handleOne(m, call, opts)))).filter(Boolean);
   if (!out.length) return new Response(null, { status: 202 });
   return Response.json(Array.isArray(msg) ? out : out[0]);
 }
 
-async function handleOne(m: any, call: CallAs): Promise<any> {
+const INSTRUCTIONS = "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.";
+
+const ACCOUNT_INSTRUCTIONS = "You're signed in to Loom as the person you work for, and you act as their agent. Call list_projects first, and pass `project` on every other tool call. To bring a repository the person already has, create_project with importUrl. ";
+
+async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: m.id, result });
   if (m.id === undefined) return null; // notification
+  const account = opts.account;
+  const core = opts.tools === "core";
+  const shown = core ? TOOLS.filter((t) => CORE.has(t.name)) : TOOLS;
+  const hidden = core ? TOOLS.filter((t) => !CORE.has(t.name)) : [];
+  const schema = (s: Record<string, any>): Record<string, any> => {
+    const out: Record<string, any> = withAs(s);
+    if (!account) return out;
+    // A default project (from ?project=) makes `project` optional.
+    return { ...out, properties: { ...out.properties, project: PROJECT }, required: opts.defaultProject ? out.required : [...(out.required ?? []), "project"] };
+  };
   switch (m.method) {
     case "initialize":
       return reply({
         protocolVersion: m.params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
         serverInfo: { name: "loom", version: "0.1.0" },
-        instructions:
-          "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.",
+        instructions: (account ? ACCOUNT_INSTRUCTIONS : "") + INSTRUCTIONS + (core ? " Only the core tools are listed; call any other Loom tool named here through loom_tool." : ""),
       });
     case "ping":
       return reply({});
-    case "tools/list":
-      return reply({ tools: TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema: withAs(inputSchema) })) });
+    case "tools/list": {
+      const tools: { name: string; description: string; inputSchema: Record<string, any> }[] = shown.map(({ name, description, inputSchema }) => ({ name, description, inputSchema: schema(inputSchema) }));
+      if (hidden.length) {
+        tools.push({
+          name: LOOM_TOOL.name,
+          description: `Call any other Loom tool by name, with the arguments it takes (\`as\`${account ? " and `project`" : ""} go in arguments too). They are:\n${hidden.map((t) => `- ${t.name}: ${t.description.split(/(?<=\.)\s/)[0]}`).join("\n")}`,
+          inputSchema: LOOM_TOOL.inputSchema,
+        });
+      }
+      if (account) tools.unshift(...ACCOUNT_TOOLS.map(({ name, description, inputSchema }) => ({ name, description, inputSchema })));
+      return reply({ tools });
+    }
     case "tools/call": {
-      const tool = TOOLS.find((t) => t.name === m.params?.name);
+      let name = m.params?.name;
+      let args = m.params?.arguments ?? {};
+      if (name === LOOM_TOOL.name) {
+        name = args.name;
+        args = args.arguments ?? {};
+      }
+      const own = account && ACCOUNT_TOOLS.find((t) => t.name === name);
+      if (own) {
+        try {
+          return reply({ content: [{ type: "text", text: JSON.stringify(await own.run(args, account!), null, 2) }] });
+        } catch (e: any) {
+          return reply({ content: [{ type: "text", text: String(e?.message ?? e) }], isError: true });
+        }
+      }
+      const tool = TOOLS.find((t) => t.name === name);
       let c: Call | null = null;
-      if (!tool) return { jsonrpc: "2.0", id: m.id, error: { code: -32602, message: `unknown tool ${m.params?.name}` } };
+      if (!tool) return { jsonrpc: "2.0", id: m.id, error: { code: -32602, message: `unknown tool ${name}` } };
       try {
-        const { as, ...args } = m.params?.arguments ?? {};
-        c = call(typeof as === "string" && as.trim() ? as.trim() : null);
-        const result = await tool.run(args, c);
+        const { as, project, ...rest } = args;
+        const where = account ? (typeof project === "string" && project.trim() ? project.trim().toLowerCase() : opts.defaultProject ?? null) : null;
+        if (account && !where) throw new Error("say which project: pass `project` (list_projects shows yours)");
+        c = call(typeof as === "string" && as.trim() ? as.trim() : null, where);
+        const result = await tool.run(rest, c);
         return reply({ content: [...notice(c), { type: "text", text: JSON.stringify(result, null, 2) }] });
       } catch (e: any) {
         return reply({ content: [...notice(c), { type: "text", text: String(e?.message ?? e) }], isError: true });

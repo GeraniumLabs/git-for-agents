@@ -1,0 +1,51 @@
+# A Loom runner on GitHub Actions: starts a Claude Code agent when a Loom
+# project has work an agent could pick up. Put it in any repository's
+# .github/workflows/ (it doesn't need the project's code: Loom is its home).
+#
+# Set in the repository's settings:
+#   variables  LOOM_URL      e.g. https://loom.example.dev
+#              LOOM_PROJECT  the project's name
+#   secrets    LOOM_KEY            an agent key for the project (trade a join code for one)
+#              ANTHROPIC_API_KEY   for Claude Code
+#
+# It runs every 30 minutes, and at once when Loom posts a webhook: in the
+# project's Settings, under Runners, add
+#   https://api.github.com/repos/<owner>/<repo>/dispatches
+# with the authorization "Bearer <a token with contents:write on this repository>".
+
+name: Loom runner
+on:
+  repository_dispatch:
+    types: [loom.work]
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: loom-runner
+  cancel-in-progress: false
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LOOM_URL: ${{ vars.LOOM_URL }}
+      LOOM_PROJECT: ${{ vars.LOOM_PROJECT }}
+      LOOM_KEY: ${{ secrets.LOOM_KEY }}
+    steps:
+      - name: Look for work
+        id: work
+        run: |
+          curl -sf -H "Authorization: Bearer $LOOM_KEY" "$LOOM_URL/api/projects/$LOOM_PROJECT/work" > work.json
+          echo "count=$(jq '.items | length' work.json)" >> "$GITHUB_OUTPUT"
+          jq -r '.items[] | "- \(.text)"' work.json
+      - name: Start an agent
+        if: steps.work.outputs.count != '0'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          jq -n --arg url "$LOOM_URL/mcp/$LOOM_PROJECT" --arg key "Bearer $LOOM_KEY" \
+            '{mcpServers: {loom: {type: "http", url: $url, headers: {Authorization: $key, "X-Loom-Agent": "github-runner"}}}}' > mcp.json
+          claude -p "$(jq -r .prompt work.json)" --mcp-config mcp.json --allowedTools mcp__loom
