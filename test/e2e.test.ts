@@ -1122,3 +1122,8 @@ test("runners: the work list shows what any agent could pick up, long-polls for 
     server.close();
   }
 });
+
+test("a change with hundreds of files is submitted, reviewed and merged", { skip: !url, timeout: 180_000 }, async () => {
+  const { stdout } = await run("node", ["demo/large-change.mjs", project("e2e-large"), "300"], { env, maxBuffer: 1 << 24 });
+  assert.match(stdout, /merged with 300 files/);
+});
