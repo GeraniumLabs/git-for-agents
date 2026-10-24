@@ -1770,7 +1770,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const knownBy: Record<string, string[]> = {};
     const authorKnows: string[] = [];
     if (paths.length) {
-      const rows = this.sql.exec(`SELECT agent_id, path FROM familiarity WHERE kind = 'wrote' AND symbol = '' AND path IN (${paths.map(() => "?").join(",")}) ORDER BY n DESC`, ...paths).toArray();
+      // One JSON parameter, not one per path: Durable Object SQL takes at most 100 parameters.
+      const rows = this.sql.exec("SELECT agent_id, path FROM familiarity WHERE kind = 'wrote' AND symbol = '' AND path IN (SELECT value FROM json_each(?)) ORDER BY n DESC", JSON.stringify(paths)).toArray();
       for (const r of rows) {
         if (r.agent_id === ch.agent_id) authorKnows.push(r.path as string);
         else (knownBy[r.path as string] ??= []).push(this.agentName(r.agent_id as string) ?? (r.agent_id as string));
@@ -3787,8 +3788,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       scores.set(agent, s);
     };
     const recency = (t: number) => 1 / (1 + (now - t) / (7 * 86400_000));
-    const where = [...files.map(() => "path = ?"), ...folders.map(() => "path LIKE ?")].join(" OR ");
-    const rows = where ? this.sql.exec(`SELECT * FROM familiarity WHERE ${where} LIMIT 5000`, ...files, ...folders.map((f) => `${f}/%`)).toArray() : [];
+    // The paths go in as JSON: a term per file broke SQLite's expression depth (100) on a change of a hundred files.
+    const rows = files.length || folders.length ? this.sql.exec(
+      "SELECT * FROM familiarity WHERE path IN (SELECT value FROM json_each(?)) OR EXISTS (SELECT 1 FROM json_each(?) f WHERE familiarity.path LIKE f.value) LIMIT 5000",
+      JSON.stringify(files), JSON.stringify(folders.map((f) => `${f}/%`))).toArray() : [];
     for (const r of rows) {
       const path = r.path as string, sym = r.symbol as string, wrote = r.kind === "wrote";
       const n = Math.min(3, r.n as number) * recency(r.last_at as number);
