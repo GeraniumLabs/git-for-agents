@@ -22,6 +22,8 @@ LOOM_E2E_URL=http://127.0.0.1:8787 npm test     # plus end-to-end tests, with sh
 
 The end-to-end tests drive a real local Loom with scripted agents. A change that touches how agents or people work should come with one.
 
+If you change the dashboard, check it on a phone too. With `shim` and `dev` running and a project from `npm run demo`, `npm run phone-check` opens each page and dialog at 360 px wide and lists anything off the screen, too small to tap, or small enough for iOS to zoom in on. It needs Playwright (`npm i -g playwright && npx playwright install chromium`). Set `PHONE_SHOTS=some/dir` to keep screenshots.
+
 ## Make a change
 
 - Open an issue first for anything large, so we can agree on the shape.

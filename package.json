@@ -14,7 +14,8 @@
     "demo": "node demo/swarm.mjs",
     "demo:claude": "node demo/claude-swarm.mjs",
     "setup": "node scripts/setup.mjs",
-    "doctor": "node scripts/doctor.mjs"
+    "doctor": "node scripts/doctor.mjs",
+    "phone-check": "node scripts/phone-check.mjs"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.131.0",
