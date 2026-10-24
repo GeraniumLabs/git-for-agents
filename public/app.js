@@ -42,7 +42,7 @@ const THEMES = { auto: ["◐", "Theme: follows your system"], light: ["☀", "Th
 function applyTheme(t) {
   if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; else delete document.documentElement.dataset.theme;
   const [icon, label] = THEMES[t] ?? THEMES.auto;
-  $("#theme").textContent = icon;
+  $("#theme").innerHTML = `${icon}<span class="menu-only"> ${label}</span>`;
   $("#theme").title = `${label} (click to change)`;
   $("#theme").setAttribute("aria-label", label);
 }
@@ -1576,6 +1576,10 @@ async function showSettings() {
     toast("Key removed");
     showSettings();
   };
+  // Phones: a row of section names at the top, since Settings is a long scroll there.
+  const sections = [...$("#detail-body").querySelectorAll("h2")];
+  $("#detail-body > h3").insertAdjacentHTML("afterend", `<nav class="jump">${sections.map((h, i) => `<button class="ghost mini" type="button" data-jump="${i}">${esc(h.textContent)}</button>`).join("")}</nav>`);
+  for (const b of $("#detail-body").querySelectorAll("[data-jump]")) b.onclick = () => sections[b.dataset.jump].scrollIntoView({ block: "start", behavior: "smooth" });
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#settings-open").onclick = () => showSettings();
@@ -2535,5 +2539,16 @@ function showHelp() {
   if (!$("#detail").open) $("#detail").showModal();
 }
 $("#help-open").onclick = () => showHelp();
+$("#tasks-open").onclick = () => showTasks();
+
+// Phones: the header is one row; the rest of it opens as a menu under ☰.
+const menu = (open) => { document.querySelector("header").classList.toggle("menu", open); $("#menu-open").setAttribute("aria-expanded", String(open)); $("#menu-open").textContent = open ? "✕" : "☰"; };
+$("#menu-open").onclick = () => menu(!document.querySelector("header").classList.contains("menu"));
+// Anything picked from the menu closes it; so does Escape or going to another page.
+$("header").addEventListener("click", (e) => { if (e.target.closest(".nav button, #np-open, #me a, #me button")) menu(false); });
+document.addEventListener("keydown", (e) => { if (e.key === "Escape") menu(false); });
+window.addEventListener("hashchange", () => menu(false));
+// Phones: Steer folds to one button until you open it.
+$("#controls .steer-toggle").onclick = (e) => { const open = $("#controls").classList.toggle("open"); e.currentTarget.setAttribute("aria-expanded", String(open)); };
 
 boot();

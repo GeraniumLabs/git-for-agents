@@ -15,24 +15,27 @@
     <input id="search" type="search" placeholder="Find an agent, task, change or file…" autocomplete="off" title="Search agents, tasks, changes and files. An agent's profile has its work, what it knows and controls to steer it.">
     <div id="search-results" class="results" hidden></div>
   </div>
-  <nav class="nav">
+  <nav class="nav" id="nav">
+    <button id="tasks-open" class="ghost menu-only" title="Every task, by stage">Tasks</button>
     <button id="code-open" class="ghost" title="Browse main and any change's files and history; download a zip or check out locally">Code</button>
     <button id="work-open" class="ghost" hidden title="Take a task yourself: get a workspace, declare what you'll touch and submit it for review, like an agent">My work</button>
     <button id="skill-open" class="ghost" title="Copy a skill that tells an agent how to work on this project. Owners can add a join code so agents register themselves">Connect an agent</button>
     <button id="settings-open" class="ghost" title="Visibility, approvals, checks, limits on questions for people, members and keys">Settings</button>
-    <button id="help-open" class="ghost help-btn" title="How Loom works: the ideas behind each part of this page">?</button>
+    <button id="help-open" class="ghost help-btn" title="How Loom works: the ideas behind each part of this page" aria-label="Help"><span class="menu-hide">?</span><span class="menu-only">Help</span></button>
   </nav>
   <div class="proj">
     <select id="project" title="Switch project. 🔒 marks a private one"></select>
-    <button id="np-open" class="ghost" title="Create a project. You'll own it">+ New</button>
+    <button id="np-open" class="ghost" title="Create a project. You'll own it">+ New<span class="menu-only"> project</span></button>
     <span id="me"></span>
     <button id="theme" class="ghost theme" type="button"></button>
     <span id="live" class="live off" title="Live: this page updates as agents work. If it says reconnecting, it catches up on its own">offline</span>
+    <button id="menu-open" class="ghost menu-btn" type="button" aria-expanded="false" aria-controls="nav" title="Menu">☰</button>
   </div>
 </header>
 
 <section id="controls" class="controls" hidden>
   <b title="Controls for people: what you set here applies to every agent">Steer</b>
+  <button class="ghost steer-toggle" type="button" aria-expanded="false">Steer agents ▾</button>
   <select id="dir-to" title="Who gets the directive"><option value="">All agents</option></select>
   <input id="dir-body" placeholder="Directive, e.g. “Don't add new dependencies”" title="An instruction agents follow over their own plan. Every agent sees it on its next call, whatever it's doing, until it acknowledges; any that haven't after 5 minutes show under Stuck. It's kept as a decision">
   <button id="dir-send" title="Send the directive">Send</button>
