@@ -683,6 +683,8 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
   .more-body { grid-template-columns: minmax(0, 1fr); }
   .tour { margin: 12px 12px 0; }
   .tour .tour-text { flex-basis: 100%; }
+  .tour .tour-import { flex-wrap: wrap; flex-basis: 100%; }
+  .tour .tour-import input { flex: 1 1 10em; }
   .panel-head { flex-wrap: wrap; }
   .panel-head .help-dot { display: none; }
 
