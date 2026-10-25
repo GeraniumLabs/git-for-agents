@@ -784,8 +784,11 @@ function historyHtml(h, isMain, landed = false) {
 
 // ── code: browse, download and check out, for people ──────────────────
 // Syntax coloring via highlight.js, vendored as a browser ESM bundle
-// (public/vendor/highlight.js). File content ends up escaped either way.
-const HL = import("./vendor/highlight.js").then((m) => m.default).catch(() => null);
+// (public/vendor/highlight.js). It loads in the background from startup; the
+// code, change and contest pages wait for it alongside their own fetches, so
+// they draw colored the first time. Content ends up escaped either way.
+let hljs = null;
+const HL = import("./vendor/highlight.js").then((m) => (hljs = m.default)).catch(() => null);
 const EXT_LANG = {
   js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
   ts: "typescript", tsx: "typescript", json: "json", css: "css", scss: "scss",
@@ -808,7 +811,7 @@ function hlRows(html) {
       if (at < 0) { out += rest; break; }
       out += rest.slice(0, at);
       const tag = rest.slice(at, rest.indexOf(">", at) + 1);
-      if (tag.startsWith("</span>")) open.pop();
+      if (tag.startsWith("</span>")) { open.pop(); out += "</span>"; }
       else {
         const cls = tag.match(/class="([^"]+)"/)?.[1];
         if (cls) { open.push(cls); out += `<span class="${cls}">`; }
@@ -818,19 +821,27 @@ function hlRows(html) {
     return out + "</span>".repeat(open.length);
   });
 }
-/** Color the code-src viewer once the file is loaded; unsupported or binary files keep the plain view. */
-const renderFile = async (path) => {
-  const el = $("#file");
-  if (!el || code.content.includes("\u0000") || code.content.split("\n").length > MAX_CODE_LINES) return;
+/** Each line of text as colored HTML for path's language, or null when it can't be colored. */
+function hlLines(text, path) {
   const lang = fileLang(path);
-  const hljs = lang ? await HL : null;
-  if (!hljs) return;
-  try {
-    const rows = hlRows(hljs.highlight(code.content, { language: lang }).value);
-    el.classList.add("hl");
-    el.firstElementChild.innerHTML = rows.map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${l}</span>`).join("");
-  } catch { /* unsupported or missing language: fall through to plain text */ }
-};
+  if (!hljs || !lang || text.includes("\u0000") || text.split("\n").length > MAX_CODE_LINES) return null;
+  try { return hlRows(hljs.highlight(text, { language: lang, ignoreIllegals: true }).value); } catch { return null; }
+}
+const codeLines = (text, path) => hlLines(text, path) ?? text.split("\n").map(esc);
+/** Color a parsed diff in place: each hunk's old and new sides are colored as runs of code, so tokens that span lines (comments, strings) stay right. */
+function colorPatch(files) {
+  for (const f of files) for (const h of f.hunks) {
+    const olds = h.lines.filter((l) => l.kind !== "add"), news = h.lines.filter((l) => l.kind !== "del");
+    const o = hlLines(olds.map((l) => l.text).join("\n"), f.path), n = hlLines(news.map((l) => l.text).join("\n"), f.path);
+    if (!o || !n) continue;
+    olds.forEach((l, i) => { l.old_html = o[i]; });
+    news.forEach((l, i) => { l.html = n[i]; });
+    for (const l of h.lines) if (l.kind === "del") l.html = l.old_html;
+  }
+  return files;
+}
+const lineHtml = (l, side) => { const h = side === "old" ? l.old_html : l.html; return h === undefined ? esc(l.text) : `<span class="hl">${h}</span>`; };
+const mark = (l) => `<span class="mk">${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>`;
 async function showClone(box, target) {
   if (!me) { box.innerHTML = `<p class="meta">Sign in to get a clone command; it carries a read-only token for an hour.</p>`; return; }
   const r = await act("POST", "/checkout", target);
@@ -884,10 +895,11 @@ function crumbs(path, isFile) {
   return `<nav class="crumbs mono"><a href="${codeHref(code.target)}">${esc(project)}</a>${links.map((l) => ` <span class="meta">/</span> ${l}`).join("")}</nav>`;
 }
 
-function srcHtml(text) {
+function srcHtml(text, path) {
   if (text.includes("\u0000")) return `<p class="empty">A binary file. Download the zip to get it.</p>`;
   const lines = text.replace(/\n$/, "").split("\n");
-  return `<pre id="file" class="code-src"><code>${lines.slice(0, MAX_CODE_LINES).map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${esc(l)}</span>`).join("")}</code></pre>${lines.length > MAX_CODE_LINES ? `<p class="meta">Showing the first ${MAX_CODE_LINES.toLocaleString()} of ${lines.length.toLocaleString()} lines. Download the zip for the rest.</p>` : ""}`;
+  const shown = codeLines(lines.slice(0, MAX_CODE_LINES).join("\n"), path);
+  return `<pre class="code-src"><code>${shown.map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${l}</span>`).join("")}</code></pre>${lines.length > MAX_CODE_LINES ? `<p class="meta">Showing the first ${MAX_CODE_LINES.toLocaleString()} of ${lines.length.toLocaleString()} lines. Download the zip for the rest.</p>` : ""}`;
 }
 
 /** A folder: its folders and files, then its README if it has one. */
@@ -909,14 +921,14 @@ async function codeFolder(dir) {
 }
 
 async function codeFile(path) {
-  const f = await api(`/files?${code.q}&path=${encodeURIComponent(path)}`);
+  const [f] = await Promise.all([api(`/files?${code.q}&path=${encodeURIComponent(path)}`), HL]);
   if (f.error) return `${crumbs(path, true)}<p class="empty">${esc(f.error)}</p>`;
   const lines = f.content.replace(/\n$/, "").split("\n").length;
   code.content = f.content;
   return `${crumbs(path, true)}
     <div class="code-file">
       <div class="code-fhead"><span class="meta">${plural(lines, ["line", "lines"])} · ${(new Blob([f.content]).size / 1024).toFixed(1)} KB</span><span class="grow"></span><button class="ghost mini" id="code-copy" title="Copy the file's contents">Copy</button></div>
-      ${srcHtml(f.content)}
+      ${srcHtml(f.content, path)}
     </div>`;
 }
 
@@ -974,7 +986,6 @@ async function loadCode(target, view, path) {
     ? historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace, target.change && /landed/.test(code.label))
     : view === "file" ? await codeFile(path) : await codeFolder(path);
   wire(main);
-  if (view === "file") renderFile(path);
   if ($("#code-copy")) $("#code-copy").onclick = () => navigator.clipboard?.writeText(code.content).then(() => toast("Copied"));
   if (main.getBoundingClientRect().top < 0) main.scrollIntoView();
 }
@@ -1935,7 +1946,7 @@ function parsePatch(text) {
 
 /** A plain unified diff, for places that only show a patch (contests). */
 function diffView(patchText) {
-  return `<div class="diffview">${parsePatch(patchText).map((f) => `<div class="dl file">${esc(f.path)}</div>${f.hunks.map((h) => `<div class="dl hunk"><span class="ln"></span><code>${esc(h.header)}</code></div>${h.lines.map((l) => `<div class="dl ${l.kind}"><span class="ln">${l.new ?? ""}</span><code>${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${esc(l.text)}</code></div>`).join("")}`).join("")}`).join("")}</div>`;
+  return `<div class="diffview">${colorPatch(parsePatch(patchText)).map((f) => `<div class="dl file">${esc(f.path)}</div>${f.hunks.map((h) => `<div class="dl hunk"><span class="ln"></span><code>${esc(h.header)}</code></div>${h.lines.map((l) => `<div class="dl ${l.kind}"><span class="ln">${l.new ?? ""}</span><code>${mark(l)}${lineHtml(l)}</code></div>`).join("")}`).join("")}`).join("")}</div>`;
 }
 
 let review = null; // the change on screen: { id, c, rv, pending, view, since, inter }
@@ -1980,7 +1991,7 @@ window.addEventListener("hashchange", route);
 $("#detail").addEventListener("close", () => { if (/^#(account|org\/)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
 async function loadReview(id) {
-  const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`)]);
+  const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
   if (c.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(c.error)}</p></div>`; return; }
   const prev = review?.id === id ? review : null;
   review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0 };
@@ -2009,7 +2020,7 @@ function drawReview() {
   const { c, rv } = review;
   const canReview = me && !["merged", "abandoned", "closed"].includes(c.status) && me.id !== c.agent_id;
   const patch = review.since ? review.inter.patch : c.patch;
-  const files = parsePatch(patch);
+  const files = colorPatch(parsePatch(patch));
   const briefOf = new Map(c.brief.files.map((f) => [f.path, f]));
   // Riskiest first, as the brief ranks them.
   const rank = new Map(c.brief.files.map((f, i) => [f.path, i]));
@@ -2102,7 +2113,7 @@ function fileBlock(f, i, b, threads, canReview) {
 function unifiedRows(f, at, canReview) {
   return f.hunks.map((h) => `<div class="dl hunk"><span class="ln"></span><span class="ln"></span><code>${esc(h.header)}</code></div>` + h.lines.map((l) => {
     const can = canReview && l.new;
-    return `<div class="dl ${l.kind}${can ? " can" : ""}" ${l.new ? `data-path="${esc(f.path)}" data-line="${l.new}"` : ""}><span class="ln">${l.old ?? ""}</span><span class="ln">${l.new ?? ""}</span><code>${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}${esc(l.text)}</code></div>${l.new ? at(l.new) : ""}`;
+    return `<div class="dl ${l.kind}${can ? " can" : ""}" ${l.new ? `data-path="${esc(f.path)}" data-line="${l.new}"` : ""}><span class="ln">${l.old ?? ""}</span><span class="ln">${l.new ?? ""}</span><code>${mark(l)}${lineHtml(l)}</code></div>${l.new ? at(l.new) : ""}`;
   }).join("")).join("");
 }
 
@@ -2126,7 +2137,7 @@ function splitRows(f, at, canReview) {
 }
 
 function splitRow(f, left, right, at, canReview) {
-  const side = (l, k) => l ? `<span class="ln">${(k === "old" ? l.old : l.new) ?? ""}</span><code class="${l.kind === "ctx" ? "" : l.kind}">${esc(l.text)}</code>` : `<span class="ln"></span><code class="empty"></code>`;
+  const side = (l, k) => l ? `<span class="ln">${(k === "old" ? l.old : l.new) ?? ""}</span><code class="${l.kind === "ctx" ? "" : l.kind}">${lineHtml(l, k)}</code>` : `<span class="ln"></span><code class="empty"></code>`;
   const n = right?.new;
   return `<div class="sl${canReview && n ? " can" : ""}" ${n ? `data-path="${esc(f.path)}" data-line="${n}"` : ""}>${side(left?.kind === "add" ? null : left, "old")}${side(right?.kind === "del" ? null : right, "new")}</div>${n ? at(n) : ""}`;
 }
@@ -2200,7 +2211,7 @@ function wireReview(canReview) {
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);
-    $("#detail-body").innerHTML = `<h3 class="mono">${esc(b.dataset.open)} <small class="meta">as change #${c.id} leaves it</small></h3><pre class="diff file-full">${f.error ? esc(f.error) : f.content.split("\n").map((l, i) => `<span class="ln">${i + 1}</span>${esc(l)}`).join("\n")}</pre>`;
+    $("#detail-body").innerHTML = `<h3 class="mono">${esc(b.dataset.open)} <small class="meta">as change #${c.id} leaves it</small></h3><pre class="diff file-full">${f.error ? esc(f.error) : codeLines(f.content, b.dataset.open).map((l, i) => `<span class="ln">${i + 1}</span>${l}`).join("\n")}</pre>`;
     $("#detail").showModal();
   };
   for (const b of root.querySelectorAll("[data-ask]")) b.onclick = async () => { await act("POST", `/changes/${c.id}/reviewers`, { reviewers: [b.dataset.ask] }); loadReview(c.id); };
@@ -2353,7 +2364,7 @@ async function loadTask(id) {
 }
 
 async function loadContest(id) {
-  const v = await api(`/contests/${id}`);
+  const [v] = await Promise.all([api(`/contests/${id}`), HL]);
   if (v.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(v.error)}</p></div>`; return; }
   review = null;
   const k = v.contest, open = k.status === "open";
