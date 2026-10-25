@@ -233,13 +233,18 @@ svg.contrib rect:hover { stroke: var(--ink); stroke-width: 1; }
 a.button { display: inline-block; text-decoration: none; cursor: pointer; border-radius: 6px; padding: 2px 8px; font-size: var(--fs-11_5); margin-top: 4px; background: var(--chip); color: var(--ink); border: 1px solid var(--line); }
 .code-row { gap: 6px; margin: 6px 0; }
 /* highlight.js token colors, on the app's existing palette (both themes).
-   Only the file viewer (#file) is colored; diffs stay plain. */
-#file.hl .hljs-comment, #file.hl .hljs-quote { color: var(--muted); font-style: italic; }
-#file.hl .hljs-keyword, #file.hl .hljs-selector-tag, #file.hl .hljs-selector-id, #file.hl .hljs-selector-class, #file.hl .hljs-tag, #file.hl .hljs-name, #file.hl .hljs-doctag, #file.hl .hljs-meta .hljs-keyword { color: var(--info); }
-#file.hl .hljs-string, #file.hl .hljs-regexp, #file.hl .hljs-attribute, #file.hl .hljs-meta .hljs-string, #file.hl .hljs-selector-attr { color: var(--ok); }
-#file.hl .hljs-number, #file.hl .hljs-literal, #file.hl .hljs-meta, #file.hl .hljs-built_in, #file.hl .hljs-symbol { color: var(--warn); }
-#file.hl .hljs-title, #file.hl .hljs-function, #file.hl .hljs-section, #file.hl .hljs-bullet { color: var(--accent); font-weight: 500; }
-#file.hl .hljs-type, #file.hl .hljs-title.class_, #file.hl .hljs-title.function_, #file.hl .hljs-params, #file.hl .hljs-property, #file.hl .hljs-variable, #file.hl .hljs-template-variable { color: inherit; }
+   hljs-* spans only appear in the file viewer, diffs and the full-file view. */
+.hljs-comment, .hljs-quote { color: var(--muted); font-style: italic; }
+.hljs-keyword, .hljs-selector-tag, .hljs-selector-id, .hljs-selector-class, .hljs-tag, .hljs-name, .hljs-doctag, .hljs-meta .hljs-keyword { color: var(--info); }
+.hljs-string, .hljs-regexp, .hljs-attribute, .hljs-meta .hljs-string, .hljs-selector-attr { color: var(--ok); }
+.hljs-number, .hljs-literal, .hljs-meta, .hljs-built_in, .hljs-symbol { color: var(--warn); }
+.hljs-title, .hljs-function, .hljs-section, .hljs-bullet { color: var(--accent); font-weight: 500; }
+.hljs-type, .hljs-title.class_, .hljs-title.function_, .hljs-params, .hljs-property, .hljs-variable, .hljs-template-variable { color: inherit; }
+.hljs-deletion { color: var(--bad); } .hljs-addition { color: var(--ok); }
+/* In a colored diff the tint says added or removed; the text reads in ink so the tokens show. */
+.dl.add .hl, .dl.del .hl, .sl code.add .hl, .sl code.del .hl { color: var(--ink); }
+.dl.add .mk, .dl.add .ln { color: var(--ok); } .dl.del .mk, .dl.del .ln { color: var(--bad); }
+.mk { user-select: none; }
 pre.copy { white-space: pre-wrap; overflow-wrap: anywhere; }
 
 /* code: its own page, a folder tree beside the file */
