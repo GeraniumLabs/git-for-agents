@@ -783,6 +783,54 @@ function historyHtml(h, isMain, landed = false) {
 }
 
 // ── code: browse, download and check out, for people ──────────────────
+// Syntax coloring via highlight.js, vendored as a browser ESM bundle
+// (public/vendor/highlight.js). File content ends up escaped either way.
+const HL = import("./vendor/highlight.js").then((m) => m.default).catch(() => null);
+const EXT_LANG = {
+  js: "javascript", mjs: "javascript", cjs: "javascript", jsx: "javascript",
+  ts: "typescript", tsx: "typescript", json: "json", css: "css", scss: "scss",
+  less: "less", html: "xml", htm: "xml", svg: "xml", xml: "xml", md: "markdown",
+  py: "python", rb: "ruby", rs: "rust", go: "go", java: "java", kt: "kotlin",
+  c: "c", h: "c", cpp: "cpp", hpp: "cpp", cc: "cpp", cs: "csharp", php: "php",
+  swift: "swift", sh: "bash", bash: "bash", zsh: "bash", sql: "sql",
+  yml: "yaml", yaml: "yaml", toml: "ini", ini: "ini", lua: "lua", pl: "perl",
+  r: "r",
+};
+const MAX_CODE_LINES = 20000;
+const fileLang = (p) => EXT_LANG[p.toLowerCase().split(".").pop()] ?? null;
+/** Re-open spans that crossed a newline, so each row keeps its token spans. */
+function hlRows(html) {
+  const open = [];
+  return html.split("\n").map((line) => {
+    let out = open.map((c) => `<span class="${c}">`).join(""), rest = line;
+    while (rest) {
+      const at = rest.indexOf("<");
+      if (at < 0) { out += rest; break; }
+      out += rest.slice(0, at);
+      const tag = rest.slice(at, rest.indexOf(">", at) + 1);
+      if (tag.startsWith("</span>")) open.pop();
+      else {
+        const cls = tag.match(/class="([^"]+)"/)?.[1];
+        if (cls) { open.push(cls); out += `<span class="${cls}">`; }
+      }
+      rest = rest.slice(rest.indexOf(">", at) + 1);
+    }
+    return out + "</span>".repeat(open.length);
+  });
+}
+/** Color the code-src viewer once the file is loaded; unsupported or binary files keep the plain view. */
+const renderFile = async (path) => {
+  const el = $("#file");
+  if (!el || code.content.includes("\u0000") || code.content.split("\n").length > MAX_CODE_LINES) return;
+  const lang = fileLang(path);
+  const hljs = lang ? await HL : null;
+  if (!hljs) return;
+  try {
+    const rows = hlRows(hljs.highlight(code.content, { language: lang }).value);
+    el.classList.add("hl");
+    el.firstElementChild.innerHTML = rows.map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${l}</span>`).join("");
+  } catch { /* unsupported or missing language: fall through to plain text */ }
+};
 async function showClone(box, target) {
   if (!me) { box.innerHTML = `<p class="meta">Sign in to get a clone command; it carries a read-only token for an hour.</p>`; return; }
   const r = await act("POST", "/checkout", target);
@@ -839,8 +887,7 @@ function crumbs(path, isFile) {
 function srcHtml(text) {
   if (text.includes("\u0000")) return `<p class="empty">A binary file. Download the zip to get it.</p>`;
   const lines = text.replace(/\n$/, "").split("\n");
-  const MAX = 20000;
-  return `<pre class="code-src"><code>${lines.slice(0, MAX).map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${esc(l)}</span>`).join("")}</code></pre>${lines.length > MAX ? `<p class="meta">Showing the first ${MAX.toLocaleString()} of ${lines.length.toLocaleString()} lines. Download the zip for the rest.</p>` : ""}`;
+  return `<pre id="file" class="code-src"><code>${lines.slice(0, MAX_CODE_LINES).map((l, i) => `<span class="cl"><span class="ln" data-ln="${i + 1}"></span>${esc(l)}</span>`).join("")}</code></pre>${lines.length > MAX_CODE_LINES ? `<p class="meta">Showing the first ${MAX_CODE_LINES.toLocaleString()} of ${lines.length.toLocaleString()} lines. Download the zip for the rest.</p>` : ""}`;
 }
 
 /** A folder: its folders and files, then its README if it has one. */
@@ -927,6 +974,7 @@ async function loadCode(target, view, path) {
     ? historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace, target.change && /landed/.test(code.label))
     : view === "file" ? await codeFile(path) : await codeFolder(path);
   wire(main);
+  if (view === "file") renderFile(path);
   if ($("#code-copy")) $("#code-copy").onclick = () => navigator.clipboard?.writeText(code.content).then(() => toast("Copied"));
   if (main.getBoundingClientRect().top < 0) main.scrollIntoView();
 }
