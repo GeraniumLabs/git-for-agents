@@ -748,6 +748,16 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
 
 /* Session traces on a change */
 .rv-traces { margin: 8px 0; }
+.file-intent { padding: 6px 10px; border-bottom: 1px solid var(--line); background: var(--head); font-size: var(--fs-12_5, 12.5px); }
+.file-intent.none { color: var(--muted); border-left: 3px solid var(--warn); }
+.fi-row { display: flex; flex-wrap: wrap; gap: 4px 8px; align-items: baseline; margin: 2px 0; }
+.fi-row .k { font-weight: 600; }
+.fi-jump { margin-left: auto; cursor: pointer; white-space: nowrap; }
+.int-mark { font-size: 11px; font-weight: 700; width: 1em; text-align: center; }
+.int-mark.ok { color: var(--good, #2e7d32); }
+.int-mark.no { color: var(--warn, #b26a00); }
+.int-a.flash { background: color-mix(in srgb, var(--warn, #f5c542) 25%, transparent); transition: background 0.3s; }
+.intent [data-tocode] { cursor: pointer; }
 .intent { border: 1px solid var(--line, #ddd); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
 .intent h3 { font-size: 14px; margin: 8px 0 4px; }
 .int-list { margin: 0; padding-left: 22px; }
