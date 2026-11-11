@@ -2,9 +2,13 @@
 # after the typecheck and tests pass. Also runs by hand from the Actions tab.
 #
 # Set in the repository's settings (Settings > Secrets and variables > Actions):
-#   secrets  CLOUDFLARE_API_TOKEN   a token that can deploy this Worker: the
-#                                   "Edit Cloudflare Workers" template, plus
-#                                   Containers edit for the checks container
+#   secrets  CLOUDFLARE_API_TOKEN   a USER API token (My Profile > API Tokens);
+#                                   an Account API token fails at /queues with
+#                                   Authentication error 10000. Start from the
+#                                   "Edit Cloudflare Workers" template, drop its
+#                                   zone policy, and add Queues, Cloudchamber
+#                                   and Artifacts edit (Containers and Workers
+#                                   R2 Storage edit come with the template).
 #            CLOUDFLARE_ACCOUNT_ID  the account Loom runs in
 #   variable LOOM_URL               where it answers, for the check after the
 #                                   deploy (default loom.geraniumlabs.workers.dev)
@@ -69,6 +73,25 @@ jobs:
           cache: npm
       - if: steps.creds.outputs.ok == 'true'
         run: npm ci
+      # Prints which Cloudflare APIs the token can reach (status codes only), so a
+      # permission the deploy needs and the token lacks shows up by name.
+      - if: steps.creds.outputs.ok == 'true'
+        name: Check what the token can reach
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          check() {
+            code=$(curl -s -o /tmp/cf.json -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "https://api.cloudflare.com/client/v4/$2")
+            echo "$1: HTTP $code $(jq -c '[.errors[]? | "\(.code) \(.message)"]' /tmp/cf.json 2>/dev/null)"
+          }
+          check "token (user)" user/tokens/verify
+          check "token (account)" "accounts/$ACCOUNT/tokens/verify"
+          check "account" "accounts/$ACCOUNT"
+          check "workers" "accounts/$ACCOUNT/workers/scripts"
+          check "queues" "accounts/$ACCOUNT/queues"
+          check "r2" "accounts/$ACCOUNT/r2/buckets"
+          check "containers" "accounts/$ACCOUNT/containers/applications"
       # Builds the checks container image with the runner's Docker and pushes it to Cloudflare's registry.
       - if: steps.creds.outputs.ok == 'true'
         name: Deploy
