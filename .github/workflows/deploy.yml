@@ -1,0 +1,89 @@
+# Deploys Loom to Cloudflare whenever main changes (a merged pull request),
+# after the typecheck and tests pass. Also runs by hand from the Actions tab.
+#
+# Set in the repository's settings (Settings > Secrets and variables > Actions):
+#   secrets  CLOUDFLARE_API_TOKEN   a token that can deploy this Worker: the
+#                                   "Edit Cloudflare Workers" template, plus
+#                                   Containers edit for the checks container
+#            CLOUDFLARE_ACCOUNT_ID  the account Loom runs in
+#   variable LOOM_URL               where it answers, for the check after the
+#                                   deploy (default loom.geraniumlabs.workers.dev)
+#
+# Without them the deploy job says so and skips, so forks stay green.
+# Worker secrets (LOOM_ADMIN_TOKEN and the rest) live in Cloudflare and are
+# kept across deploys; vars come from wrangler.toml.
+#
+# To require an approval before each deploy, add required reviewers to the
+# "production" environment under Settings > Environments.
+
+name: Deploy
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time, in merge order; a newer merge waits for the one running.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run typecheck
+      - run: npm test
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - name: Check for Cloudflare credentials
+        id: creds
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          if [ -z "$TOKEN" ] || [ -z "$ACCOUNT" ]; then
+            echo "::notice::CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID aren't set, so nothing was deployed."
+            echo "ok=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+          fi
+      - if: steps.creds.outputs.ok == 'true'
+        uses: actions/checkout@v4
+      - if: steps.creds.outputs.ok == 'true'
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.creds.outputs.ok == 'true'
+        run: npm ci
+      # Builds the checks container image with the runner's Docker and pushes it to Cloudflare's registry.
+      - if: steps.creds.outputs.ok == 'true'
+        name: Deploy
+        run: npx wrangler deploy --message "${GITHUB_SHA::7}"
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      - if: steps.creds.outputs.ok == 'true'
+        name: Check the live site answers
+        env:
+          LOOM_URL: ${{ vars.LOOM_URL || 'https://loom.geraniumlabs.workers.dev' }}
+        run: |
+          for i in 1 2 3 4 5; do
+            code=$(curl -s -o /dev/null -w "%{http_code}" "${LOOM_URL%/}/api/projects") && [ "$code" = 200 ] && exit 0
+            sleep 10
+          done
+          echo "::error::the live site didn't answer 200 after the deploy (last status $code)"
+          exit 1
