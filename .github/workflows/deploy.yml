@@ -74,6 +74,25 @@ jobs:
           cache: npm
       - if: steps.creds.outputs.ok == 'true'
         run: npm ci
+      # Prints which Cloudflare APIs the token can reach (status codes only), so a
+      # permission the deploy needs and the token lacks shows up by name.
+      - if: steps.creds.outputs.ok == 'true'
+        name: Check what the token can reach
+        env:
+          TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          ACCOUNT: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          check() {
+            code=$(curl -s -o /tmp/cf.json -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "https://api.cloudflare.com/client/v4/$2")
+            echo "$1: HTTP $code $(jq -c '[.errors[]? | "\(.code) \(.message)"]' /tmp/cf.json 2>/dev/null)"
+          }
+          check "token (user)" user/tokens/verify
+          check "token (account)" "accounts/$ACCOUNT/tokens/verify"
+          check "account" "accounts/$ACCOUNT"
+          check "workers" "accounts/$ACCOUNT/workers/scripts"
+          check "queues" "accounts/$ACCOUNT/queues"
+          check "r2" "accounts/$ACCOUNT/r2/buckets"
+          check "containers" "accounts/$ACCOUNT/containers/applications"
       # Builds the checks container image with the runner's Docker and pushes it to Cloudflare's registry.
       - if: steps.creds.outputs.ok == 'true'
         name: Deploy
