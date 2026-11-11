@@ -745,3 +745,15 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
   .dc, .dc-new { margin: 4px 8px 6px; }
   .rv-page summary, .thr summary { white-space: normal; overflow-wrap: anywhere; }
 }
+
+/* Session traces on a change */
+.rv-traces { margin: 8px 0; }
+.traces { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
+.traces > li { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel); min-width: 0; }
+.steps { margin: 6px 0 0; padding-left: 22px; max-height: 480px; overflow: auto; }
+.step { margin: 4px 0; }
+.step .k { font-weight: 600; margin-right: 6px; }
+.step pre { margin: 2px 0 0; white-space: pre-wrap; word-break: break-word; font-size: 12px; max-height: 8em; overflow: auto; background: var(--head); padding: 4px 6px; border-radius: 4px; }
+.step.thought pre { font-style: italic; }
+.step.error .k { color: var(--del, #c0392b); }
+.step.loom .k code { font-weight: 700; }

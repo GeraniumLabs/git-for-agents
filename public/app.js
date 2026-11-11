@@ -516,6 +516,49 @@ function renderNotes() {
   for (const b of document.querySelectorAll("[data-note-retire]")) b.onclick = () => act("POST", `/notes/${b.dataset.noteRetire}/retire`, {});
 }
 
+// ── session traces: what the agents behind a change read, thought and did ─
+
+const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n ?? 0));
+const STEP_LABEL = { prompt: "Prompt", thought: "Thought", message: "Said", tool_call: "Called", tool_result: "Got back", error: "Error" };
+
+async function traceFetch(path) {
+  const r = await fetch(`/api/projects/${project}${path}`, { headers: keyHeader() });
+  const body = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(body.error ?? `HTTP ${r.status}`);
+  return body;
+}
+
+/** The traces on a change, each with its steps a click away. People only, unless an owner lets agents read them. */
+async function showTraces(box, changeId) {
+  if (box.dataset.open) { box.innerHTML = ""; delete box.dataset.open; return; }
+  box.dataset.open = "1";
+  box.innerHTML = `<p class="meta">Loading…</p>`;
+  let r;
+  try { r = await traceFetch(`/traces?change=${changeId}`); } catch (e) { box.innerHTML = `<p class="meta">${esc(e.message)}</p>`; return; }
+  box.innerHTML = r.traces.length ? `<ul class="traces">${r.traces.map((t) => `<li data-trace="${t.id}">
+      <div><b>${who(t.agent)}</b> · ${esc(t.source)}${t.models.length ? ` · ${t.models.map(esc).join(", ")}` : ""}
+        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}</span></div>
+      <div class="row"><button class="ghost mini" data-steps="${t.id}">Steps</button><button class="ghost mini" data-raw="${t.id}">Full log</button></div>
+      <ol class="steps" id="steps-${t.id}"></ol></li>`).join("")}</ul>` : `<p class="meta">No traces yet.</p>`;
+  wire(box);
+  box.querySelectorAll("[data-steps]").forEach((b) => (b.onclick = async () => {
+    const ol = box.querySelector(`#steps-${b.dataset.steps}`);
+    if (ol.childElementCount) { ol.innerHTML = ""; return; }
+    let t;
+    try { t = await traceFetch(`/traces/${b.dataset.steps}?limit=500`); } catch (e) { ol.innerHTML = `<li class="meta">${esc(e.message)}</li>`; return; }
+    ol.innerHTML = t.stepList.map((s) => `<li class="step ${s.kind}${s.loomCall ? " loom" : ""}">
+      <span class="k">${STEP_LABEL[s.kind] ?? s.kind}${s.tool ? ` <code>${esc(s.loomCall ? `loom ${s.loomCall}` : s.tool)}</code>` : ""}</span>
+      ${s.files.length ? `<span class="meta mono">${s.files.slice(0, 3).map(esc).join(", ")}${s.files.length > 3 ? "…" : ""}</span>` : ""}
+      <pre>${esc(s.preview)}</pre></li>`).join("") + (t.more ? `<li class="meta">First 500 steps shown; the full log has the rest.</li>` : "");
+  }));
+  box.querySelectorAll("[data-raw]").forEach((b) => (b.onclick = async () => {
+    const r = await fetch(`/api/projects/${project}/traces/${b.dataset.raw}/raw`, { headers: keyHeader() });
+    if (!r.ok) return;
+    const url = URL.createObjectURL(new Blob([await r.text()], { type: "text/plain" }));
+    window.open(url, "_blank", "noopener");
+  }));
+}
+
 // ── attachments: screenshots, builds, logs and documents agents posted ─
 const bytes = (n) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 const attUrl = (a, download = false) => `${a.url}?${download ? "download=1" : ""}${keyQuery()}`;
@@ -1457,6 +1500,15 @@ async function showSettings() {
     <h2>Review agent</h2>
     ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
+    <h2>Session traces</h2>
+    ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
+      const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
+      return `<p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
+      + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
+      <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
+      <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
+      <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea>
+      <div class="row"><button class="ghost" id="trace-save">Save</button><span id="trace-out" class="meta"></span></div>` : ""); })()}
     <h2>Runners</h2>
     <p class="meta">Loom doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Loom tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
     ${isOwner() ? `${hooks.map((h) => `<div class="qrow"><span class="grow"><span class="mono">${esc(h.url)}</span> <span class="meta">${esc(h.events.join(", "))}${h.github ? " · GitHub dispatch" : ""}${h.lastDelivery ? ` · last ${h.lastDelivery.status && h.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(h.lastDelivery.error || String(h.lastDelivery.status))}`} ${ago(h.lastDelivery.at)}` : " · nothing sent yet"}</span></span><button class="ghost mini" data-hook-test="${esc(h.id)}">Test</button><button class="ghost mini" data-hook-delete="${esc(h.id)}">Delete</button></div>`).join("")}
@@ -1591,6 +1643,18 @@ async function showSettings() {
     toast(state.project.reviewAgent.enabled ? "Review agent on" : "Review agent off");
     showSettings();
   };
+  if ($("#trace-save")) {
+    // The owner's patterns aren't in the public state (one might quote a secret), so they're fetched here.
+    traceFetch("/traces/settings").then((t) => { if ($("#trace-redact")) $("#trace-redact").value = (t.redact ?? []).join("\n"); }).catch(() => {});
+    $("#trace-save").onclick = async () => {
+      const redact = $("#trace-redact").value.split("\n").map((x) => x.trim()).filter(Boolean);
+      try {
+        const r = await act("POST", "/settings", { traces: { thoughts: $("#trace-thoughts").checked, agentsCanRead: $("#trace-agents").checked, redact } });
+        state.project.traces = { ...state.project.traces, thoughts: r.traces.thoughts, agentsCanRead: r.traces.agentsCanRead, redactRules: r.traces.redact.length };
+      } catch { return; }
+      toast("Trace settings saved");
+    };
+  }
   wireBilling($("#detail-body"));
   if ($("#mail-on")) $("#mail-on").onclick = async () => {
     try { await act("POST", "/me/email", { email: $("#mail-on").dataset.to }); } catch { return; }
@@ -1832,6 +1896,8 @@ function describe(e) {
     case "review.requested": return ["review", `Review requested on #${e.change_id}`];
     case "review.submitted": return ["review", `${who} ${d.verdict === "approve" ? "approved" : d.verdict === "request_changes" ? "requested changes on" : "commented on"} #${e.change_id}${d.body ? `: “${esc(d.body.slice(0, 140))}”` : ""}`];
     case "attachment.added": return ["", `${who} attached <a href="/api/projects/${project}/attachments/${d.id}/raw?${keyQuery()}" target="_blank" rel="noopener">${esc(d.name)}</a>${e.change_id ? ` to #${e.change_id}` : e.task_id ? ` to task #${e.task_id}` : ""}${d.caption ? `: ${esc(d.caption)}` : ""}`];
+    case "trace.added": return ["", `${who} uploaded a session trace${e.change_id ? ` for #${e.change_id}` : ""} (${plural(d.steps ?? 0, ["step", "steps"])}${d.redactions ? `, ${d.redactions} secret${d.redactions === 1 ? "" : "s"} removed` : ""})`];
+    case "trace.removed": return ["", `${who} deleted a session trace`];
     case "attachment.removed": return ["", `${who} removed the attachment ${esc(d.name)}`];
     case "change.queued": return ["", `#${e.change_id} entered the merge queue (position ${d.position})`];
     case "merge.started": return ["", `Merging #${e.change_id}…`];
@@ -2049,6 +2115,7 @@ function drawReview() {
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
+      ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
       <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
       <div id="clone-box"></div>
     </div>
@@ -2208,6 +2275,8 @@ function wireReview(canReview) {
     drawReview();
   };
   root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id });
+  const tb = root.querySelector("[data-traces]");
+  if (tb) tb.onclick = () => showTraces($("#traces-box"), c.id);
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);

@@ -17,6 +17,10 @@ Changes waiting on a person (protected paths, a brief that flags them) aren't on
 
 The answer also carries `prompt`, a ready-made instruction for the agent you start, and `mcp`, the project's MCP URL. Like the attention feed, it long-polls: pass the last answer's `known` and `wait=25`, and it returns as soon as something new appears. Agents see the same list with the `list_work` tool.
 
+## Session traces
+
+To keep each agent's session log with its changes, add [`recipes/trace-hook.mjs`](../recipes/trace-hook.mjs) as a Claude Code `SessionEnd` hook on the machine that runs agents. It uploads with the same `LOOM_URL`, `LOOM_PROJECT` and `LOOM_KEY`, and as the agent named in `LOOM_AGENT`, which `runner.mjs` sets for each agent it starts. See [Session traces](guide.md#session-traces-review-decisions-after-the-fact).
+
 ## Webhooks
 
 In the project's **Settings → Runners**, an owner adds a webhook. Loom posts to it:
