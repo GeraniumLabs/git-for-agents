@@ -2,9 +2,14 @@
 # after the typecheck and tests pass. Also runs by hand from the Actions tab.
 #
 # Set in the repository's settings (Settings > Secrets and variables > Actions):
-#   secrets  CLOUDFLARE_API_TOKEN   a token that can deploy this Worker: the
-#                                   "Edit Cloudflare Workers" template, plus
-#                                   Containers edit for the checks container
+#   secrets  CLOUDFLARE_API_TOKEN   an account token that can deploy this Worker
+#                                   and every binding in wrangler.toml. Account
+#                                   permissions: Workers Scripts edit, Queues
+#                                   edit, Workers R2 Storage edit, Containers
+#                                   edit, Account Settings read, and Artifacts
+#                                   edit where the token page lists it.
+#                                   ("Edit Cloudflare Workers" alone fails at
+#                                   /queues with Authentication error 10000.)
 #            CLOUDFLARE_ACCOUNT_ID  the account Loom runs in
 #   variable LOOM_URL               where it answers, for the check after the
 #                                   deploy (default loom.geraniumlabs.workers.dev)
