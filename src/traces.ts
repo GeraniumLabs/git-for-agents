@@ -469,3 +469,10 @@ async function pipe(bytes: Uint8Array, stream: CompressionStream | Decompression
 }
 export const gzip = (text: string) => pipe(new TextEncoder().encode(text), new CompressionStream("gzip"));
 export const gunzip = async (bytes: Uint8Array) => new TextDecoder().decode(await pipe(bytes, new DecompressionStream("gzip")));
+
+/** A SHA-256 fingerprint, hex: what a trace's evidence is pinned to. */
+export async function sha256Hex(data: string | Uint8Array): Promise<string> {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}

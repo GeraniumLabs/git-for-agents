@@ -1167,14 +1167,24 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.ok(!raw.includes("sk-ant-api03"), "the secret never reached storage");
   assert.ok(raw.includes("[redacted:anthropic-key]"));
 
-  // The same session again replaces it; with thoughts off they're gone from steps and log.
+  // Fingerprinted on arrival, and the stored log still matches.
+  assert.match(tr.sha256, /^[0-9a-f]{64}$/);
+  assert.match(tr.originalSha256, /^[0-9a-f]{64}$/);
+  assert.notEqual(tr.sha256, tr.originalSha256, "the stored log is the redacted one");
+  assert.equal((await admin.req("GET", `/traces/${tr.id}/verify`)).ok, true);
+
+  // The same session again is a new version; the first stays on record. With thoughts off they're gone from steps and log.
   await admin.req("POST", "/settings", { traces: { thoughts: false, agentsCanRead: true } });
   const again = await (await upload(transcript)).json();
-  assert.equal(again.id, tr.id);
-  assert.equal(again.replaced, true);
+  assert.notEqual(again.id, tr.id);
+  assert.equal(again.version, 2);
+  assert.equal(again.supersedes, tr.id);
   assert.equal(again.steps, 2);
   const mine = await ada.req("GET", `/traces?change=${ch.id}`);
-  assert.equal(mine.traces.length, 1, "agents can read once an owner allows it");
+  assert.equal(mine.traces.length, 1, "agents can read once an owner allows it; only the latest version is listed");
+  assert.equal((await admin.req("GET", `/traces?change=${ch.id}&history=1`)).traces.length, 2);
+  const versions = (await admin.req("GET", `/traces/${again.id}/versions`)).versions;
+  assert.deepEqual(versions.map((v: any) => [v.id, v.version, v.supersededBy]), [[tr.id, 1, again.id], [again.id, 2, null]]);
 
   // Through MCP, with no hook.
   const res = await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" },
@@ -1183,5 +1193,14 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.equal(viaMcp.source, "text");
   assert.equal(viaMcp.change, ch.id);
   assert.equal((await ada.change(ch.id)).traceCount, 2);
-  assert.deepEqual(await ada.req("DELETE", `/traces/${viaMcp.id}`), { ok: true, id: viaMcp.id });
+  assert.deepEqual(await ada.req("DELETE", `/traces/${viaMcp.id}`), { ok: true, id: viaMcp.id, versions: [viaMcp.id] });
+
+  // Deleting a session removes every version's content but keeps the record of it.
+  const gone = await admin.req("DELETE", `/traces/${again.id}`);
+  assert.deepEqual(gone.versions.sort(), [tr.id, again.id].sort());
+  assert.equal((await fetch(`${base}/traces/${tr.id}/raw`, { headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } })).status, 410);
+  const record = (await admin.req("GET", `/traces?change=${ch.id}&history=1`)).traces.find((x: any) => x.id === again.id);
+  assert.equal(record.removed.reason, "deleted");
+  assert.equal(record.sha256, again.sha256, "the fingerprint outlives the content");
+  assert.equal((await ada.change(ch.id)).traceCount, 0);
 });

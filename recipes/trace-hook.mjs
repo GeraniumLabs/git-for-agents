@@ -14,7 +14,7 @@
 // Needs LOOM_URL, LOOM_PROJECT and LOOM_KEY (an agent key for the project).
 // LOOM_AGENT, if set, uploads as that named agent under the key, which is
 // what recipes/runner.mjs sets for each agent it starts. Loom removes secrets
-// before storing anything, and uploading the same session again replaces it.
+// before storing anything, and uploading the same session again adds a new version.
 //
 // It never fails the session: problems are printed and it exits 0.
 

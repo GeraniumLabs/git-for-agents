@@ -537,7 +537,7 @@ async function showTraces(box, changeId) {
   try { r = await traceFetch(`/traces?change=${changeId}`); } catch (e) { box.innerHTML = `<p class="meta">${esc(e.message)}</p>`; return; }
   box.innerHTML = r.traces.length ? `<ul class="traces">${r.traces.map((t) => `<li data-trace="${t.id}">
       <div><b>${who(t.agent)}</b> · ${esc(t.source)}${t.models.length ? ` · ${t.models.map(esc).join(", ")}` : ""}
-        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}</span></div>
+        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}${t.version > 1 ? ` · version ${t.version}` : ""}${t.sha256 ? ` · <span title="SHA-256 of the stored log: ${esc(t.sha256)}">sha256 ${esc(t.sha256.slice(0, 12))}</span>` : ""}</span></div>
       <div class="row"><button class="ghost mini" data-steps="${t.id}">Steps</button><button class="ghost mini" data-raw="${t.id}">Full log</button></div>
       <ol class="steps" id="steps-${t.id}"></ol></li>`).join("")}</ul>` : `<p class="meta">No traces yet.</p>`;
   wire(box);

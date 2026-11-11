@@ -23,7 +23,7 @@ import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
-import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
+import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
@@ -140,6 +140,9 @@ function randomId(bytes = 12): string {
 /** Two questions to people whose words overlap this much show as one card. */
 const SIMILAR_QUESTION = 0.6;
 
+/** A session trace that hasn't been replaced by a later version or removed. */
+const LIVE_TRACE = "superseded_by IS NULL AND removed_at IS NULL";
+
 export class ProjectCoordinator extends DurableObject<Env> {
   private sql: SqlStorage;
   private repos?: RepoStore;
@@ -157,6 +160,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.migrateTables();
     for (const ddl of [
       "ALTER TABLE agents ADD COLUMN paused TEXT",
+      // Session traces as evidence: fingerprints, versions instead of overwrites, and a record of removals.
+      "ALTER TABLE traces ADD COLUMN sha256 TEXT",
+      "ALTER TABLE traces ADD COLUMN original_sha256 TEXT",
+      "ALTER TABLE traces ADD COLUMN version INTEGER DEFAULT 1",
+      "ALTER TABLE traces ADD COLUMN superseded_by INTEGER",
+      "ALTER TABLE traces ADD COLUMN removed_at INTEGER",
+      "ALTER TABLE traces ADD COLUMN removed_by TEXT",
+      "ALTER TABLE traces ADD COLUMN removed_reason TEXT",
       "ALTER TABLE threads ADD COLUMN terms TEXT",
       "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
@@ -902,6 +913,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (b === "settings") { ownerOnly("see trace settings"); return json(this.traceSettings); }
       if (!b) return json(await this.listTraces(url.searchParams));
       if (b && c === "raw") return await this.serveTrace(Number(b));
+      if (b && c === "verify") return json(await this.verifyTrace(Number(b)));
+      if (b && c === "versions") return json(this.traceVersions(Number(b)));
       if (b && !c) return json(await this.traceDetail(Number(b), url.searchParams));
     }
 
@@ -2437,6 +2450,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       for (const d of decisions.slice(0, 6)) lines.push(`- ${d.byName ?? d.by}: ${clip(d.decision, 300)}`);
     }
     if (task.attempt) lines.push("", `Won contest #${task.parent} over the other attempts.`);
+    // The session logs behind it, pinned by fingerprint: the evidence for why it was made.
+    const traces = this.sql.exec(`SELECT id, agent_id, session_id, version, sha256 FROM traces WHERE ${LIVE_TRACE} AND sha256 IS NOT NULL AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) ORDER BY id`, id, id).toArray();
+    if (traces.length) {
+      lines.push("", "Session traces:");
+      for (const t of traces.slice(0, 10)) lines.push(`Loom-Trace: #${t.id} v${t.version ?? 1} ${this.agentName(t.agent_id as string)}${t.session_id ? ` session ${t.session_id}` : ""} sha256:${t.sha256}`);
+    }
     return lines.join("\n").slice(0, 6000);
   }
 
@@ -4868,7 +4887,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private traceCount(changeId: number): number {
-    return this.sql.exec("SELECT COUNT(*) AS n FROM traces WHERE change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)", changeId, changeId).one().n as number;
+    return this.sql.exec(`SELECT COUNT(*) AS n FROM traces WHERE ${LIVE_TRACE} AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?))`, changeId, changeId).one().n as number;
   }
 
   private traceView(r: any) {
@@ -4878,6 +4897,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       startedAt: r.started_at, endedAt: r.ended_at, steps: r.step_count, loomCalls: r.loom_calls, tokensIn: r.tokens_in, tokensOut: r.tokens_out, costUsd: r.cost_usd,
       size: r.size, stored: r.stored, redactions: r.redactions, redactionKinds: JSON.parse(r.redaction_kinds ?? "{}"), thoughts: !!r.thoughts,
       createdAt: r.created_at, updatedAt: r.updated_at, expiresAt: r.expires_at,
+      sha256: r.sha256 ?? null, originalSha256: r.original_sha256 ?? null, version: r.version ?? 1, supersededBy: r.superseded_by ?? null,
+      removed: r.removed_at ? { at: r.removed_at, by: r.removed_by, byName: r.removed_by ? this.agentName(r.removed_by) : null, reason: r.removed_reason } : null,
       url: `/api/projects/${this.project}/traces/${r.id}/raw`,
     };
   }
@@ -4892,11 +4913,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
     await this.pruneTraces();
     const limit = Math.min(Number(q.get("limit") ?? 100) || 100, 500);
     const change = q.get("change"), task = q.get("task"), agent = q.get("agent");
+    // Earlier versions and removed traces stay on record; ?history=1 lists them too.
+    const live = q.get("history") === "1" ? "1 = 1" : LIVE_TRACE;
     let rows;
-    if (change) rows = this.sql.exec("SELECT * FROM traces WHERE change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?) ORDER BY id DESC LIMIT ?", Number(change), Number(change), limit);
-    else if (task) rows = this.sql.exec("SELECT * FROM traces WHERE task_id = ? ORDER BY id DESC LIMIT ?", Number(task), limit);
-    else if (agent) rows = this.sql.exec("SELECT * FROM traces WHERE agent_id = ? ORDER BY id DESC LIMIT ?", this.profile(agent).agent.id, limit);
-    else rows = this.sql.exec("SELECT * FROM traces ORDER BY id DESC LIMIT ?", limit);
+    if (change) rows = this.sql.exec(`SELECT * FROM traces WHERE ${live} AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) ORDER BY id DESC LIMIT ?`, Number(change), Number(change), limit);
+    else if (task) rows = this.sql.exec(`SELECT * FROM traces WHERE ${live} AND task_id = ? ORDER BY id DESC LIMIT ?`, Number(task), limit);
+    else if (agent) rows = this.sql.exec(`SELECT * FROM traces WHERE ${live} AND agent_id = ? ORDER BY id DESC LIMIT ?`, this.profile(agent).agent.id, limit);
+    else rows = this.sql.exec(`SELECT * FROM traces WHERE ${live} ORDER BY id DESC LIMIT ?`, limit);
     const used = this.storedTraceBytes();
     return { traces: rows.toArray().map((r) => this.traceView(r)), used, limits: this.traceLimits };
   }
@@ -4932,14 +4955,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /**
    * Store an agent's session log: secrets out first (the unredacted text is
    * never written), then the log to R2 and its steps to the index. A second
-   * upload of the same session by the same agent replaces the first (hooks
-   * upload the whole file each time), or adds to it with append.
+   * upload of the same session by the same agent becomes a new version (hooks
+   * upload the whole file each time; append adds to the last version). Earlier
+   * versions are kept, so what a reviewer saw can't be swapped out later. Each
+   * version is fingerprinted: the log as stored, and the log as received.
    */
   private async uploadTrace(actor: Agent, req: Request, body: any, raw: boolean) {
     const declared = Number(req.headers.get("content-length") ?? "0");
     if (raw && declared > MAX_TRACE_BYTES) throw new HttpError(413, `a trace is at most ${MAX_TRACE_BYTES / 1024 / 1024} MB`);
     let text = raw ? await req.text() : typeof body.text === "string" ? body.text : "";
     if (!text.trim()) throw new HttpError(400, "send the session log as the request body, or as text");
+    // Whoever holds the original log can show it's the one Loom received, though Loom only keeps it redacted.
+    const originalSha = await sha256Hex(text);
     const wanted = body.source ? String(body.source) : null;
     if (wanted && !TRACE_SOURCES.includes(wanted as TraceSource)) throw new HttpError(400, `source is one of ${TRACE_SOURCES.join(", ")}`);
     const settings = this.traceSettings;
@@ -4948,7 +4975,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     // An earlier upload of this session: replaced, or added to.
     const sessionOf = sessionGiven ?? parseTrace(text.slice(0, 200_000), (wanted as TraceSource) ?? detectSource(text), false).sessionId;
-    const earlier = sessionOf ? this.sql.exec("SELECT * FROM traces WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1", actor.id, sessionOf).toArray()[0] as any : undefined;
+    const earlier = sessionOf ? this.sql.exec(`SELECT * FROM traces WHERE agent_id = ? AND session_id = ? AND ${LIVE_TRACE} ORDER BY id DESC LIMIT 1`, actor.id, sessionOf).toArray()[0] as any : undefined;
     if (append && earlier) {
       const prev = await this.context.get(traceKeys(this.project, earlier.id).log);
       text = `${prev ? await gunzip(new Uint8Array(await prev.arrayBuffer())) : ""}\n${text}`;
@@ -4965,10 +4992,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Both go to R2 gzipped; the quota counts what's actually stored.
     const [logGz, stepsGz] = await Promise.all([gzip(stored), gzip(JSON.stringify(parsed.steps))]);
     const storedBytes = logGz.byteLength + stepsGz.byteLength;
+    const sha = await sha256Hex(stored);
     const limits = this.traceLimits;
-    if (limits.bytes > 0 && this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) {
+    if (limits.bytes > 0 && this.storedTraceBytes() + storedBytes > limits.bytes) {
       await this.pruneTraces();
-      if (this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) throw new HttpError(413, `this project's traces would pass ${(limits.bytes / 1024 ** 3).toFixed(1)} GB; an owner can delete old ones, or a plan with more room lifts the limit`);
+      if (this.storedTraceBytes() + storedBytes > limits.bytes) throw new HttpError(413, `this project's traces would pass ${(limits.bytes / 1024 ** 3).toFixed(1)} GB; an owner can delete old ones, or a plan with more room lifts the limit`);
     }
 
     // Where it belongs: what the upload names, else the changes this agent had open during the session.
@@ -4995,16 +5023,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const cols = [actor.id, taskId, changeId, JSON.stringify(links), source, sessionOf, runner, JSON.stringify(models), parsed.startedAt, parsed.endedAt,
       parsed.steps.length, parsed.steps.filter((x) => x.loomCall && x.kind === "tool_call").length, parsed.tokensIn, parsed.tokensOut, parsed.costUsd,
       bytes.byteLength, storedBytes, red.count, JSON.stringify(red.kinds), settings.thoughts ? 1 : 0];
-    let id: number;
-    if (earlier) {
-      id = earlier.id;
-      this.sql.exec(`UPDATE traces SET agent_id = ?, task_id = ?, change_id = ?, links = ?, source = ?, session_id = ?, runner = COALESCE(?, runner), models = ?, started_at = ?, ended_at = ?,
-        step_count = ?, loom_calls = ?, tokens_in = ?, tokens_out = ?, cost_usd = ?, size = ?, stored = ?, redactions = ?, redaction_kinds = ?, thoughts = ?, updated_at = ?, expires_at = ? WHERE id = ?`, ...cols, now, expires, id);
-    } else {
-      id = this.sql.exec(`INSERT INTO traces (agent_id, task_id, change_id, links, source, session_id, runner, models, started_at, ended_at,
-        step_count, loom_calls, tokens_in, tokens_out, cost_usd, size, stored, redactions, redaction_kinds, thoughts, created_at, updated_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, ...cols, now, now, expires).one().id as number;
-    }
+    const version = earlier ? (earlier.version ?? 1) + 1 : 1;
+    const id = this.sql.exec(`INSERT INTO traces (agent_id, task_id, change_id, links, source, session_id, runner, models, started_at, ended_at,
+      step_count, loom_calls, tokens_in, tokens_out, cost_usd, size, stored, redactions, redaction_kinds, thoughts, created_at, updated_at, expires_at,
+      sha256, original_sha256, version)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, ...cols, now, now, expires, sha, originalSha, version).one().id as number;
     try {
       const keys = traceKeys(this.project, id);
       await Promise.all([
@@ -5012,41 +5035,71 @@ export class ProjectCoordinator extends DurableObject<Env> {
         this.context.put(keys.steps, stepsGz, { httpMetadata: { contentType: "application/gzip" } }),
       ]);
     } catch (e) {
-      if (!earlier) this.sql.exec("DELETE FROM traces WHERE id = ?", id);
+      this.sql.exec("DELETE FROM traces WHERE id = ?", id);
       throw e;
     }
+    if (earlier) this.sql.exec("UPDATE traces SET superseded_by = ? WHERE id = ?", id, earlier.id);
     const view = this.traceView(this.traceRow(id));
-    if (!earlier) this.emit("trace.added", { actor: actor.id, task: taskId, change: changeId, data: { id, source, steps: view.steps, redactions: red.count } });
-    return { ...view, replaced: !!earlier && !append, appended: !!earlier && append };
+    this.emit("trace.added", { actor: actor.id, task: taskId, change: changeId, data: { id, source, steps: view.steps, redactions: red.count, version, sha256: sha, ...(earlier ? { supersedes: earlier.id } : {}) } });
+    return { ...view, supersedes: earlier?.id ?? null, appended: !!earlier && append };
   }
 
   private async serveTrace(id: number): Promise<Response> {
-    this.traceRow(id);
+    const r = this.traceRow(id);
+    if (r.removed_at) throw new HttpError(410, `trace ${id} was removed (${r.removed_reason}); its fingerprint stays on record`);
     const obj = await this.context.get(traceKeys(this.project, id).log);
     if (!obj) throw new HttpError(404, `trace ${id} is missing from storage`);
     // Plain text, never rendered: a log can hold anything an agent read.
     return new Response(await gunzip(new Uint8Array(await obj.arrayBuffer())), { headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff", "content-security-policy": "sandbox", "cache-control": "private, no-store" } });
   }
 
-  /** Whoever uploaded it, or one of the project's people, can delete a trace. */
+  /**
+   * Whoever uploaded it, or one of the project's people, can delete a trace:
+   * all its versions' content goes, but the record that it existed (who sent
+   * it, its fingerprints, who removed it and when) stays.
+   */
   private async removeTrace(actor: Agent, id: number) {
     const r = this.traceRow(id);
     if (r.agent_id !== actor.id && (actor.role !== "human" || actor.standin)) throw new HttpError(403, "only whoever uploaded a trace, or one of the project's people, can delete it");
-    await this.dropTrace(id);
-    this.emit("trace.removed", { actor: actor.id, task: r.task_id, change: r.change_id, data: { id } });
-    return { ok: true, id };
+    if (r.removed_at) return { ok: true, id, removed: this.traceView(r).removed };
+    const versions = r.session_id
+      ? this.sql.exec("SELECT id FROM traces WHERE agent_id = ? AND session_id = ? AND removed_at IS NULL", r.agent_id, r.session_id).toArray().map((x) => x.id as number)
+      : [id];
+    for (const v of versions) await this.dropTrace(v, actor.id, "deleted");
+    this.emit("trace.removed", { actor: actor.id, task: r.task_id, change: r.change_id, data: { id, versions, sha256: r.sha256 } });
+    return { ok: true, id, versions };
   }
 
-  private async dropTrace(id: number) {
+  /** The content goes; a row with the fingerprints stays as the record. */
+  private async dropTrace(id: number, by: string | null, reason: string) {
     const keys = traceKeys(this.project, id);
     await this.context.delete([keys.log, keys.steps]);
-    this.sql.exec("DELETE FROM traces WHERE id = ?", id);
+    this.sql.exec("UPDATE traces SET removed_at = ?, removed_by = ?, removed_reason = ?, stored = 0 WHERE id = ?", Date.now(), by, reason, id);
   }
 
   /** Traces past their plan's retention go, a few at a time, whenever traces are read or written (no alarm needed). */
   private async pruneTraces() {
-    const old = this.sql.exec("SELECT id FROM traces WHERE expires_at IS NOT NULL AND expires_at < ? LIMIT 50", Date.now()).toArray().map((r) => r.id as number);
-    for (const id of old) await this.dropTrace(id);
+    const old = this.sql.exec("SELECT id FROM traces WHERE removed_at IS NULL AND expires_at IS NOT NULL AND expires_at < ? LIMIT 50", Date.now()).toArray().map((r) => r.id as number);
+    for (const id of old) await this.dropTrace(id, null, "expired");
+  }
+
+  /** Check a trace's stored log still matches the fingerprint taken when it arrived. */
+  private async verifyTrace(id: number) {
+    const r = this.traceRow(id);
+    if (r.removed_at) return { id, ok: false, sha256: r.sha256, removed: this.traceView(r).removed };
+    const obj = await this.context.get(traceKeys(this.project, id).log);
+    if (!obj) return { id, ok: false, sha256: r.sha256, reason: "the log is missing from storage" };
+    const now = await sha256Hex(await gunzip(new Uint8Array(await obj.arrayBuffer())));
+    return { id, ok: !!r.sha256 && now === r.sha256, sha256: r.sha256, current: now, originalSha256: r.original_sha256 };
+  }
+
+  /** Every version of a trace's session, oldest first, removed ones included. */
+  private traceVersions(id: number) {
+    const r = this.traceRow(id);
+    const rows = r.session_id
+      ? this.sql.exec("SELECT * FROM traces WHERE agent_id = ? AND session_id = ? ORDER BY id", r.agent_id, r.session_id).toArray()
+      : [r];
+    return { versions: rows.map((x) => this.traceView(x)) };
   }
 
   // ── attachments: screenshots, builds, logs and documents agents post ─────
