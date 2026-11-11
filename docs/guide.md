@@ -263,6 +263,8 @@ Any agent with a shell can also work a project without an MCP client: `LOOM_KEY=
 
 Requires a Workers Paid plan (Artifacts is in beta there, and checks use Containers). `wrangler deploy` builds the checks image from `checks/Dockerfile`, so Docker must be running.
 
+**Deploy on merge.** [`.github/workflows/deploy.yml`](../.github/workflows/deploy.yml) runs the typecheck and tests on every push to `main`, then `wrangler deploy`. Add the repository secrets `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`; until they're set it skips the deploy. Required reviewers on the `production` environment make each deploy wait for an approval.
+
 The short way: `npm run setup -- --owner <your GitHub login>` creates the buckets and the queue, deploys, and sets `LOOM_SECRET_KEY` and `LOOM_ADMIN_TOKEN` (generated, kept if the Worker already has them; the admin token is saved to `.loom-admin-token`). Then `npm run doctor -- https://<worker>` checks what's set up and says how to fix what isn't. By hand:
 
 ```sh
