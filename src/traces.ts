@@ -476,3 +476,101 @@ export async function sha256Hex(data: string | Uint8Array): Promise<string> {
   const digest = await crypto.subtle.digest("SHA-256", bytes);
   return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
+
+// ── intent: what was asked and what the agent chose, from a trace ─────────
+
+export interface IntentAct {
+  seq: number;
+  ts: number | null;
+  /** edit, loom, command, refused or failed. */
+  kind: "edit" | "loom" | "command" | "refused" | "failed";
+  /** One line: what the agent did. */
+  what: string;
+  /** What the agent said or thought just before, if anything: its stated reason. */
+  why?: string;
+  files: string[];
+  /** The prompt this act answers (its seq), so a reviewer can see what it was asked. */
+  ask?: number;
+}
+
+export interface Intent {
+  asks: { seq: number; ts: number | null; text: string }[];
+  acts: IntentAct[];
+}
+
+const EDIT_TOOLS = /^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|str_replace_based_edit_tool|edit_file|write_file|create_file)$/i;
+const SHELL_TOOLS = /^(Bash|shell|local_shell|exec_command|run_terminal_cmd|terminal)$/i;
+/** Commands whose effects outlive the session: what a reviewer needs to see the agent chose. */
+const WEIGHTY = /\bgit\s+(push|commit|merge|rebase|reset|revert|tag|cherry-pick)\b|\bwrangler\s+(deploy|delete|secret|r2|d1)\b|\bnpm\s+publish\b|\brm\s+-[a-z]*r[a-z]*f?\b|\bcurl\b[^\n]*-X\s*(POST|PUT|PATCH|DELETE)\b|\bgh\s+(pr|release|repo)\b|\bkubectl\s+(apply|delete)\b|\bterraform\s+(apply|destroy)\b|\bdocker\s+push\b|\bpsql\b|\bDROP\s+TABLE\b/i;
+const LOOM_ACTS = new Set(["declare_intent", "release_intent", "submit_change", "update_change", "write_files", "review_change", "vote", "ask_human", "propose", "answer_proposal", "open_dispute", "state_position", "run_checks", "claim_task", "release_task", "create_task", "publish_contract"]);
+const REFUSED = /permission (for this [a-z ]+ )?(was )?denied|not permitted|refused|forbidden|\b403\b/i;
+
+/** A heredoc's body is data (a script, a file), not the command: `cat <<'EOF' … EOF`. */
+const HEREDOC = /<<-?\s*['"]?(\w+)['"]?[\s\S]*?(?:\n\1\b|$)/g;
+/** The command from a shell call's arguments, which are JSON ({"command": "…"}) and may be cut off. */
+export function commandOf(preview: string): string {
+  const m = /"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(preview);
+  if (!m) return preview;
+  try { return JSON.parse(`"${m[1]}"`); } catch { return m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"); }
+}
+const samePath = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+const oneLine = (t: string, n = 200) => { const s = t.replace(/\s+/g, " ").trim(); return s.length > n ? `${s.slice(0, n)}…` : s; };
+
+/**
+ * From a trace's steps, what bears on one change: the agent's consequential
+ * acts (edits to the change's files, Loom calls about its task or change,
+ * commands with lasting effects, refusals and failures), each with the
+ * reason the agent gave just before and the person's prompt it answered.
+ */
+export function intentOf(steps: Step[], scope: { paths: string[]; taskId?: number | null; changeId?: number | null }): Intent {
+  const mentions = (s: Step) => {
+    const ids = [scope.taskId != null ? `"taskId":${scope.taskId}` : null, scope.changeId != null ? `"changeId":${scope.changeId}` : null, scope.changeId != null ? `"change":${scope.changeId}` : null].filter(Boolean) as string[];
+    return ids.some((i) => s.preview.replace(/\s/g, "").includes(i));
+  };
+  const touches = (s: Step) => s.files.some((f) => scope.paths.some((p) => samePath(f, p))) || (SHELL_TOOLS.test(s.tool ?? "") && scope.paths.some((p) => s.preview.includes(p)));
+  const relevant = steps.filter((s) => s.kind === "tool_call" && (touches(s) || (s.loomCall && mentions(s))));
+  if (!relevant.length) return { asks: [], acts: [] };
+  // What concerns this change is the turns (a prompt and everything up to the next) that touched it: a
+  // deploy or push after the edits is part of the turn; a later turn on something else isn't.
+  const turnOf = new Map<number, number>();
+  let turn = 0;
+  for (const s of steps) { if (s.kind === "prompt") turn = s.seq; turnOf.set(s.seq, turn); }
+  const turns = new Set(relevant.map((s) => turnOf.get(s.seq)));
+
+  const acts: IntentAct[] = [];
+  const asks = new Map<number, { seq: number; ts: number | null; text: string }>();
+  let ask: Step | undefined, why: Step | undefined;
+  const editedOnce = new Set<string>();
+  let lastCall: Step | undefined;
+  for (const s of steps) {
+    if (s.kind === "prompt") { ask = s; why = undefined; editedOnce.clear(); continue; }
+    if (s.kind === "message" || s.kind === "thought") { why = s; continue; }
+    if (s.kind === "tool_call") lastCall = s;
+    if (!turns.has(turnOf.get(s.seq))) continue;
+    const add = (kind: IntentAct["kind"], what: string, files: string[] = []) => {
+      const a: IntentAct = { seq: s.seq, ts: s.ts, kind, what, files };
+      if (why) a.why = oneLine(why.preview, 300);
+      if (ask) { a.ask = ask.seq; asks.set(ask.seq, { seq: ask.seq, ts: ask.ts, text: oneLine(ask.preview, 500) }); }
+      acts.push(a);
+      why = undefined;
+    };
+    if (s.kind === "tool_call") {
+      const tool = s.tool ?? "tool";
+      if (s.loomCall && LOOM_ACTS.has(s.loomCall)) add("loom", `${s.loomCall} ${oneLine(s.preview, 160)}`, s.files);
+      else if (EDIT_TOOLS.test(tool) && touches(s)) {
+        const fresh = s.files.filter((f) => !editedOnce.has(f));
+        if (!fresh.length) continue; // later edits to the same file add nothing a reviewer needs here
+        fresh.forEach((f) => editedOnce.add(f));
+        add("edit", fresh.map((f) => scope.paths.find((p) => samePath(f, p)) ?? f).join(", "), s.files);
+      } else if (SHELL_TOOLS.test(tool)) {
+        const cmd = commandOf(s.preview);
+        if (WEIGHTY.test(cmd.replace(HEREDOC, ""))) add("command", oneLine(cmd, 200), s.files);
+      }
+    } else if ((s.kind === "error" || s.kind === "tool_result") && (s.error || s.kind === "error")) {
+      const call = lastCall;
+      if (REFUSED.test(s.preview)) add("refused", `${call?.tool ?? "a call"} was refused: ${oneLine(s.preview, 200)}`, call?.files ?? []);
+      else if (call && acts.some((a) => a.seq === call.seq)) add("failed", `${call.tool} failed: ${oneLine(s.preview, 200)}`, call.files);
+    }
+  }
+  return { asks: [...asks.values()], acts };
+}

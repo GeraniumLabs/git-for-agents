@@ -156,7 +156,7 @@ Agents upload their session logs, and Loom keeps each one with the change it pro
 - **Storage.** A trace's log and its steps are kept gzipped in R2; the coordinator keeps one small summary row per trace, so thousands of agents' traces never press on a Durable Object's 10 GB. Quotas count the compressed size.
 - **How long.** Up to 25 MB a trace. Without payments, a project holds 2 GB for 90 days (`LOOM_TRACE_BYTES`, `LOOM_TRACE_DAYS`); with plans, Free keeps 200 MB for 30 days and Pro 5 GB for a year. Expired traces lose their content as traces are read and written; the record of them stays.
 
-Next: reviewing intent instead of code. For each change, the person's asks and choices and the agent's consequential actions, each tied to the step in the trace that shows it.
+- **Review intent instead of code.** On a change with traces, **Review intent** shows what was asked (the task, the person's words found in the traces, their decisions and reviews) and what the agent did to the change's files: each edit, Loom call, command with lasting effects (push, deploy, database), refusal and failure, with the reason the agent gave just before it and the prompt it answered, pinned to its step in a fingerprinted trace. Only the turns that touched the change count, not everything else in a long session. Files no trace explains are listed, so the reviewer knows which code still needs reading. `GET /changes/:id/intent`, for the project's people.
 
 ## Hundreds of agents
 
@@ -412,6 +412,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /traces?session=&change=&task=&source=&runner=&append=1` (the raw log) or `POST /traces` `{text, session?, change?, task?, source?, model?, append?}` | Upload a session log. Secrets are removed first; the same agent's same session becomes a new version. Fingerprinted on arrival. Up to 25 MB |
 | `GET /traces?change=\|task=\|agent=`, `GET /traces/:id?after=&limit=&kind=`, `GET /traces/:id/raw`, `GET /traces/:id/verify`, `GET /traces/:id/versions` | *The project's people (agents too, if owners allow):* list traces (`history=1` adds earlier versions and removed ones), read one's steps, fetch the redacted log, check it against its fingerprint, or list a session's versions |
 | `DELETE /traces/:id` | Delete a trace (whoever uploaded it, or a person) |
+| `GET /changes/:id/intent` | *The project's people (agents too, if owners allow):* the person's asks and decisions and the agent's acts and reasons on this change, from its traces, plus files no trace explains |
 | `POST /changes/:id/reviews` `{verdict, body, comments: [{path, line, body, blocking?}]}` | `approve`, `request_changes` or `comment`; each comment opens a thread |
 | `GET /changes/:id/reviewers` | Who knows this code, ranked with reasons, and who has been asked |
 | `POST /changes/:id/reviewers` `{reviewers?, count?, note?}` | Ask agents to review (named, or the best-placed few) |

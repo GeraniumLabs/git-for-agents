@@ -23,7 +23,7 @@ import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
-import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
+import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, intentOf, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
@@ -781,7 +781,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "tasks" && b && !c) return json(this.taskView(Number(b)));
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b && c === "interdiff") return json(await this.interdiff(Number(b), url.searchParams));
-      if (a === "changes" && b) return json(await this.changeDetail(Number(b)));
+      // A change's intent comes from its session traces, so it's for the people who can read those (below).
+      if (a === "changes" && b && c !== "intent") return json(await this.changeDetail(Number(b)));
       if (a === "review-tasks") return json(this.reviewTasks(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : undefined));
       if (a === "reviews") return json(await this.reviewQueue(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : null));
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
@@ -908,6 +909,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
     // Traces are for the project's people (and its agents, if an owner allows), even on a public project.
+    if (a === "changes" && b && c === "intent" && m === "GET") {
+      this.assertCanReadTraces(actor);
+      return json(await this.changeIntent(Number(b)));
+    }
     if (a === "traces" && m === "GET") {
       this.assertCanReadTraces(actor);
       if (b === "settings") { ownerOnly("see trace settings"); return json(this.traceSettings); }
@@ -5081,6 +5086,40 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async pruneTraces() {
     const old = this.sql.exec("SELECT id FROM traces WHERE removed_at IS NULL AND expires_at IS NOT NULL AND expires_at < ? LIMIT 50", Date.now()).toArray().map((r) => r.id as number);
     for (const id of old) await this.dropTrace(id, null, "expired");
+  }
+
+  /**
+   * What a change was meant to do and who decided what, for reviewing intent
+   * instead of code: the person's asks and decisions, the agent's acts on the
+   * change's files with the reasons it gave, each pinned to a step of a
+   * fingerprinted trace.
+   */
+  private async changeIntent(id: number) {
+    const ch = this.change(id);
+    const task = this.task(ch.task_id);
+    const files: unknown = typeof ch.files === "string" ? JSON.parse(ch.files) : ch.files;
+    const paths: string[] = (Array.isArray(files) ? files : []).map((f: any) => (typeof f === "string" ? f : f?.path)).filter(Boolean);
+    const traces = this.sql.exec(`SELECT * FROM traces WHERE ${LIVE_TRACE} AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) ORDER BY id`, id, id).toArray() as any[];
+    const person: any[] = [];
+    const agent: any[] = [];
+    for (const t of traces) {
+      const it = intentOf(await this.traceSteps(t.id), { paths, taskId: ch.task_id as number, changeId: id });
+      for (const a of it.asks) person.push({ kind: "ask", text: a.text, at: a.ts, trace: t.id, seq: a.seq });
+      for (const a of it.acts) agent.push({ ...a, at: a.ts, trace: t.id, agent: t.agent_id, agentName: this.agentName(t.agent_id) });
+    }
+    const people = new Set(["admin", ...this.sql.exec("SELECT id FROM agents WHERE role = 'human'").toArray().map((r) => r.id as string)]);
+    for (const d of this.decisionRows("retired_at IS NULL AND (change_id = ? OR task_id = ?)", id, ch.task_id)) person.push({ kind: "decision", text: d.decision, question: d.question, at: d.created_at, by: d.by, byName: d.byName });
+    for (const r of this.sql.exec("SELECT reviewer, verdict, body, created_at FROM reviews WHERE change_id = ? AND verdict != 'comment' ORDER BY id", id).toArray()) {
+      if (people.has(r.reviewer as string)) person.push({ kind: "review", text: `${r.verdict === "approve" ? "approved" : "requested changes"}${r.body ? `: ${r.body}` : ""}`, at: r.created_at, by: r.reviewer, byName: this.agentName(r.reviewer as string) });
+    }
+    person.sort((x, y) => (x.at ?? 0) - (y.at ?? 0));
+    return {
+      change: id, title: ch.title, summary: ch.summary, paths,
+      task: { id: task.id, title: task.title, description: task.description, by: task.created_by, byName: task.created_by ? this.agentName(task.created_by as string) : null, byPerson: people.has(task.created_by as string) },
+      person, agent,
+      evidence: traces.map((t) => ({ trace: t.id, agent: t.agent_id, agentName: this.agentName(t.agent_id), version: t.version ?? 1, sha256: t.sha256, session: t.session_id })),
+      unexplained: paths.filter((p) => !agent.some((a) => a.kind === "edit" && a.files.some((f: string) => f === p || f.endsWith(`/${p}`)))),
+    };
   }
 
   /** Check a trace's stored log still matches the fingerprint taken when it arrived. */

@@ -1204,3 +1204,42 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.equal(record.sha256, again.sha256, "the fingerprint outlives the content");
   assert.equal((await ada.change(ch.id)).traceCount, 0);
 });
+
+test("a change's intent: the person's asks and decisions, the agent's acts and reasons, pinned to traces", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-intent");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "intent", files: SEED, requiredApprovals: 2 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", {});
+  const now = Date.now();
+  const at = (s: number) => new Date(now + s * 1000).toISOString();
+  const L = (o: unknown) => JSON.stringify(o);
+  const log = [
+    L({ type: "user", sessionId: "s-i", timestamp: at(0), message: { role: "user", content: "Trim titles before saving" } }),
+    L({ type: "assistant", sessionId: "s-i", timestamp: at(1), message: { id: "a1", role: "assistant", content: [{ type: "text", text: "Trimming in db.js keeps every caller covered." }] } }),
+    L({ type: "assistant", sessionId: "s-i", timestamp: at(2), message: { id: "a2", role: "assistant", content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "/w/src/db.js", old_string: "a", new_string: "b" } }] } }),
+    L({ type: "assistant", sessionId: "s-i", timestamp: at(3), message: { id: "a3", role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "git push origin HEAD" } }] } }),
+    L({ type: "user", sessionId: "s-i", timestamp: at(4), message: { role: "user", content: "Also, the weather looks nice" } }),
+    L({ type: "assistant", sessionId: "s-i", timestamp: at(5), message: { id: "a4", role: "assistant", content: [{ type: "tool_use", id: "b2", name: "Bash", input: { command: "git push origin other" } }] } }),
+  ].join("\n");
+  const tr = await (await fetch(`${url}/api/projects/${name}/traces?change=${ch.id}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/x-ndjson" }, body: log })).json();
+  await admin.review(ch.id, "approve", "Trimming at the source is right");
+
+  const base = `${url}/api/projects/${name}`;
+  assert.equal((await fetch(`${base}/changes/${ch.id}/intent`)).status, 401, "intent comes from traces: people only");
+  assert.equal((await fetch(`${base}/changes/${ch.id}/intent`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+  const it = await admin.req("GET", `/changes/${ch.id}/intent`);
+  assert.deepEqual(it.paths, ["src/db.js"]);
+  assert.deepEqual(it.person.map((p: any) => [p.kind, p.text]), [["ask", "Trim titles before saving"], ["review", "approved: Trimming at the source is right"]]);
+  assert.deepEqual(it.agent.map((a: any) => a.kind), ["edit", "command"], "the push in the turn that edited db.js; not the later one");
+  assert.match(it.agent[0].why, /keeps every caller covered/);
+  assert.equal(it.agent[0].trace, tr.id);
+  assert.deepEqual(it.evidence.map((e: any) => [e.trace, e.sha256]), [[tr.id, tr.sha256]]);
+  assert.deepEqual(it.unexplained, []);
+  assert.equal((await admin.change(ch.id)).status !== undefined, true, "the public change view still works");
+});

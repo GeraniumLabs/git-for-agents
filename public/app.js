@@ -559,6 +559,36 @@ async function showTraces(box, changeId) {
   }));
 }
 
+const ACT_LABEL = { edit: "Edited", loom: "Loom", command: "Ran", refused: "Refused", failed: "Failed" };
+const PERSON_LABEL = { ask: "Asked", decision: "Decided", review: "Reviewed" };
+
+/**
+ * Review intent instead of code: what the person asked and decided, what the
+ * agent did to this change's files and the reason it gave, each pinned to a
+ * step of a fingerprinted trace, and the files no trace explains.
+ */
+async function showIntent(box, changeId) {
+  if (box.dataset.open) { box.innerHTML = ""; delete box.dataset.open; return; }
+  box.dataset.open = "1";
+  box.innerHTML = `<p class="meta">Loading…</p>`;
+  let it;
+  try { it = await traceFetch(`/changes/${changeId}/intent`); } catch (e) { box.innerHTML = `<p class="meta">${esc(e.message)}</p>`; return; }
+  const when = (t) => (t ? `${ago(t)} ago` : "");
+  const pin = (x) => (x.trace ? `<span class="meta" title="Step ${x.seq} of session trace #${x.trace}">trace #${x.trace} · step ${x.seq}</span>` : "");
+  const person = it.person.map((p) => `<li class="int-p ${p.kind}"><span class="k">${PERSON_LABEL[p.kind] ?? p.kind}</span>${p.byName ? ` <b>${esc(p.byName)}</b>` : ""} ${p.question ? `<span class="meta">${esc(p.question)} →</span> ` : ""}${esc(p.text)} ${pin(p)} <span class="meta">${when(p.at)}</span></li>`).join("");
+  const agent = it.agent.map((a) => `<li class="int-a ${a.kind}"><span class="k">${ACT_LABEL[a.kind] ?? a.kind}</span> <span class="what">${esc(a.what)}</span>
+      ${a.why ? `<div class="int-why">“${esc(a.why)}”</div>` : ""}<div>${pin(a)} <span class="meta">${esc(a.agentName ?? "")} ${when(a.at)}</span></div></li>`).join("");
+  box.innerHTML = `<div class="intent">
+    <h3>What was asked</h3>
+    ${it.task ? `<p class="meta">Task #${it.task.id} “${esc(it.task.title)}”${it.task.byName ? `, filed by ${esc(it.task.byName)}${it.task.byPerson ? "" : " (an agent)"}` : ""}${it.task.description ? `: ${esc(it.task.description)}` : ""}</p>` : ""}
+    ${person ? `<ol class="int-list">${person}</ol>` : `<p class="meta">No person's words reach this change in its traces.</p>`}
+    <h3>What the agent did, and why</h3>
+    ${agent ? `<ol class="int-list">${agent}</ol>` : `<p class="meta">The traces don't show the agent working on this change's files.</p>`}
+    ${it.unexplained.length ? `<p class="warn">No trace shows how these changed: ${it.unexplained.map((p) => `<code>${esc(p)}</code>`).join(", ")}. Review their code.</p>` : `<p class="meta">Every file in the change is accounted for in a trace.</p>`}
+    <p class="meta">Evidence: ${it.evidence.map((e) => `trace #${e.trace}${e.version > 1 ? ` v${e.version}` : ""} by ${esc(e.agentName)}${e.sha256 ? ` <span class="mono" title="${esc(e.sha256)}">sha256 ${esc(e.sha256.slice(0, 12))}</span>` : ""}`).join(" · ")}</p>
+  </div>`;
+}
+
 // ── attachments: screenshots, builds, logs and documents agents posted ─
 const bytes = (n) => n < 1024 ? `${n} B` : n < 1024 ** 2 ? `${(n / 1024).toFixed(0)} KB` : `${(n / 1024 ** 2).toFixed(1)} MB`;
 const attUrl = (a, download = false) => `${a.url}?${download ? "download=1" : ""}${keyQuery()}`;
@@ -2115,7 +2145,7 @@ function drawReview() {
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
-      ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
+      ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-intent title="What the person asked and decided, and what the agent did to this change's files and why, from the session traces">Review intent</button> <button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="intent-box"></div><div id="traces-box"></div></div>` : ""}
       <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
       <div id="clone-box"></div>
     </div>
@@ -2277,6 +2307,8 @@ function wireReview(canReview) {
   root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id });
   const tb = root.querySelector("[data-traces]");
   if (tb) tb.onclick = () => showTraces($("#traces-box"), c.id);
+  const ib = root.querySelector("[data-intent]");
+  if (ib) ib.onclick = () => showIntent($("#intent-box"), c.id);
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);

@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPattern, detectSource, dropThoughts, filesOf, loomCallOf, parseTrace, promptOf, redact, traceLimits } from "../src/traces.ts";
+import { checkPattern, detectSource, dropThoughts, filesOf, intentOf, loomCallOf, parseTrace, promptOf, redact, traceLimits } from "../src/traces.ts";
 
 const line = (o: unknown) => JSON.stringify(o);
 
@@ -171,4 +171,23 @@ test("harness wake-ups are context; a person's words inside them are the prompt"
 test("a person's words relayed by another agent count, and entities are decoded", () => {
   assert.deepEqual(promptOf('<relay><cited author="user" name="J">ok that finally works</cited><note>J says it works</note></relay>'), { kind: "prompt", text: "ok that finally works" });
   assert.equal(promptOf('<message from="human">I&#39;m &quot;here&quot;</message>').text, `I'm "here"`);
+});
+
+test("a change's intent: the person's ask, and the agent's acts on its files with the reason it gave", () => {
+  const log = [
+    line({ type: "user", sessionId: "s-3", timestamp: "2026-11-11T10:00:00Z", message: { role: "user", content: "Make the deploy use a user token" } }),
+    line({ type: "assistant", sessionId: "s-3", timestamp: "2026-11-11T10:00:01Z", message: { id: "a1", role: "assistant", content: [{ type: "text", text: "Account tokens fail at /queues, so I'll document user tokens." }] } }),
+    line({ type: "assistant", sessionId: "s-3", timestamp: "2026-11-11T10:00:02Z", message: { id: "a2", role: "assistant", content: [{ type: "tool_use", id: "e1", name: "Edit", input: { file_path: "/repo/.github/workflows/deploy.yml", old_string: "a", new_string: "b" } }] } }),
+    line({ type: "user", sessionId: "s-3", timestamp: "2026-11-11T10:00:03Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "e1", content: "ok" }] } }),
+    line({ type: "assistant", sessionId: "s-3", timestamp: "2026-11-11T10:00:04Z", message: { id: "a3", role: "assistant", content: [{ type: "tool_use", id: "e2", name: "Edit", input: { file_path: "/repo/.github/workflows/deploy.yml", old_string: "b", new_string: "c" } }] } }),
+    line({ type: "assistant", sessionId: "s-3", timestamp: "2026-11-11T10:00:05Z", message: { id: "a4", role: "assistant", content: [{ type: "tool_use", id: "b1", name: "Bash", input: { command: "npx wrangler deploy" } }] } }),
+    line({ type: "user", sessionId: "s-3", timestamp: "2026-11-11T10:00:06Z", message: { role: "user", content: [{ type: "tool_result", tool_use_id: "b1", is_error: true, content: "Permission for this action was denied by the auto mode classifier." }] } }),
+    line({ type: "assistant", sessionId: "s-3", timestamp: "2026-11-11T10:00:07Z", message: { id: "a5", role: "assistant", content: [{ type: "tool_use", id: "x1", name: "Edit", input: { file_path: "/repo/README.md", old_string: "a", new_string: "b" } }] } }),
+  ].join("\n");
+  const it = intentOf(parseTrace(log).steps, { paths: [".github/workflows/deploy.yml"] });
+  assert.deepEqual(it.asks.map((a) => a.text), ["Make the deploy use a user token"]);
+  assert.deepEqual(it.acts.map((a) => a.kind), ["edit", "command", "refused"], "one edit per file, the deploy, its refusal; README is outside the change");
+  assert.match(it.acts[0].why!, /Account tokens fail/);
+  assert.equal(it.acts[0].ask, it.asks[0].seq);
+  assert.deepEqual(intentOf(parseTrace(log).steps, { paths: ["other.ts"] }), { asks: [], acts: [] });
 });

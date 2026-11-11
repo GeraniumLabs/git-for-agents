@@ -748,6 +748,14 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
 
 /* Session traces on a change */
 .rv-traces { margin: 8px 0; }
+.intent { border: 1px solid var(--line, #ddd); border-radius: 6px; padding: 8px 12px; margin: 8px 0; }
+.intent h3 { font-size: 14px; margin: 8px 0 4px; }
+.int-list { margin: 0; padding-left: 22px; }
+.int-list li { margin: 4px 0; }
+.int-list .k { font-weight: 600; margin-right: 4px; }
+.int-a .what { font-family: var(--mono, ui-monospace, monospace); font-size: 12px; word-break: break-word; }
+.int-a .int-why { font-style: italic; margin: 2px 0; color: var(--muted, inherit); }
+.int-a.refused .k, .int-a.failed .k { color: var(--del, #c0392b); }
 .traces { list-style: none; margin: 8px 0 0; padding: 0; display: grid; gap: 8px; }
 .traces > li { border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; background: var(--panel); min-width: 0; }
 .steps { margin: 6px 0 0; padding-left: 22px; max-height: 480px; overflow: auto; }
