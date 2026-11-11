@@ -127,3 +127,11 @@ test("limits come from the plan when the server takes payments", () => {
   assert.equal(traceLimits({} as any, "free").days, 90, "no payments: the server's own settings");
   assert.equal(traceLimits({ LOOM_TRACE_DAYS: "0" } as any, null).days, 0);
 });
+
+test("logs and steps are stored gzipped and come back the same", async () => {
+  const { gzip, gunzip, traceKeys } = await import("../src/traces.ts");
+  const packed = await gzip(claudeCode.repeat(20));
+  assert.ok(packed.byteLength < claudeCode.length * 20 / 5, "agent logs compress well");
+  assert.equal(await gunzip(packed), claudeCode.repeat(20));
+  assert.deepEqual(traceKeys("p", 3), { log: "p/traces/3/log.gz", steps: "p/traces/3/steps.json.gz" });
+});

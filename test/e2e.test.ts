@@ -1152,6 +1152,7 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.equal(tr.loomCalls, 1);
   assert.equal(tr.redactions, 1);
   assert.deepEqual(tr.models, ["claude-test"]);
+  assert.ok(tr.stored > 0 && tr.stored < tr.size * 2, "stored gzipped in R2");
 
   // People only, even on a public project.
   assert.equal((await fetch(`${base}/traces?change=${ch.id}`)).status, 401);

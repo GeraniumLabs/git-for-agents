@@ -23,7 +23,7 @@ import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
-import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, parseTrace, redact, detectSource, traceLimits, type TraceSource } from "./traces";
+import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
@@ -286,17 +286,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS traces (
         id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, task_id INTEGER, change_id INTEGER, links TEXT DEFAULT '[]',
         source TEXT NOT NULL, session_id TEXT, runner TEXT, models TEXT DEFAULT '[]', started_at INTEGER, ended_at INTEGER,
-        step_count INTEGER DEFAULT 0, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0, cost_usd REAL,
-        size INTEGER NOT NULL, redactions INTEGER DEFAULT 0, redaction_kinds TEXT DEFAULT '{}', thoughts INTEGER DEFAULT 1,
+        step_count INTEGER DEFAULT 0, loom_calls INTEGER DEFAULT 0, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0, cost_usd REAL,
+        size INTEGER NOT NULL, stored INTEGER NOT NULL DEFAULT 0, redactions INTEGER DEFAULT 0, redaction_kinds TEXT DEFAULT '{}', thoughts INTEGER DEFAULT 1,
         created_at INTEGER, updated_at INTEGER, expires_at INTEGER);
       CREATE INDEX IF NOT EXISTS traces_change ON traces (change_id);
       CREATE INDEX IF NOT EXISTS traces_session ON traces (agent_id, session_id);
       CREATE INDEX IF NOT EXISTS traces_expiry ON traces (expires_at);
-      CREATE TABLE IF NOT EXISTS trace_steps (
-        trace_id INTEGER NOT NULL, seq INTEGER NOT NULL, ts INTEGER, kind TEXT NOT NULL, tool TEXT, loom_call TEXT,
-        preview TEXT, files TEXT DEFAULT '[]', model TEXT, tokens_in INTEGER, tokens_out INTEGER, error INTEGER DEFAULT 0,
-        PRIMARY KEY (trace_id, seq));
-      CREATE INDEX IF NOT EXISTS trace_steps_loom ON trace_steps (loom_call, ts);
       CREATE TABLE IF NOT EXISTS directive_acks (
         seq INTEGER, agent TEXT, note TEXT, acked_at INTEGER, PRIMARY KEY (seq, agent));
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
@@ -907,7 +902,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (b === "settings") { ownerOnly("see trace settings"); return json(this.traceSettings); }
       if (!b) return json(await this.listTraces(url.searchParams));
       if (b && c === "raw") return await this.serveTrace(Number(b));
-      if (b && !c) return json(this.traceDetail(Number(b), url.searchParams));
+      if (b && !c) return json(await this.traceDetail(Number(b), url.searchParams));
     }
 
     // Agents acknowledge directives (paused ones too: a directive may be why they're paused).
@@ -4877,12 +4872,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private traceView(r: any) {
-    const loomCalls = this.sql.exec("SELECT COUNT(*) AS n FROM trace_steps WHERE trace_id = ? AND loom_call IS NOT NULL AND kind = 'tool_call'", r.id).one().n as number;
     return {
       id: r.id, agent: r.agent_id, agentName: this.agentName(r.agent_id), source: r.source, sessionId: r.session_id, runner: r.runner,
       task: r.task_id, change: r.change_id, changes: JSON.parse(r.links ?? "[]"), models: JSON.parse(r.models ?? "[]"),
-      startedAt: r.started_at, endedAt: r.ended_at, steps: r.step_count, loomCalls, tokensIn: r.tokens_in, tokensOut: r.tokens_out, costUsd: r.cost_usd,
-      size: r.size, redactions: r.redactions, redactionKinds: JSON.parse(r.redaction_kinds ?? "{}"), thoughts: !!r.thoughts,
+      startedAt: r.started_at, endedAt: r.ended_at, steps: r.step_count, loomCalls: r.loom_calls, tokensIn: r.tokens_in, tokensOut: r.tokens_out, costUsd: r.cost_usd,
+      size: r.size, stored: r.stored, redactions: r.redactions, redactionKinds: JSON.parse(r.redaction_kinds ?? "{}"), thoughts: !!r.thoughts,
       createdAt: r.created_at, updatedAt: r.updated_at, expiresAt: r.expires_at,
       url: `/api/projects/${this.project}/traces/${r.id}/raw`,
     };
@@ -4903,18 +4897,29 @@ export class ProjectCoordinator extends DurableObject<Env> {
     else if (task) rows = this.sql.exec("SELECT * FROM traces WHERE task_id = ? ORDER BY id DESC LIMIT ?", Number(task), limit);
     else if (agent) rows = this.sql.exec("SELECT * FROM traces WHERE agent_id = ? ORDER BY id DESC LIMIT ?", this.profile(agent).agent.id, limit);
     else rows = this.sql.exec("SELECT * FROM traces ORDER BY id DESC LIMIT ?", limit);
-    const used = this.sql.exec("SELECT COALESCE(SUM(size), 0) AS n FROM traces").one().n as number;
+    const used = this.storedTraceBytes();
     return { traces: rows.toArray().map((r) => this.traceView(r)), used, limits: this.traceLimits };
   }
 
-  private traceDetail(id: number, q: URLSearchParams) {
+  private storedTraceBytes(): number {
+    return this.sql.exec("SELECT COALESCE(SUM(stored), 0) AS n FROM traces").one().n as number;
+  }
+
+  /** A trace's steps, read from R2 (they're never kept in the coordinator). */
+  private async traceSteps(id: number): Promise<Step[]> {
+    const obj = await this.context.get(traceKeys(this.project, id).steps);
+    if (!obj) return [];
+    return JSON.parse(await gunzip(new Uint8Array(await obj.arrayBuffer())));
+  }
+
+  private async traceDetail(id: number, q: URLSearchParams) {
     const r = this.traceRow(id);
     const after = Number(q.get("after") ?? 0) || 0;
     const limit = Math.min(Number(q.get("limit") ?? 200) || 200, 1000);
     const kinds = q.get("kind")?.split(",").filter(Boolean);
-    const steps = this.sql.exec(`SELECT * FROM trace_steps WHERE trace_id = ? AND seq > ?${kinds?.length ? ` AND kind IN (${kinds.map(() => "?").join(",")})` : ""} ORDER BY seq LIMIT ?`, id, after, ...(kinds ?? []), limit)
-      .toArray().map((s: any) => ({ seq: s.seq, ts: s.ts, kind: s.kind, tool: s.tool, loomCall: s.loom_call, preview: s.preview, files: JSON.parse(s.files ?? "[]"), model: s.model, tokensIn: s.tokens_in, tokensOut: s.tokens_out, error: !!s.error }));
-    return { ...this.traceView(r), stepList: steps, more: steps.length === limit ? steps[steps.length - 1].seq : null };
+    const all = (await this.traceSteps(id)).filter((s) => s.seq > after && (!kinds?.length || kinds.includes(s.kind)));
+    const steps = all.slice(0, limit).map((s) => ({ ...s, tool: s.tool ?? null, loomCall: s.loomCall ?? null, model: s.model ?? null, error: !!s.error }));
+    return { ...this.traceView(r), stepList: steps, more: all.length > limit ? steps[steps.length - 1].seq : null };
   }
 
   /** The changes an agent had open during a session: the ones it touched between the session's first and last step. */
@@ -4945,8 +4950,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const sessionOf = sessionGiven ?? parseTrace(text.slice(0, 200_000), (wanted as TraceSource) ?? detectSource(text), false).sessionId;
     const earlier = sessionOf ? this.sql.exec("SELECT * FROM traces WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1", actor.id, sessionOf).toArray()[0] as any : undefined;
     if (append && earlier) {
-      const prev = await this.context.get(`${this.project}/traces/${earlier.id}`);
-      text = `${prev ? await prev.text() : ""}\n${text}`;
+      const prev = await this.context.get(traceKeys(this.project, earlier.id).log);
+      text = `${prev ? await gunzip(new Uint8Array(await prev.arrayBuffer())) : ""}\n${text}`;
     }
 
     const source = (wanted as TraceSource) ?? detectSource(text);
@@ -4956,15 +4961,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!settings.thoughts) stored = dropThoughts(stored, source);
     const bytes = new TextEncoder().encode(stored);
     if (bytes.byteLength > MAX_TRACE_BYTES) throw new HttpError(413, `a trace is at most ${MAX_TRACE_BYTES / 1024 / 1024} MB; this one is ${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB`);
+    const parsed = parseTrace(stored, source, settings.thoughts);
+    // Both go to R2 gzipped; the quota counts what's actually stored.
+    const [logGz, stepsGz] = await Promise.all([gzip(stored), gzip(JSON.stringify(parsed.steps))]);
+    const storedBytes = logGz.byteLength + stepsGz.byteLength;
     const limits = this.traceLimits;
-    const used = this.sql.exec("SELECT COALESCE(SUM(size), 0) AS n FROM traces").one().n as number;
-    if (limits.bytes > 0 && used - (earlier?.size ?? 0) + bytes.byteLength > limits.bytes) {
+    if (limits.bytes > 0 && this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) {
       await this.pruneTraces();
-      const again = this.sql.exec("SELECT COALESCE(SUM(size), 0) AS n FROM traces").one().n as number;
-      if (again - (earlier?.size ?? 0) + bytes.byteLength > limits.bytes) throw new HttpError(413, `this project's traces would pass ${(limits.bytes / 1024 ** 3).toFixed(1)} GB; an owner can delete old ones, or a plan with more room lifts the limit`);
+      if (this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) throw new HttpError(413, `this project's traces would pass ${(limits.bytes / 1024 ** 3).toFixed(1)} GB; an owner can delete old ones, or a plan with more room lifts the limit`);
     }
 
-    const parsed = parseTrace(stored, source, settings.thoughts);
     // Where it belongs: what the upload names, else the changes this agent had open during the session.
     let changeId: number | null = body.change !== undefined && body.change !== null && body.change !== "" ? Number(body.change) : null;
     let taskId: number | null = body.task !== undefined && body.task !== null && body.task !== "" ? Number(body.task) : null;
@@ -4987,29 +4993,26 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const runner = body.runner ? String(body.runner).slice(0, 80) : null;
     const models = parsed.models.length ? parsed.models : body.model ? [String(body.model).slice(0, 80)] : [];
     const cols = [actor.id, taskId, changeId, JSON.stringify(links), source, sessionOf, runner, JSON.stringify(models), parsed.startedAt, parsed.endedAt,
-      parsed.steps.length, parsed.tokensIn, parsed.tokensOut, parsed.costUsd, bytes.byteLength, red.count, JSON.stringify(red.kinds), settings.thoughts ? 1 : 0];
+      parsed.steps.length, parsed.steps.filter((x) => x.loomCall && x.kind === "tool_call").length, parsed.tokensIn, parsed.tokensOut, parsed.costUsd,
+      bytes.byteLength, storedBytes, red.count, JSON.stringify(red.kinds), settings.thoughts ? 1 : 0];
     let id: number;
     if (earlier) {
       id = earlier.id;
       this.sql.exec(`UPDATE traces SET agent_id = ?, task_id = ?, change_id = ?, links = ?, source = ?, session_id = ?, runner = COALESCE(?, runner), models = ?, started_at = ?, ended_at = ?,
-        step_count = ?, tokens_in = ?, tokens_out = ?, cost_usd = ?, size = ?, redactions = ?, redaction_kinds = ?, thoughts = ?, updated_at = ?, expires_at = ? WHERE id = ?`, ...cols, now, expires, id);
-      this.sql.exec("DELETE FROM trace_steps WHERE trace_id = ?", id);
+        step_count = ?, loom_calls = ?, tokens_in = ?, tokens_out = ?, cost_usd = ?, size = ?, stored = ?, redactions = ?, redaction_kinds = ?, thoughts = ?, updated_at = ?, expires_at = ? WHERE id = ?`, ...cols, now, expires, id);
     } else {
       id = this.sql.exec(`INSERT INTO traces (agent_id, task_id, change_id, links, source, session_id, runner, models, started_at, ended_at,
-        step_count, tokens_in, tokens_out, cost_usd, size, redactions, redaction_kinds, thoughts, created_at, updated_at, expires_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, ...cols, now, now, expires).one().id as number;
-    }
-    for (const s of parsed.steps) {
-      this.sql.exec("INSERT INTO trace_steps (trace_id, seq, ts, kind, tool, loom_call, preview, files, model, tokens_in, tokens_out, error) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        id, s.seq, s.ts, s.kind, s.tool ?? null, s.loomCall ?? null, s.preview, JSON.stringify(s.files), s.model ?? null, s.tokensIn ?? null, s.tokensOut ?? null, s.error ? 1 : 0);
+        step_count, loom_calls, tokens_in, tokens_out, cost_usd, size, stored, redactions, redaction_kinds, thoughts, created_at, updated_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, ...cols, now, now, expires).one().id as number;
     }
     try {
-      await this.context.put(`${this.project}/traces/${id}`, bytes, { httpMetadata: { contentType: "text/plain; charset=utf-8" } });
+      const keys = traceKeys(this.project, id);
+      await Promise.all([
+        this.context.put(keys.log, logGz, { httpMetadata: { contentType: "application/gzip" } }),
+        this.context.put(keys.steps, stepsGz, { httpMetadata: { contentType: "application/gzip" } }),
+      ]);
     } catch (e) {
-      if (!earlier) {
-        this.sql.exec("DELETE FROM trace_steps WHERE trace_id = ?", id);
-        this.sql.exec("DELETE FROM traces WHERE id = ?", id);
-      }
+      if (!earlier) this.sql.exec("DELETE FROM traces WHERE id = ?", id);
       throw e;
     }
     const view = this.traceView(this.traceRow(id));
@@ -5019,10 +5022,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async serveTrace(id: number): Promise<Response> {
     this.traceRow(id);
-    const obj = await this.context.get(`${this.project}/traces/${id}`);
+    const obj = await this.context.get(traceKeys(this.project, id).log);
     if (!obj) throw new HttpError(404, `trace ${id} is missing from storage`);
     // Plain text, never rendered: a log can hold anything an agent read.
-    return new Response(obj.body, { headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff", "content-security-policy": "sandbox", "cache-control": "private, no-store" } });
+    return new Response(await gunzip(new Uint8Array(await obj.arrayBuffer())), { headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff", "content-security-policy": "sandbox", "cache-control": "private, no-store" } });
   }
 
   /** Whoever uploaded it, or one of the project's people, can delete a trace. */
@@ -5035,8 +5038,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async dropTrace(id: number) {
-    await this.context.delete(`${this.project}/traces/${id}`);
-    this.sql.exec("DELETE FROM trace_steps WHERE trace_id = ?", id);
+    const keys = traceKeys(this.project, id);
+    await this.context.delete([keys.log, keys.steps]);
     this.sql.exec("DELETE FROM traces WHERE id = ?", id);
   }
 

@@ -152,6 +152,7 @@ Agents upload their session logs, and Loom keeps each one with the change it pro
 - **Where they go.** A trace names its change or task, or Loom links it to the changes that agent had open during the session. A change shows **Session traces** when it has any.
 - **Secrets.** Before anything is stored, Loom removes API keys, tokens, private keys, passwords, credentials in URLs, Loom keys, the project's own model keys, and anything matching an owner's patterns (**Settings › Session traces**). The unredacted text is never written. Each trace says how many items were removed.
 - **Who can read them.** The project's people, even on a public project. Owners can let agents read them too, so an agent can see what an earlier attempt tried. Owners can also stop keeping the models' own reasoning, which is then dropped from the steps and the stored log.
+- **Storage.** A trace's log and its steps are kept gzipped in R2; the coordinator keeps one small summary row per trace, so thousands of agents' traces never press on a Durable Object's 10 GB. Quotas count the compressed size.
 - **How long.** Up to 25 MB a trace. Without payments, a project holds 2 GB for 90 days (`LOOM_TRACE_BYTES`, `LOOM_TRACE_DAYS`); with plans, Free keeps 200 MB for 30 days and Pro 5 GB for a year. Expired traces are removed as traces are read and written.
 
 Next: a timeline that puts each agent's reasoning beside Loom's events on a change, questions answered from the traces, and a weekly report across them.

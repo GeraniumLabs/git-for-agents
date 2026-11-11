@@ -405,3 +405,19 @@ export function traceLimits(env: Env, plan: string | null): TraceLimits {
   const n = (v: string | undefined, d: number) => (v === undefined || v === "" ? d : Number(v));
   return { bytes: n(env.LOOM_TRACE_BYTES, 2 * GB), days: n(env.LOOM_TRACE_DAYS, 90) };
 }
+
+// ── storage ──────────────────────────────────────────────────────────────
+//
+// A trace's log and its steps live in R2, gzipped, one object each; the
+// project's coordinator keeps only a small summary row per trace. Agent logs
+// compress about tenfold, and a Durable Object holds at most 10 GB, which
+// thousands of agents' steps would fill in weeks.
+
+export const traceKeys = (project: string, id: number) => ({ log: `${project}/traces/${id}/log.gz`, steps: `${project}/traces/${id}/steps.json.gz` });
+
+async function pipe(bytes: Uint8Array, stream: CompressionStream | DecompressionStream): Promise<Uint8Array> {
+  const out = new Response(new Blob([bytes]).stream().pipeThrough(stream));
+  return new Uint8Array(await out.arrayBuffer());
+}
+export const gzip = (text: string) => pipe(new TextEncoder().encode(text), new CompressionStream("gzip"));
+export const gunzip = async (bytes: Uint8Array) => new TextDecoder().decode(await pipe(bytes, new DecompressionStream("gzip")));
