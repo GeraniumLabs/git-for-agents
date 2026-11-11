@@ -19,7 +19,7 @@ export const MAX_TRACE_BYTES = 25 * 1024 * 1024;
 export type TraceSource = "claude-code" | "codex" | "otel" | "text";
 export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "otel", "text"];
 
-export type StepKind = "prompt" | "thought" | "message" | "tool_call" | "tool_result" | "error";
+export type StepKind = "prompt" | "context" | "thought" | "message" | "tool_call" | "tool_result" | "error";
 
 export interface Step {
   seq: number;
@@ -93,6 +93,19 @@ const BEARER = /\b(Bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/g;
 /** API_KEY=..., "password": "...", token: ... — the value goes, the name stays. Never crosses a quote, so JSON stays valid. */
 const ASSIGNED = /\b([A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|credentials?)[A-Za-z0-9_]*)(\\?["']?\s*[:=]\s*\\?["']?)([^\s"'\\,;(){}[\]]{8,})/gi;
 
+/**
+ * What a name=value match that isn't a secret looks like in real agent logs:
+ * token counts (`tokensIn: 1200`, `"thinkingTokens":25361`), numbers, and
+ * code that reads a secret rather than holding one (`env.LOOM_SECRET_KEY`,
+ * `s.tokens_in`, `process.env.TOKEN`).
+ */
+function notASecret(name: string, value: string): boolean {
+  if (/^-?\d+(\.\d+)?$/.test(value)) return true;
+  if (/tokens|token_?count|tokens?_?(in|out)$|max_?tokens/i.test(name)) return true;
+  if (/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$/.test(value)) return true;
+  return false;
+}
+
 export interface Redaction {
   text: string;
   count: number;
@@ -108,11 +121,15 @@ export interface Redaction {
 export function redact(text: string, opts: { literals?: string[]; patterns?: string[] } = {}): Redaction {
   const kinds: Record<string, number> = {};
   const hit = (kind: string) => (kinds[kind] = (kinds[kind] ?? 0) + 1);
-  let out = text;
+  // Screenshots and other inline images go first: text redaction can't see a
+  // secret inside a picture of a dashboard, and they're a large share of a log.
+  let out = text
+    .replace(/("data"\s*:\s*")([A-Za-z0-9+/=]{1000,})(")/g, (_m, a, data, z) => (hit("image"), `${a}[redacted:image ${Math.round(data.length * 0.75 / 1024)} KB]${z}`))
+    .replace(/data:image\/[a-z+.-]+;base64,[A-Za-z0-9+/=]{1000,}/g, (m) => (hit("image"), `[redacted:image ${Math.round(m.length * 0.75 / 1024)} KB]`));
   for (const [kind, re] of SECRET_PATTERNS) out = out.replace(re, () => (hit(kind), `[redacted:${kind}]`));
   out = out.replace(URL_CREDENTIALS, (_m, scheme) => (hit("url-credentials"), `${scheme}[redacted:url-credentials]@`));
   out = out.replace(BEARER, (_m, pre) => (hit("bearer"), `${pre}[redacted:bearer]`));
-  out = out.replace(ASSIGNED, (m, name, sep, value) => (value.startsWith("[redacted") ? m : (hit("assigned"), `${name}${sep}[redacted:assigned]`)));
+  out = out.replace(ASSIGNED, (m, name, sep, value) => (value.startsWith("[redacted") || notASecret(name, value) ? m : (hit("assigned"), `${name}${sep}[redacted:assigned]`)));
   for (const lit of opts.literals ?? []) {
     if (!lit || lit.length < 6) continue;
     const pieces = out.split(lit);
@@ -157,7 +174,17 @@ const jsonLines = (text: string): any[] => {
 export function detectSource(text: string): TraceSource {
   const head = text.slice(0, 20_000).trimStart();
   if (head.startsWith("{") && /"resourceSpans"\s*:/.test(head)) return "otel";
-  const lines = jsonLines(head).slice(0, 20);
+  // Whole lines, not the first 20 KB: a real transcript's first prompt line
+  // often carries a long system context and runs well past that.
+  const lines: any[] = [];
+  let at = 0;
+  while (lines.length < 40 && at < text.length && at < 8_000_000) {
+    const end = text.indexOf("\n", at);
+    const t = text.slice(at, end < 0 ? text.length : end).trim();
+    at = end < 0 ? text.length : end + 1;
+    if (!t.startsWith("{")) continue;
+    try { lines.push(JSON.parse(t)); } catch { /* cut off, or prose */ }
+  }
   if (lines.some((l) => ["session_meta", "response_item", "event_msg", "turn_context"].includes(l?.type) && l.payload)) return "codex";
   if (lines.some((l) => ["user", "assistant", "summary", "system"].includes(l?.type) && (l.message || l.sessionId || l.summary))) return "claude-code";
   return "text";
@@ -218,6 +245,24 @@ class Builder {
   }
 }
 
+/**
+ * A "user" turn in an agent's log is often not a person: a harness wakes the
+ * agent with a notification, loads a skill, or captions an image, usually
+ * wrapped in a tag. Those are context, not prompts. A person's words inside a
+ * harness envelope (<message from="human">…</message>) are the prompt.
+ */
+const unescapeXml = (t: string) => t.replace(/&(#\d+|#x[0-9a-f]+|amp|lt|gt|quot|apos);/gi, (m, e: string) =>
+  e[0] === "#" ? String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" } as Record<string, string>)[e.toLowerCase()] ?? m);
+
+export function promptOf(text: string, meta = false): { kind: "prompt" | "context"; text: string } {
+  const said = [...text.matchAll(/<(message|cited)\b[^>]*\b(?:from|author)="(?:human|user)"[^>]*>([\s\S]*?)<\/\1>/g)].map((m) => unescapeXml(m[2].trim())).filter(Boolean);
+  if (said.length) return { kind: "prompt", text: said.join("\n") };
+  if (meta) return { kind: "context", text };
+  const t = text.trimStart();
+  if (/^<[a-z][\w-]*[\s>/]/i.test(t) || /^\[Image[:\s]/.test(t) || /^Base directory for this skill/.test(t) || /^Caveat: /.test(t)) return { kind: "context", text };
+  return { kind: "prompt", text };
+}
+
 function parseClaudeCode(text: string, keepThoughts: boolean): ParsedTrace {
   const b = new Builder(keepThoughts);
   const tools = new Map<string, string>(); // tool_use id → tool name
@@ -245,7 +290,10 @@ function parseClaudeCode(text: string, keepThoughts: boolean): ParsedTrace {
       if (!c || typeof c !== "object") continue;
       if (c.type === "text") {
         const user = l.type === "user" || msg.role === "user";
-        b.add({ ts, kind: user ? "prompt" : "message", preview: asText(c.text), model, ...(user ? {} : usage()) });
+        if (user) {
+          const p = promptOf(asText(c.text), !!l.isMeta);
+          b.add({ ts, kind: p.kind, preview: p.text, model });
+        } else b.add({ ts, kind: "message", preview: asText(c.text), model, ...usage() });
       } else if (c.type === "thinking" || c.type === "redacted_thinking") {
         b.add({ ts, kind: "thought", preview: asText(c.thinking ?? "[redacted thinking]"), model, ...usage() });
       } else if (c.type === "tool_use") {

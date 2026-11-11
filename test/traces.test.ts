@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { checkPattern, detectSource, dropThoughts, filesOf, loomCallOf, parseTrace, redact, traceLimits } from "../src/traces.ts";
+import { checkPattern, detectSource, dropThoughts, filesOf, loomCallOf, parseTrace, promptOf, redact, traceLimits } from "../src/traces.ts";
 
 const line = (o: unknown) => JSON.stringify(o);
 
@@ -134,4 +134,41 @@ test("logs and steps are stored gzipped and come back the same", async () => {
   assert.ok(packed.byteLength < claudeCode.length * 20 / 5, "agent logs compress well");
   assert.equal(await gunzip(packed), claudeCode.repeat(20));
   assert.deepEqual(traceKeys("p", 3), { log: "p/traces/3/log.gz", steps: "p/traces/3/steps.json.gz" });
+});
+
+test("a real transcript is recognized even when its first prompt runs past 20 KB", () => {
+  const big = [
+    line({ type: "queue-operation", operation: "enqueue", sessionId: "s-2", timestamp: "2026-11-11T00:00:00Z" }),
+    line({ type: "user", sessionId: "s-2", timestamp: "2026-11-11T00:00:01Z", message: { role: "user", content: "context ".repeat(5000) + "go" } }),
+    line({ type: "assistant", sessionId: "s-2", timestamp: "2026-11-11T00:00:02Z", message: { id: "m9", role: "assistant", model: "m", content: [{ type: "text", text: "ok" }] } }),
+  ].join("\n");
+  assert.equal(detectSource(big), "claude-code");
+  assert.equal(parseTrace(big).sessionId, "s-2");
+});
+
+test("token counts and code that reads a secret aren't redacted", () => {
+  const r = redact('tokensIn: 1200, "thinkingTokens":25361, const key = env.LOOM_SECRET_KEY, max_tokens=4096, b.tokensOut = s.tokens_out');
+  assert.equal(r.count, 0, r.text);
+  assert.equal(redact("api_key: abcdefgh12345678").count, 1, "a real value still goes");
+});
+
+test("inline images are dropped from the stored log", () => {
+  const png = "iVBORw0KGgo" + "A".repeat(4000);
+  const r = redact(line({ type: "user", message: { content: [{ type: "image", source: { type: "base64", media_type: "image/png", data: png } }] } }) + `\n<img src="data:image/png;base64,${png}">`);
+  assert.equal(r.kinds.image, 2);
+  assert.ok(!r.text.includes("AAAAAAAA"));
+  assert.doesNotThrow(() => JSON.parse(r.text.split("\n")[0]));
+});
+
+test("harness wake-ups are context; a person's words inside them are the prompt", () => {
+  assert.deepEqual(promptOf('<wake reason="mention"><message from="human" author="J">Ok what\'s next</message></wake>'), { kind: "prompt", text: "Ok what's next" });
+  assert.equal(promptOf("<task-notification>\n<status>pending</status></task-notification>").kind, "context");
+  assert.equal(promptOf("[Image: original 2480x1184]").kind, "context");
+  assert.equal(promptOf("anything", true).kind, "context", "lines the agent marks as meta");
+  assert.equal(promptOf("Add due dates to todos").kind, "prompt");
+});
+
+test("a person's words relayed by another agent count, and entities are decoded", () => {
+  assert.deepEqual(promptOf('<relay><cited author="user" name="J">ok that finally works</cited><note>J says it works</note></relay>'), { kind: "prompt", text: "ok that finally works" });
+  assert.equal(promptOf('<message from="human">I&#39;m &quot;here&quot;</message>').text, `I'm "here"`);
 });

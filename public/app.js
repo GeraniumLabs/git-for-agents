@@ -519,7 +519,7 @@ function renderNotes() {
 // ── session traces: what the agents behind a change read, thought and did ─
 
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n ?? 0));
-const STEP_LABEL = { prompt: "Prompt", thought: "Thought", message: "Said", tool_call: "Called", tool_result: "Got back", error: "Error" };
+const STEP_LABEL = { prompt: "Prompt", context: "Context", thought: "Thought", message: "Said", tool_call: "Called", tool_result: "Got back", error: "Error" };
 
 async function traceFetch(path) {
   const r = await fetch(`/api/projects/${project}${path}`, { headers: keyHeader() });
