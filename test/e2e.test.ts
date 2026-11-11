@@ -1127,3 +1127,61 @@ test("a change with hundreds of files is submitted, reviewed and merged", { skip
   const { stdout } = await run("node", ["demo/large-change.mjs", project("e2e-large"), "300"], { env, maxBuffer: 1 << 24 });
   assert.match(stdout, /merged with 300 files/);
 });
+
+test("agents upload session traces: secrets removed, linked to the change, readable by people only", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-traces");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "traces", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// v1\n" }, "v1");
+  const ch = await ada.submit(t.id, t.title, "Trim", {});
+  const base = `${url}/api/projects/${name}`;
+  const now = new Date().toISOString();
+  const transcript = [
+    { type: "user", sessionId: "s-e2e", timestamp: now, message: { role: "user", content: "Trim titles; my key is sk-ant-api03-abcdefghijklmnopqrstuvwxyz" } },
+    { type: "assistant", sessionId: "s-e2e", timestamp: now, message: { id: "m1", role: "assistant", model: "claude-test", usage: { input_tokens: 10, output_tokens: 5 }, content: [{ type: "thinking", thinking: "declare first" }, { type: "tool_use", id: "t1", name: "mcp__loom__declare_intent", input: { paths: ["src/db.js"] } }] } },
+  ].map((l) => JSON.stringify(l)).join("\n");
+  const upload = (body: string, agentKey = ada.key) => fetch(`${base}/traces?source=claude-code`, { method: "POST", headers: { authorization: `Bearer ${agentKey}`, "content-type": "application/x-ndjson" }, body });
+  const tr = await (await upload(transcript)).json();
+  assert.equal(tr.change, ch.id, "linked to the change ada had open during the session");
+  assert.equal(tr.steps, 3);
+  assert.equal(tr.loomCalls, 1);
+  assert.equal(tr.redactions, 1);
+  assert.deepEqual(tr.models, ["claude-test"]);
+  assert.ok(tr.stored > 0 && tr.stored < tr.size * 2, "stored gzipped in R2");
+
+  // People only, even on a public project.
+  assert.equal((await fetch(`${base}/traces?change=${ch.id}`)).status, 401);
+  assert.equal((await fetch(`${base}/traces?change=${ch.id}`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+  const list = await admin.req("GET", `/traces?change=${ch.id}`);
+  assert.equal(list.traces.length, 1);
+  assert.equal((await ada.change(ch.id)).traceCount, 1);
+  const detail = await admin.req("GET", `/traces/${tr.id}`);
+  assert.deepEqual(detail.stepList.map((s: any) => s.kind), ["prompt", "thought", "tool_call"]);
+  assert.equal(detail.stepList[2].loomCall, "declare_intent");
+  const raw = await (await fetch(`${base}/traces/${tr.id}/raw`, { headers: { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } })).text();
+  assert.ok(!raw.includes("sk-ant-api03"), "the secret never reached storage");
+  assert.ok(raw.includes("[redacted:anthropic-key]"));
+
+  // The same session again replaces it; with thoughts off they're gone from steps and log.
+  await admin.req("POST", "/settings", { traces: { thoughts: false, agentsCanRead: true } });
+  const again = await (await upload(transcript)).json();
+  assert.equal(again.id, tr.id);
+  assert.equal(again.replaced, true);
+  assert.equal(again.steps, 2);
+  const mine = await ada.req("GET", `/traces?change=${ch.id}`);
+  assert.equal(mine.traces.length, 1, "agents can read once an owner allows it");
+
+  // Through MCP, with no hook.
+  const res = await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: "attach_trace", arguments: { text: "Plain notes from a session", change: ch.id } } }) });
+  const viaMcp = JSON.parse((await res.json()).result.content.at(-1).text);
+  assert.equal(viaMcp.source, "text");
+  assert.equal(viaMcp.change, ch.id);
+  assert.equal((await ada.change(ch.id)).traceCount, 2);
+  assert.deepEqual(await ada.req("DELETE", `/traces/${viaMcp.id}`), { ok: true, id: viaMcp.id });
+});

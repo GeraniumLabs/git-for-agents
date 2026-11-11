@@ -26,6 +26,10 @@ export interface Env {
   LOOM_MAX_AGENTS?: string;
   /** Minutes of checks one project may run a day (UTC). Default 120; 0 means no limit. Past it, the merge queue waits for the next day. */
   LOOM_CHECK_MINUTES_PER_DAY?: string;
+  /** Bytes of session traces a project may hold when the server takes no payments (default 2 GB; 0 is no limit). */
+  LOOM_TRACE_BYTES?: string;
+  /** Days a session trace is kept when the server takes no payments (default 90; 0 is forever). */
+  LOOM_TRACE_DAYS?: string;
   /** Stripe: with both set, people get the free plan and can pay for Loom Pro (src/billing.ts). */
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;

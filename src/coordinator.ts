@@ -23,6 +23,7 @@ import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
+import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
@@ -282,6 +283,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
         caption TEXT, agent_id TEXT, task_id INTEGER, change_id INTEGER, created_at INTEGER);
       CREATE INDEX IF NOT EXISTS attachments_change ON attachments (change_id);
       CREATE INDEX IF NOT EXISTS attachments_task ON attachments (task_id);
+      CREATE TABLE IF NOT EXISTS traces (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, agent_id TEXT, task_id INTEGER, change_id INTEGER, links TEXT DEFAULT '[]',
+        source TEXT NOT NULL, session_id TEXT, runner TEXT, models TEXT DEFAULT '[]', started_at INTEGER, ended_at INTEGER,
+        step_count INTEGER DEFAULT 0, loom_calls INTEGER DEFAULT 0, tokens_in INTEGER DEFAULT 0, tokens_out INTEGER DEFAULT 0, cost_usd REAL,
+        size INTEGER NOT NULL, stored INTEGER NOT NULL DEFAULT 0, redactions INTEGER DEFAULT 0, redaction_kinds TEXT DEFAULT '{}', thoughts INTEGER DEFAULT 1,
+        created_at INTEGER, updated_at INTEGER, expires_at INTEGER);
+      CREATE INDEX IF NOT EXISTS traces_change ON traces (change_id);
+      CREATE INDEX IF NOT EXISTS traces_session ON traces (agent_id, session_id);
+      CREATE INDEX IF NOT EXISTS traces_expiry ON traces (expires_at);
       CREATE TABLE IF NOT EXISTS directive_acks (
         seq INTEGER, agent TEXT, note TEXT, acked_at INTEGER, PRIMARY KEY (seq, agent));
       CREATE INDEX IF NOT EXISTS review_requests_open ON review_requests (status, reviewer);
@@ -633,7 +643,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const [a, b, c, d] = parts;
     const m = req.method;
     // An attachment can arrive as raw bytes rather than JSON.
-    const rawUpload = a === "attachments" && !b && m === "POST" && (url.searchParams.has("name") || !/json/i.test(req.headers.get("content-type") ?? ""));
+    const rawUpload = (a === "attachments" && !b && m === "POST" && (url.searchParams.has("name") || !/json/i.test(req.headers.get("content-type") ?? "")))
+      // A trace is usually JSON Lines, so only a plain application/json body is a JSON request.
+      || (a === "traces" && !b && m === "POST" && !/^application\/json\b/i.test(req.headers.get("content-type") ?? ""));
     const body = (m === "POST" || m === "PUT") && !rawUpload ? await req.json<any>().catch(() => ({})) : {};
     // Where links in webhooks point; the Durable Object only learns its origin from requests.
     if (url.hostname !== "do" && this.meta("project") && this.meta("origin") !== url.origin) this.setMeta("origin", url.origin);
@@ -870,12 +882,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
+      if (body.traces !== undefined) this.setTraceSettings(body.traces ?? {});
       if (body.model !== undefined) this.setMeta("model_options", JSON.stringify({ ...this.modelOptions, ...Object.fromEntries(Object.entries(body.model ?? {}).filter(([k]) => k === "reviewers" || k === "intent").map(([k, v]) => [k, !!v])) }));
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -883,6 +896,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
+    // Traces are for the project's people (and its agents, if an owner allows), even on a public project.
+    if (a === "traces" && m === "GET") {
+      this.assertCanReadTraces(actor);
+      if (b === "settings") { ownerOnly("see trace settings"); return json(this.traceSettings); }
+      if (!b) return json(await this.listTraces(url.searchParams));
+      if (b && c === "raw") return await this.serveTrace(Number(b));
+      if (b && !c) return json(await this.traceDetail(Number(b), url.searchParams));
+    }
 
     // Agents acknowledge directives (paused ones too: a directive may be why they're paused).
     if (a === "directives" && c === "ack" && m === "POST") return json(this.ackDirectives(actor, b === "all" ? null : [Number(b)], body.note));
@@ -907,7 +928,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "decisions" && b && c === "retire") return json(this.retireDecision(actor, Number(b)));
     }
     // A paused agent can still read, talk and answer, but not change code.
-    const talking = ["threads", "messages", "proposals", "consults", "disputes", "attachments"].includes(a);
+    const talking = ["threads", "messages", "proposals", "consults", "disputes", "attachments", "traces"].includes(a);
     if (actor.paused && !talking) throw new HttpError(423, `you are paused: ${actor.paused}. Wait for a human to resume you; you can still post in threads.`);
     if (a === "tasks" && !b && m === "POST") return json(this.createTask(actor, body));
     if (a === "tasks" && b && c === "claim") return json(await this.claim(actor, Number(b)));
@@ -950,6 +971,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "notes" && !b && m === "POST") return json(this.remember(actor, body));
     if (a === "attachments" && !b && m === "POST") return json(await this.attach(actor, req, rawUpload ? Object.fromEntries(url.searchParams) : body, rawUpload));
     if (a === "attachments" && b && !c && m === "DELETE") return json(await this.removeAttachment(actor, Number(b)));
+    if (a === "traces" && !b && m === "POST") return json(await this.uploadTrace(actor, req, rawUpload ? Object.fromEntries(url.searchParams) : body, rawUpload));
+    if (a === "traces" && b && !c && m === "DELETE") return json(await this.removeTrace(actor, Number(b)));
     if (a === "notes" && b && c === "votes" && m === "POST") return json(this.rateNote(actor, Number(b), body));
     if (a === "notes" && b && c === "retire" && m === "POST") return json(this.retireNote(actor, Number(b)));
     throw new HttpError(404, `no route ${m} ${url.pathname}`);
@@ -1714,6 +1737,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
       patch: text, context: ctx ? await ctx.json() : null,
       threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
+      traceCount: this.traceCount(id),
       reviewedHeads: this.sql.exec("SELECT reviewer, head, MAX(created_at) AS at FROM reviews WHERE change_id = ? AND COALESCE(vote, 0) = 0 GROUP BY reviewer, head ORDER BY at", id).toArray(),
     };
   }
@@ -3540,7 +3564,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -4815,6 +4839,214 @@ export class ProjectCoordinator extends DurableObject<Env> {
       attachments: this.attachmentsWhere("task_id = ?", taskId),
       events,
     };
+  }
+
+  // ── session traces: what an agent saw, thought and did, kept with its change ─
+
+  private get traceSettings(): { thoughts: boolean; agentsCanRead: boolean; redact: string[] } {
+    return { thoughts: true, agentsCanRead: false, redact: [], ...JSON.parse(this.meta("trace_settings") ?? "{}") };
+  }
+
+  private setTraceSettings(body: { thoughts?: boolean; agentsCanRead?: boolean; redact?: string[] }) {
+    const cfg = this.traceSettings;
+    if (body.thoughts !== undefined) cfg.thoughts = !!body.thoughts;
+    if (body.agentsCanRead !== undefined) cfg.agentsCanRead = !!body.agentsCanRead;
+    if (body.redact !== undefined) {
+      if (!Array.isArray(body.redact) || body.redact.length > 50) throw new HttpError(400, "traces.redact is a list of up to 50 regular expressions");
+      for (const p of body.redact) { const bad = checkPattern(p); if (bad) throw new HttpError(400, bad); }
+      cfg.redact = body.redact;
+    }
+    this.setMeta("trace_settings", JSON.stringify(cfg));
+  }
+
+  private get traceLimits() { return traceLimits(this.env, this.meta("plan")); }
+
+  private assertCanReadTraces(actor: Agent) {
+    if (actor.role === "human" && !actor.standin) return;
+    if (actor.role !== "human" && this.traceSettings.agentsCanRead) return;
+    throw new HttpError(403, actor.role === "human" ? "a stand-in key can't read traces" : "only the project's people can read traces; an owner can let agents read them in Settings");
+  }
+
+  private traceCount(changeId: number): number {
+    return this.sql.exec("SELECT COUNT(*) AS n FROM traces WHERE change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)", changeId, changeId).one().n as number;
+  }
+
+  private traceView(r: any) {
+    return {
+      id: r.id, agent: r.agent_id, agentName: this.agentName(r.agent_id), source: r.source, sessionId: r.session_id, runner: r.runner,
+      task: r.task_id, change: r.change_id, changes: JSON.parse(r.links ?? "[]"), models: JSON.parse(r.models ?? "[]"),
+      startedAt: r.started_at, endedAt: r.ended_at, steps: r.step_count, loomCalls: r.loom_calls, tokensIn: r.tokens_in, tokensOut: r.tokens_out, costUsd: r.cost_usd,
+      size: r.size, stored: r.stored, redactions: r.redactions, redactionKinds: JSON.parse(r.redaction_kinds ?? "{}"), thoughts: !!r.thoughts,
+      createdAt: r.created_at, updatedAt: r.updated_at, expiresAt: r.expires_at,
+      url: `/api/projects/${this.project}/traces/${r.id}/raw`,
+    };
+  }
+
+  private traceRow(id: number) {
+    const r = this.sql.exec("SELECT * FROM traces WHERE id = ?", id).toArray()[0];
+    if (!r) throw new HttpError(404, `no trace ${id}`);
+    return r as any;
+  }
+
+  private async listTraces(q: URLSearchParams) {
+    await this.pruneTraces();
+    const limit = Math.min(Number(q.get("limit") ?? 100) || 100, 500);
+    const change = q.get("change"), task = q.get("task"), agent = q.get("agent");
+    let rows;
+    if (change) rows = this.sql.exec("SELECT * FROM traces WHERE change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?) ORDER BY id DESC LIMIT ?", Number(change), Number(change), limit);
+    else if (task) rows = this.sql.exec("SELECT * FROM traces WHERE task_id = ? ORDER BY id DESC LIMIT ?", Number(task), limit);
+    else if (agent) rows = this.sql.exec("SELECT * FROM traces WHERE agent_id = ? ORDER BY id DESC LIMIT ?", this.profile(agent).agent.id, limit);
+    else rows = this.sql.exec("SELECT * FROM traces ORDER BY id DESC LIMIT ?", limit);
+    const used = this.storedTraceBytes();
+    return { traces: rows.toArray().map((r) => this.traceView(r)), used, limits: this.traceLimits };
+  }
+
+  private storedTraceBytes(): number {
+    return this.sql.exec("SELECT COALESCE(SUM(stored), 0) AS n FROM traces").one().n as number;
+  }
+
+  /** A trace's steps, read from R2 (they're never kept in the coordinator). */
+  private async traceSteps(id: number): Promise<Step[]> {
+    const obj = await this.context.get(traceKeys(this.project, id).steps);
+    if (!obj) return [];
+    return JSON.parse(await gunzip(new Uint8Array(await obj.arrayBuffer())));
+  }
+
+  private async traceDetail(id: number, q: URLSearchParams) {
+    const r = this.traceRow(id);
+    const after = Number(q.get("after") ?? 0) || 0;
+    const limit = Math.min(Number(q.get("limit") ?? 200) || 200, 1000);
+    const kinds = q.get("kind")?.split(",").filter(Boolean);
+    const all = (await this.traceSteps(id)).filter((s) => s.seq > after && (!kinds?.length || kinds.includes(s.kind)));
+    const steps = all.slice(0, limit).map((s) => ({ ...s, tool: s.tool ?? null, loomCall: s.loomCall ?? null, model: s.model ?? null, error: !!s.error }));
+    return { ...this.traceView(r), stepList: steps, more: all.length > limit ? steps[steps.length - 1].seq : null };
+  }
+
+  /** The changes an agent had open during a session: the ones it touched between the session's first and last step. */
+  private changesDuring(agentId: string, from: number | null, to: number | null): number[] {
+    if (from === null || to === null) return [];
+    const slack = 10 * 60_000;
+    return this.sql.exec("SELECT id FROM changes WHERE agent_id = ? AND created_at <= ? AND updated_at >= ? ORDER BY id", agentId, to + slack, from - slack).toArray().map((r) => r.id as number);
+  }
+
+  /**
+   * Store an agent's session log: secrets out first (the unredacted text is
+   * never written), then the log to R2 and its steps to the index. A second
+   * upload of the same session by the same agent replaces the first (hooks
+   * upload the whole file each time), or adds to it with append.
+   */
+  private async uploadTrace(actor: Agent, req: Request, body: any, raw: boolean) {
+    const declared = Number(req.headers.get("content-length") ?? "0");
+    if (raw && declared > MAX_TRACE_BYTES) throw new HttpError(413, `a trace is at most ${MAX_TRACE_BYTES / 1024 / 1024} MB`);
+    let text = raw ? await req.text() : typeof body.text === "string" ? body.text : "";
+    if (!text.trim()) throw new HttpError(400, "send the session log as the request body, or as text");
+    const wanted = body.source ? String(body.source) : null;
+    if (wanted && !TRACE_SOURCES.includes(wanted as TraceSource)) throw new HttpError(400, `source is one of ${TRACE_SOURCES.join(", ")}`);
+    const settings = this.traceSettings;
+    const sessionGiven = body.session ? String(body.session).slice(0, 200) : null;
+    const append = body.append === true || body.append === "1" || body.append === "true";
+
+    // An earlier upload of this session: replaced, or added to.
+    const sessionOf = sessionGiven ?? parseTrace(text.slice(0, 200_000), (wanted as TraceSource) ?? detectSource(text), false).sessionId;
+    const earlier = sessionOf ? this.sql.exec("SELECT * FROM traces WHERE agent_id = ? AND session_id = ? ORDER BY id DESC LIMIT 1", actor.id, sessionOf).toArray()[0] as any : undefined;
+    if (append && earlier) {
+      const prev = await this.context.get(traceKeys(this.project, earlier.id).log);
+      text = `${prev ? await gunzip(new Uint8Array(await prev.arrayBuffer())) : ""}\n${text}`;
+    }
+
+    const source = (wanted as TraceSource) ?? detectSource(text);
+    const literals = (await Promise.all((Object.keys(KEY_KINDS) as KeyKind[]).map((k) => this.projectKey(k)))).filter((k): k is string => !!k);
+    const red = redact(text, { literals, patterns: settings.redact });
+    let stored = red.text;
+    if (!settings.thoughts) stored = dropThoughts(stored, source);
+    const bytes = new TextEncoder().encode(stored);
+    if (bytes.byteLength > MAX_TRACE_BYTES) throw new HttpError(413, `a trace is at most ${MAX_TRACE_BYTES / 1024 / 1024} MB; this one is ${(bytes.byteLength / 1024 / 1024).toFixed(1)} MB`);
+    const parsed = parseTrace(stored, source, settings.thoughts);
+    // Both go to R2 gzipped; the quota counts what's actually stored.
+    const [logGz, stepsGz] = await Promise.all([gzip(stored), gzip(JSON.stringify(parsed.steps))]);
+    const storedBytes = logGz.byteLength + stepsGz.byteLength;
+    const limits = this.traceLimits;
+    if (limits.bytes > 0 && this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) {
+      await this.pruneTraces();
+      if (this.storedTraceBytes() - (earlier?.stored ?? 0) + storedBytes > limits.bytes) throw new HttpError(413, `this project's traces would pass ${(limits.bytes / 1024 ** 3).toFixed(1)} GB; an owner can delete old ones, or a plan with more room lifts the limit`);
+    }
+
+    // Where it belongs: what the upload names, else the changes this agent had open during the session.
+    let changeId: number | null = body.change !== undefined && body.change !== null && body.change !== "" ? Number(body.change) : null;
+    let taskId: number | null = body.task !== undefined && body.task !== null && body.task !== "" ? Number(body.task) : null;
+    let links: number[] = [];
+    if (changeId !== null) {
+      const ch = this.change(changeId);
+      if (taskId !== null && taskId !== ch.task_id) throw new HttpError(400, `change #${changeId} is for task #${ch.task_id}, not #${taskId}`);
+      taskId = ch.task_id as number;
+      links = [changeId];
+    } else {
+      if (taskId !== null) this.task(taskId);
+      links = this.changesDuring(actor.id, parsed.startedAt, parsed.endedAt);
+      if (taskId !== null) links = links.filter((id) => (this.change(id).task_id as number) === taskId);
+      changeId = links.length ? links[links.length - 1] : null;
+      if (changeId !== null && taskId === null) taskId = this.change(changeId).task_id as number;
+    }
+
+    const now = Date.now();
+    const expires = limits.days > 0 ? now + limits.days * 86_400_000 : null;
+    const runner = body.runner ? String(body.runner).slice(0, 80) : null;
+    const models = parsed.models.length ? parsed.models : body.model ? [String(body.model).slice(0, 80)] : [];
+    const cols = [actor.id, taskId, changeId, JSON.stringify(links), source, sessionOf, runner, JSON.stringify(models), parsed.startedAt, parsed.endedAt,
+      parsed.steps.length, parsed.steps.filter((x) => x.loomCall && x.kind === "tool_call").length, parsed.tokensIn, parsed.tokensOut, parsed.costUsd,
+      bytes.byteLength, storedBytes, red.count, JSON.stringify(red.kinds), settings.thoughts ? 1 : 0];
+    let id: number;
+    if (earlier) {
+      id = earlier.id;
+      this.sql.exec(`UPDATE traces SET agent_id = ?, task_id = ?, change_id = ?, links = ?, source = ?, session_id = ?, runner = COALESCE(?, runner), models = ?, started_at = ?, ended_at = ?,
+        step_count = ?, loom_calls = ?, tokens_in = ?, tokens_out = ?, cost_usd = ?, size = ?, stored = ?, redactions = ?, redaction_kinds = ?, thoughts = ?, updated_at = ?, expires_at = ? WHERE id = ?`, ...cols, now, expires, id);
+    } else {
+      id = this.sql.exec(`INSERT INTO traces (agent_id, task_id, change_id, links, source, session_id, runner, models, started_at, ended_at,
+        step_count, loom_calls, tokens_in, tokens_out, cost_usd, size, stored, redactions, redaction_kinds, thoughts, created_at, updated_at, expires_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`, ...cols, now, now, expires).one().id as number;
+    }
+    try {
+      const keys = traceKeys(this.project, id);
+      await Promise.all([
+        this.context.put(keys.log, logGz, { httpMetadata: { contentType: "application/gzip" } }),
+        this.context.put(keys.steps, stepsGz, { httpMetadata: { contentType: "application/gzip" } }),
+      ]);
+    } catch (e) {
+      if (!earlier) this.sql.exec("DELETE FROM traces WHERE id = ?", id);
+      throw e;
+    }
+    const view = this.traceView(this.traceRow(id));
+    if (!earlier) this.emit("trace.added", { actor: actor.id, task: taskId, change: changeId, data: { id, source, steps: view.steps, redactions: red.count } });
+    return { ...view, replaced: !!earlier && !append, appended: !!earlier && append };
+  }
+
+  private async serveTrace(id: number): Promise<Response> {
+    this.traceRow(id);
+    const obj = await this.context.get(traceKeys(this.project, id).log);
+    if (!obj) throw new HttpError(404, `trace ${id} is missing from storage`);
+    // Plain text, never rendered: a log can hold anything an agent read.
+    return new Response(await gunzip(new Uint8Array(await obj.arrayBuffer())), { headers: { "content-type": "text/plain; charset=utf-8", "x-content-type-options": "nosniff", "content-security-policy": "sandbox", "cache-control": "private, no-store" } });
+  }
+
+  /** Whoever uploaded it, or one of the project's people, can delete a trace. */
+  private async removeTrace(actor: Agent, id: number) {
+    const r = this.traceRow(id);
+    if (r.agent_id !== actor.id && (actor.role !== "human" || actor.standin)) throw new HttpError(403, "only whoever uploaded a trace, or one of the project's people, can delete it");
+    await this.dropTrace(id);
+    this.emit("trace.removed", { actor: actor.id, task: r.task_id, change: r.change_id, data: { id } });
+    return { ok: true, id };
+  }
+
+  private async dropTrace(id: number) {
+    const keys = traceKeys(this.project, id);
+    await this.context.delete([keys.log, keys.steps]);
+    this.sql.exec("DELETE FROM traces WHERE id = ?", id);
+  }
+
+  /** Traces past their plan's retention go, a few at a time, whenever traces are read or written (no alarm needed). */
+  private async pruneTraces() {
+    const old = this.sql.exec("SELECT id FROM traces WHERE expires_at IS NOT NULL AND expires_at < ? LIMIT 50", Date.now()).toArray().map((r) => r.id as number);
+    for (const id of old) await this.dropTrace(id);
   }
 
   // ── attachments: screenshots, builds, logs and documents agents post ─────

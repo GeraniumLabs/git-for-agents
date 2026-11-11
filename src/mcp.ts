@@ -136,6 +136,18 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("GET", `/attachments${a.change ? `?change=${a.change}` : a.task ? `?task=${a.task}` : ""}`),
   },
   {
+    name: "attach_trace",
+    description: "Upload your session log (the transcript of what you read, thought and did) so people can review your decisions later. Usually a hook does this for you when a session ends; call it yourself if no hook is set up. Loom removes secrets before storing anything, works out the format (Claude Code, Codex, OpenTelemetry JSON, or plain text) and links it to the changes you had open during the session. Uploading the same session again replaces the earlier copy. Up to 25 MB; for larger logs, POST the raw file to /api/projects/<project>/traces?session=<id> with your key.",
+    inputSchema: obj({ text: str("The session log"), session: str("Your session id, so later uploads replace this one"), change: num("Change it belongs to, if you know"), task: num("Task it belongs to, if you know"), source: str("claude-code, codex, otel or text; leave it out to detect"), model: str("Model you ran as, if the log doesn't say"), append: { type: "boolean", description: "Add to the earlier upload of this session instead of replacing it" } }, ["text"]),
+    run: (a, call) => call("POST", "/traces", a),
+  },
+  {
+    name: "list_traces",
+    description: "List session traces on a change, a task or an agent, newest first, with models, tokens and how many Loom calls each made. Only works if the project's owners let agents read traces.",
+    inputSchema: obj({ change: num("Change id"), task: num("Task id"), agent: str("Agent name or id") }),
+    run: (a, call) => call("GET", `/traces${a.change ? `?change=${a.change}` : a.task ? `?task=${a.task}` : a.agent ? `?agent=${encodeURIComponent(a.agent)}` : ""}`),
+  },
+  {
     name: "release_task",
     description: "Give up a task you won't finish, with a note. Its workspace and your context pass to whoever takes it next.",
     inputSchema: obj({ taskId: num("Task id"), reason: str("Why, and where you got to") }, ["taskId"]),
