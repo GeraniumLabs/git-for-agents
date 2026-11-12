@@ -1419,3 +1419,40 @@ test("per-agent limits: paths, changes a day and check minutes, from the agent, 
   await assert.rejects(admin.req("POST", "/agent-limits", { limits: { paths: "src" } }), /list of path patterns/);
   await assert.rejects(admin.req("POST", "/agent-limits", { limits: { speed: 3 } }), /unknown limit/);
 });
+
+test("submit on push: a commit with a Loom-Submit trailer opens the change, no MCP needed", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-pushsubmit");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "submit on push", requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Say hello", "");
+  const claim = await ada.claim(t.id);
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(`${tmpdir()}/loom-pushsubmit-`);
+  const git = (...a: string[]) => run("git", ["-c", `http.extraHeader=Authorization: Bearer ${claim.workspace.token}`, "-c", "user.name=ada", "-c", "user.email=ada@example.com", ...a], { cwd: dir });
+  await git("clone", claim.workspace.remote, ".");
+  // A push without the trailer only shows in the activity.
+  await writeFile(`${dir}/hello.txt`, "hello\n");
+  await git("add", "hello.txt");
+  await git("commit", "-m", "wip");
+  await git("push", "origin", "HEAD:main");
+  await sleep(1500);
+  assert.ok(!(await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "change.submitted"), "no trailer, no change");
+  await writeFile(`${dir}/hello.txt`, "hello, world\n");
+  await git("commit", "-am", "Say hello to the world\n\nAdds hello.txt for new visitors.\n\nLoom-Submit: Say hello");
+  await git("push", "origin", "HEAD:main");
+  let ch: any;
+  for (let i = 0; i < 40 && !ch; i++) {
+    await sleep(250);
+    const events = (await admin.req("GET", "/events?after=0")).events;
+    const opened = events.find((e: any) => e.type === "change.submitted");
+    const id = opened?.change ?? opened?.changeId ?? opened?.change_id;
+    if (id) ch = await ada.change(id);
+  }
+  assert.ok(ch, "the push opened a change");
+  assert.equal(ch.title, "Say hello");
+  assert.equal(ch.summary, "Adds hello.txt for new visitors.");
+  assert.equal(ch.task_id, t.id);
+});

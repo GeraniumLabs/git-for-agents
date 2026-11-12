@@ -102,6 +102,26 @@ export interface Agent {
   traceKey?: string;
 }
 
+/**
+ * The `Loom-Submit:` trailer of a commit message, if it has one: the title
+ * (the trailer's value, or the subject), the summary (the body without
+ * trailers) and an optional `Loom-Approach:`.
+ */
+export function submitTrailers(message: string): { title: string; summary: string; approach?: string } | null {
+  const lines = message.replace(/\r/g, "").trimEnd().split("\n");
+  let end = lines.length;
+  while (end > 1 && /^[A-Za-z][\w-]*:\s?.*$/.test(lines[end - 1])) end--;
+  const trailers = lines.slice(end);
+  const get = (name: string) => trailers.find((l) => l.toLowerCase().startsWith(`${name.toLowerCase()}:`))?.slice(name.length + 1).trim();
+  const submit = get("Loom-Submit");
+  if (submit === undefined) return null;
+  const subject = lines[0]?.trim() ?? "";
+  const title = (submit && !/^(yes|true|1)$/i.test(submit) ? submit : subject).slice(0, 200);
+  const summary = lines.slice(1, end).join("\n").trim() || subject;
+  const approach = get("Loom-Approach");
+  return { title: title || "Change", summary, ...(approach ? { approach } : {}) };
+}
+
 /** What one agent (or every agent under one key) may do. A missing field is no limit. */
 export interface AgentLimits {
   /** Path patterns it may write, declare intents on and change; empty or missing is everywhere. */
@@ -1626,7 +1646,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (p.after && this.meta(`pushed:${p.repo}`) === p.after) return { ignored: "Loom's own push" };
     this.emit("workspace.pushed", { actor: ws.agent_id, task: ws.task_id, data: { workspace: p.repo, head: p.after, before: p.before, commits: p.commits } });
     const ch = this.sql.exec("SELECT id, agent_id, head FROM changes WHERE task_id = ? AND workspace = ? AND status NOT IN ('merged','merging','abandoned','closed')", ws.task_id, p.repo).toArray()[0];
-    if (!ch) return { change: null };
+    if (!ch) return await this.submitOnPush(ws, p);
     if (p.after && ch.head === p.after) return { change: ch.id, unchanged: true };
     const owner = this.sql.exec("SELECT id, name, role FROM agents WHERE id = ?", ch.agent_id).toArray()[0] as unknown as Agent | undefined;
     if (!owner) return { change: ch.id, ignored: "its author is gone" };
@@ -1637,6 +1657,39 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // Merging meanwhile, or nothing against main any more: the push stays in the activity.
       if (e instanceof HttpError) return { change: ch.id, ignored: e.message };
       throw e;
+    }
+  }
+
+  /**
+   * Submit on push: a pushed commit whose message carries a `Loom-Submit:`
+   * trailer opens the task's change, so an agent with only git and a shell
+   * needs no MCP or HTTP call to submit. The trailer's value (or the commit's
+   * subject) is the title, the rest of the message the summary, and an
+   * optional `Loom-Approach:` trailer explains a contest attempt.
+   */
+  private async submitOnPush(ws: any, p: Push) {
+    if (!ws.task_id || !p.after) return { change: null };
+    const task = this.sql.exec("SELECT assignee FROM tasks WHERE id = ?", ws.task_id).toArray()[0];
+    const owner = task?.assignee ? this.sql.exec("SELECT id, name, role, paused FROM agents WHERE id = ?", task.assignee).toArray()[0] as unknown as Agent | undefined : undefined;
+    if (!owner) return { change: null };
+    let message = "";
+    try {
+      const w = await Workspace.open(this.remote(ws.name, await this.token(ws.name, "read")));
+      message = (await w.log(p.after, 1))[0]?.message ?? "";
+    } catch (e) {
+      console.error("reading the pushed commit", ws.name, e);
+      return { change: null };
+    }
+    const sub = submitTrailers(message);
+    if (!sub) return { change: null };
+    try {
+      const ch = await this.submitChange(owner, { taskId: ws.task_id, title: sub.title, summary: sub.summary, approach: sub.approach, context: { via: "git push", commit: p.after } });
+      return { change: ch.id, submitted: true, status: ch.status };
+    } catch (e) {
+      // Can't submit (out of scope, a contest attempt with no approach…): say why where the agent will look.
+      if (!(e instanceof HttpError)) throw e;
+      this.emit("change.submit_failed", { actor: owner.id, task: ws.task_id, to: owner.id, data: { via: "git push", commit: p.after, error: e.message } });
+      return { change: null, error: e.message };
     }
   }
 
