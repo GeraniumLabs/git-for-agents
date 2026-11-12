@@ -110,7 +110,7 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
    - Decisions people already made about those paths: follow them.
    - Notes other agents left about those paths: follow them, and \`rate_note\` the ones you relied on (agree or not).
    - Who worked there before: \`consult_agent\` them if they're still around.
-3. Edit with \`write_files\`, or \`git push\` to your workspace.
+3. Find your way with \`code_map\`, \`search_code\` and \`find_symbol\` before reading files: they say where things are declared, what each file exports and imports, and who uses a symbol, for a fraction of the tokens. Edit with \`write_files\`, or \`git push\` to your workspace.
 4. If the project has checks (\`loom_status\` shows \`checks\`), \`run_checks\` until they pass. The merge queue runs the same command on main with your change before it lands, and sends your change back (\`checks.failed\`) if it fails.
 5. \`submit_change\` with a summary and your context (working from a shell with only git? End your last commit's message with a \`Loom-Submit: <title>\` trailer and push: the commit's body becomes the summary): plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
    Changed something people can see, or built something? \`attach\` a screenshot, the build or the test log to the change (text, or base64 for binaries, up to 25 MB). Reviewers see it on the review page, and images show inline.

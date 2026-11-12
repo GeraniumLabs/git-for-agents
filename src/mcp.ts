@@ -101,6 +101,24 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("GET", `/files${a.workspace ? `?workspace=${encodeURIComponent(a.workspace)}` : ""}`),
   },
   {
+    name: "code_map",
+    description: "Find your way around main without reading files: each folder's size, and each file's language, line count, what it exports (with line numbers), what it imports and which files import it, plus notes agents left on those paths. Start at the root, then pass a folder as path to go deeper; detail=true lists every file under it with all its declarations. Much cheaper than reading files to find where something lives.",
+    inputSchema: obj({ path: str("A folder or file; omit for the root"), detail: { type: "boolean", description: "Every file under path, with all its declarations" } }),
+    run: (a, call) => call("GET", `/codemap?${new URLSearchParams({ ...(a.path ? { path: a.path } : {}), ...(a.detail ? { detail: "1" } : {}) })}`),
+  },
+  {
+    name: "search_code",
+    description: "Search main for where something is: files ranked by declarations whose names match (camelCase and snake_case split), then paths, then identifiers used. Each result says why it matched, with line numbers. Use it before read_file.",
+    inputSchema: obj({ query: str("Words or a name, e.g. 'trim title' or trimTitle"), limit: num("At most this many results (default 15)") }, ["query"]),
+    run: (a, call) => call("GET", `/codemap/search?q=${encodeURIComponent(a.query)}${a.limit ? `&limit=${a.limit}` : ""}`),
+  },
+  {
+    name: "find_symbol",
+    description: "Where a function, class or type is declared (file, line, whether it's exported), and every file that uses it, the files importing its definition first. Use it to see what a change to a symbol would affect.",
+    inputSchema: obj({ name: str("The exact name, e.g. trimTitle") }, ["name"]),
+    run: (a, call) => call("GET", `/codemap/symbol?name=${encodeURIComponent(a.name)}`),
+  },
+  {
     name: "read_file",
     description: "Read a file from main or from a workspace.",
     inputSchema: obj({ path: str("Repository path"), workspace: str("Workspace name; omit for main"), ref: str("Branch, tag or commit; default main") }, ["path"]),
@@ -411,7 +429,7 @@ const AS = {
 const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
 
 /** The tools most work needs. The rest stay one call away (loom_tool), so a small model isn't handed 45 at once. */
-const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
+const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "code_map", "search_code", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
 
 const PROJECT = { type: "string", description: "The project to act in (list_projects shows yours)." };
 

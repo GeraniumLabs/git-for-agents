@@ -1698,3 +1698,35 @@ test("evals score every version of a change: command evals in the check containe
   assert.equal(list.find((e: any) => e.name === "Size").average, 0.65);
   assert.equal(list.find((e: any) => e.name === "Security").trend[0].runs, 2);
 });
+
+test("the code map: a project's files, exports and imports over HTTP and MCP, rebuilt when main moves", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-codemap");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "code map", files: SEED, requiredApprovals: 0 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const root = await ada.req("GET", "/codemap");
+  assert.ok(root.folders.some((f: any) => f.path === "src"), JSON.stringify(root));
+  const src = await ada.req("GET", "/codemap?path=src");
+  assert.ok(src.files.length >= 2);
+  assert.ok(src.files.every((f: any) => Array.isArray(f.exports) && Array.isArray(f.importedBy)));
+  // MCP, as an agent would.
+  const mcp = async (tool: string, args: any) => {
+    const r = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }) })).json();
+    return JSON.parse(r.result.content[0].text.replace(/^[\s\S]*?(\{)/, "$1"));
+  };
+  // Land a new function; the map moves with main.
+  const t = await ada.createTask("Add slugify", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/slug.js": "export function slugifyTitle(t) {\n  return t.toLowerCase();\n}\n", "src/use.js": "import { slugifyTitle } from \"./slug.js\";\nexport const go = () => slugifyTitle(\"A\");\n" }, "slug");
+  const ch = await ada.submit(t.id, t.title, "slug", {});
+  for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+  const found = await mcp("search_code", { query: "slugify title" });
+  assert.equal(found.results[0].path, "src/slug.js", JSON.stringify(found));
+  const sym = await mcp("find_symbol", { name: "slugifyTitle" });
+  assert.deepEqual(sym.defs.map((d: any) => [d.path, d.line, d.exported]), [["src/slug.js", 1, true]]);
+  assert.deepEqual(sym.usedIn.map((u: any) => [u.path, u.imports]), [["src/use.js", ["src/slug.js"]]]);
+  const file = await mcp("code_map", { path: "src/slug.js" });
+  assert.deepEqual(file.files[0].importedBy, ["src/use.js"]);
+});

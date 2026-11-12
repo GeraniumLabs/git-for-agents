@@ -26,6 +26,7 @@ import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, s
 import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, intentOf, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
+import { MAX_FILE_BYTES, SKIP, buildMap, findSymbol, mapView, searchMap, type CodeMap } from "./codemap";
 import { ask, factoryReport, stepSources, type ReportChange, type ReportTrace, type Source } from "./analysis";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
@@ -885,6 +886,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "reviews") return json(await this.reviewQueue(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : null));
       if (a === "activity") return json(this.activity(url.searchParams.get("agent"), url.searchParams.get("range")));
       if (a === "files") return json(await this.readFiles(url.searchParams));
+      if (a === "codemap") {
+        const map = await this.codeMap();
+        if (b === "search") return json({ head: map.head, query: url.searchParams.get("q") ?? "", results: searchMap(map, url.searchParams.get("q") ?? "", Math.min(Number(url.searchParams.get("limit") ?? 15) || 15, 50)) });
+        if (b === "symbol") return json({ head: map.head, ...findSymbol(map, url.searchParams.get("name") ?? "") });
+        const view = mapView(map, url.searchParams.get("path") ?? "", url.searchParams.get("detail") === "1");
+        return json({ ...view, notes: this.notesUnder(view.path), files: view.files, skipped: map.skipped, totalFiles: map.files.length });
+      }
       if (a === "archive") return await this.archive(url.searchParams);
       if (a === "commits") return json(await this.commits(url.searchParams));
       if (a === "skill") return new Response(skill(url.origin, this.project, this.meta("description") ?? "", await this.liveJoinCode(url.searchParams.get("code"))), { headers: { "content-type": "text/markdown; charset=utf-8" } });
@@ -3006,6 +3014,47 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
       this.emit("change.sent_back", { change: id, task: ch.task_id, to: ch.agent_id, data: { reason: `the ${name} eval scored ${score}, under ${e.threshold}`, advice: "get_change shows the eval's notes; fix it and update_change" } });
     }
+  }
+
+  // ── the code map: main's files, declarations and imports, without reading them ──
+
+  private mapCache: CodeMap | null = null;
+  private mapBuilding: Promise<CodeMap> | null = null;
+
+  /** The code map of main as it is now: from memory, then R2, else built (once at a time) and saved for this head. */
+  private async codeMap(): Promise<CodeMap> {
+    const head = this.meta("main_head") ?? "";
+    if (this.mapCache?.head === head) return this.mapCache;
+    if (this.mapBuilding) return this.mapBuilding;
+    this.mapBuilding = (async () => {
+      const key = `${this.project}/codemap/${head || "empty"}.json.gz`;
+      const saved = await this.context.get(key);
+      if (saved) return JSON.parse(await gunzip(new Uint8Array(await saved.arrayBuffer()))) as CodeMap;
+      const w = await Workspace.open(await this.mainRemote("read"));
+      const at = await w.head();
+      const files: { path: string; text: string }[] = [];
+      let skipped = 0;
+      for (const [path, { oid }] of await w.flatten(at)) {
+        if (SKIP.test(path) || files.length >= 5000) { skipped++; continue; }
+        const bytes = await w.readBytes(oid);
+        if (bytes.byteLength > MAX_FILE_BYTES || bytes.subarray(0, 8000).includes(0)) { skipped++; continue; }
+        files.push({ path, text: new TextDecoder().decode(bytes) });
+      }
+      const map = buildMap(at ?? "", files, skipped);
+      await this.context.put(key, await gzip(JSON.stringify(map)));
+      return map;
+    })().finally(() => { this.mapBuilding = null; });
+    this.mapCache = await this.mapBuilding;
+    return this.mapCache;
+  }
+
+  /** Notes agents left on paths under a folder, so the map carries what they learned. */
+  private notesUnder(prefix: string) {
+    const pre = prefix === "/" ? "" : prefix;
+    return this.sql.exec("SELECT id, text, paths, kind FROM notes WHERE retired_at IS NULL ORDER BY id DESC LIMIT 200").toArray()
+      .map((n) => ({ id: n.id, text: n.text, kind: n.kind, paths: JSON.parse(n.paths as string) as string[] }))
+      .filter((n) => !pre || n.paths.some((p) => p.startsWith(pre) || pre.startsWith(p.replace(/\*+$/, ""))))
+      .slice(0, 20);
   }
 
   // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──
