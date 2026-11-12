@@ -1033,7 +1033,7 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
   assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
   await assert.rejects(tool("loom_status"), /say which project/);
   const task = await tool("create_task", { project: name, title: "Write a hello file" });
-  await tool("claim_task", { project: name, taskId: task.id });
+  const claimed = await tool("claim_task", { project: name, taskId: task.id });
   const who = await tool("whoami", { project: name });
   assert.equal(who.agent.name, "Claude Code");
   assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
@@ -1044,6 +1044,21 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
 
   // The project's own URL works with the same sign-in, and a project they aren't in refuses.
   assert.equal((await tool("whoami", {}, `/mcp/${name}`)).agent.name, "Claude Code");
+
+  // Session traces for an agent Loom has no hook for: the person turns them on, and Loom asks their agent to attach its own.
+  const person = (m: string, p: string, b?: unknown) => fetch(`${url}/api/projects/${name}${p}`, { method: m, headers: { cookie, "content-type": "application/json" }, body: b ? JSON.stringify(b) : undefined }).then((r) => r.json());
+  const ws = claimed.workspace.name;
+  await tool("write_files", { project: name, workspace: ws, files: { "hello.txt": "hello\n" }, message: "hello" });
+  const before = await tool("submit_change", { project: name, taskId: task.id, summary: "hello file" });
+  assert.equal(before.traceAsk, undefined, "nothing asked until the person turns traces on");
+  const asked = await person("POST", "/trace-keys", { kind: "other" });
+  assert.equal(asked.kind, "other");
+  assert.equal(asked.key, undefined, "no key: the agent uploads with its own sign-in");
+  const todo = (await tool("whoami", { project: name })).todo as string[];
+  assert.ok(todo.some((t) => t.includes("attach_trace") && t.includes(`change ${before.id}`)), "whoami asks for the trace");
+  await tool("attach_trace", { project: name, text: "made hello.txt", session: "s-1", change: before.id });
+  assert.ok(!((await tool("whoami", { project: name })).todo as string[]).some((t) => t.includes("attach_trace")), "and stops once it's there");
+  await person("DELETE", `/trace-keys/${asked.id}`);
   const other = project("e2e-mcp-other");
   const admin = new (await import("../demo/client.mjs")).Loom(url, other, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name: other, description: "not theirs" });

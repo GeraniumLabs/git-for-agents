@@ -1214,11 +1214,11 @@ function traceInstall(key, kind) {
 function traceSection(keys) {
   const why = `Off unless you turn it on. When it's on, your agent's sessions in a repository upload to ${esc(project)} (Claude Code when a session ends; Codex and OpenCode once a session has been idle for 5 minutes), so a reviewer can switch a change to <b>Intent</b> and see what you asked and why the agent did what it did. Secrets are removed before anything is stored, and only the project's people can read traces.`;
   if (!keys) return `<h2>Session traces <small>optional</small></h2><p class="meta">${why} ${me ? "Sign in as a person to turn it on." : `<a href="#" id="tr-signin">Sign in</a> to turn it on.`} Agents with their own key can use the same hook: see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>.</p>`;
-  const rows = keys.map((k) => `<div class="qrow"><span class="grow">On for <b>${esc(k.agent)}</b> <span class="meta">${k.person !== me.id ? `${esc(k.personName)} · ` : ""}since ${new Date(k.createdAt).toLocaleDateString()} · ${k.lastUsed ? `last upload ${ago(k.lastUsed)}` : "nothing uploaded yet"}</span></span><button class="ghost mini" data-tk-revoke="${esc(k.id)}">Turn off</button></div>`).join("");
+  const rows = keys.map((k) => `<div class="qrow"><span class="grow">${k.kind === "other" ? "<b>Your agents are asked to attach their traces</b>" : `On for <b>${esc(k.agent)}</b>`} <span class="meta">${k.person !== me.id ? `${esc(k.personName)} · ` : ""}since ${new Date(k.createdAt).toLocaleDateString()} · ${k.kind === "other" ? "they call attach_trace when they submit" : k.lastUsed ? `last upload ${ago(k.lastUsed)}` : "nothing uploaded yet"}</span></span><button class="ghost mini" data-tk-revoke="${esc(k.id)}">Turn off</button></div>`).join("");
   return `<h2>Session traces <small>optional</small></h2><p class="meta">${why}</p>
     ${rows}
-    <div class="row"><select id="tk-kind" title="The agent you run in this repository">${Object.entries(TRACE_AGENTS).map(([k, n]) => `<option value="${k}">${n}</option>`).join("")}</select><button class="ghost" id="tk-go">${keys.length ? "Turn on in another repository" : "Turn on"}</button></div>
-    <p class="meta">Another agent? Turn on any of these, then send its session log yourself with <span class="mono">node ~/.loom/trace-hook.mjs --project ${esc(project)} --file &lt;log&gt;</span>, or have it call the <span class="mono">attach_trace</span> tool. Loom reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
+    <div class="row"><select id="tk-kind" title="The agent you run in this repository">${Object.entries(TRACE_AGENTS).map(([k, n]) => `<option value="${k}">${n}</option>`).join("")}${keys.some((k) => k.kind === "other") ? "" : `<option value="other">Another agent</option>`}</select><button class="ghost" id="tk-go">${keys.length ? "Turn on in another repository" : "Turn on"}</button></div>
+    <p class="meta">For another agent, Loom asks your agents to upload their own session with the <span class="mono">attach_trace</span> tool when they submit a change. Loom reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
     <div id="tk-out"></div>`;
 }
 function wireTraceSection(redraw) {
@@ -1226,7 +1226,12 @@ function wireTraceSection(redraw) {
   if ($("#tk-go")) $("#tk-go").onclick = async () => {
     let k;
     const kind = $("#tk-kind").value;
-    try { k = await act("POST", "/trace-keys", { agent: TRACE_AGENTS[kind] }); } catch { return; }
+    if (kind === "other") {
+      try { await act("POST", "/trace-keys", { kind }); } catch { return; }
+      toast("Session traces on: your agents are asked to attach their traces when they submit");
+      return redraw();
+    }
+    try { k = await act("POST", "/trace-keys", { agent: TRACE_AGENTS[kind], kind }); } catch { return; }
     const cmd = traceInstall(k, kind);
     const hook = { "claude-code": `adds a <span class="mono">SessionEnd</span> hook to <span class="mono">.claude/settings.local.json</span>`, codex: `sets <span class="mono">notify</span> in <span class="mono">~/.codex/config.toml</span>, for sessions in this repository`, opencode: `adds a plugin in <span class="mono">~/.config/opencode/plugins</span>, for sessions in this repository` }[kind];
     $("#tk-out").innerHTML = `<div class="card fresh"><b>Run this in the root of your repository</b>
