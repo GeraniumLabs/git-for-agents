@@ -19,6 +19,12 @@ namespace = "loom"
 binding = "ARTIFACTS_EU"
 namespace = "loom-eu"
 
+# US FedRAMP residency works the same way (Enterprise accounts): create both
+# with jurisdiction "fedramp" first, then uncomment this and CONTEXT_FEDRAMP.
+# [[artifacts]]
+# binding = "ARTIFACTS_FEDRAMP"
+# namespace = "loom-fedramp"
+
 [[durable_objects.bindings]]
 name = "PROJECT"
 class_name = "ProjectCoordinator"
@@ -52,6 +58,11 @@ bucket_name = "loom-context"
 binding = "CONTEXT_EU"
 bucket_name = "loom-context-eu"
 jurisdiction = "eu"
+
+# [[r2_buckets]]
+# binding = "CONTEXT_FEDRAMP"
+# bucket_name = "loom-context-fedramp"
+# jurisdiction = "fedramp"
 
 # Artifacts event subscriptions: each workspace's pushes arrive here (src/events.ts).
 [[queues.consumers]]

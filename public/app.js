@@ -3,6 +3,8 @@
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+/** Durable Object location hints (src/residency.ts PLACEMENTS). */
+const PLACEMENTS = { wnam: "Western North America", enam: "Eastern North America", sam: "South America", weur: "Western Europe", eeur: "Eastern Europe", apac: "Asia-Pacific", oc: "Oceania", afr: "Africa", me: "the Middle East" };
 const PALETTE = ["#f38020", "#2b6cb0", "#2f8f5b", "#9f50c8", "#c53030", "#0f8b8d", "#b7791f", "#d53f8c"];
 
 let project = new URLSearchParams(location.search).get("project");
@@ -1351,7 +1353,9 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
-    ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
+    ${(auth.regions ?? []).length ? `<label>Where its data lives <select id="np-where"><option value="">Anywhere: Cloudflare keeps it where it serves it best</option>${(auth.regions ?? []).map((j) => `<option value="${j}">${j === "eu" ? "In the EU" : j === "fedramp" ? "In the US, FedRAMP data centers" : esc(j)}</option>`).join("")}</select></label>` : ""}
+    <label>Where its agents run <select id="np-place"><option value="">Wherever you are now</option>${Object.entries(PLACEMENTS).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select></label>
+    <p class="meta">The project's coordinator does its git work, so it should sit near the agents. Both choices are made once: a project can't move later.</p>
     <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
   wireBilling($("#detail-body"));
@@ -1423,7 +1427,7 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
       if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-where")?.value ? { jurisdiction: $("#np-where").value } : {}), ...($("#np-place")?.value ? { placement: $("#np-place").value } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;
@@ -1603,7 +1607,7 @@ async function showSettings() {
     <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Loom is its home: nothing is written back.</p>
     ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
     <h2>Where the data lives</h2>
-    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
+    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}

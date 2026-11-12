@@ -2,7 +2,7 @@ import { handleMcp, type Account } from "./mcp";
 import { agentNameOf, handleOAuth, mcpGrant, signInFirst } from "./oauth";
 import { USER_HEADER, githubGrant, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
-import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
+import { parseJurisdiction, parsePlacement, projectNamespace, type Jurisdiction } from "./residency";
 import { eventsEnabled, projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
@@ -149,10 +149,13 @@ async function createProject(env: Env, user: User | null, body: any): Promise<Re
   if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
   const jurisdiction = parseJurisdiction(env, body.jurisdiction);
   if (jurisdiction && typeof jurisdiction === "object") return Response.json({ error: jurisdiction.error }, { status: jurisdiction.status });
+  const placement = parsePlacement(body.placement);
+  if (placement && typeof placement === "object") return Response.json({ error: placement.error }, { status: placement.status });
   // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
   if ((await locate(env, body.name)).exists) return Response.json({ error: "project already exists" }, { status: 409 });
   const ns = projectNamespace(env, jurisdiction);
-  const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined, plan }) });
+  // A location hint counts only on the coordinator's first request, which is this one.
+  const res = await ns.get(ns.idFromName(body.name), placement ? { locationHint: placement } : undefined).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, placement, owner: user ?? undefined, plan }) });
   if (res.ok) {
     await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null, org: user ? org : null }) });
     located.set(body.name, jurisdiction);
@@ -213,6 +216,7 @@ export default {
         pushEvents: eventsEnabled(env),
         payments: billingOn(env),
         eu: !!(env.ARTIFACTS_EU && env.CONTEXT_EU),
+        fedramp: !!(env.ARTIFACTS_FEDRAMP && env.CONTEXT_FEDRAMP),
         owners: logins(env.LOOM_OWNERS).length,
         creators: logins(env.LOOM_CREATORS ?? "*").includes("*") ? "anyone signed in" : `${logins(env.LOOM_CREATORS).length} listed`,
       }, { headers: { "cache-control": "no-store" } });

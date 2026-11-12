@@ -67,6 +67,10 @@ export interface Env {
   /** Artifacts namespace names, as in wrangler.toml; push subscriptions name them. Default "loom" and "loom-eu". */
   ARTIFACTS_NAMESPACE?: string;
   ARTIFACTS_EU_NAMESPACE?: string;
+  /** US FedRAMP residency, the same way: an Artifacts namespace and an R2 bucket with jurisdiction "fedramp". Both or neither. */
+  ARTIFACTS_FEDRAMP?: Artifacts;
+  CONTEXT_FEDRAMP?: R2Bucket;
+  ARTIFACTS_FEDRAMP_NAMESPACE?: string;
   /** Artifacts push events: the queue they arrive on, and an API token (Queues Write) to subscribe each workspace. */
   CF_ACCOUNT_ID?: string;
   CF_EVENTS_TOKEN?: string;

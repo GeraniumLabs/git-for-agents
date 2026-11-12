@@ -7,7 +7,7 @@ import { DurableObject } from "cloudflare:workers";
 import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
 import { anyOverlap, matches, normalizePattern, overlaps as patternsOverlap } from "./paths";
 import { makeStore, type RepoStore } from "./store";
-import { contextBucket, artifactsNamespace, type Jurisdiction } from "./residency";
+import { contextBucket, artifactsNamespace, isJurisdiction, PLACEMENTS, type Jurisdiction, type Placement } from "./residency";
 import { subscribePushes, unsubscribe, type Push } from "./events";
 import type { Env } from "./env";
 import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge, type ProjectContext } from "./delegate";
@@ -437,9 +437,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!p) throw new HttpError(404, "project not found");
     return p;
   }
-  /** Where the project keeps its data: "eu", or null for anywhere. Set once, at init. */
+  /** Where the project keeps its data: "eu", "fedramp", or null for anywhere. Set once, at init. */
   private get jurisdiction(): Jurisdiction | null {
-    return this.meta("jurisdiction") === "eu" ? "eu" : null;
+    const j = this.meta("jurisdiction");
+    return isJurisdiction(j) ? j : null;
+  }
+  /** Where the coordinator was asked to start, or null for wherever the first request came from. Set once, at init. */
+  private get placement(): Placement | null {
+    const p = this.meta("placement");
+    return p && p in PLACEMENTS ? (p as Placement) : null;
   }
   private get store(): RepoStore {
     return (this.repos ??= makeStore(this.env, this.jurisdiction));
@@ -1163,7 +1169,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── project setup ────────────────────────────────────────────────────────
 
-  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; plan?: ProjectPlan; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; import?: ImportSource }) {
+  private async init(body: { name: string; description?: string; files?: unknown; requiredApprovals?: number; owner?: User; plan?: ProjectPlan; visibility?: string; checks?: { command?: string; timeoutSec?: number }; jurisdiction?: Jurisdiction | null; placement?: Placement | null; import?: ImportSource }) {
     if (this.meta("project")) throw new HttpError(409, "project already exists");
     const name = body.name;
     let from: string | null = null;
@@ -1175,7 +1181,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       }
     }
     // Before the first repo is made: the jurisdiction picks the Artifacts namespace and R2 bucket.
-    if (body.jurisdiction === "eu") this.setMeta("jurisdiction", "eu");
+    if (isJurisdiction(body.jurisdiction)) this.setMeta("jurisdiction", body.jurisdiction);
+    if (body.placement && body.placement in PLACEMENTS) this.setMeta("placement", body.placement);
     const repo = `${name}`;
     const created = await this.store.create(repo, body.description);
     // Main: the imported branch with its history, or a README.
@@ -4817,7 +4824,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -6479,7 +6486,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       agents, tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),

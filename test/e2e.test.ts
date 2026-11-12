@@ -412,6 +412,19 @@ test("a plain git push to a workspace updates its change, through Artifacts push
   assert.equal(events.filter((e: any) => e.type === "workspace.pushed").length, 1);
 });
 
+test("a project can ask for its coordinator near its agents, and FedRAMP only where the server has it", { skip: !url, timeout: 60_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-place");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await assert.rejects(admin.createProject({ name, placement: "moon" }), /400/);
+  // This server has no FedRAMP namespace and bucket, so it says it can't.
+  await assert.rejects(admin.createProject({ name, jurisdiction: "fedramp" }), /503/);
+  await admin.createProject({ name, description: "near agents in Asia", placement: "apac", requiredApprovals: 0 });
+  const p = (await admin.state()).project;
+  assert.equal(p.placement, "apac");
+  assert.equal(p.jurisdiction, null);
+});
+
 test("a project created in the EU says so, and its name can't be reused elsewhere", { skip: !url, timeout: 120_000 }, async () => {
   const { Loom } = await import("../demo/client.mjs");
   const name = project("e2e-eu");

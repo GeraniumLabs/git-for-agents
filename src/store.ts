@@ -143,15 +143,17 @@ export class ShimStore implements RepoStore {
 export interface StoreEnv {
   ARTIFACTS?: Artifacts;
   ARTIFACTS_EU?: Artifacts;
+  ARTIFACTS_FEDRAMP?: Artifacts;
   ARTIFACTS_SHIM_URL?: string;
 }
 
-/** The repos of a project, in the EU namespace when it keeps its data there. */
-export function makeStore(env: StoreEnv, jurisdiction: "eu" | null = null): RepoStore {
-  if (jurisdiction === "eu") {
-    if (env.ARTIFACTS_EU) return new ArtifactsStore(env.ARTIFACTS_EU);
+/** The repos of a project, in its jurisdiction's namespace when it keeps its data in one. */
+export function makeStore(env: StoreEnv, jurisdiction: "eu" | "fedramp" | null = null): RepoStore {
+  if (jurisdiction) {
+    const ns = jurisdiction === "eu" ? env.ARTIFACTS_EU : env.ARTIFACTS_FEDRAMP;
+    if (ns) return new ArtifactsStore(ns);
     if (env.ARTIFACTS_SHIM_URL) return new ShimStore(env.ARTIFACTS_SHIM_URL);
-    throw new Error("this project keeps its data in the EU, but the Worker has no ARTIFACTS_EU binding");
+    throw new Error(`this project keeps its data in a jurisdiction (${jurisdiction}), but the Worker has no ARTIFACTS_${jurisdiction.toUpperCase()} binding`);
   }
   if (env.ARTIFACTS) return new ArtifactsStore(env.ARTIFACTS);
   if (env.ARTIFACTS_SHIM_URL) return new ShimStore(env.ARTIFACTS_SHIM_URL);
