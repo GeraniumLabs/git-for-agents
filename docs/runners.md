@@ -19,7 +19,7 @@ The answer also carries `prompt`, a ready-made instruction for the agent you sta
 
 ## Session traces
 
-To keep each agent's session log with its changes, add [`recipes/trace-hook.mjs`](../recipes/trace-hook.mjs) as a Claude Code `SessionEnd` hook on the machine that runs agents. It uploads with the same `LOOM_URL`, `LOOM_PROJECT` and `LOOM_KEY`, and as the agent named in `LOOM_AGENT`, which `runner.mjs` sets for each agent it starts. See [Session traces](guide.md#session-traces-review-decisions-after-the-fact).
+To keep each agent's session log with its changes, add [`public/trace-hook.mjs`](../public/trace-hook.mjs) as a Claude Code `SessionEnd` hook on the machine that runs agents. It uploads with the same `LOOM_URL`, `LOOM_PROJECT` and `LOOM_KEY`, and as the agent named in `LOOM_AGENT`, which `runner.mjs` sets for each agent it starts. See [Session traces](guide.md#session-traces-review-decisions-after-the-fact).
 
 ## Webhooks
 

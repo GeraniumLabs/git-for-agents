@@ -98,6 +98,8 @@ export interface Agent {
   standin?: { id: string; name: string; scopes: Scope[] };
   /** Set when this agent works under another agent's key, by its own name. */
   under?: { id: string; name: string };
+  /** Set when the request came with a trace key: it can only upload session traces. */
+  traceKey?: string;
 }
 
 export interface LoomEvent {
@@ -286,6 +288,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS trace_keys (
+        id TEXT PRIMARY KEY, person TEXT NOT NULL, agent_name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
+        created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
       CREATE TABLE IF NOT EXISTS runner_hooks (
         id TEXT PRIMARY KEY, url TEXT NOT NULL, events TEXT NOT NULL, secret TEXT, auth TEXT, seen TEXT DEFAULT '[]', last_seq INTEGER DEFAULT 0,
         last_delivery TEXT, created_by TEXT, created_at INTEGER, revoked_at INTEGER);
@@ -554,7 +559,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (await sameSecret(key, this.env.LOOM_ADMIN_TOKEN)) return "admin";
     const hash = await sha256(key);
     const row = this.sql.exec("SELECT id, name, role, paused, identity, owner, joined_via FROM agents WHERE key_hash = ?", hash).toArray()[0];
-    if (!row) return this.standinFor(hash);
+    if (!row) return (await this.traceKeyFor(hash, req)) ?? this.standinFor(hash);
     const as = req.headers.get(AGENT_HEADER)?.trim();
     if (as && row.role !== "human" && as.toLowerCase() !== (row.name as string).toLowerCase()) return this.underKey(row, as);
     this.sql.exec("UPDATE agents SET last_seen = ? WHERE id = ?", Date.now(), row.id);
@@ -819,6 +824,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.actors.set(req, actor.id);
     const ownerOnly = (what: string) => { if (!actor.owner) throw new HttpError(403, `only the project's owners can ${what}`); };
 
+    // A trace key uploads session traces and nothing else.
+    if (actor.traceKey) {
+      if (!(a === "traces" && !b && m === "POST")) throw new HttpError(403, "a trace key can only upload session traces (POST /traces)");
+      return json(await this.uploadTrace(actor, req, rawUpload ? Object.fromEntries(url.searchParams) : body, rawUpload));
+    }
+
     // A stand-in reaches only what its person allowed, and never settings, people or keys.
     if (actor.standin) {
       const need = scopeFor(m, parts);
@@ -912,6 +923,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "intent" && m === "GET") {
       this.assertCanReadTraces(actor);
       return json(await this.changeIntent(Number(b)));
+    }
+    // Opt-in trace uploads: a person's key for the hook on their own machine.
+    if (a === "trace-keys" && !actor.standin) {
+      if (!b && m === "GET") return json(this.listTraceKeys(actor));
+      if (!b && m === "POST") return json(await this.createTraceKey(actor, body));
+      if (b && m === "DELETE") return json(this.revokeTraceKey(actor, b));
     }
     if (a === "traces" && m === "GET") {
       this.assertCanReadTraces(actor);
@@ -3004,6 +3021,54 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** Which agent action is a stand-in's, by request, so it can be put on record once it succeeds. */
   private standinActs = new WeakMap<Request, { id: string; name: string; person: string; action: string }>();
+
+  /**
+   * A trace key: a person's opt-in hook uploads their agent's sessions with it.
+   * It acts as that person's agent (by the key's agent name, or the hook's
+   * x-loom-agent) and can do nothing but upload traces.
+   */
+  private async traceKeyFor(hash: string, req: Request): Promise<Agent | null> {
+    const k = this.sql.exec("SELECT id, person, agent_name FROM trace_keys WHERE key_hash = ? AND revoked_at IS NULL", hash).toArray()[0];
+    if (!k) return null;
+    const p = this.sql.exec("SELECT id, name, role, paused, joined_via FROM agents WHERE id = ?", k.person).toArray()[0];
+    if (!p || p.role !== "human" || p.paused) throw new HttpError(401, "the person this trace key belongs to is no longer in the project");
+    this.sql.exec("UPDATE trace_keys SET last_used = ? WHERE id = ?", Date.now(), k.id);
+    const name = req.headers.get(AGENT_HEADER)?.trim() || (k.agent_name as string);
+    const agent = await this.underKey({ ...p, role: "builder" }, name);
+    return { ...agent, traceKey: k.id as string };
+  }
+
+  private traceKeyView(r: any) {
+    return { id: r.id, agent: r.agent_name, person: r.person, personName: this.agentName(r.person), createdAt: r.created_at, lastUsed: r.last_used ?? null };
+  }
+
+  private listTraceKeys(actor: Agent) {
+    const rows = actor.owner
+      ? this.sql.exec("SELECT * FROM trace_keys WHERE revoked_at IS NULL ORDER BY created_at").toArray()
+      : this.sql.exec("SELECT * FROM trace_keys WHERE revoked_at IS NULL AND person = ? ORDER BY created_at", actor.id).toArray();
+    return rows.map((r) => this.traceKeyView(r));
+  }
+
+  private async createTraceKey(actor: Agent, body: { agent?: unknown }) {
+    if (actor.id === "admin" || actor.role !== "human") throw new HttpError(403, "trace keys are for the project's people; agents with a key upload traces with it");
+    const agent = typeof body.agent === "string" && body.agent.trim() ? body.agent.trim() : "Claude Code";
+    if (agent.length > 40) throw new HttpError(400, "an agent name is 40 characters at most");
+    if ((this.sql.exec("SELECT COUNT(*) AS n FROM trace_keys WHERE person = ? AND revoked_at IS NULL", actor.id).one().n as number) >= 10) throw new HttpError(429, "you have 10 trace keys; revoke one first");
+    const id = `tk_${randomId(6)}`;
+    const key = `loomtrace_${randomId(20)}`;
+    this.sql.exec("INSERT INTO trace_keys (id, person, agent_name, key_hash, created_at) VALUES (?, ?, ?, ?, ?)", id, actor.id, agent, await sha256(key), Date.now());
+    this.emit("trace_key.created", { actor: actor.id, data: { id, agent } });
+    return { ...this.traceKeyView(this.sql.exec("SELECT * FROM trace_keys WHERE id = ?", id).one()), key };
+  }
+
+  private revokeTraceKey(actor: Agent, id: string) {
+    const r = this.sql.exec("SELECT * FROM trace_keys WHERE id = ? AND revoked_at IS NULL", id).toArray()[0];
+    if (!r) throw new HttpError(404, `no trace key ${id}`);
+    if (r.person !== actor.id && !actor.owner) throw new HttpError(403, "only its person or an owner can revoke a trace key");
+    this.sql.exec("UPDATE trace_keys SET revoked_at = ? WHERE id = ?", Date.now(), id);
+    this.emit("trace_key.revoked", { actor: actor.id, data: { id } });
+    return { ok: true, id };
+  }
 
   private standinFor(hash: string): Agent {
     const s = this.sql.exec("SELECT id, name, person, scopes FROM standins WHERE key_hash = ? AND revoked_at IS NULL", hash).toArray()[0];
