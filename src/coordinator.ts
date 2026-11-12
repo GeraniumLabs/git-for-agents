@@ -170,6 +170,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE traces ADD COLUMN removed_at INTEGER",
       "ALTER TABLE traces ADD COLUMN removed_by TEXT",
       "ALTER TABLE traces ADD COLUMN removed_reason TEXT",
+      // Which agent a trace key is for; "other" has no key and asks the person's agents to attach_trace themselves.
+      "ALTER TABLE trace_keys ADD COLUMN kind TEXT",
       "ALTER TABLE threads ADD COLUMN terms TEXT",
       "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
@@ -1630,7 +1632,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const contest = this.openContest(body.taskId);
     if (contest) this.contestEntered(contest.id as number);
     // Who already knows this code, so the author can ask them to review it.
-    return { ...this.change(id), suggestedReviewers: status === "review" ? await this.rankedCandidates(id, 3) : [] };
+    const traceAsk = this.traceAsk(actor, id);
+    return { ...this.change(id), suggestedReviewers: status === "review" ? await this.rankedCandidates(id, 3) : [], ...(traceAsk ? { traceAsk } : {}) };
   }
 
   private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }, via: "push" | null = null) {
@@ -3039,7 +3042,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private traceKeyView(r: any) {
-    return { id: r.id, agent: r.agent_name, person: r.person, personName: this.agentName(r.person), createdAt: r.created_at, lastUsed: r.last_used ?? null };
+    return { id: r.id, kind: r.kind ?? "claude-code", agent: r.agent_name, person: r.person, personName: this.agentName(r.person), createdAt: r.created_at, lastUsed: r.last_used ?? null };
   }
 
   private listTraceKeys(actor: Agent) {
@@ -3049,16 +3052,31 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return rows.map((r) => this.traceKeyView(r));
   }
 
-  private async createTraceKey(actor: Agent, body: { agent?: unknown }) {
+  private async createTraceKey(actor: Agent, body: { agent?: unknown; kind?: unknown }) {
     if (actor.id === "admin" || actor.role !== "human") throw new HttpError(403, "trace keys are for the project's people; agents with a key upload traces with it");
-    const agent = typeof body.agent === "string" && body.agent.trim() ? body.agent.trim() : "Claude Code";
+    const kind = typeof body.kind === "string" ? body.kind : "claude-code";
+    if (!["claude-code", "codex", "opencode", "other"].includes(kind)) throw new HttpError(400, "kind is claude-code, codex, opencode or other");
+    const agent = typeof body.agent === "string" && body.agent.trim() ? body.agent.trim() : ({ "claude-code": "Claude Code", codex: "Codex", opencode: "OpenCode", other: "your agents" } as Record<string, string>)[kind];
     if (agent.length > 40) throw new HttpError(400, "an agent name is 40 characters at most");
     if ((this.sql.exec("SELECT COUNT(*) AS n FROM trace_keys WHERE person = ? AND revoked_at IS NULL", actor.id).one().n as number) >= 10) throw new HttpError(429, "you have 10 trace keys; revoke one first");
     const id = `tk_${randomId(6)}`;
-    const key = `loomtrace_${randomId(20)}`;
-    this.sql.exec("INSERT INTO trace_keys (id, person, agent_name, key_hash, created_at) VALUES (?, ?, ?, ?, ?)", id, actor.id, agent, await sha256(key), Date.now());
-    this.emit("trace_key.created", { actor: actor.id, data: { id, agent } });
-    return { ...this.traceKeyView(this.sql.exec("SELECT * FROM trace_keys WHERE id = ?", id).one()), key };
+    // "other": no hook to give a key to; Loom asks the person's agents to upload their own sessions instead.
+    const key = kind === "other" ? null : `loomtrace_${randomId(20)}`;
+    if (kind === "other" && this.asksForTraces(actor.id)) throw new HttpError(409, "your agents are already asked to attach their traces");
+    this.sql.exec("INSERT INTO trace_keys (id, person, agent_name, key_hash, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)", id, actor.id, agent, await sha256(key ?? `unused_${randomId(20)}`), Date.now(), kind);
+    this.emit("trace_key.created", { actor: actor.id, data: { id, agent, kind } });
+    return { ...this.traceKeyView(this.sql.exec("SELECT * FROM trace_keys WHERE id = ?", id).one()), ...(key ? { key } : {}) };
+  }
+
+  /** Whether a person asked their agents to upload their own session traces (an agent with no hook Loom can install). */
+  private asksForTraces(person: string | undefined): boolean {
+    return !!person && !!this.sql.exec("SELECT 1 FROM trace_keys WHERE person = ? AND kind = 'other' AND revoked_at IS NULL LIMIT 1", person).toArray().length;
+  }
+  /** What to tell an agent whose person asked for traces, about a change of its own. */
+  private traceAsk(actor: Agent, changeId: number): string | null {
+    if (actor.traceKey || !this.asksForTraces(actor.under?.id)) return null;
+    if (this.sql.exec(`SELECT 1 FROM traces WHERE ${LIVE_TRACE} AND agent_id = ? AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) LIMIT 1`, actor.id, changeId, changeId).toArray().length) return null;
+    return `${this.agentName(actor.under!.id)} turned on session traces: call attach_trace with your session log (the transcript of this session: what you were asked, read, thought and did) and change ${changeId}, so reviewers can check your intent. Upload it again with the same session id when you change it.`;
   }
 
   private revokeTraceKey(actor: Agent, id: string) {
@@ -4807,6 +4825,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...tasks.filter((t) => t.status === "open").map((t) => `Task #${t.id} "${t.title}" was assigned to you: claim_task it to get its workspace, then work on it`),
       ...tasks.filter((t) => t.status !== "open" && !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
       ...this.contestsToVote(actor).map((c) => `Contest #${c.id} "${c.title}" has ${c.ready} attempts in: compare_attempts, then vote`),
+      ...changes.map((c) => this.traceAsk(actor, c.id as number)).filter((t): t is string => !!t).slice(0, 1),
     ];
     const reviewTasks = this.reviewTasks(actor.id);
     const untaken = reviewTasks.filter((t) => t.status === "open");
@@ -5016,10 +5035,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** The changes an agent had open during a session: the ones it touched between the session's first and last step. */
-  private changesDuring(agentId: string, from: number | null, to: number | null): number[] {
+  private changesDuring(agentId: string, from: number | null, to: number | null, person?: string): number[] {
     if (from === null || to === null) return [];
     const slack = 10 * 60_000;
-    return this.sql.exec("SELECT id FROM changes WHERE agent_id = ? AND created_at <= ? AND updated_at >= ? ORDER BY id", agentId, to + slack, from - slack).toArray().map((r) => r.id as number);
+    // A person's trace key may name their agent differently from how the agent's
+    // MCP client named itself, so it links to the changes of any of their own agents.
+    const who = person ? "(agent_id = ? OR agent_id IN (SELECT id FROM agents WHERE via = ?))" : "agent_id = ?";
+    return this.sql.exec(`SELECT id FROM changes WHERE ${who} AND created_at <= ? AND updated_at >= ? ORDER BY id`, ...(person ? [agentId, person] : [agentId]), to + slack, from - slack).toArray().map((r) => r.id as number);
   }
 
   /**
@@ -5080,7 +5102,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       links = [changeId];
     } else {
       if (taskId !== null) this.task(taskId);
-      links = this.changesDuring(actor.id, parsed.startedAt, parsed.endedAt);
+      links = this.changesDuring(actor.id, parsed.startedAt, parsed.endedAt, actor.traceKey ? actor.under?.id : undefined);
       if (taskId !== null) links = links.filter((id) => (this.change(id).task_id as number) === taskId);
       changeId = links.length ? links[links.length - 1] : null;
       if (changeId !== null && taskId === null) taskId = this.change(changeId).task_id as number;

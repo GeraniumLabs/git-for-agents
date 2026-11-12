@@ -1033,7 +1033,7 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
   assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
   await assert.rejects(tool("loom_status"), /say which project/);
   const task = await tool("create_task", { project: name, title: "Write a hello file" });
-  await tool("claim_task", { project: name, taskId: task.id });
+  const claimed = await tool("claim_task", { project: name, taskId: task.id });
   const who = await tool("whoami", { project: name });
   assert.equal(who.agent.name, "Claude Code");
   assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
@@ -1044,6 +1044,21 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
 
   // The project's own URL works with the same sign-in, and a project they aren't in refuses.
   assert.equal((await tool("whoami", {}, `/mcp/${name}`)).agent.name, "Claude Code");
+
+  // Session traces for an agent Loom has no hook for: the person turns them on, and Loom asks their agent to attach its own.
+  const person = (m: string, p: string, b?: unknown) => fetch(`${url}/api/projects/${name}${p}`, { method: m, headers: { cookie, "content-type": "application/json" }, body: b ? JSON.stringify(b) : undefined }).then((r) => r.json());
+  const ws = claimed.workspace.name;
+  await tool("write_files", { project: name, workspace: ws, files: { "hello.txt": "hello\n" }, message: "hello" });
+  const before = await tool("submit_change", { project: name, taskId: task.id, summary: "hello file" });
+  assert.equal(before.traceAsk, undefined, "nothing asked until the person turns traces on");
+  const asked = await person("POST", "/trace-keys", { kind: "other" });
+  assert.equal(asked.kind, "other");
+  assert.equal(asked.key, undefined, "no key: the agent uploads with its own sign-in");
+  const todo = (await tool("whoami", { project: name })).todo as string[];
+  assert.ok(todo.some((t) => t.includes("attach_trace") && t.includes(`change ${before.id}`)), "whoami asks for the trace");
+  await tool("attach_trace", { project: name, text: "made hello.txt", session: "s-1", change: before.id });
+  assert.ok(!((await tool("whoami", { project: name })).todo as string[]).some((t) => t.includes("attach_trace")), "and stops once it's there");
+  await person("DELETE", `/trace-keys/${asked.id}`);
   const other = project("e2e-mcp-other");
   const admin = new (await import("../demo/client.mjs")).Loom(url, other, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name: other, description: "not theirs" });
@@ -1301,5 +1316,64 @@ test("session traces are opt-in: a person's trace key installs the hook, uploads
 
   await run("node", [join(home, ".loom/trace-hook.mjs"), "--uninstall", name], { env: henv, cwd: repo });
   assert.equal(JSON.parse(readFileSync(join(repo, ".claude/settings.local.json"), "utf8")).hooks, undefined);
+  assert.ok(!existsSync(join(home, ".loom/traces", `${name}.json`)));
+
+  // Codex: notify after each turn; the session uploads once it has been idle.
+  const cx = await jo.req("POST", "/trace-keys", { agent: "Codex" });
+  const ienv = { ...henv, LOOM_TRACE_IDLE_SECONDS: "1" };
+  const { mkdirSync } = await import("node:fs");
+  mkdirSync(join(home, ".codex"), { recursive: true });
+  writeFileSync(join(home, ".codex/config.toml"), 'model = "gpt-6-codex"\n\n[tui]\nnotifications = true\n');
+  await run("node", [script, "--install", url!, name, cx.key, "--for", "codex"], { env: ienv, cwd: repo });
+  const toml = readFileSync(join(home, ".codex/config.toml"), "utf8");
+  assert.match(toml.split("\n")[0], /^notify = \["node", ".*trace-hook\.mjs", "--codex-notify"\]/, "notify goes at the top level");
+  assert.match(toml, /\[tui\]\nnotifications = true/, "the rest of the config stays");
+  mkdirSync(join(home, ".codex/sessions/2026/11/12"), { recursive: true });
+  const thread = "0193-thread-abc";
+  writeFileSync(join(home, `.codex/sessions/2026/11/12/rollout-2026-11-12T03-00-00-${thread}.jsonl`), [
+    { timestamp: new Date().toISOString(), type: "session_meta", payload: { id: thread, cwd: repo } },
+    { timestamp: new Date().toISOString(), type: "response_item", payload: { type: "message", role: "user", content: [{ type: "input_text", text: "fix the flaky test" }] } },
+  ].map((l) => JSON.stringify(l)).join("\n") + "\n");
+  const notify = JSON.stringify({ type: "agent-turn-complete", "thread-id": thread, "turn-id": "1", cwd: join(repo, "src"), "input-messages": [], "last-assistant-message": "done" });
+  await run("node", [join(home, ".loom/trace-hook.mjs"), "--codex-notify", notify], { env: ienv, cwd: repo });
+  const elsewhere = JSON.stringify({ type: "agent-turn-complete", "thread-id": "other", cwd: tmpdir() });
+  await run("node", [join(home, ".loom/trace-hook.mjs"), "--codex-notify", elsewhere], { env: ienv, cwd: tmpdir() });
+  let cxTrace: any;
+  for (let i = 0; i < 40 && !cxTrace; i++) {
+    await new Promise((r) => setTimeout(r, 250));
+    cxTrace = (await jo.req("GET", "/traces")).traces.find((t: any) => t.source === "codex");
+  }
+  assert.ok(cxTrace, "the Codex session uploaded after going idle");
+  assert.equal(cxTrace.sessionId, thread);
+  assert.equal(cxTrace.agentName, "Codex");
+  assert.equal(cxTrace.runner, "codex notify");
+
+  // OpenCode: a plugin that reads the session through OpenCode's client once it's idle.
+  const oc = await jo.req("POST", "/trace-keys", { agent: "OpenCode" });
+  await run("node", [script, "--install", url!, name, oc.key, "--for", "opencode"], { env: ienv, cwd: repo });
+  const plugin = join(home, ".config/opencode/plugins/loom-trace.js");
+  assert.ok(existsSync(plugin));
+  const session = { info: { id: "ses_9" }, messages: [{ info: { id: "m1", sessionID: "ses_9", role: "user", time: { created: Date.now() } }, parts: [{ type: "text", text: "Trim titles" }] }] };
+  const client = { session: { get: async () => ({ data: session.info }), messages: async () => ({ data: session.messages }) } };
+  const saved = process.env.HOME, idle = process.env.LOOM_TRACE_IDLE_SECONDS;
+  process.env.HOME = home; process.env.LOOM_TRACE_IDLE_SECONDS = "0";
+  try {
+    const { LoomTrace } = await import(`${plugin}?t=${Date.now()}`);
+    const hooks = await LoomTrace({ client, directory: repo });
+    await hooks.event({ event: { type: "session.idle", properties: { sessionID: "ses_9" } } });
+    let ocTrace: any;
+    for (let i = 0; i < 40 && !ocTrace; i++) {
+      await new Promise((r) => setTimeout(r, 250));
+      ocTrace = (await jo.req("GET", "/traces")).traces.find((t: any) => t.source === "opencode");
+    }
+    assert.ok(ocTrace, "the OpenCode session uploaded");
+    assert.equal(ocTrace.sessionId, "ses_9");
+    assert.equal(ocTrace.agentName, "OpenCode");
+    assert.equal(ocTrace.stepCount ?? ocTrace.steps, 1);
+  } finally { process.env.HOME = saved; if (idle === undefined) delete process.env.LOOM_TRACE_IDLE_SECONDS; else process.env.LOOM_TRACE_IDLE_SECONDS = idle; }
+
+  await run("node", [join(home, ".loom/trace-hook.mjs"), "--uninstall", name], { env: ienv, cwd: repo });
+  assert.ok(!readFileSync(join(home, ".codex/config.toml"), "utf8").includes("trace-hook"), "Codex's notify is taken out");
+  assert.ok(!existsSync(plugin), "the OpenCode plugin is removed");
   assert.ok(!existsSync(join(home, ".loom/traces", `${name}.json`)));
 });

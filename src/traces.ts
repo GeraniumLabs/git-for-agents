@@ -8,16 +8,16 @@
 // The redacted log itself goes to R2, so nothing in it is lost.
 //
 // Formats read: Claude Code transcripts and Codex session logs (one JSON
-// object per line), and OpenTelemetry spans that follow the GenAI
-// conventions. Anything else is kept as plain text, with no steps.
+// object per line), OpenCode sessions (one document, as `opencode export`
+// prints it), and OpenTelemetry spans that follow the GenAI conventions. Anything else is kept as plain text, with no steps.
 
 import { billingOn } from "./billing";
 import type { Env } from "./env";
 
 export const MAX_TRACE_BYTES = 25 * 1024 * 1024;
 
-export type TraceSource = "claude-code" | "codex" | "otel" | "text";
-export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "otel", "text"];
+export type TraceSource = "claude-code" | "codex" | "opencode" | "otel" | "text";
+export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "opencode", "otel", "text"];
 
 export type StepKind = "prompt" | "context" | "thought" | "message" | "tool_call" | "tool_result" | "error";
 
@@ -174,6 +174,8 @@ const jsonLines = (text: string): any[] => {
 export function detectSource(text: string): TraceSource {
   const head = text.slice(0, 20_000).trimStart();
   if (head.startsWith("{") && /"resourceSpans"\s*:/.test(head)) return "otel";
+  // OpenCode: one JSON document, the shape of `opencode export` ({info, messages: [{info, parts}]}).
+  if (head.startsWith("{") && /"messages"\s*:/.test(head) && /"parts"\s*:/.test(head) && /"sessionID"\s*:/.test(head)) return "opencode";
   // Whole lines, not the first 20 KB: a real transcript's first prompt line
   // often carries a long system context and runs well past that.
   const lines: any[] = [];
@@ -209,7 +211,7 @@ export function filesOf(args: any): string[] {
     return [...out];
   }
   if (!args || typeof args !== "object") return [];
-  add(args.file_path); add(args.path); add(args.notebook_path);
+  add(args.file_path); add(args.filePath); add(args.path); add(args.notebook_path);
   if (Array.isArray(args.paths)) args.paths.forEach(add);
   const files = args.files;
   if (Array.isArray(files)) files.forEach((f: any) => add(typeof f === "string" ? f : f?.path));
@@ -363,6 +365,61 @@ function parseCodex(text: string, keepThoughts: boolean): ParsedTrace {
   return b.done("codex");
 }
 
+/**
+ * OpenCode: a session as `opencode export` prints it, or as Loom's plugin sends
+ * it: {info: Session, messages: [{info: Message, parts: Part[]}]}. Its MCP tools
+ * are named <server>_<tool>, so Loom's are loom_<tool>.
+ */
+function parseOpenCode(text: string, keepThoughts: boolean): ParsedTrace {
+  const b = new Builder(keepThoughts);
+  let doc: any;
+  try { doc = JSON.parse(text); } catch {
+    // Only the start of a log (Loom reads one to find its session): no steps, just the id.
+    b.sessionId = (text.match(/^\s*\{\s*"info"\s*:\s*\{\s*"id"\s*:\s*"([^"]+)"/) ?? text.match(/"sessionID"\s*:\s*"([^"]+)"/))?.[1] ?? null;
+    return b.done("opencode");
+  }
+  const messages: any[] = Array.isArray(doc?.messages) ? doc.messages : Array.isArray(doc) ? doc : [];
+  b.sessionId = doc?.info?.id ?? messages[0]?.info?.sessionID ?? null;
+  const loomOf = (tool: string, args: any) => loomCallOf(tool, args) ?? (/^loom_/i.test(tool) ? tool.replace(/^loom_/i, "") : undefined);
+  let cost = 0, costed = false;
+  for (const m of messages) {
+    const info = m?.info ?? {};
+    const user = info.role === "user";
+    const model = !user && typeof info.modelID === "string" ? info.modelID : undefined;
+    if (model) b.models.add(model);
+    const ts = time(info.time?.created);
+    b.seen(time(info.time?.completed));
+    if (!user && info.tokens) {
+      b.tokensIn += (info.tokens.input ?? 0) + (info.tokens.cache?.read ?? 0) + (info.tokens.cache?.write ?? 0);
+      b.tokensOut += (info.tokens.output ?? 0) + (info.tokens.reasoning ?? 0);
+    }
+    if (!user && typeof info.cost === "number") { cost += info.cost; costed = true; }
+    for (const part of Array.isArray(m?.parts) ? m.parts : []) {
+      const pts = time(part?.time?.start) ?? ts;
+      if (part?.type === "text") {
+        if (part.ignored) continue;
+        if (user) {
+          const p = promptOf(asText(part.text), !!part.synthetic);
+          b.add({ ts: pts, kind: p.kind, preview: p.text });
+        } else b.add({ ts: pts, kind: "message", preview: asText(part.text), model });
+      } else if (part?.type === "reasoning") {
+        b.add({ ts: pts, kind: "thought", preview: asText(part.text) || "[reasoning]", model });
+      } else if (part?.type === "tool") {
+        const name = String(part.tool ?? "tool");
+        const st = part.state ?? {};
+        const args = st.input ?? {};
+        b.add({ ts: time(st.time?.start) ?? pts, kind: "tool_call", tool: name, loomCall: loomOf(name, args), preview: asText(args), files: filesOf(args), model });
+        if (st.status === "completed") b.add({ ts: time(st.time?.end) ?? pts, kind: "tool_result", tool: name, loomCall: loomOf(name, null), preview: asText(st.output) });
+        else if (st.status === "error") b.add({ ts: time(st.time?.end) ?? pts, kind: "error", tool: name, loomCall: loomOf(name, null), preview: asText(st.error), error: true });
+      } else if (part?.type === "patch" && Array.isArray(part.files)) {
+        b.add({ ts: pts, kind: "tool_call", tool: "patch", preview: part.files.join(", "), files: part.files.filter((f: unknown) => typeof f === "string"), model });
+      }
+    }
+  }
+  if (costed) b.cost = cost;
+  return b.done("opencode");
+}
+
 function parseOtel(text: string, keepThoughts: boolean): ParsedTrace {
   const b = new Builder(keepThoughts);
   let doc: any;
@@ -408,15 +465,24 @@ function parseText(text: string): ParsedTrace {
 export function parseTrace(text: string, source: TraceSource = detectSource(text), keepThoughts = true): ParsedTrace {
   if (source === "claude-code") return parseClaudeCode(text, keepThoughts);
   if (source === "codex") return parseCodex(text, keepThoughts);
+  if (source === "opencode") return parseOpenCode(text, keepThoughts);
   if (source === "otel") return parseOtel(text, keepThoughts);
   return parseText(text);
 }
 
 /**
  * Take the model's own reasoning out of the stored log too, when a project
- * keeps no thoughts: thinking blocks from Claude Code, reasoning items from Codex.
+ * keeps no thoughts: thinking blocks from Claude Code, reasoning items from
+ * Codex, reasoning parts from OpenCode.
  */
 export function dropThoughts(text: string, source: TraceSource): string {
+  if (source === "opencode") {
+    try {
+      const doc = JSON.parse(text);
+      for (const m of Array.isArray(doc?.messages) ? doc.messages : []) if (Array.isArray(m?.parts)) m.parts = m.parts.filter((p: any) => p?.type !== "reasoning");
+      return JSON.stringify(doc);
+    } catch { return text; }
+  }
   if (source !== "claude-code" && source !== "codex") return text;
   return text.split("\n").flatMap((line) => {
     const t = line.trim();
@@ -498,7 +564,7 @@ export interface Intent {
   acts: IntentAct[];
 }
 
-const EDIT_TOOLS = /^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|str_replace_based_edit_tool|edit_file|write_file|create_file)$/i;
+const EDIT_TOOLS = /^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|patch|str_replace_based_edit_tool|edit_file|write_file|create_file)$/i;
 const SHELL_TOOLS = /^(Bash|shell|local_shell|exec_command|run_terminal_cmd|terminal)$/i;
 /** Commands whose effects outlive the session: what a reviewer needs to see the agent chose. */
 const WEIGHTY = /\bgit\s+(push|commit|merge|rebase|reset|revert|tag|cherry-pick)\b|\bwrangler\s+(deploy|delete|secret|r2|d1)\b|\bnpm\s+publish\b|\brm\s+-[a-z]*r[a-z]*f?\b|\bcurl\b[^\n]*-X\s*(POST|PUT|PATCH|DELETE)\b|\bgh\s+(pr|release|repo)\b|\bkubectl\s+(apply|delete)\b|\bterraform\s+(apply|destroy)\b|\bdocker\s+push\b|\bpsql\b|\bDROP\s+TABLE\b/i;
