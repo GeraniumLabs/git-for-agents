@@ -1553,7 +1553,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = this.fileWrites(body.files);
     this.assertInScope(actor, Object.keys(files), "write");
     const remote = this.remote(name, await this.token(name, "write"));
-    const w = await Workspace.open(remote);
+    const w = await Workspace.open(remote, "main", this.seed());
     const parent = await w.head();
     const task = ws.task_id ? this.sql.exec("SELECT title FROM tasks WHERE id = ?", ws.task_id).toArray()[0] : null;
     const message = body.message?.trim() || (task ? `${task.title} (task #${ws.task_id})` : `Update ${Object.keys(files).slice(0, 3).join(", ")}${Object.keys(files).length > 3 ? ` and ${Object.keys(files).length - 3} more` : ""}`);
@@ -1630,7 +1630,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const landedChange = q.get("change") ? this.change(Number(q.get("change"))) : null;
     const merged = landedChange?.status === "merged" && landedChange.merged_commit ? landedChange : null;
     if (merged) repo = this.mainRepo;
-    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
     let head = await w.head();
     if (!head) return { repo, commits: [] };
     let mainHead: string | null = null;
@@ -1665,7 +1665,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** The files of main, a workspace or a change as a zip. */
   private async archive(q: URLSearchParams) {
     const { repo, label, at } = this.repoFor({ workspace: q.get("workspace"), change: q.get("change") });
-    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
     const flat = await w.flatten(at ?? (await w.head()));
     const files: { path: string; data: Uint8Array }[] = [];
     let size = 0;
@@ -1684,7 +1684,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const path = q.get("path");
     if (path && at) {
       // A landed change: read the file as main had it at that commit.
-      const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+      const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
       const e = (await w.flatten(at)).get(path);
       if (!e) throw new HttpError(404, `${path} not found at ${ref}`);
       return { repo, ref, path, content: await w.readText(e.oid) };
@@ -1694,7 +1694,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (content === null) throw new HttpError(404, `${path} not found at ${ref}`);
       return { repo, ref, path, content };
     }
-    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")));
+    const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
     const flat = await w.flatten(at ?? (await w.head()));
     return { repo, ref, files: [...flat.keys()].sort() };
   }
@@ -1751,7 +1751,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!owner) return { change: null };
     let message = "";
     try {
-      const w = await Workspace.open(this.remote(ws.name, await this.token(ws.name, "read")));
+      const w = await Workspace.open(this.remote(ws.name, await this.token(ws.name, "read")), "main", this.seed());
       message = (await w.log(p.after, 1))[0]?.message ?? "";
     } catch (e) {
       console.error("reading the pushed commit", ws.name, e);
@@ -1922,7 +1922,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** Head, merge base, changed files and patch of a workspace against main. */
   private async analyze(wsName: string) {
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const main = (await w.head())!;
     const head = await w.fetchFrom("ws", this.remote(wsName, await this.token(wsName, "read")));
     const base = (await w.mergeBase(main, head)) ?? main;
@@ -1935,6 +1935,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = diffFlat(B, H);
     let patch = "";
     const symbols: Record<string, string[]> = {};
+    let symbolBudget = 256 * 1024;
     // Both sides of every changed file, kept per head so a reviewer can see
     // what changed since they last looked.
     const snapshot: Snapshot = { before: {}, after: {} };
@@ -1944,8 +1945,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       patch += unifiedDiff(f.path, a, b);
       snapshot.before[f.path] = a;
       snapshot.after[f.path] = b;
-      const names = symbolsTouched(a, b);
-      if (names.length) symbols[f.path] = names;
+      // Symbols feed reviewer routing; a change to thousands of files keeps the first ones (a SQLite value tops out at 2 MB).
+      if (symbolBudget > 0) {
+        const names = symbolsTouched(a, b);
+        if (names.length) { symbols[f.path] = names; symbolBudget -= f.path.length + names.join().length + 8; }
+      }
     }
     return { head, base, files, patch, symbols, snapshot };
   }
@@ -2476,7 +2480,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     let w: Workspace, mainW: Remote, main: string;
     try {
       mainW = await this.mainRemote("write");
-      w = await Workspace.open(mainW);
+      w = await this.openMain("write", mainW);
       main = (await w.head())!;
     } catch (e: any) {
       return this.retryMerge(ids, e);
@@ -2962,7 +2966,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (ch.head !== head || !this.checks) return;
     const runs = this.sql.exec("SELECT r.id, e.name, e.command FROM eval_runs r JOIN evals e ON e.name = r.eval WHERE r.change_id = ? AND r.head = ? AND e.kind = 'command' AND r.status = 'pending'", id, head).toArray() as any[];
     if (!runs.length) return;
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const main = (await w.head())!;
     const fetched = await w.fetchFrom("ws", this.remote(ch.workspace, await this.token(ch.workspace, "read")));
     const merged = await w.isAncestor(main, fetched) ? null : await w.merge(main, fetched);
@@ -3042,7 +3046,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const key = `${this.project}/codemap/${head || "empty"}.json.gz`;
       const saved = await this.context.get(key);
       if (saved) return JSON.parse(await gunzip(new Uint8Array(await saved.arrayBuffer()))) as CodeMap;
-      const w = await Workspace.open(await this.mainRemote("read"));
+      const w = await this.openMain("read");
       const at = await w.head();
       const files: { path: string; text: string }[] = [];
       let skipped = 0;
@@ -3134,7 +3138,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const settings = this.previewSettings;
     if (!settings || ch.head !== head) return;
     const started = Date.now();
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const commit = await this.landingCommit(w, ch);
     const flat = await w.flatten(commit);
     let files = new Map<string, Uint8Array>();
@@ -3191,6 +3195,26 @@ export class ProjectCoordinator extends DurableObject<Env> {
     });
   }
 
+  // ── main's objects, kept between operations ──
+
+  private mainSeed: Workspace | null = null;
+
+  /** Main's last objects to start from, unless they've piled up past a few hundred files. */
+  private seed(): Workspace | null {
+    return this.mainSeed && this.mainSeed.objectFiles() < 400 ? this.mainSeed : null;
+  }
+
+  /**
+   * A workspace on main. Each operation gets its own (refs are per
+   * operation), but it starts from the objects the last one fetched, so only
+   * what changed since comes over the network.
+   */
+  private async openMain(mode: "read" | "write", remote?: Remote): Promise<Workspace> {
+    const w = await Workspace.open(remote ?? (await this.mainRemote(mode)), "main", this.seed());
+    this.mainSeed = w;
+    return w;
+  }
+
   // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──
 
   /** What main was just before a change landed. Older changes didn't record it: the merge commit's first parent, or the change landed before it. */
@@ -3213,7 +3237,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const open = this.sql.exec("SELECT t.id, c.id AS change FROM tasks t LEFT JOIN changes c ON c.task_id = t.id AND c.status NOT IN ('abandoned','closed') WHERE t.reverts = ? AND t.status NOT IN ('closed','abandoned')", id).toArray()[0];
     if (open) throw new HttpError(409, open.change ? `change #${open.change} already reverts #${id}` : `task #${open.id} already reverts #${id}`);
     const reason = String(body?.reason ?? "").trim();
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const main = (await w.head())!;
     const before = await this.mergedBefore(w, ch);
     const trial = await w.revert(ch.merged_commit as string, before, main);
@@ -3279,7 +3303,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private async runBisect(id: number, actor: Agent, command: string | null, goodChange: number | null) {
     const history = this.landedHistory();
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const main = (await w.head())!;
     // The point before the first landed change, so a project broken by its first change still finds it.
     const first = history[0] ? this.change(history[0].change) : null;
@@ -3450,7 +3474,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (task.assignee !== actor.id && actor.id !== "admin") throw new HttpError(403, `task ${taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name})`);
     if (!this.checks) throw new HttpError(409, "this project has no check command; an owner sets one in Settings");
     if (!task.workspace) throw new HttpError(409, `task ${taskId} has no workspace yet; claim it first`);
-    const w = await Workspace.open(await this.mainRemote("read"));
+    const w = await this.openMain("read");
     const main = (await w.head())!;
     const head = await w.fetchFrom("ws", this.remote(task.workspace as string, await this.token(task.workspace as string, "read")));
     const merged = await w.isAncestor(main, head) ? null : await w.merge(main, head);
@@ -3504,7 +3528,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!landed.length) return;
     const notes = await Promise.all(landed.map(async (l) => ({ oid: l.oid, text: await this.gitNote(l.id) })));
     const remote = await this.mainRemote("write");
-    const w = await Workspace.open(remote);
+    const w = await this.openMain("write", remote);
     await w.addNotes(remote, notes, MERGE_IDENTITY);
   }
 
@@ -3639,7 +3663,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!task.workspace) throw new HttpError(400, "task has no workspace yet; claim it first");
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).one() as any;
     const wsRemote = this.remote(task.workspace, await this.token(task.workspace, "write"));
-    const w = await Workspace.open(wsRemote);
+    const w = await Workspace.open(wsRemote, "main", this.seed());
     const ours = (await w.head())!;
     const main = await w.fetchFrom("main", await this.mainRemote("read"));
     if (await w.isAncestor(main, ours)) return { status: "up-to-date", head: ours };
@@ -4375,7 +4399,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.countingTests = true;
       this.mainTestsStale = false;
       this.ctx.waitUntil((async () => {
-        const w = await Workspace.open(this.remote(this.mainRepo, await this.token(this.mainRepo, "read")));
+        const w = await Workspace.open(this.remote(this.mainRepo, await this.token(this.mainRepo, "read")), "main", this.seed());
         this.setMeta("main_tests", String(countTests(await w.flatten(this.meta("main_head")))));
       })().catch((e) => console.error("count tests", e)).finally(() => { this.countingTests = false; }));
     }

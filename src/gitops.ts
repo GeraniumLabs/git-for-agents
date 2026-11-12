@@ -66,12 +66,26 @@ export class Workspace {
   private fetched: { remote: string; ref: string; token: string }[] = [];
   private constructor() {}
 
-  /** Clone the default branch of `origin` without a checkout. */
-  static async open(origin: Remote, branch = "main"): Promise<Workspace> {
+  /**
+   * Clone the default branch of `origin` without a checkout. With `seed`, an
+   * earlier workspace of the same repository, start from the objects it
+   * already has and fetch only what's new: on a big repository that's the
+   * difference between moving megabytes and moving a few objects.
+   */
+  static async open(origin: Remote, branch = "main", seed?: Workspace | null): Promise<Workspace> {
     const w = new Workspace();
     await w.fs.mkdir(DIR);
     await git.init({ fs: w.fs, dir: DIR, defaultBranch: branch });
     await git.addRemote({ fs: w.fs, dir: DIR, remote: "origin", url: origin.url });
+    const known = seed ? await seed.head(branch) : null;
+    if (seed && known) {
+      w.fs.adopt(seed.fs, `${DIR}/.git/objects`);
+      const shallow = await seed.fs.readFile(`${DIR}/.git/shallow`, "utf8").catch(() => null);
+      if (shallow) await w.fs.writeFile(`${DIR}/.git/shallow`, shallow);
+      // What we already have, so the fetch asks only for what's newer.
+      await git.writeRef({ fs: w.fs, dir: DIR, ref: `refs/remotes/origin/${branch}`, value: known, force: true });
+      await git.writeRef({ fs: w.fs, dir: DIR, ref: `refs/heads/${branch}`, value: known, force: true });
+    }
     try {
       await git.fetch({ fs: w.fs, http, dir: DIR, remote: "origin", ref: branch, singleBranch: true, tags: false, depth: HISTORY, onAuth: auth(origin.token) });
       w.fetched.push({ remote: "origin", ref: branch, token: origin.token });
@@ -82,6 +96,11 @@ export class Workspace {
       if (!/Could not find|NotFoundError|empty/i.test(String(e?.message ?? e))) throw e;
     }
     return w;
+  }
+
+  /** How many pack and loose object files this workspace holds: a cache past a few hundred starts fresh. */
+  objectFiles(): number {
+    return this.fs.count(`${DIR}/.git/objects`);
   }
 
   async head(branch = "main"): Promise<string | null> {

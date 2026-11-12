@@ -182,6 +182,8 @@ Under the hood:
 - The merge queue lands up to 8 changes per push.
 - The dashboard reads one `/overview` summary over its WebSocket, at most once a second.
 
+`demo/load.mjs` drives N simulated agents through the real API. The [benchmark page](/benchmark.html) shows every saved run (`--json bench/results/<name>.json`, then `node bench/build.mjs`), including bigger repositories (`--repo-files 5000 --repo-mb 20`). Workspaces start from the git objects main already fetched, so on a 2,000-file repository a commit takes 1.5s instead of 9s. One change of 40 MB of new files still fails to merge in time; import big codebases in batches of about 1,000 files.
+
 `demo/load.mjs` drives N simulated agents through the real API. Results on one laptop with `wrangler dev`, where one local `workerd` thread does all the git work:
 
 | agents | merged | wall time | merges/hour | submit to merged (p50) |

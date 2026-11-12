@@ -1,0 +1,71 @@
+{
+  "label": "20 agents, 5,000 files / 20 MB",
+  "at": "2026-11-12T04:41:53.128Z",
+  "target": "local wrangler dev",
+  "agents": 20,
+  "reviewers": 2,
+  "shared": 0.3,
+  "repo": {
+    "files": 5041,
+    "mb": 20.3,
+    "seededMs": 276243
+  },
+  "merged": 20,
+  "failed": 0,
+  "wallSeconds": 54.3,
+  "mergesPerHour": 1325,
+  "submitToMerged": {
+    "p50": 20940,
+    "p95": 28501,
+    "max": 28501,
+    "n": 20
+  },
+  "requests": {
+    "claim": {
+      "p50": 1706,
+      "p95": 4567,
+      "max": 4567,
+      "n": 20
+    },
+    "intent": {
+      "p50": 237,
+      "p95": 1653,
+      "max": 1653,
+      "n": 20
+    },
+    "read": {
+      "p50": 278,
+      "p95": 1535,
+      "max": 1535,
+      "n": 7
+    },
+    "commit": {
+      "p50": 5974,
+      "p95": 10549,
+      "max": 10549,
+      "n": 20
+    },
+    "events": {
+      "p50": 1996,
+      "p95": 13422,
+      "max": 17763,
+      "n": 127
+    },
+    "submit": {
+      "p50": 8364,
+      "p95": 15688,
+      "max": 15688,
+      "n": 20
+    },
+    "review": {
+      "p50": 1478,
+      "p95": 3690,
+      "max": 3690,
+      "n": 20
+    }
+  },
+  "conflicts": 0,
+  "syncs": 0,
+  "retries": 0,
+  "errors": {}
+}
