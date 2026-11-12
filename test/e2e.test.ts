@@ -1648,3 +1648,53 @@ test("ask Loom about a change or an incident, cited to trace steps; the incident
   assert.equal(adaCard.landed, 3);
   assert.equal((await admin.req("GET", "/scorecards?agent=ada")).agents.length, 1);
 });
+
+test("evals score every version of a change: command evals in the check container, review evals by an agent off the work list", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-evals");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "evals", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
+  await assert.rejects(ada.req("POST", "/evals", { name: "Size", command: "true" }), /owners/);
+  await assert.rejects(admin.req("POST", "/evals", { name: "Security", rubric: "x" }), /rubric/);
+  await admin.req("POST", "/evals", { name: "Size", command: `n=$(cat *.txt | wc -c); echo "score: $(( n < 20 ? 100 : 30 ))%"` });
+  await admin.req("POST", "/evals", { name: "Security", rubric: "1 if the change handles input safely and leaks nothing; 0 if it adds a hole.", blocking: true, threshold: 0.5 });
+
+  const t = await ada.createTask("Add a note", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "note.txt": "short\n" }, "note");
+  const ch = await ada.submit(t.id, t.title, "note", {});
+  let evals: any[] = [];
+  for (let i = 0; i < 60; i++) { evals = (await admin.change(ch.id)).evals; if (evals.find((e) => e.eval === "Size")?.status === "done") break; await sleep(250); }
+  const size = evals.find((e) => e.eval === "Size");
+  assert.equal(size.score, 1, JSON.stringify(size));
+  assert.equal(evals.find((e) => e.eval === "Security").status, "pending");
+
+  // The review eval is a job on the work list and in other agents' todo, not the author's.
+  const work = await (await fetch(`${url}/api/projects/${name}/work`, { headers: { authorization: `Bearer ${rex.key}` } })).json();
+  assert.ok(work.items.some((i: any) => i.kind === "eval" && i.change === ch.id));
+  assert.ok((await rex.me()).todo.some((x: string) => /eval/.test(x)));
+  assert.ok(!(await ada.me()).todo.some((x: string) => /eval to score/.test(x)));
+  await assert.rejects(ada.req("POST", `/changes/${ch.id}/evals/Security/take`), /another agent/);
+  const took = await rex.req("POST", `/changes/${ch.id}/evals/Security/take`);
+  assert.match(took.rubric, /input safely/);
+  // A blocking eval under its threshold sends the change back.
+  const scored = await rex.req("POST", `/changes/${ch.id}/evals/Security`, { score: 0.2, notes: "Echoes user input into a shell command." });
+  assert.equal(scored.passed, false);
+  assert.equal((await ada.change(ch.id)).status, "changes_requested");
+
+  // A new version gets new runs; the old score shows as previous.
+  await ada.write(ws, { "note.txt": "a much longer note than before, over twenty bytes\n" }, "longer");
+  await ada.update(ch.id, "longer");
+  for (let i = 0; i < 60; i++) { evals = (await admin.change(ch.id)).evals; if (evals.find((e) => e.eval === "Size")?.status === "done") break; await sleep(250); }
+  assert.equal(evals.find((e) => e.eval === "Size").score, 0.3);
+  assert.equal(evals.find((e) => e.eval === "Size").previous, 1);
+  assert.equal(evals.find((e) => e.eval === "Security").previous, 0.2);
+  await rex.req("POST", `/changes/${ch.id}/evals/Security`, { score: "pass", notes: "Input is quoted now." });
+  const list = (await admin.req("GET", "/evals")).evals;
+  assert.equal(list.find((e: any) => e.name === "Size").scored, 2);
+  assert.equal(list.find((e: any) => e.name === "Size").average, 0.65);
+  assert.equal(list.find((e: any) => e.name === "Security").trend[0].runs, 2);
+});

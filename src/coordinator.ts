@@ -57,6 +57,15 @@ const DIRECTIVE_ACK_MS = 5 * 60_000;
 /** Shortest approach a contest attempt may explain itself with. */
 const MIN_APPROACH = 60;
 /** Longest: it's read side by side with the other attempts', by a person, at a glance. */
+/** An eval's score from a command's output: a last `score: 0.8` (or 80%) line wins; otherwise passing is 1, failing 0. */
+export function scoreOf(output: string, ok: boolean): number {
+  const m = [...output.matchAll(/\bscore\s*[:=]\s*([0-9]*\.?[0-9]+)\s*(%)?/gi)].pop();
+  if (!m) return ok ? 1 : 0;
+  let v = Number(m[1]);
+  if (m[2] || v > 1) v = v / 100;
+  return Math.max(0, Math.min(1, Math.round(v * 1000) / 1000));
+}
+
 /** A bisect runs the checks at most this many times, and is taken for dead after this long. */
 const MAX_BISECT_RUNS = 16;
 /** Questions a project's people may ask Loom a day: each is one model call. */
@@ -359,6 +368,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
         id INTEGER PRIMARY KEY AUTOINCREMENT, started_by TEXT, reason TEXT, command TEXT, auto INTEGER DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'running', steps TEXT DEFAULT '[]', culprit INTEGER, verdict TEXT, error TEXT,
         created_at INTEGER, done_at INTEGER);
+      CREATE TABLE IF NOT EXISTS evals (
+        name TEXT PRIMARY KEY, kind TEXT NOT NULL, command TEXT, rubric TEXT, blocking INTEGER DEFAULT 0, threshold REAL DEFAULT 0.5,
+        created_by TEXT, created_at INTEGER, updated_at INTEGER);
+      CREATE TABLE IF NOT EXISTS eval_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, eval TEXT NOT NULL, change_id INTEGER NOT NULL, head TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'pending',
+        score REAL, notes TEXT, by TEXT, taken_at INTEGER, ms INTEGER, created_at INTEGER, done_at INTEGER, UNIQUE (eval, change_id, head));
+      CREATE INDEX IF NOT EXISTS eval_runs_change ON eval_runs (change_id);
       CREATE TABLE IF NOT EXISTS check_secrets (
         name TEXT PRIMARY KEY, ct TEXT NOT NULL, iv TEXT NOT NULL, sealed_by TEXT NOT NULL, on_demand INTEGER DEFAULT 0,
         created_by TEXT, created_at INTEGER, updated_at INTEGER);
@@ -863,6 +879,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "changes" && b && c === "reviewers") return json({ candidates: this.reviewerCandidates(Number(b), Number(url.searchParams.get("limit") ?? 5)), requested: this.reviewRequests(Number(b)) });
       if (a === "changes" && b && c === "interdiff") return json(await this.interdiff(Number(b), url.searchParams));
       // A change's intent comes from its session traces, so it's for the people who can read those (below).
+      if (a === "changes" && b && c === "evals") return json({ evals: this.changeEvals(Number(b)) });
       if (a === "changes" && b && c !== "intent") return json(await this.changeDetail(Number(b)));
       if (a === "review-tasks") return json(this.reviewTasks(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : undefined));
       if (a === "reviews") return json(await this.reviewQueue(url.searchParams.get("for") ? this.resolveAgent(url.searchParams.get("for")!) : null));
@@ -1080,6 +1097,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(await this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
+    if (a === "evals" && !b && m === "GET") return json(this.evalsView());
+    if (a === "evals" && m === "POST" && !b) { ownerOnly("define evals"); return json(this.saveEval(actor, body)); }
+    if (a === "evals" && b && m === "DELETE") { ownerOnly("remove evals"); return json(this.removeEval(actor, decodeURIComponent(b))); }
+    if (a === "changes" && b && c === "evals" && !d && m === "GET") return json({ evals: this.changeEvals(Number(b)) });
+    if (a === "changes" && b && c === "evals" && d && url.pathname.endsWith("/take") && m === "POST") return json(this.takeEval(actor, Number(b), decodeURIComponent(d)));
+    if (a === "changes" && b && c === "evals" && d && m === "POST") return json(await this.scoreEval(actor, Number(b), decodeURIComponent(d), body));
     if (a === "changes" && b && c === "revert" && m === "POST") return json(await this.revertChange(actor, Number(b), body));
     if (a === "bisects" && m === "POST" && !b) return json(await this.startBisect(actor, body));
     if (a === "bisects" && m === "GET") return json(b ? this.bisectView(Number(b)) : { bisects: this.sql.exec("SELECT id FROM bisects ORDER BY id DESC LIMIT 20").toArray().map((r) => this.bisectView(r.id as number)) });
@@ -1771,6 +1794,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const current = this.change(id).status;
     if (current === "review") this.requestReview(id, actor.id);
     else if (current === "queued" && status === "queued") await this.enqueue(id);
+    this.queueEvals(id);
     const contest = this.openContest(body.taskId);
     if (contest) this.contestEntered(contest.id as number);
     // Who already knows this code, so the author can ask them to review it.
@@ -1807,6 +1831,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(via ? { via } : {}), ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
     if (status === "review") this.requestReview(id, actor.id);
     else await this.enqueue(id);
+    this.queueEvals(id);
     const contest = this.openContest(ch.task_id);
     if (contest) await this.settleContest(contest.id as number);
     return { ...this.change(id), openThreads: this.openThreadList(id) };
@@ -1923,7 +1948,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const text = patch ? await patch.text() : "";
     return {
       ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
-      reverts: task.reverts ?? null, revertedBy: ch.status === "merged" ? this.revertOf(id) : null,
+      reverts: task.reverts ?? null, revertedBy: ch.status === "merged" ? this.revertOf(id) : null, evals: this.changeEvals(id),
       patch: text, context: ctx ? await ctx.json() : null,
       threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
       traceCount: this.traceCount(id),
@@ -2809,6 +2834,178 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     const list = await this.context.list({ prefix: `${this.project}/reports/` });
     return { reports: list.objects.map((o) => o.key.split("/").pop()!.replace(/\.json$/, "")).sort().reverse() };
+  }
+
+  // ── evals: scored on every push, by the check container or by agents runners start ──
+
+  private evalRow(name: string) {
+    const r = this.sql.exec("SELECT * FROM evals WHERE name = ?", name).toArray()[0] as any;
+    if (!r) throw new HttpError(404, `no eval ${name}; GET /evals lists them`);
+    return r;
+  }
+
+  /**
+   * An eval scores every version of every change from 0 to 1. A command eval
+   * runs in the check container (its last line may say `score: 0.8`; otherwise
+   * passing is 1 and failing 0) and costs check minutes. A review eval is a job
+   * for an agent: any agent but the author takes it, reads the change against
+   * the rubric and scores it. Loom never runs that agent; runners do.
+   */
+  private saveEval(actor: Agent, body: any) {
+    const name = String(body?.name ?? "").trim();
+    if (!/^[A-Za-z][\w -]{0,39}$/.test(name)) throw new HttpError(400, "an eval's name is up to 40 letters, digits, spaces, - or _ (e.g. Security)");
+    const kind = body.kind === "command" || body.command ? "command" : "review";
+    const command = kind === "command" ? String(body.command ?? "").trim() : null;
+    const rubric = String(body.rubric ?? "").trim() || null;
+    if (kind === "command" && !command) throw new HttpError(400, "a command eval needs a command");
+    if (kind === "command" && !this.checks) throw new HttpError(409, "command evals run in the check container: set a check command in Settings first");
+    if (kind === "review" && (!rubric || rubric.length < 10)) throw new HttpError(400, "a review eval needs a rubric: what a reviewer scores, and what a 1 and a 0 look like");
+    if ((command?.length ?? 0) > 2000 || (rubric?.length ?? 0) > 4000) throw new HttpError(400, "keep the command under 2000 characters and the rubric under 4000");
+    const threshold = body.threshold == null ? 0.5 : Number(body.threshold);
+    if (!(threshold >= 0 && threshold <= 1)) throw new HttpError(400, "threshold is a score between 0 and 1");
+    if (!this.sql.exec("SELECT 1 FROM evals WHERE name = ?", name).toArray().length && (this.sql.exec("SELECT COUNT(*) AS n FROM evals").one().n as number) >= 20) throw new HttpError(409, "a project has at most 20 evals");
+    const t = Date.now();
+    this.sql.exec(`INSERT INTO evals (name, kind, command, rubric, blocking, threshold, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT (name) DO UPDATE SET kind = excluded.kind, command = excluded.command, rubric = excluded.rubric, blocking = excluded.blocking, threshold = excluded.threshold, updated_at = excluded.updated_at`,
+      name, kind, command, rubric, body.blocking ? 1 : 0, threshold, actor.id, t, t);
+    this.emit("settings.eval_saved", { actor: actor.id, data: { name, kind, blocking: !!body.blocking, threshold } });
+    return this.evalsView();
+  }
+
+  private removeEval(actor: Agent, name: string) {
+    this.evalRow(name);
+    this.sql.exec("DELETE FROM evals WHERE name = ?", name);
+    this.sql.exec("UPDATE eval_runs SET status = 'stale' WHERE eval = ? AND status IN ('pending','taken')", name);
+    this.emit("settings.eval_removed", { actor: actor.id, data: { name } });
+    return this.evalsView();
+  }
+
+  /** Each eval with its trend: the average score per week over the last eight weeks. */
+  private evalsView() {
+    const since = Date.now() - 8 * WEEK_MS;
+    return {
+      evals: this.sql.exec("SELECT * FROM evals ORDER BY name").toArray().map((e: any) => {
+        const runs = this.sql.exec("SELECT score, done_at FROM eval_runs WHERE eval = ? AND status = 'done' AND done_at >= ? ORDER BY done_at", e.name, since).toArray();
+        const weeks = new Map<number, number[]>();
+        for (const r of runs) { const w = Math.floor((Date.now() - (r.done_at as number)) / WEEK_MS); weeks.set(w, [...(weeks.get(w) ?? []), r.score as number]); }
+        const avg = (xs: number[]) => Math.round((100 * xs.reduce((a, b) => a + b, 0)) / xs.length) / 100;
+        return {
+          name: e.name, kind: e.kind, command: e.command, rubric: e.rubric, blocking: !!e.blocking, threshold: e.threshold,
+          scored: runs.length, average: runs.length ? avg(runs.map((r) => r.score as number)) : null,
+          trend: [...weeks].sort((a, b) => b[0] - a[0]).map(([w, xs]) => ({ weeksAgo: w, average: avg(xs), runs: xs.length })),
+          waiting: this.sql.exec("SELECT COUNT(*) AS n FROM eval_runs WHERE eval = ? AND status IN ('pending','taken')", e.name).one().n,
+        };
+      }),
+    };
+  }
+
+  /** The latest run of each eval on a change's current version, with the score its previous version got. */
+  private changeEvals(id: number) {
+    const ch = this.change(id);
+    return this.sql.exec("SELECT * FROM evals ORDER BY name").toArray().map((e: any) => {
+      const r = this.sql.exec("SELECT * FROM eval_runs WHERE eval = ? AND change_id = ? AND head = ?", e.name, id, ch.head).toArray()[0] as any;
+      const prev = this.sql.exec("SELECT score FROM eval_runs WHERE eval = ? AND change_id = ? AND head != ? AND status = 'done' ORDER BY id DESC LIMIT 1", e.name, id, ch.head).toArray()[0];
+      return {
+        eval: e.name, kind: e.kind, blocking: !!e.blocking, threshold: e.threshold, rubric: e.rubric,
+        status: r?.status ?? "not run", score: r?.score ?? null, notes: r?.notes ?? null, by: r?.by ?? null, byName: r?.by ? this.agentName(r.by) : null, ms: r?.ms ?? null,
+        passed: r?.status === "done" ? r.score >= e.threshold : null, previous: prev ? prev.score : null,
+      };
+    });
+  }
+
+  /** Review-eval jobs waiting for an agent: never stuck with one that took it and went quiet for 30 minutes. */
+  private openEvalRuns() {
+    const stale = Date.now() - 30 * 60_000;
+    return this.sql.exec(`SELECT r.id, r.eval, r.change_id, r.created_at, e.rubric, c.title, c.agent_id AS author FROM eval_runs r JOIN evals e ON e.name = r.eval JOIN changes c ON c.id = r.change_id
+      WHERE e.kind = 'review' AND c.head = r.head AND c.status NOT IN ('merged','closed','abandoned') AND (r.status = 'pending' OR (r.status = 'taken' AND r.taken_at < ?)) ORDER BY r.id LIMIT 50`, stale).toArray()
+      .map((r: any) => ({ id: r.id as number, eval: r.eval as string, change_id: r.change_id as number, created_at: r.created_at as number, rubric: String(r.rubric ?? "").slice(0, 160), title: r.title as string, author: r.author as string }));
+  }
+
+  private evalChain: Promise<void> = Promise.resolve();
+
+  /** A new version of a change: every eval gets a run for it, and command evals start. */
+  private queueEvals(id: number) {
+    const evals = this.sql.exec("SELECT * FROM evals").toArray() as any[];
+    if (!evals.length) return;
+    const ch = this.change(id);
+    this.sql.exec("UPDATE eval_runs SET status = 'stale' WHERE change_id = ? AND head != ? AND status IN ('pending','taken')", id, ch.head);
+    for (const e of evals) this.sql.exec("INSERT OR IGNORE INTO eval_runs (eval, change_id, head, created_at) VALUES (?, ?, ?, ?)", e.name, id, ch.head, Date.now());
+    if (evals.some((e) => e.kind === "review")) this.emit("eval.requested", { change: id, task: ch.task_id, data: { title: ch.title, evals: evals.filter((e) => e.kind === "review").map((e) => e.name), advice: "take_eval, read the change against the rubric, then score_eval" } });
+    if (evals.some((e) => e.kind === "command")) {
+      this.evalChain = this.evalChain.then(() => this.runCommandEvals(id, ch.head as string)).catch((e) => console.error("evals", e));
+      this.ctx.waitUntil(this.evalChain);
+    }
+  }
+
+  private async runCommandEvals(id: number, head: string) {
+    const ch = this.change(id);
+    if (ch.head !== head || !this.checks) return;
+    const runs = this.sql.exec("SELECT r.id, e.name, e.command FROM eval_runs r JOIN evals e ON e.name = r.eval WHERE r.change_id = ? AND r.head = ? AND e.kind = 'command' AND r.status = 'pending'", id, head).toArray() as any[];
+    if (!runs.length) return;
+    const w = await Workspace.open(await this.mainRemote("read"));
+    const main = (await w.head())!;
+    const fetched = await w.fetchFrom("ws", this.remote(ch.workspace, await this.token(ch.workspace, "read")));
+    const merged = await w.isAncestor(main, fetched) ? null : await w.merge(main, fetched);
+    const commit = merged?.tree ? await w.commit(merged.tree, [main, fetched], "evals", MERGE_IDENTITY) : fetched;
+    for (const r of runs) {
+      let score: number | null = null, notes: string, ms = 0;
+      try {
+        const out = await this.checkCommit(w, commit, true, r.command);
+        ms = out.ms;
+        this.chargeChecks([ch.agent_id], out.ms);
+        score = scoreOf(out.output, out.ok);
+        notes = out.output.slice(-1500);
+      } catch (e: any) {
+        notes = String(e?.message ?? e).slice(0, 500);
+      }
+      this.sql.exec("UPDATE eval_runs SET status = ?, score = ?, notes = ?, by = 'loom', ms = ?, done_at = ? WHERE id = ?", score == null ? "failed" : "done", score, notes, ms, Date.now(), r.id);
+      if (score != null) this.evalScored(id, r.name, score, notes, "loom");
+      else this.emit("eval.failed_to_run", { change: id, task: ch.task_id, data: { eval: r.name, error: notes } });
+    }
+  }
+
+  private takeEval(actor: Agent, id: number, name: string) {
+    const e = this.evalRow(name);
+    const ch = this.change(id);
+    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Loom runs it`);
+    if (ch.agent_id === actor.id) throw new HttpError(403, "you wrote this change; another agent scores it");
+    const r = this.sql.exec("SELECT * FROM eval_runs WHERE eval = ? AND change_id = ? AND head = ?", name, id, ch.head).toArray()[0] as any;
+    if (!r) throw new HttpError(404, `no ${name} eval waiting on change ${id}'s current version`);
+    if (r.status === "done") throw new HttpError(409, `${name} on change ${id} is already scored (${r.score})`);
+    if (r.status === "taken" && r.by !== actor.id && Date.now() - r.taken_at < 30 * 60_000) throw new HttpError(409, `${this.agentName(r.by)} is scoring it`);
+    this.sql.exec("UPDATE eval_runs SET status = 'taken', by = ?, taken_at = ? WHERE id = ?", actor.id, Date.now(), r.id);
+    this.emit("eval.taken", { actor: actor.id, change: id, task: ch.task_id, data: { eval: name } });
+    return { eval: name, change: id, rubric: e.rubric, threshold: e.threshold, advice: "get_change, read it against the rubric, then score_eval with a score from 0 to 1 and notes saying why" };
+  }
+
+  private async scoreEval(actor: Agent, id: number, name: string, body: any) {
+    const e = this.evalRow(name);
+    const ch = this.change(id);
+    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Loom runs it`);
+    if (ch.agent_id === actor.id) throw new HttpError(403, "you wrote this change; another agent scores it");
+    const score = body?.score === "pass" ? 1 : body?.score === "fail" ? 0 : Number(body?.score);
+    if (!(score >= 0 && score <= 1)) throw new HttpError(400, "score is a number from 0 to 1 (or pass / fail)");
+    const notes = String(body?.notes ?? "").trim();
+    if (notes.length < 5) throw new HttpError(400, "say why in notes: what in the change earned the score");
+    const r = this.sql.exec("SELECT * FROM eval_runs WHERE eval = ? AND change_id = ? AND head = ?", name, id, ch.head).toArray()[0] as any;
+    if (!r) throw new HttpError(404, `no ${name} eval waiting on change ${id}'s current version`);
+    if (r.status === "done") throw new HttpError(409, `${name} on change ${id} is already scored (${r.score})`);
+    if (r.status === "taken" && r.by !== actor.id && Date.now() - r.taken_at < 30 * 60_000) throw new HttpError(409, `${this.agentName(r.by)} is scoring it`);
+    this.sql.exec("UPDATE eval_runs SET status = 'done', score = ?, notes = ?, by = ?, done_at = ? WHERE id = ?", score, notes.slice(0, 4000), actor.id, Date.now(), r.id);
+    this.evalScored(id, name, score, notes, actor.id);
+    return { eval: name, change: id, score, passed: score >= e.threshold, evals: this.changeEvals(id) };
+  }
+
+  /** A blocking eval under its threshold sends the change back, like a failed check. */
+  private evalScored(id: number, name: string, score: number, notes: string, by: string) {
+    const e = this.evalRow(name);
+    const ch = this.change(id);
+    const failed = score < e.threshold;
+    this.emit(failed ? "eval.failed" : "eval.scored", { actor: by === "loom" ? undefined : by, change: id, task: ch.task_id, to: failed ? ch.agent_id : undefined, data: { eval: name, score, threshold: e.threshold, blocking: !!e.blocking, notes: notes.slice(-600) } });
+    if (failed && e.blocking && ["review", "queued"].includes(ch.status as string)) {
+      this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
+      this.emit("change.sent_back", { change: id, task: ch.task_id, to: ch.agent_id, data: { reason: `the ${name} eval scored ${score}, under ${e.threshold}`, advice: "get_change shows the eval's notes; fix it and update_change" } });
+    }
   }
 
   // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──
@@ -4077,6 +4274,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const c of this.sql.exec("SELECT id, task_id, title, agent_id, status, updated_at FROM changes WHERE status IN ('conflict','changes_requested','checks_failed')").toArray()) {
       if (present.has(c.agent_id as string)) continue;
       items.push({ key: `fix:${c.id}:${c.status}`, kind: "fix", change: c.id as number, task: c.task_id as number, text: `Change #${c.id} "${c.title}" is ${String(c.status).replace("_", " ")} and ${this.agentName(c.agent_id as string)} is away`, since: c.updated_at as number, url: link(`#change/${c.id}`) });
+    }
+    for (const r of this.openEvalRuns()) {
+      items.push({ key: `eval:${r.id}`, kind: "eval", change: r.change_id, text: `Score change #${r.change_id} "${r.title}" on the ${r.eval} eval: ${r.rubric}`, since: r.created_at, url: link(`#change/${r.change_id}`) });
     }
     const merged = new Set(this.sql.exec("SELECT id FROM tasks WHERE status = 'merged'").toArray().map((r) => r.id as number));
     for (const t of this.sql.exec("SELECT id, title, depends_on, contest_status, updated_at FROM tasks WHERE status = 'open' AND assignee IS NULL AND COALESCE(attempt, 0) = 0 ORDER BY id LIMIT 100").toArray()) {
@@ -5568,6 +5768,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     ];
     const reviewTasks = this.reviewTasks(actor.id);
     const untaken = reviewTasks.filter((t) => t.status === "open");
+    const evalJobs = actor.role === "human" ? [] : this.openEvalRuns().filter((r) => r.author !== actor.id);
+    if (evalJobs.length) todo.push(`${evalJobs.length} eval${evalJobs.length === 1 ? "" : "s"} to score (${evalJobs.slice(0, 3).map((r) => `${r.eval} on #${r.change_id}`).join(", ")}${evalJobs.length > 3 ? ", …" : ""}): take_eval one, get_change, then score_eval`);
     if (untaken.length && actor.role !== "human") todo.push(`${untaken.length} review task${untaken.length === 1 ? "" : "s"} nobody has taken (${untaken.slice(0, 3).map((t) => `#${t.change}`).join(", ")}${untaken.length > 3 ? ", …" : ""}): take_review one, then get_change and review_change`);
     return {
       agent: actor, mainFrozen: this.meta("frozen"), todo, directives, reviewRequests, reviewTasks, tasks, changes,

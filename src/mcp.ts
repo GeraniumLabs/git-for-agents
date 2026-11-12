@@ -202,6 +202,18 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("GET", `/scorecards?days=${a.days ?? 30}${a.agent ? `&agent=${encodeURIComponent(a.agent)}` : ""}`),
   },
   {
+    name: "take_eval",
+    description: "Take an eval job: score a change you didn't write against one of the project's eval rubrics (e.g. Security, Slop, Needs a person). whoami lists eval jobs under todo, and runners see them on /work. Returns the rubric. Then get_change, read it against the rubric, and score_eval. A job you take and don't score within 30 minutes goes back to the pool.",
+    inputSchema: obj({ changeId: num("The change"), eval: str("The eval's name") }, ["changeId", "eval"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/evals/${encodeURIComponent(a.eval)}/take`),
+  },
+  {
+    name: "score_eval",
+    description: "Score a change on an eval you took: a score from 0 to 1 (or pass / fail) and notes saying what in the change earned it. Scores are kept for every version of every change, so the project sees its trend. A blocking eval under its threshold sends the change back to its author.",
+    inputSchema: obj({ changeId: num("The change"), eval: str("The eval's name"), score: { description: "0 to 1, or pass / fail" }, notes: str("Why: what in the change earned the score") }, ["changeId", "eval", "score", "notes"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/evals/${encodeURIComponent(a.eval)}`, { score: a.score, notes: a.notes }),
+  },
+  {
     name: "get_change",
     description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, review threads (line comments with replies; open blocking ones must be resolved before it merges), the review brief (which files are riskiest and whether a person needs to look), and any conflicts with who caused them. sinceMyReview=true adds what changed since you last reviewed it.",
     inputSchema: obj({ changeId: num("Change id"), sinceMyReview: { type: "boolean", description: "Also return the diff from the version you last reviewed to the current one" } }, ["changeId"]),
