@@ -256,6 +256,14 @@ async function reviewStandIn(req, res) {
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const prompt = String(body.messages?.[0]?.content ?? "");
+  if (body.output_config?.format?.schema?.properties?.answer) {
+    // A question about what Loom holds: answer from the first trace step, else the first source.
+    const refs = [...prompt.matchAll(/^\[([A-Z]\d+(?:\.\d+)?)\] (.*)$/gm)];
+    const pick = refs.find((r) => r[1].startsWith("T")) ?? refs[0];
+    const answer = pick ? `From the sources: ${pick[2].slice(0, 120)} [${pick[1]}]` : "The sources don't say.";
+    return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "text", text: JSON.stringify({ answer, citations: pick ? [pick[1]] : [] }) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
+  }
   // Loom numbers each diff line by its line in the new file.
   let file = null, bug = null;
   for (const l of prompt.split("\n")) {

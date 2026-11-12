@@ -26,6 +26,7 @@ import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, s
 import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, intentOf, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
+import { ask, factoryReport, stepSources, type ReportChange, type ReportTrace, type Source } from "./analysis";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
@@ -58,6 +59,9 @@ const MIN_APPROACH = 60;
 /** Longest: it's read side by side with the other attempts', by a person, at a glance. */
 /** A bisect runs the checks at most this many times, and is taken for dead after this long. */
 const MAX_BISECT_RUNS = 16;
+/** Questions a project's people may ask Loom a day: each is one model call. */
+const ASKS_PER_DAY = 100;
+const WEEK_MS = 7 * 86_400_000;
 const BISECT_STALE_MS = 60 * 60_000;
 /** Changes by different agents failing the checks in a row before Loom checks main itself. */
 const AUTO_BISECT_AFTER = 3;
@@ -1017,6 +1021,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.assertCanReadTraces(actor);
       return json(await this.changeIntent(Number(b)));
     }
+    // Asking Loom about what it holds, the incident view and the factory report: people only, like traces.
+    if (a === "ask" && m === "POST") { this.assertCanReadTraces(actor); return json(await this.askLoom(actor, body)); }
+    if (a === "incident" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.incident(url.searchParams)); }
+    if (a === "report" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.weeklyReport(Number(url.searchParams.get("days") ?? 7))); }
+    if (a === "reports" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.savedReports(b)); }
     // Opt-in trace uploads: a person's key for the hook on their own machine.
     if (a === "trace-keys" && !actor.standin) {
       if (!b && m === "GET") return json(this.listTraceKeys(actor));
@@ -2370,6 +2379,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
+    await this.maybeWeeklyReport().catch((e) => console.error("weekly report", e));
     // Work that stopped moving needs no event to need a person, or a runner.
     this.notifySoon();
     this.hooksSoon();
@@ -2566,6 +2576,175 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const env: Record<string, string> = {};
     for (const s of await this.checkSecrets()) if (!onDemand || s.onDemand) env[s.name] = s.value;
     return env;
+  }
+
+  // ── asking Loom: answers cited to the steps and events they came from ──
+
+  private eventSources(where: string, ...args: unknown[]): Source[] {
+    return this.sql.exec(`SELECT * FROM events WHERE ${where} ORDER BY seq LIMIT 400`, ...args).toArray().map((e: any) => {
+      const data = e.data ? String(e.data) : "";
+      return { ref: `E${e.seq}`, text: `${new Date(e.ts).toISOString().slice(0, 16)} ${e.type}${e.actor ? ` by ${this.agentName(e.actor) ?? e.actor}` : ""}${e.change_id ? ` on change #${e.change_id}` : ""}${e.task_id ? ` (task #${e.task_id})` : ""}${data && data !== "{}" ? `: ${data.slice(0, 400)}` : ""}` };
+    });
+  }
+
+  private reviewSources(changeId: number): Source[] {
+    return this.sql.exec("SELECT * FROM reviews WHERE change_id = ? ORDER BY id", changeId).toArray().map((r: any) => ({
+      ref: `R${r.id}`, text: `${this.agentName(r.reviewer) ?? r.reviewer} reviewed change #${changeId}: ${r.verdict}${r.body ? `: ${String(r.body).slice(0, 600)}` : ""}${r.comments && r.comments !== "[]" ? ` · line comments: ${String(r.comments).slice(0, 600)}` : ""}`,
+    }));
+  }
+
+  private filesOf(files: unknown): FileChange[] {
+    const v = typeof files === "string" ? JSON.parse(files) : files;
+    return Array.isArray(v) ? v.map((f: any) => (typeof f === "string" ? { path: f, status: "modified" } : f)) : [];
+  }
+
+  private linkedTraces(changeId: number): any[] {
+    return this.sql.exec(`SELECT * FROM traces WHERE ${LIVE_TRACE} AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) ORDER BY id`, changeId, changeId).toArray();
+  }
+
+  private async changeSources(id: number): Promise<{ scope: string; sources: Source[] }> {
+    const ch = this.change(id);
+    const task = this.task(ch.task_id);
+    const sources: Source[] = [
+      { ref: `C${id}`, text: `Change #${id} "${ch.title}" by ${this.agentName(ch.agent_id)}, ${ch.status}, for task #${task.id} "${task.title}": ${task.description ?? ""}. Summary: ${ch.summary ?? ""}. Files: ${(this.filesOf(ch.files)).map((f) => f.path).join(", ")}` },
+      ...this.reviewSources(id),
+      ...this.eventSources("change_id = ? OR task_id = ?", id, ch.task_id),
+    ];
+    for (const t of this.linkedTraces(id)) sources.push(...stepSources(t.id, this.agentName(t.agent_id) ?? t.agent_id, await this.traceSteps(t.id)));
+    return { scope: `change #${id} "${ch.title}" by ${this.agentName(ch.agent_id)}`, sources };
+  }
+
+  private async askLoom(actor: Agent, body: { question?: string; change?: number; bisect?: number; trace?: number }) {
+    if (actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "asking Loom is for the project's people");
+    const question = String(body?.question ?? "").trim();
+    if (question.length < 3 || question.length > 1000) throw new HttpError(400, "ask a question of 3 to 1000 characters");
+    const day = new Date().toISOString().slice(0, 10);
+    const asked = Number(this.meta(`asks:${day}`) ?? 0);
+    if (asked >= ASKS_PER_DAY) throw new HttpError(429, `this project has asked ${ASKS_PER_DAY} questions today; ask again tomorrow (UTC)`);
+    const model = await this.reviewModel();
+    if (!model) throw new HttpError(503, "no model connected: an owner adds an Anthropic key in Settings");
+    let scope: string, sources: Source[];
+    if (body.change) ({ scope, sources } = await this.changeSources(Number(body.change)));
+    else if (body.bisect) ({ scope, sources } = await this.incidentSources(Number(body.bisect)));
+    else if (body.trace) {
+      const t = this.traceRow(Number(body.trace));
+      scope = `${this.agentName(t.agent_id)}'s session, trace #${t.id}`;
+      sources = stepSources(t.id, this.agentName(t.agent_id) ?? t.agent_id, await this.traceSteps(t.id));
+    } else {
+      scope = `the project ${this.project}: what happened recently`;
+      sources = this.eventSources("seq > (SELECT COALESCE(MAX(seq), 0) - 400 FROM events)");
+    }
+    this.setMeta(`asks:${day}`, String(asked + 1));
+    const r = await ask(model, question, scope, sources);
+    if (!r.ok) throw new HttpError(502, r.reason);
+    return { question, about: scope, ...r };
+  }
+
+  // ── the incident view: what landed since main was last green, and who knew what ──
+
+  private async incidentSources(bisectId: number): Promise<{ scope: string; sources: Source[] }> {
+    const inc = await this.incident(new URLSearchParams({ bisect: String(bisectId) }));
+    const sources: Source[] = inc.runs.map((r: any, i: number) => ({ ref: `B${bisectId}.${i + 1}`, text: `Check run at ${r.change ? `change #${r.change} "${r.title}"` : r.title} (v${r.version}): ${r.ok ? "passed" : `failed: ${r.output ?? ""}`}` }));
+    for (const c of inc.changes) {
+      sources.push({ ref: `C${c.id}`, text: `Change #${c.id} "${c.title}" by ${c.authorName}, landed v${c.version}, files ${c.files.join(", ")}; reviews: ${c.reviews.map((r: any) => `${r.reviewerName} ${r.verdict}`).join(", ") || "none"}` });
+      sources.push(...this.reviewSources(c.id));
+    }
+    if (inc.suspect) {
+      const s = await this.changeSources(inc.suspect.id);
+      sources.push(...s.sources.filter((x) => !sources.some((y) => y.ref === x.ref)));
+    }
+    return { scope: `main breaking: bisect #${bisectId} (${inc.verdict ?? "running"})`, sources };
+  }
+
+  private async incident(q: URLSearchParams) {
+    let from = 0, to = this.mainVersion, verdict: string | null = null, runs: any[] = [], suspectId: number | null = null, command = this.checks?.command ?? null, bisectId: number | null = null;
+    if (q.get("bisect")) {
+      const b = this.bisectView(Number(q.get("bisect")));
+      bisectId = b.id; verdict = b.verdict; runs = b.steps; command = b.command; suspectId = b.culprit?.id ?? null;
+      const good = b.steps.filter((s: any) => s.ok).map((s: any) => s.version);
+      const bad = b.steps.filter((s: any) => !s.ok).map((s: any) => s.version);
+      from = good.length ? Math.max(...good) : 0;
+      to = bad.length ? Math.max(...bad) : to;
+    } else if (q.get("change")) {
+      const ch = this.change(Number(q.get("change")));
+      const target = ch.status === "merged" ? ch : (this.task(ch.task_id).reverts ? this.change(this.task(ch.task_id).reverts) : null);
+      if (!target?.merged_version) throw new HttpError(409, `change ${ch.id} hasn't landed`);
+      suspectId = target.id; from = (target.merged_version as number) - 1; to = this.mainVersion;
+    } else throw new HttpError(400, "say what broke: ?bisect=<id> or ?change=<id>");
+    const rows = this.sql.exec("SELECT * FROM changes WHERE status = 'merged' AND merged_version > ? AND merged_version <= ? ORDER BY merged_version LIMIT 30", from, to).toArray() as any[];
+    const changes = rows.map((c) => ({
+      id: c.id as number, title: c.title, author: c.agent_id, authorName: this.agentName(c.agent_id), version: c.merged_version, landedAt: c.updated_at,
+      files: (this.filesOf(c.files)).map((f) => f.path),
+      reviews: this.sql.exec("SELECT reviewer, verdict FROM reviews WHERE change_id = ? AND verdict != 'comment' ORDER BY id", c.id).toArray().map((r) => ({ reviewer: r.reviewer, reviewerName: this.agentName(r.reviewer as string), verdict: r.verdict })),
+      traces: this.linkedTraces(c.id).map((t) => ({ id: t.id, agent: t.agent_id, agentName: this.agentName(t.agent_id) })),
+      revertedBy: this.revertOf(c.id),
+      suspect: c.id === suspectId,
+    }));
+    let suspect: any = null;
+    if (suspectId) {
+      const ch = this.change(suspectId);
+      const failing = runs.find((r) => r.change === suspectId && !r.ok)?.output ?? null;
+      const files = (this.filesOf(ch.files)).map((f) => f.path);
+      const named = failing ? files.filter((f) => failing.includes(f) || failing.includes(f.split("/").pop()!)) : [];
+      // What the author knew: did they run the checks, who approved it, and the steps where they wrote the files the failure names.
+      const ranChecks = this.sql.exec("SELECT data FROM events WHERE type = 'checks.ran' AND actor = ? AND task_id = ? ORDER BY seq DESC LIMIT 1", ch.agent_id, ch.task_id).toArray()[0];
+      const knew: Source[] = [];
+      for (const t of this.linkedTraces(suspectId).filter((t) => t.agent_id === ch.agent_id)) {
+        const look = named.length ? named : files;
+        const edits = (await this.traceSteps(t.id)).filter((s) => s.kind === "tool_call" && s.files.some((f) => look.some((p) => f === p || f.endsWith(`/${p}`))));
+        knew.push(...stepSources(t.id, this.agentName(t.agent_id) ?? t.agent_id, edits.slice(-6), () => true));
+      }
+      suspect = {
+        id: suspectId, title: ch.title, author: ch.agent_id, authorName: this.agentName(ch.agent_id), failing, filesNamed: named,
+        ranChecks: ranChecks ? JSON.parse(ranChecks.data as string)?.ok ?? null : null,
+        approvedBy: this.sql.exec("SELECT reviewer FROM reviews WHERE change_id = ? AND verdict = 'approve'", suspectId).toArray().map((r) => this.agentName(r.reviewer as string)),
+        knew, revertedBy: this.revertOf(suspectId),
+      };
+    }
+    return { bisect: bisectId, command, verdict, from, to, runs, changes, suspect };
+  }
+
+  // ── the factory report: a week of traces and changes, and what to change ──
+
+  private async weeklyReport(days: number) {
+    days = Math.min(Math.max(Math.floor(days) || 7, 1), 31);
+    const to = Date.now(), from = to - days * 86_400_000;
+    const traceRows = this.sql.exec(`SELECT * FROM traces WHERE ${LIVE_TRACE} AND COALESCE(ended_at, created_at) >= ? ORDER BY id DESC LIMIT 200`, from).toArray() as any[];
+    const traces: ReportTrace[] = [];
+    for (const t of traceRows) traces.push({ id: t.id, agent: t.agent_id, agentName: this.agentName(t.agent_id) ?? t.agent_id, models: JSON.parse(t.models ?? "[]"), tokensIn: t.tokens_in ?? 0, tokensOut: t.tokens_out ?? 0, costUsd: t.cost_usd ?? null, steps: await this.traceSteps(t.id) });
+    const changes: ReportChange[] = (this.sql.exec("SELECT * FROM changes WHERE created_at >= ? ORDER BY id LIMIT 1000", from).toArray() as any[]).map((c) => ({
+      id: c.id, title: c.title, agent: c.agent_id, agentName: this.agentName(c.agent_id) ?? c.agent_id, status: c.status,
+      rounds: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", c.id).one().n as number,
+      checksFailed: this.sql.exec("SELECT COUNT(*) AS n FROM events WHERE change_id = ? AND type = 'checks.failed'", c.id).one().n as number,
+      reverted: c.status === "merged" && !!this.revertOf(c.id),
+      models: [...new Set(this.linkedTraces(c.id).flatMap((t) => JSON.parse(t.models ?? "[]") as string[]))],
+    }));
+    const failures = this.sql.exec("SELECT change_id, data FROM events WHERE type = 'checks.failed' AND ts >= ?", from).toArray().map((e) => ({ change: e.change_id as number, output: String(JSON.parse(e.data as string)?.output ?? "") }));
+    return { days, ...factoryReport(from, to, traces, changes, failures) };
+  }
+
+  /** Once a week, while the project is active, the report is saved and announced. */
+  private async maybeWeeklyReport() {
+    const last = Number(this.meta("report_at") ?? 0);
+    if (Date.now() - last < WEEK_MS) return;
+    if (!last) { this.setMeta("report_at", String(Date.now())); return; } // the first report covers a whole week
+    this.setMeta("report_at", String(Date.now()));
+    const r = await this.weeklyReport(7);
+    if (!r.sessions && !r.changes) return;
+    const day = new Date().toISOString().slice(0, 10);
+    await this.context.put(`${this.project}/reports/${day}.json`, JSON.stringify(r), { httpMetadata: { contentType: "application/json" } });
+    this.emit("report.weekly", { data: { date: day, sessions: r.sessions, changes: r.changes, landed: r.landed, findings: r.findings.slice(0, 5).map((f) => f.title) } });
+  }
+
+  private async savedReports(date?: string) {
+    if (date) {
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) throw new HttpError(400, "a report is named by its date, YYYY-MM-DD");
+      const obj = await this.context.get(`${this.project}/reports/${date}.json`);
+      if (!obj) throw new HttpError(404, `no report for ${date}`);
+      return obj.json();
+    }
+    const list = await this.context.list({ prefix: `${this.project}/reports/` });
+    return { reports: list.objects.map((o) => o.key.split("/").pop()!.replace(/\.json$/, "")).sort().reverse() };
   }
 
   // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──

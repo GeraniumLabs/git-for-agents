@@ -1576,3 +1576,63 @@ test("when changes by different agents keep failing the checks, Loom bisects mai
   assert.equal(b.auto, true);
   assert.equal(b.culprit?.id, bad, JSON.stringify(b));
 });
+
+test("ask Loom about a change or an incident, cited to trace steps; the incident view and the factory report", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-ask");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "ask", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const base = `${url}/api/projects/${name}`;
+  const land = async (file: string, edits = 1) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await ada.submit(t.id, t.title, file, {});
+    const now = new Date().toISOString();
+    const lines = [
+      { type: "user", sessionId: `s-${file}`, timestamp: now, message: { role: "user", content: `Add ${file}` } },
+      { type: "assistant", sessionId: `s-${file}`, timestamp: now, message: { id: "m1", role: "assistant", model: "claude-test", usage: { input_tokens: 100, output_tokens: 10 }, content: [
+        { type: "text", text: `I'll write ${file} without running the tests.` },
+        ...Array.from({ length: edits }, (_, i) => ({ type: "tool_use", id: `w${i}`, name: "Write", input: { file_path: file, content: "x" } })),
+      ] } },
+    ];
+    const tr = await (await fetch(`${base}/traces?source=claude-code&change=${ch.id}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/x-ndjson" }, body: lines.map((l) => JSON.stringify(l)).join("\n") })).json();
+    assert.equal(tr.change, ch.id);
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+    return { id: ch.id as number, trace: tr.id as number };
+  };
+  await land("a.txt");
+  const b = await land("b.txt", 7);
+  await land("c.txt");
+
+  // Ask about a change: the answer cites a step of its trace.
+  await assert.rejects(ada.req("POST", "/ask", { question: "why?", change: b.id }), /people/);
+  const ans = await admin.req("POST", "/ask", { question: "Did ada run the tests before writing b.txt?", change: b.id });
+  assert.equal(ans.ok, true);
+  assert.ok(ans.citations.length >= 1, JSON.stringify(ans));
+  assert.match(ans.citations[0].ref, new RegExp(`^T${b.trace}\\.`));
+  assert.match(ans.answer, /\[T\d+\.\d+\]/);
+
+  // The incident view from a bisect: what landed since green, the suspect and what its author did.
+  const bis = await admin.req("POST", "/bisects", { command: "test ! -f b.txt" });
+  let done: any;
+  for (let i = 0; i < 120 && (!done || done.status === "running"); i++) { await sleep(500); done = await admin.req("GET", `/bisects/${bis.id}`); }
+  assert.equal(done.culprit?.id, b.id);
+  const inc = await admin.req("GET", `/incident?bisect=${bis.id}`);
+  assert.deepEqual(inc.changes.map((c: any) => c.id).includes(b.id), true);
+  assert.equal(inc.suspect.id, b.id);
+  assert.ok(inc.suspect.knew.length >= 1 && inc.suspect.knew.every((k: any) => k.ref.startsWith(`T${b.trace}.`)), "the steps where ada wrote b.txt");
+  assert.equal((await admin.req("GET", `/incident?change=${b.id}`)).suspect.id, b.id);
+  const incAns = await admin.req("POST", "/ask", { question: "What broke main?", bisect: bis.id });
+  assert.ok(incAns.citations.length >= 1);
+
+  // The factory report: thrash on b.txt, and each model's numbers.
+  const rep = await admin.req("GET", "/report?days=7");
+  assert.equal(rep.sessions, 3);
+  assert.equal(rep.landed, 3);
+  assert.ok(rep.findings.some((f: any) => f.kind === "thrash" && /b\.txt 7 times/.test(f.title)), JSON.stringify(rep.findings));
+  assert.equal(rep.models.find((m: any) => m.model === "claude-test")?.landed, 3);
+  assert.equal((await fetch(`${base}/report`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+});

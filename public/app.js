@@ -1610,7 +1610,7 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
-    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Loom checks main itself and, if main fails, finds the change that broke it."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
+    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Loom checks main itself and, if main fails, finds the change that broke it."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>, <a href="#incident/bisect/${state.project.lastBisect.id}">incident view</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
     ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
     ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
     ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
@@ -1631,7 +1631,7 @@ async function showSettings() {
     <h2>Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
-      return `<p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
+      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change, and how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
       + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
       <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
@@ -2180,9 +2180,79 @@ function showTask(id) {
 }
 
 /** The dashboard, or a change, contest, task or the code on its own page, from the URL. */
+// ── asking Loom, the incident view and the factory report ──
+
+/** A question box: asks Loom about `about` ({change}, {bisect} or {trace}) and shows the answer with what it cites. */
+function askBox(about, placeholder) {
+  const id = `ask-${Math.random().toString(36).slice(2, 8)}`;
+  setTimeout(() => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    const input = box.querySelector("input"), out = box.querySelector(".ask-out"), btn = box.querySelector("button");
+    const go = async () => {
+      const question = input.value.trim();
+      if (!question) return;
+      btn.disabled = true; out.innerHTML = `<p class="meta">Reading the traces and events…</p>`;
+      try {
+        const r = await act("POST", "/ask", { question, ...about });
+        const cite = (t) => esc(t).replace(/\[([A-Z]\d+(?:\.\d+)?)\]/g, (_, ref) => `<a href="#" class="cite mono" data-ref="${ref}">${ref}</a>`);
+        out.innerHTML = `<p>${cite(r.answer)}</p>${r.citations.length ? `<details><summary class="meta">${plural(r.citations.length, ["source", "sources"])} · ${esc(r.model)}${r.truncated ? " · some sources didn't fit" : ""}</summary>${r.citations.map((c) => `<p class="meta" data-src="${esc(c.ref)}"><span class="mono">${esc(c.ref)}</span> ${esc(c.text)}</p>`).join("")}</details>` : `<p class="meta">${esc(r.model)}, citing nothing: the sources may not cover this.</p>`}`;
+        for (const a of out.querySelectorAll(".cite")) a.onclick = (e) => { e.preventDefault(); const d = out.querySelector("details"); if (d) d.open = true; out.querySelector(`[data-src="${a.dataset.ref}"]`)?.scrollIntoView({ block: "nearest" }); };
+      } catch { out.innerHTML = ""; }
+      btn.disabled = false;
+    };
+    btn.onclick = go;
+    input.onkeydown = (e) => { if (e.key === "Enter") go(); };
+  });
+  return `<div class="ask-box" id="${id}"><div class="row"><input class="grow" maxlength="1000" placeholder="${esc(placeholder)}"><button class="ghost mini">Ask</button></div><div class="ask-out"></div></div>`;
+}
+
+async function showIncident(kind, id) {
+  if (!isHuman()) return showSignIn("The incident view reads agents' session traces, so only the project's people can see it.");
+  let inc; try { inc = await act("GET", `/incident?${kind}=${id}`); } catch { return; }
+  const s = inc.suspect;
+  $("#detail-body").innerHTML = `
+    <h3>Incident · ${inc.bisect ? `bisect #${inc.bisect}` : `change #${id}`}</h3>
+    <p class="meta">${inc.command ? `<span class="mono">${esc(inc.command)}</span> · ` : ""}${inc.verdict ? `${esc(inc.verdict.replace(/^./, (c) => c.toUpperCase()))}.` : "Changes landed from the suspect on."} ${inc.from ? `Last passing at v${inc.from}.` : ""}</p>
+    ${s ? `<h2>Most likely: <a href="#change/${s.id}">#${s.id} ${esc(s.title)}</a></h2>
+      <p class="meta">By ${esc(s.authorName ?? s.author)}. ${s.ranChecks === true ? "They ran the checks and they passed then." : s.ranChecks === false ? "They ran the checks, and they failed." : "They didn't run the checks themselves."} ${s.approvedBy.length ? `Approved by ${s.approvedBy.map(esc).join(", ")}.` : "Nobody approved it; it landed without review."}${s.filesNamed.length ? ` The failure names ${s.filesNamed.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}.` : ""}</p>
+      ${s.failing ? `<pre class="mono out">${esc(s.failing)}</pre>` : ""}
+      ${s.knew.length ? `<p class="meta"><b>What the author did to those files</b>, from their session:</p>${s.knew.map((k) => `<p class="meta"><span class="mono">${esc(k.ref)}</span> ${esc(k.text)}</p>`).join("")}` : `<p class="meta">No session trace from the author covers these files.</p>`}
+      <div class="row">${s.revertedBy ? `<a class="button ghost" href="#change/${s.revertedBy}">Reverted by #${s.revertedBy}</a>` : `<button class="ghost" id="inc-revert">Revert #${s.id}</button>`}</div>` : ""}
+    <h2>What landed${inc.from ? ` since v${inc.from}` : ""}</h2>
+    ${inc.changes.map((c) => `<div class="qrow"><span class="grow"><a href="#change/${c.id}">#${c.id} ${esc(c.title)}</a> <span class="meta">v${c.version} · ${esc(c.authorName ?? c.author)} · ${plural(c.files.length, ["file", "files"])} · ${c.reviews.length ? c.reviews.map((r) => `${esc(r.reviewerName ?? r.reviewer)} ${r.verdict === "approve" ? "approved" : "asked for changes"}`).join(", ") : "no review"} · ${c.traces.length ? plural(c.traces.length, ["trace", "traces"]) : "no trace"}${c.revertedBy ? ` · reverted by #${c.revertedBy}` : ""}</span></span>${c.suspect ? `<span class="pill checks_failed">suspect</span>` : ""}</div>`).join("") || `<p class="empty">Nothing landed in between.</p>`}
+    ${inc.runs.length ? `<h2>Check runs</h2>${[...inc.runs].sort((a, b) => a.version - b.version).map((r) => `<p class="meta">${r.ok ? "✓" : "✗"} ${r.change ? `#${r.change} ${esc(r.title)}` : esc(r.title)} · v${r.version} · ${Math.round(r.ms / 1000)}s</p>`).join("")}` : ""}
+    <h2>Ask about it</h2>
+    ${inc.bisect ? askBox({ bisect: inc.bisect }, "What did the author know when they changed this?") : s ? askBox({ change: s.id }, "Why did this change land without tests?") : ""}`;
+  if ($("#inc-revert")) $("#inc-revert").onclick = async () => {
+    $("#inc-revert").disabled = true;
+    let r; try { r = await act("POST", `/changes/${s.id}/revert`, { reason: inc.bisect ? `Bisect #${inc.bisect}: ${inc.verdict}` : "" }); } catch { $("#inc-revert").disabled = false; return; }
+    toast(`Revert #${r.id} is in the merge queue`); location.hash = `#change/${r.id}`;
+  };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
+async function showReport(days) {
+  if (!isHuman()) return showSignIn("The factory report reads agents' session traces, so only the project's people can see it.");
+  let r; try { r = await act("GET", `/report?days=${days}`); } catch { return; }
+  const num = (n) => (n == null ? "–" : n >= 10_000 ? `${Math.round(n / 1000)}k` : String(n));
+  const table = (rows, label) => rows.length ? `<table class="report"><tr><th>${label}</th><th>Sessions</th><th>Tokens</th><th>Changes</th><th>Landed</th><th>Rework rounds</th><th>Failed checks</th><th>Reverted</th><th>Tokens per landed change</th></tr>${rows.map((m) => `<tr><td>${esc(m.model)}</td><td>${m.sessions}</td><td>${num(m.tokens)}</td><td>${m.changes}</td><td>${m.landed}</td><td>${m.reworkRounds}</td><td>${m.checksFailed}</td><td>${m.reverted}</td><td>${num(m.tokensPerLanded)}</td></tr>`).join("")}</table>` : "";
+  $("#detail-body").innerHTML = `
+    <h3>Factory report · last ${r.days} days</h3>
+    <p class="meta">${plural(r.sessions, ["session", "sessions"])}, ${plural(r.changes, ["change", "changes"])}, ${r.landed} landed. <a href="#report/${r.days === 7 ? 30 : 7}">Last ${r.days === 7 ? 30 : 7} days</a></p>
+    <h2>What to change</h2>
+    ${r.findings.map((f) => `<div class="card"><b>${esc(f.title)}</b><p class="meta">${esc(f.detail)}</p><p>${esc(f.suggest)}</p><p class="meta">${f.refs.map((x) => x.startsWith("#") ? `<a href="#change/${x.slice(1)}">${esc(x)}</a>` : `<span class="mono">${esc(x)}</span>`).join(" ")}</p></div>`).join("") || `<p class="empty">Nothing stood out. Findings need session traces: turn on uploads in Connect an agent.</p>`}
+    <h2>By model</h2>${table(r.models, "Model") || `<p class="empty">No sessions yet.</p>`}
+    <h2>By agent</h2>${table(r.agents, "Agent")}
+    <h2>Ask about the project</h2>${askBox({}, "Which agent's changes get sent back most, and why?")}`;
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
 function route() {
   const page = /^#(?:account|org\/([a-z0-9-]+))$/.exec(location.hash);
   if (page) { page[1] ? showOrg(page[1]) : showAccount(); return; }
+  const ana = /^#(?:incident\/(bisect|change)\/(\d+)|report(?:\/(\d+))?)$/.exec(location.hash);
+  if (ana) { ana[1] ? showIncident(ana[1], Number(ana[2])) : showReport(Number(ana[3] ?? 7)); return; }
   const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
   const cm = /^#code(?:\/change\/(\d+)|\/workspace\/([^/]+))?(?:\/(history)|\/(tree|file)\/(.+?))?\/?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!(m || cm));
@@ -2202,7 +2272,7 @@ function route() {
 }
 window.addEventListener("hashchange", route);
 // Closing the account or an org page leaves its link, so the same link opens it again.
-$("#detail").addEventListener("close", () => { if (/^#(account|org\/)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
+$("#detail").addEventListener("close", () => { if (/^#(account|org\/|incident\/|report)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
 async function loadReview(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
@@ -2271,8 +2341,9 @@ function drawReview() {
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
+      ${isHuman() && c.traceCount ? askBox({ change: c.id }, "Ask about this change: why did the author skip the tests?") : ""}
       ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
-      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}${c.reverts ? `<a class="button ghost mini" href="#change/${c.reverts}">Reverts #${c.reverts}</a>` : ""}${c.revertedBy ? `<a class="button ghost mini" href="#change/${c.revertedBy}">Reverted by #${c.revertedBy}</a>` : c.status === "merged" && isHuman() ? `<button class="ghost mini" data-revert title="Take this change back out of main: a revert goes through the merge queue, so the checks still run">Revert</button>` : ""}</div>
+      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}${c.reverts ? `<a class="button ghost mini" href="#change/${c.reverts}">Reverts #${c.reverts}</a>` : ""}${c.revertedBy ? `<a class="button ghost mini" href="#change/${c.revertedBy}">Reverted by #${c.revertedBy}</a><a class="button ghost mini" href="#incident/change/${c.id}">Incident view</a>` : c.status === "merged" && isHuman() ? `<button class="ghost mini" data-revert title="Take this change back out of main: a revert goes through the merge queue, so the checks still run">Revert</button>` : ""}</div>
       <div id="clone-box"></div>
     </div>
     <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
