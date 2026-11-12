@@ -5,6 +5,7 @@
 // In local development the Artifacts shim runs the command in a temp
 // directory instead.
 
+import { maskSecrets } from "./mask";
 import { DurableObject } from "cloudflare:workers";
 import type { Env } from "./env";
 
@@ -25,29 +26,33 @@ const OUTPUT_TAIL = 8000;
 const tail = (s: string) => (s.length > OUTPUT_TAIL ? `…\n${s.slice(-OUTPUT_TAIL)}` : s);
 
 /** Run `command` over `files` and report. */
-export async function runCheck(env: Env, project: string, files: Map<string, { bytes: Uint8Array; mode: string }>, command: string, timeoutSec: number): Promise<CheckResult> {
+/**
+ * Run `command` over `files` and report. `secrets` become environment
+ * variables in the run; their values are masked in the output it returns.
+ */
+export async function runCheck(env: Env, project: string, files: Map<string, { bytes: Uint8Array; mode: string }>, command: string, timeoutSec: number, secrets: Record<string, string> = {}): Promise<CheckResult> {
   const archive = tar(files);
   const started = Date.now();
   if (env.CHECKS) {
-    const r = await env.CHECKS.getByName(project).run(archive, command, timeoutSec * 1000);
-    return { ...r, output: tail(r.output), ms: Date.now() - started, runner: "container", command };
+    const r = await env.CHECKS.getByName(project).run(archive, command, timeoutSec * 1000, secrets);
+    return { ...r, output: tail(maskSecrets(r.output, secrets)), ms: Date.now() - started, runner: "container", command };
   }
   if (env.ARTIFACTS_SHIM_URL) {
     const res = await fetch(`${env.ARTIFACTS_SHIM_URL}/checks/run`, {
       method: "POST",
-      headers: { "x-command": encodeURIComponent(command), "x-timeout": String(timeoutSec) },
+      headers: { "x-command": encodeURIComponent(command), "x-timeout": String(timeoutSec), ...(Object.keys(secrets).length ? { "x-env": btoa(unescape(encodeURIComponent(JSON.stringify(secrets)))) } : {}) },
       body: archive,
     });
     if (!res.ok) throw new Error(`local check runner: ${res.status} ${await res.text()}`);
     const r = (await res.json()) as { exitCode: number; output: string };
-    return { ok: r.exitCode === 0, exitCode: r.exitCode, output: tail(r.output), ms: Date.now() - started, runner: "local", command };
+    return { ok: r.exitCode === 0, exitCode: r.exitCode, output: tail(maskSecrets(r.output, secrets)), ms: Date.now() - started, runner: "local", command };
   }
   throw new Error("no check runner: deploy with the CHECKS container binding, or run the Artifacts shim locally");
 }
 
 /** One container per project. Runs are serialized by the coordinator's merge queue; each gets a fresh directory. */
 export class CheckRunner extends DurableObject<Env> {
-  async run(archive: Uint8Array, command: string, timeoutMs: number): Promise<{ ok: boolean; exitCode: number; output: string }> {
+  async run(archive: Uint8Array, command: string, timeoutMs: number, secrets: Record<string, string> = {}): Promise<{ ok: boolean; exitCode: number; output: string }> {
     const c = this.ctx.container;
     if (!c) throw new Error("the CHECKS Durable Object has no container configured");
     if (!c.running) {
@@ -70,7 +75,7 @@ export class CheckRunner extends DurableObject<Env> {
     if (unpacked!.exitCode !== 0) return { ok: false, exitCode: unpacked!.exitCode, output: `unpacking the code failed:\n${new TextDecoder().decode(unpacked!.stdout)}` };
     const abort = AbortSignal.timeout(timeoutMs);
     try {
-      const p = await c.exec(["sh", "-c", command], { cwd: dir, stderr: "combined", signal: abort, env: { CI: "1", HOME: "/root" } });
+      const p = await c.exec(["sh", "-c", command], { cwd: dir, stderr: "combined", signal: abort, env: { ...secrets, CI: "1", HOME: "/root" } });
       const out = await p.output();
       return { ok: out.exitCode === 0, exitCode: out.exitCode, output: new TextDecoder().decode(out.stdout) };
     } catch (e: any) {

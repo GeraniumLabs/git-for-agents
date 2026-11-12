@@ -217,7 +217,8 @@ async function runCheck(req, res) {
       t.stdin.end(Buffer.concat(chunks));
     });
     const result = await new Promise((ok) => {
-      const child = spawn("sh", ["-c", command], { cwd: dir, env: { ...process.env, CI: "1" } });
+      const extra = req.headers["x-env"] ? JSON.parse(Buffer.from(req.headers["x-env"], "base64").toString("utf8")) : {};
+      const child = spawn("sh", ["-c", command], { cwd: dir, env: { ...process.env, ...extra, CI: "1" } });
       let output = "";
       child.stdout.on("data", (d) => (output += d));
       child.stderr.on("data", (d) => (output += d));

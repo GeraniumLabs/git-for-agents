@@ -1586,8 +1586,8 @@ async function showInvite(code) {
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null, account = null, hooks = [];
-  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : []]); } catch { return; }
+  let mail = null, account = null, hooks = [], cs = null;
+  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : [], isOwner() ? act("GET", "/check-secrets").catch(() => null) : null]).then((r) => { cs = r.pop(); return r; }); } catch { return; }
   const org = state?.project?.org ?? null;
   const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
@@ -1610,6 +1610,9 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
+    ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
+    ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
+    ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
     <h2>Questions for people</h2>
     <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
     ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
@@ -1749,6 +1752,18 @@ async function showSettings() {
   };
   if ($("#threads-toggle")) $("#threads-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { resolveThreads: state.project.resolveThreads === false }); state.project.resolveThreads = r.resolveThreads; } catch { return; }
+    showSettings();
+  };
+  if ($("#cs-save")) $("#cs-save").onclick = async () => {
+    try { await act("POST", "/check-secrets", { name: $("#cs-name").value.trim(), value: $("#cs-value").value, onDemand: $("#cs-demand").checked }); } catch { return; }
+    toast("Secret saved"); showSettings();
+  };
+  for (const b of document.querySelectorAll("[data-secret-remove]")) b.onclick = async () => {
+    try { await act("DELETE", `/check-secrets/${encodeURIComponent(b.dataset.secretRemove)}`); } catch { return; }
+    showSettings();
+  };
+  for (const b of document.querySelectorAll("[data-secret-demand]")) b.onclick = async () => {
+    try { await act("POST", "/check-secrets", { name: b.dataset.secretDemand, onDemand: !!b.dataset.on }); } catch { return; }
     showSettings();
   };
   if ($("#dl-save")) $("#dl-save").onclick = async () => {

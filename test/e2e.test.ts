@@ -1456,3 +1456,43 @@ test("submit on push: a commit with a Loom-Submit trailer opens the change, no M
   assert.equal(ch.summary, "Adds hello.txt for new visitors.");
   assert.equal(ch.task_id, t.id);
 });
+
+test("check secrets: the merge queue's checks get them, agents' run_checks only when allowed, and output never shows them", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-secrets");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "check secrets", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { checks: { command: `echo "token is $NPM_TOKEN"; [ -n "$NPM_TOKEN" ]` } });
+  const adaKey = await admin.addAgent("ada", "builder");
+  const ada = admin.as(adaKey.key);
+  const value = "s3cr3t-npm-token-value";
+  await assert.rejects(ada.req("POST", "/check-secrets", { name: "NPM_TOKEN", value }), /owners/);
+  await assert.rejects(admin.req("POST", "/check-secrets", { name: "npm-token", value }), /env var name/);
+  const saved = await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", value });
+  assert.deepEqual(saved.secrets.map((s: any) => [s.name, s.onDemand]), [["NPM_TOKEN", false]]);
+  assert.ok(!JSON.stringify(saved).includes(value), "the value is never sent back");
+
+  const t = await ada.createTask("Add a file", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "a.txt": "a\n" }, "a");
+  // An agent's own run doesn't get a merge-queue-only secret.
+  const without = await ada.req("POST", `/tasks/${t.id}/checks`);
+  assert.equal(without.ok, false);
+  assert.match(without.output, /token is\s*$/m);
+  // Allowed in run_checks: it gets it, and the output shows its name, not its value.
+  await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", onDemand: true });
+  const withIt = await ada.req("POST", `/tasks/${t.id}/checks`);
+  assert.equal(withIt.ok, true, withIt.output);
+  assert.match(withIt.output, /token is \[secret NPM_TOKEN\]/);
+  assert.ok(!withIt.output.includes(value));
+
+  // Back to merge queue only: the change still lands, because the queue's checks get every secret.
+  await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", onDemand: false });
+  const ch = await ada.submit(t.id, t.title, "a", {});
+  await admin.review(ch.id, "approve", "ok");
+  for (let i = 0; i < 60 && (await admin.change(ch.id)).status !== "merged"; i++) await sleep(500);
+  const done = await admin.change(ch.id);
+  assert.equal(done.status, "merged", JSON.stringify(done.checks ?? done.status));
+  assert.ok(!JSON.stringify(done).includes(value), "nothing about the change shows the value");
+  assert.deepEqual((await admin.req("DELETE", "/check-secrets/NPM_TOKEN")).secrets, []);
+});

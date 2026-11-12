@@ -343,6 +343,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS check_secrets (
+        name TEXT PRIMARY KEY, ct TEXT NOT NULL, iv TEXT NOT NULL, sealed_by TEXT NOT NULL, on_demand INTEGER DEFAULT 0,
+        created_by TEXT, created_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS agent_usage (
         day TEXT NOT NULL, grp TEXT NOT NULL, checks_ms INTEGER DEFAULT 0, PRIMARY KEY (day, grp));
       CREATE TABLE IF NOT EXISTS trace_keys (
@@ -937,6 +940,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (m === "GET") { if (!actor.owner && actor.id !== target.id) throw new HttpError(403, "only owners and the agent itself see its limits"); return json(this.limitsView(target.id)); }
       ownerOnly("set an agent's limits");
       return json(this.setAgentLimits(actor, target.id, body));
+    }
+    if (a === "check-secrets") {
+      ownerOnly("manage check secrets");
+      if (m === "GET" && !b) return json(this.checkSecretsView());
+      if (m === "POST" && !b) return json(await this.saveCheckSecret(actor, body));
+      if (m === "DELETE" && b) return json(this.removeCheckSecret(actor, decodeURIComponent(b)));
     }
     if (a === "agent-limits") {
       if (m === "GET") return json({ defaults: this.defaultLimits });
@@ -2477,7 +2486,72 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── checks: the project's tests run on what would land, before main moves ──
 
-  private async checkCommit(w: Workspace, commit: string): Promise<CheckResult> {
+  // ── check secrets: env vars the check command gets, sealed at rest, masked in output ──
+
+  private secretCache: { name: string; value: string; onDemand: boolean }[] | null = null;
+  private async checkSecrets(): Promise<{ name: string; value: string; onDemand: boolean }[]> {
+    if (this.secretCache) return this.secretCache;
+    const out = [];
+    for (const r of this.sql.exec("SELECT name, ct, iv, sealed_by, on_demand FROM check_secrets").toArray() as any[]) {
+      const value = await unseal(this.env, this.project, r);
+      if (value !== null) out.push({ name: r.name as string, value, onDemand: !!r.on_demand });
+    }
+    return (this.secretCache = out);
+  }
+
+  private checkSecretsView() {
+    return {
+      canSave: !!sealer(this.env),
+      secrets: this.sql.exec("SELECT name, on_demand, created_by, created_at, updated_at, sealed_by FROM check_secrets ORDER BY name").toArray().map((r) => ({
+        name: r.name, onDemand: !!r.on_demand, setBy: this.agentName(r.created_by as string) ?? r.created_by, updatedAt: r.updated_at,
+        readable: !!this.env[r.sealed_by === "secret" ? "LOOM_SECRET_KEY" : "LOOM_ADMIN_TOKEN"],
+      })),
+    };
+  }
+
+  private async saveCheckSecret(actor: Agent, body: any) {
+    const name = typeof body.name === "string" ? body.name.trim() : "";
+    if (!/^[A-Z_][A-Z0-9_]*$/.test(name) || name.length > 64) throw new HttpError(400, "a secret's name is an env var name: capitals, digits and _, up to 64 characters (e.g. NPM_TOKEN)");
+    if (["CI", "HOME", "PATH"].includes(name)) throw new HttpError(400, `${name} is set by Loom`);
+    const existing = this.sql.exec("SELECT name FROM check_secrets WHERE name = ?", name).toArray()[0];
+    const value = body.value;
+    if (existing && value === undefined) {
+      this.sql.exec("UPDATE check_secrets SET on_demand = ?, updated_at = ? WHERE name = ?", body.onDemand ? 1 : 0, Date.now(), name);
+    } else {
+      if (typeof value !== "string" || value.length < 4) throw new HttpError(400, "a secret's value is a string of at least 4 characters");
+      if (value.length > 16_384) throw new HttpError(400, "a secret is at most 16 KB");
+      if (!existing && (this.sql.exec("SELECT COUNT(*) AS n FROM check_secrets").one().n as number) >= 50) throw new HttpError(409, "a project has at most 50 check secrets");
+      let sealed;
+      try { sealed = await seal(this.env, this.project, value); } catch (e: any) { throw new HttpError(503, e.message); }
+      const t = Date.now();
+      this.sql.exec(`INSERT INTO check_secrets (name, ct, iv, sealed_by, on_demand, created_by, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT (name) DO UPDATE SET ct = excluded.ct, iv = excluded.iv, sealed_by = excluded.sealed_by, on_demand = excluded.on_demand, created_by = excluded.created_by, updated_at = excluded.updated_at`,
+        name, sealed.ct, sealed.iv, sealed.by, body.onDemand ? 1 : 0, actor.id, t, t);
+    }
+    this.secretCache = null;
+    this.emit("settings.check_secret_saved", { actor: actor.id, data: { name, onDemand: !!body.onDemand } });
+    return this.checkSecretsView();
+  }
+
+  private removeCheckSecret(actor: Agent, name: string) {
+    this.sql.exec("DELETE FROM check_secrets WHERE name = ?", name);
+    this.secretCache = null;
+    this.emit("settings.check_secret_removed", { actor: actor.id, data: { name } });
+    return this.checkSecretsView();
+  }
+
+  /**
+   * The secrets a check run gets. The merge queue's checks get all of them;
+   * an agent's on-demand run_checks only the ones marked onDemand, because
+   * code an agent wrote can print or send whatever it is given.
+   */
+  private async secretsFor(onDemand: boolean): Promise<Record<string, string>> {
+    const env: Record<string, string> = {};
+    for (const s of await this.checkSecrets()) if (!onDemand || s.onDemand) env[s.name] = s.value;
+    return env;
+  }
+
+  private async checkCommit(w: Workspace, commit: string, onDemand = false): Promise<CheckResult> {
     const flat = await w.flatten(commit);
     const files = new Map<string, { bytes: Uint8Array; mode: string }>();
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
@@ -2486,7 +2560,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const budget = this.limits.checkMinutes * 60_000;
     const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
     if (budget > 0 && used >= budget) throw new CheckBudgetError(budget / 60_000, Date.parse(`${day}T00:00:00Z`) + 86_400_000);
-    const r = await runCheck(this.env, this.project, files, command, timeoutSec);
+    const r = await runCheck(this.env, this.project, files, command, timeoutSec, await this.secretsFor(onDemand));
     this.setMeta(`checks_ms:${day}`, String(used + r.ms));
     return r;
   }
@@ -2565,7 +2639,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       note = "Ran on main with your workspace merged in: what would land.";
     } else if (merged) note = "Your workspace conflicts with main, so this ran on your workspace alone; sync_workspace before you submit.";
     this.assertCheckQuota(actor);
-    const r = await this.checkCommit(w, commit).catch((e) => { throw e instanceof CheckBudgetError ? new HttpError(429, e.message) : e; });
+    const r = await this.checkCommit(w, commit, true).catch((e) => { throw e instanceof CheckBudgetError ? new HttpError(429, e.message) : e; });
     this.chargeChecks([actor.id], r.ms);
     this.emit("checks.ran", { actor: actor.id, task: taskId, data: { ok: r.ok, command: r.command, ms: r.ms } });
     return { ...r, note };
@@ -5299,7 +5373,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
 
     const source = (wanted as TraceSource) ?? detectSource(text);
-    const literals = (await Promise.all((Object.keys(KEY_KINDS) as KeyKind[]).map((k) => this.projectKey(k)))).filter((k): k is string => !!k);
+    const literals = (await Promise.all((Object.keys(KEY_KINDS) as KeyKind[]).map((k) => this.projectKey(k)))).filter((k): k is string => !!k)
+      .concat((await this.checkSecrets()).map((s) => s.value));
     const red = redact(text, { literals, patterns: settings.redact });
     let stored = red.text;
     if (!settings.thoughts) stored = dropThoughts(stored, source);
