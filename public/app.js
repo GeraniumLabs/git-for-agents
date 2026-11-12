@@ -519,7 +519,7 @@ function renderNotes() {
 // ── session traces: what the agents behind a change read, thought and did ─
 
 const tokens = (n) => (n >= 1e6 ? `${(n / 1e6).toFixed(1)}M` : n >= 1e3 ? `${Math.round(n / 1e3)}k` : String(n ?? 0));
-const STEP_LABEL = { prompt: "Prompt", thought: "Thought", message: "Said", tool_call: "Called", tool_result: "Got back", error: "Error" };
+const STEP_LABEL = { prompt: "Prompt", context: "Context", thought: "Thought", message: "Said", tool_call: "Called", tool_result: "Got back", error: "Error" };
 
 async function traceFetch(path) {
   const r = await fetch(`/api/projects/${project}${path}`, { headers: keyHeader() });
@@ -537,7 +537,7 @@ async function showTraces(box, changeId) {
   try { r = await traceFetch(`/traces?change=${changeId}`); } catch (e) { box.innerHTML = `<p class="meta">${esc(e.message)}</p>`; return; }
   box.innerHTML = r.traces.length ? `<ul class="traces">${r.traces.map((t) => `<li data-trace="${t.id}">
       <div><b>${who(t.agent)}</b> · ${esc(t.source)}${t.models.length ? ` · ${t.models.map(esc).join(", ")}` : ""}
-        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}</span></div>
+        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}${t.version > 1 ? ` · version ${t.version}` : ""}${t.sha256 ? ` · <span title="SHA-256 of the stored log: ${esc(t.sha256)}">sha256 ${esc(t.sha256.slice(0, 12))}</span>` : ""}</span></div>
       <div class="row"><button class="ghost mini" data-steps="${t.id}">Steps</button><button class="ghost mini" data-raw="${t.id}">Full log</button></div>
       <ol class="steps" id="steps-${t.id}"></ol></li>`).join("")}</ul>` : `<p class="meta">No traces yet.</p>`;
   wire(box);
@@ -557,6 +557,55 @@ async function showTraces(box, changeId) {
     const url = URL.createObjectURL(new Blob([await r.text()], { type: "text/plain" }));
     window.open(url, "_blank", "noopener");
   }));
+}
+
+const ACT_LABEL = { edit: "Edited", loom: "Loom", command: "Ran", refused: "Refused", failed: "Failed" };
+const PERSON_LABEL = { ask: "Asked", decision: "Decided", review: "Reviewed" };
+
+const samePathUi = (a, b) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+const actId = (a) => `act-${a.trace}-${a.seq}`;
+/** The agent's acts that touched a file, from the change's intent. */
+const actsForFile = (path) => (review?.intent?.agent ?? []).filter((a) => a.files.some((f) => samePathUi(f, path)));
+const askOf = (a) => review?.intent?.person.find((p) => p.kind === "ask" && p.trace === a.trace && p.seq === a.ask);
+const pin = (x) => (x.trace ? `<span class="meta" title="Step ${x.seq} of session trace #${x.trace}">trace #${x.trace} · step ${x.seq}</span>` : "");
+
+/** Above a file's diff: why it changed (the agent's reason and what it was asked), or that no trace says. */
+function fileIntentHtml(path) {
+  const acts = actsForFile(path);
+  if (!acts.length) return `<div class="file-intent none">No session trace shows why this file changed. Its code is the only record: read it closely.</div>`;
+  return `<div class="file-intent">${acts.slice(0, 3).map((a) => {
+    const ask = askOf(a);
+    return `<div class="fi-row"><span class="k">${ACT_LABEL[a.kind] ?? a.kind}</span>
+      ${a.why ? `<span class="int-why">“${esc(a.why)}”</span>` : `<span class="meta">No reason given.</span>`}
+      ${ask ? `<span class="meta">· asked: “${esc(ask.text.length > 140 ? ask.text.slice(0, 140) + "…" : ask.text)}”</span>` : ""}
+      <a class="fi-jump" data-toact="${actId(a)}" title="See this act among everything asked and done">In intent →</a></div>`;
+  }).join("")}${acts.length > 3 ? `<div class="meta">and ${acts.length - 3} more in the intent view</div>` : ""}</div>`;
+}
+
+/**
+ * Review intent instead of code: what the person asked and decided, what the
+ * agent did to this change's files and the reason it gave, each pinned to a
+ * step of a fingerprinted trace, and the files no trace explains. Every file
+ * an act touched links back to its code.
+ */
+function intentHtml(it, shown = []) {
+  const when = (t) => (t ? `${ago(t)} ago` : "");
+  const codeLink = (f) => {
+    const p = shown.find((x) => samePathUi(f, x));
+    return p ? `<a class="mono" data-tocode="${esc(p)}" title="Jump to this file's code">${esc(p)} ↗</a>` : `<span class="mono">${esc(f)}</span>`;
+  };
+  const person = it.person.map((p) => `<li class="int-p ${p.kind}"><span class="k">${PERSON_LABEL[p.kind] ?? p.kind}</span>${p.byName ? ` <b>${esc(p.byName)}</b>` : ""} ${p.question ? `<span class="meta">${esc(p.question)} →</span> ` : ""}${esc(p.text)} ${pin(p)} <span class="meta">${when(p.at)}</span></li>`).join("");
+  const agent = it.agent.map((a) => `<li class="int-a ${a.kind}" id="${actId(a)}"><span class="k">${ACT_LABEL[a.kind] ?? a.kind}</span> <span class="what">${a.kind === "edit" ? a.files.map(codeLink).join(", ") : esc(a.what)}</span>
+      ${a.why ? `<div class="int-why">“${esc(a.why)}”</div>` : ""}<div>${pin(a)} <span class="meta">${esc(a.agentName ?? "")} ${when(a.at)}</span></div></li>`).join("");
+  return `<div class="intent">
+    <h3>What was asked</h3>
+    ${it.task ? `<p class="meta">Task #${it.task.id} “${esc(it.task.title)}”${it.task.byName ? `, filed by ${esc(it.task.byName)}${it.task.byPerson ? "" : " (an agent)"}` : ""}${it.task.description ? `: ${esc(it.task.description)}` : ""}</p>` : ""}
+    ${person ? `<ol class="int-list">${person}</ol>` : `<p class="meta">No person's words reach this change in its traces.</p>`}
+    <h3>What the agent did, and why</h3>
+    ${agent ? `<ol class="int-list">${agent}</ol>` : `<p class="meta">The traces don't show the agent working on this change's files.</p>`}
+    ${it.unexplained.length ? `<p class="warn">No trace shows how these changed: ${it.unexplained.map(codeLink).join(", ")}. Review their code.</p>` : `<p class="meta">Every file in the change is accounted for in a trace.</p>`}
+    <p class="meta">Evidence: ${it.evidence.map((e) => `trace #${e.trace}${e.version > 1 ? ` v${e.version}` : ""} by ${esc(e.agentName)}${e.sha256 ? ` <span class="mono" title="${esc(e.sha256)}">sha256 ${esc(e.sha256.slice(0, 12))}</span>` : ""}`).join(" · ")}</p>
+  </div>`;
 }
 
 // ── attachments: screenshots, builds, logs and documents agents posted ─
@@ -2060,7 +2109,14 @@ async function loadReview(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
   if (c.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(c.error)}</p></div>`; return; }
   const prev = review?.id === id ? review : null;
-  review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0 };
+  review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0,
+    intent: prev?.intent ?? null, mode: prev?.mode ?? "code" };
+  // Intent comes from the session traces, which only the project's people read: fetched alongside, drawn when it arrives.
+  if (c.traceCount && isHuman()) traceFetch(`/changes/${id}/intent`).then((it) => {
+    if (review?.id !== id) return;
+    review.intent = it;
+    const y = window.scrollY; drawReview(); window.scrollTo(0, y);
+  }).catch(() => {});
   const lastMine = c.reviewedHeads.filter((r) => r.reviewer === me?.id).at(-1)?.head;
   review.lastMine = lastMine && lastMine !== c.head ? lastMine : null;
   if (review.since === null) review.since = !!review.lastMine;
@@ -2101,6 +2157,7 @@ function drawReview() {
     return `<li class="${seen.has(f.path) ? "seen" : ""}${i === review.file ? " on" : ""}" data-goto="${i}" title="${esc(f.path)}${b?.flags.length ? "\n" + b.flags.map((x) => "• " + x.text).join("\n") : ""}">
       <input type="checkbox" data-viewed="${esc(f.path)}" ${seen.has(f.path) ? "checked" : ""} title="Viewed">
       <span class="risk r${Math.min(3, Math.ceil((b?.score ?? 0) / 2))}"></span>
+      ${review.intent ? (actsForFile(f.path).length ? `<span class="int-mark ok" title="A session trace shows why this changed">✓</span>` : `<span class="int-mark no" title="No session trace explains this file: read its code">?</span>`) : ""}
       <span class="fname">${esc(f.path)}</span>
       ${n ? `<span class="tcount" title="open threads">${n}</span>` : ""}
       <span class="add">+${f.plus}</span><span class="del">−${f.minus}</span></li>`;
@@ -2131,14 +2188,15 @@ function drawReview() {
       </aside>
       <section class="rv-diff">
         <div class="rv-tools">
+          ${review.intent ? `<span class="seg" title="Read the change as code, or as what was asked and what the agent chose (i)"><button data-mode="code" class="${review.mode === "code" ? "on" : ""}">Code</button><button data-mode="intent" class="${review.mode === "intent" ? "on" : ""}">Intent</button></span>` : ""}
           <span class="seg"><button data-view="unified" class="${review.view === "unified" ? "on" : ""}" title="Old and new lines in one column">Unified</button><button data-view="split" class="${review.view === "split" ? "on" : ""}" title="Old on the left, new on the right">Split</button></span>
           ${review.lastMine ? `<span class="seg"><button data-since="0" class="${review.since ? "" : "on"}">All changes</button><button data-since="1" class="${review.since ? "on" : ""}">Since your review</button></span>` : ""}
           <span class="meta grow">${canReview ? "Click a line to comment on it." : !me ? "Sign in to review." : me.id === c.agent_id ? "Your own change: answer the threads on it." : ""}</span>
           ${open.length ? `<span class="pill changes_requested">${plural(open.length, ["open thread", "open threads"])}</span>` : ""}
         </div>
         ${review.since ? `<p class="meta since">Showing what changed since you reviewed it (${review.lastMine.slice(0, 7)} → ${c.head.slice(0, 7)}).</p>` : ""}
-        ${orphanThreads(c, files)}
-        ${files.map((f, i) => fileBlock(f, i, briefOf.get(f.path), threadsAt(f.path), canReview)).join("")}
+        ${review.intent && review.mode === "intent" ? intentHtml(review.intent, files.map((f) => f.path)) : `${orphanThreads(c, files)}
+        ${files.map((f, i) => fileBlock(f, i, briefOf.get(f.path), threadsAt(f.path), canReview)).join("")}`}
         ${canReview ? `<div class="rv-submit panel">
           <textarea id="rv-body" rows="2" placeholder="Review summary (optional)"></textarea>
           <div class="row"><span class="meta grow" id="rv-pending"></span>
@@ -2172,6 +2230,7 @@ function fileBlock(f, i, b, threads, canReview) {
       ${(b?.flags ?? []).map((x) => `<span class="flag ${x.kind}">${esc(x.text)}</span>`).join("")}
       <span class="grow"></span><span class="add">+${f.plus}</span> <span class="del">−${f.minus}</span>
       ${f.deleted ? "" : `<button class="ghost mini" data-open="${esc(f.path)}" title="The whole file as this change leaves it">View file</button>`}</div>
+    ${review.intent ? fileIntentHtml(f.path) : ""}
     ${elsewhere.length ? `<div class="rv-orphans">${elsewhere.map((t) => threadHtml(t, true)).join("")}</div>` : ""}
     <div class="diffview rv-dv ${review.view}">${body}</div>
   </div>`;
@@ -2277,6 +2336,17 @@ function wireReview(canReview) {
   root.querySelector("[data-browse]").onclick = () => showCode({ change: c.id });
   const tb = root.querySelector("[data-traces]");
   if (tb) tb.onclick = () => showTraces($("#traces-box"), c.id);
+  // Code ⇄ intent: the toggle, a file's reasons to the act in the intent view, and an act back to its file's code.
+  const setMode = (mode, then) => { review.mode = mode; drawReview(); then?.(); };
+  for (const b of root.querySelectorAll("[data-mode]")) b.onclick = () => setMode(b.dataset.mode, () => window.scrollTo(0, root.querySelector(".rv-diff").offsetTop - 60));
+  for (const a of root.querySelectorAll("[data-toact]")) a.onclick = () => setMode("intent", () => {
+    const el = document.getElementById(a.dataset.toact);
+    if (!el) return;
+    el.scrollIntoView({ block: "center" });
+    el.classList.add("flash");
+    setTimeout(() => el.classList.remove("flash"), 1600);
+  });
+  for (const a of root.querySelectorAll("[data-tocode]")) a.onclick = () => setMode("code", () => document.getElementById(fileId(a.dataset.tocode))?.scrollIntoView({ block: "start" }));
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);
@@ -2337,12 +2407,13 @@ function wireReview(canReview) {
   });
 }
 
-// Keyboard: j and k move between files, v marks the current one viewed.
+// Keyboard: j and k move between files, v marks the current one viewed, i switches between code and intent.
 document.addEventListener("keydown", (e) => {
   if (!review || $("#review").hidden || e.metaKey || e.ctrlKey || e.altKey || e.target.closest("input, textarea, select") || $("#detail").open) return;
   const lis = $("#review").querySelectorAll("[data-goto]");
   if (e.key === "j" || e.key === "k") lis[Math.max(0, Math.min(lis.length - 1, review.file + (e.key === "j" ? 1 : -1)))]?.click();
   else if (e.key === "v") { const x = lis[review.file]?.querySelector("[data-viewed]"); if (x) { x.checked = !x.checked; x.onchange(); } }
+  else if (e.key === "i" && review.intent) $(`#review [data-mode="${review.mode === "intent" ? "code" : "intent"}"]`)?.click();
 });
 
 // A change on screen refreshes when its review moves, unless you're mid-comment.

@@ -19,7 +19,7 @@ export const MAX_TRACE_BYTES = 25 * 1024 * 1024;
 export type TraceSource = "claude-code" | "codex" | "otel" | "text";
 export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "otel", "text"];
 
-export type StepKind = "prompt" | "thought" | "message" | "tool_call" | "tool_result" | "error";
+export type StepKind = "prompt" | "context" | "thought" | "message" | "tool_call" | "tool_result" | "error";
 
 export interface Step {
   seq: number;
@@ -93,6 +93,19 @@ const BEARER = /\b(Bearer\s+)[A-Za-z0-9._~+/-]{16,}=*/g;
 /** API_KEY=..., "password": "...", token: ... — the value goes, the name stays. Never crosses a quote, so JSON stays valid. */
 const ASSIGNED = /\b([A-Za-z0-9_]*(?:api[_-]?key|secret|token|password|passwd|access[_-]?key|credentials?)[A-Za-z0-9_]*)(\\?["']?\s*[:=]\s*\\?["']?)([^\s"'\\,;(){}[\]]{8,})/gi;
 
+/**
+ * What a name=value match that isn't a secret looks like in real agent logs:
+ * token counts (`tokensIn: 1200`, `"thinkingTokens":25361`), numbers, and
+ * code that reads a secret rather than holding one (`env.LOOM_SECRET_KEY`,
+ * `s.tokens_in`, `process.env.TOKEN`).
+ */
+function notASecret(name: string, value: string): boolean {
+  if (/^-?\d+(\.\d+)?$/.test(value)) return true;
+  if (/tokens|token_?count|tokens?_?(in|out)$|max_?tokens/i.test(name)) return true;
+  if (/^[A-Za-z_$][\w$]*(\.[A-Za-z_$][\w$]*)+$/.test(value)) return true;
+  return false;
+}
+
 export interface Redaction {
   text: string;
   count: number;
@@ -108,11 +121,15 @@ export interface Redaction {
 export function redact(text: string, opts: { literals?: string[]; patterns?: string[] } = {}): Redaction {
   const kinds: Record<string, number> = {};
   const hit = (kind: string) => (kinds[kind] = (kinds[kind] ?? 0) + 1);
-  let out = text;
+  // Screenshots and other inline images go first: text redaction can't see a
+  // secret inside a picture of a dashboard, and they're a large share of a log.
+  let out = text
+    .replace(/("data"\s*:\s*")([A-Za-z0-9+/=]{1000,})(")/g, (_m, a, data, z) => (hit("image"), `${a}[redacted:image ${Math.round(data.length * 0.75 / 1024)} KB]${z}`))
+    .replace(/data:image\/[a-z+.-]+;base64,[A-Za-z0-9+/=]{1000,}/g, (m) => (hit("image"), `[redacted:image ${Math.round(m.length * 0.75 / 1024)} KB]`));
   for (const [kind, re] of SECRET_PATTERNS) out = out.replace(re, () => (hit(kind), `[redacted:${kind}]`));
   out = out.replace(URL_CREDENTIALS, (_m, scheme) => (hit("url-credentials"), `${scheme}[redacted:url-credentials]@`));
   out = out.replace(BEARER, (_m, pre) => (hit("bearer"), `${pre}[redacted:bearer]`));
-  out = out.replace(ASSIGNED, (m, name, sep, value) => (value.startsWith("[redacted") ? m : (hit("assigned"), `${name}${sep}[redacted:assigned]`)));
+  out = out.replace(ASSIGNED, (m, name, sep, value) => (value.startsWith("[redacted") || notASecret(name, value) ? m : (hit("assigned"), `${name}${sep}[redacted:assigned]`)));
   for (const lit of opts.literals ?? []) {
     if (!lit || lit.length < 6) continue;
     const pieces = out.split(lit);
@@ -157,7 +174,17 @@ const jsonLines = (text: string): any[] => {
 export function detectSource(text: string): TraceSource {
   const head = text.slice(0, 20_000).trimStart();
   if (head.startsWith("{") && /"resourceSpans"\s*:/.test(head)) return "otel";
-  const lines = jsonLines(head).slice(0, 20);
+  // Whole lines, not the first 20 KB: a real transcript's first prompt line
+  // often carries a long system context and runs well past that.
+  const lines: any[] = [];
+  let at = 0;
+  while (lines.length < 40 && at < text.length && at < 8_000_000) {
+    const end = text.indexOf("\n", at);
+    const t = text.slice(at, end < 0 ? text.length : end).trim();
+    at = end < 0 ? text.length : end + 1;
+    if (!t.startsWith("{")) continue;
+    try { lines.push(JSON.parse(t)); } catch { /* cut off, or prose */ }
+  }
   if (lines.some((l) => ["session_meta", "response_item", "event_msg", "turn_context"].includes(l?.type) && l.payload)) return "codex";
   if (lines.some((l) => ["user", "assistant", "summary", "system"].includes(l?.type) && (l.message || l.sessionId || l.summary))) return "claude-code";
   return "text";
@@ -218,6 +245,24 @@ class Builder {
   }
 }
 
+/**
+ * A "user" turn in an agent's log is often not a person: a harness wakes the
+ * agent with a notification, loads a skill, or captions an image, usually
+ * wrapped in a tag. Those are context, not prompts. A person's words inside a
+ * harness envelope (<message from="human">…</message>) are the prompt.
+ */
+const unescapeXml = (t: string) => t.replace(/&(#\d+|#x[0-9a-f]+|amp|lt|gt|quot|apos);/gi, (m, e: string) =>
+  e[0] === "#" ? String.fromCodePoint(e[1] === "x" || e[1] === "X" ? parseInt(e.slice(2), 16) : Number(e.slice(1))) : ({ amp: "&", lt: "<", gt: ">", quot: '"', apos: "'" } as Record<string, string>)[e.toLowerCase()] ?? m);
+
+export function promptOf(text: string, meta = false): { kind: "prompt" | "context"; text: string } {
+  const said = [...text.matchAll(/<(message|cited)\b[^>]*\b(?:from|author)="(?:human|user)"[^>]*>([\s\S]*?)<\/\1>/g)].map((m) => unescapeXml(m[2].trim())).filter(Boolean);
+  if (said.length) return { kind: "prompt", text: said.join("\n") };
+  if (meta) return { kind: "context", text };
+  const t = text.trimStart();
+  if (/^<[a-z][\w-]*[\s>/]/i.test(t) || /^\[Image[:\s]/.test(t) || /^Base directory for this skill/.test(t) || /^Caveat: /.test(t)) return { kind: "context", text };
+  return { kind: "prompt", text };
+}
+
 function parseClaudeCode(text: string, keepThoughts: boolean): ParsedTrace {
   const b = new Builder(keepThoughts);
   const tools = new Map<string, string>(); // tool_use id → tool name
@@ -245,7 +290,10 @@ function parseClaudeCode(text: string, keepThoughts: boolean): ParsedTrace {
       if (!c || typeof c !== "object") continue;
       if (c.type === "text") {
         const user = l.type === "user" || msg.role === "user";
-        b.add({ ts, kind: user ? "prompt" : "message", preview: asText(c.text), model, ...(user ? {} : usage()) });
+        if (user) {
+          const p = promptOf(asText(c.text), !!l.isMeta);
+          b.add({ ts, kind: p.kind, preview: p.text, model });
+        } else b.add({ ts, kind: "message", preview: asText(c.text), model, ...usage() });
       } else if (c.type === "thinking" || c.type === "redacted_thinking") {
         b.add({ ts, kind: "thought", preview: asText(c.thinking ?? "[redacted thinking]"), model, ...usage() });
       } else if (c.type === "tool_use") {
@@ -421,3 +469,108 @@ async function pipe(bytes: Uint8Array, stream: CompressionStream | Decompression
 }
 export const gzip = (text: string) => pipe(new TextEncoder().encode(text), new CompressionStream("gzip"));
 export const gunzip = async (bytes: Uint8Array) => new TextDecoder().decode(await pipe(bytes, new DecompressionStream("gzip")));
+
+/** A SHA-256 fingerprint, hex: what a trace's evidence is pinned to. */
+export async function sha256Hex(data: string | Uint8Array): Promise<string> {
+  const bytes = typeof data === "string" ? new TextEncoder().encode(data) : data;
+  const digest = await crypto.subtle.digest("SHA-256", bytes);
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("");
+}
+
+// ── intent: what was asked and what the agent chose, from a trace ─────────
+
+export interface IntentAct {
+  seq: number;
+  ts: number | null;
+  /** edit, loom, command, refused or failed. */
+  kind: "edit" | "loom" | "command" | "refused" | "failed";
+  /** One line: what the agent did. */
+  what: string;
+  /** What the agent said or thought just before, if anything: its stated reason. */
+  why?: string;
+  files: string[];
+  /** The prompt this act answers (its seq), so a reviewer can see what it was asked. */
+  ask?: number;
+}
+
+export interface Intent {
+  asks: { seq: number; ts: number | null; text: string }[];
+  acts: IntentAct[];
+}
+
+const EDIT_TOOLS = /^(Edit|MultiEdit|Write|NotebookEdit|apply_patch|str_replace_based_edit_tool|edit_file|write_file|create_file)$/i;
+const SHELL_TOOLS = /^(Bash|shell|local_shell|exec_command|run_terminal_cmd|terminal)$/i;
+/** Commands whose effects outlive the session: what a reviewer needs to see the agent chose. */
+const WEIGHTY = /\bgit\s+(push|commit|merge|rebase|reset|revert|tag|cherry-pick)\b|\bwrangler\s+(deploy|delete|secret|r2|d1)\b|\bnpm\s+publish\b|\brm\s+-[a-z]*r[a-z]*f?\b|\bcurl\b[^\n]*-X\s*(POST|PUT|PATCH|DELETE)\b|\bgh\s+(pr|release|repo)\b|\bkubectl\s+(apply|delete)\b|\bterraform\s+(apply|destroy)\b|\bdocker\s+push\b|\bpsql\b|\bDROP\s+TABLE\b/i;
+const LOOM_ACTS = new Set(["declare_intent", "release_intent", "submit_change", "update_change", "write_files", "review_change", "vote", "ask_human", "propose", "answer_proposal", "open_dispute", "state_position", "run_checks", "claim_task", "release_task", "create_task", "publish_contract"]);
+const REFUSED = /permission (for this [a-z ]+ )?(was )?denied|not permitted|refused|forbidden|\b403\b/i;
+
+/** A heredoc's body is data (a script, a file), not the command: `cat <<'EOF' … EOF`. */
+const HEREDOC = /<<-?\s*['"]?(\w+)['"]?[\s\S]*?(?:\n\1\b|$)/g;
+/** The command from a shell call's arguments, which are JSON ({"command": "…"}) and may be cut off. */
+export function commandOf(preview: string): string {
+  const m = /"(?:command|cmd)"\s*:\s*"((?:[^"\\]|\\.)*)/.exec(preview);
+  if (!m) return preview;
+  try { return JSON.parse(`"${m[1]}"`); } catch { return m[1].replace(/\\n/g, "\n").replace(/\\"/g, '"').replace(/\\\\/g, "\\"); }
+}
+const samePath = (a: string, b: string) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
+const oneLine = (t: string, n = 200) => { const s = t.replace(/\s+/g, " ").trim(); return s.length > n ? `${s.slice(0, n)}…` : s; };
+
+/**
+ * From a trace's steps, what bears on one change: the agent's consequential
+ * acts (edits to the change's files, Loom calls about its task or change,
+ * commands with lasting effects, refusals and failures), each with the
+ * reason the agent gave just before and the person's prompt it answered.
+ */
+export function intentOf(steps: Step[], scope: { paths: string[]; taskId?: number | null; changeId?: number | null }): Intent {
+  const mentions = (s: Step) => {
+    const ids = [scope.taskId != null ? `"taskId":${scope.taskId}` : null, scope.changeId != null ? `"changeId":${scope.changeId}` : null, scope.changeId != null ? `"change":${scope.changeId}` : null].filter(Boolean) as string[];
+    return ids.some((i) => s.preview.replace(/\s/g, "").includes(i));
+  };
+  const touches = (s: Step) => s.files.some((f) => scope.paths.some((p) => samePath(f, p))) || (SHELL_TOOLS.test(s.tool ?? "") && scope.paths.some((p) => s.preview.includes(p)));
+  const relevant = steps.filter((s) => s.kind === "tool_call" && (touches(s) || (s.loomCall && mentions(s))));
+  if (!relevant.length) return { asks: [], acts: [] };
+  // What concerns this change is the turns (a prompt and everything up to the next) that touched it: a
+  // deploy or push after the edits is part of the turn; a later turn on something else isn't.
+  const turnOf = new Map<number, number>();
+  let turn = 0;
+  for (const s of steps) { if (s.kind === "prompt") turn = s.seq; turnOf.set(s.seq, turn); }
+  const turns = new Set(relevant.map((s) => turnOf.get(s.seq)));
+
+  const acts: IntentAct[] = [];
+  const asks = new Map<number, { seq: number; ts: number | null; text: string }>();
+  let ask: Step | undefined, why: Step | undefined;
+  const editedOnce = new Set<string>();
+  let lastCall: Step | undefined;
+  for (const s of steps) {
+    if (s.kind === "prompt") { ask = s; why = undefined; editedOnce.clear(); continue; }
+    if (s.kind === "message" || s.kind === "thought") { why = s; continue; }
+    if (s.kind === "tool_call") lastCall = s;
+    if (!turns.has(turnOf.get(s.seq))) continue;
+    const add = (kind: IntentAct["kind"], what: string, files: string[] = []) => {
+      const a: IntentAct = { seq: s.seq, ts: s.ts, kind, what, files };
+      if (why) a.why = oneLine(why.preview, 300);
+      if (ask) { a.ask = ask.seq; asks.set(ask.seq, { seq: ask.seq, ts: ask.ts, text: oneLine(ask.preview, 500) }); }
+      acts.push(a);
+      why = undefined;
+    };
+    if (s.kind === "tool_call") {
+      const tool = s.tool ?? "tool";
+      if (s.loomCall && LOOM_ACTS.has(s.loomCall)) add("loom", `${s.loomCall} ${oneLine(s.preview, 160)}`, s.files);
+      else if (EDIT_TOOLS.test(tool) && touches(s)) {
+        const fresh = s.files.filter((f) => !editedOnce.has(f));
+        if (!fresh.length) continue; // later edits to the same file add nothing a reviewer needs here
+        fresh.forEach((f) => editedOnce.add(f));
+        add("edit", fresh.map((f) => scope.paths.find((p) => samePath(f, p)) ?? f).join(", "), s.files);
+      } else if (SHELL_TOOLS.test(tool)) {
+        const cmd = commandOf(s.preview);
+        if (WEIGHTY.test(cmd.replace(HEREDOC, ""))) add("command", oneLine(cmd, 200), s.files);
+      }
+    } else if ((s.kind === "error" || s.kind === "tool_result") && (s.error || s.kind === "error")) {
+      const call = lastCall;
+      if (REFUSED.test(s.preview)) add("refused", `${call?.tool ?? "a call"} was refused: ${oneLine(s.preview, 200)}`, call?.files ?? []);
+      else if (call && acts.some((a) => a.seq === call.seq)) add("failed", `${call.tool} failed: ${oneLine(s.preview, 200)}`, call.files);
+    }
+  }
+  return { asks: [...asks.values()], acts };
+}
