@@ -1137,6 +1137,7 @@ async function showSkill(joinCode, fresh = false) {
     <h2>Your own agent, in one line</h2>
     <p class="meta">Run one of these where your agent runs. It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Sub-agents pass their own name as <span class="mono">as</span>. Any other MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once.</p>
     ${oneLine.map((c) => `<div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
+    ${traceSection(me && isHuman() && me.id !== "admin" && !me.standin ? await api("/trace-keys").catch(() => []) : null)}
     <p class="meta">For agents you won't sign in for, such as a swarm or a runner on a server, use a join code:</p>
     ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
       : `<h2>1. Get a join code</h2>
@@ -1157,6 +1158,7 @@ async function showSkill(joinCode, fresh = false) {
     </section>
     <h2>The skill</h2>
     <pre class="diff copy skill">${esc(text)}</pre>`;
+  wireTraceSection(() => showSkill(joinCode, fresh));
   if ($("#mk-go")) $("#mk-go").onclick = async () => {
     const n = $("#mk-name").value.trim();
     if (!n) return;
@@ -1202,6 +1204,40 @@ async function showSkill(joinCode, fresh = false) {
 $("#skill-open").onclick = () => showSkill();
 
 // ── new projects ────────────────────────────────────────────────────────
+// ── optional session traces: a person's hook uploads their agent's sessions ──
+function traceInstall(key) {
+  return `mkdir -p ~/.loom && curl -fsS ${location.origin}/trace-hook.mjs -o ~/.loom/trace-hook.mjs && node ~/.loom/trace-hook.mjs --install ${location.origin} ${project} ${key.key}${key.agent !== "Claude Code" ? ` --agent "${key.agent.replace(/"/g, "")}"` : ""}`;
+}
+/** keys: this person's trace keys, or null when the viewer can't make one. */
+function traceSection(keys) {
+  const why = `Off unless you turn it on. When it's on, your Claude Code sessions in a repository upload to ${esc(project)} when they end, so a reviewer can switch a change to <b>Intent</b> and see what you asked and why the agent did what it did. Secrets are removed before anything is stored, and only the project's people can read traces.`;
+  if (!keys) return `<h2>Session traces <small>optional</small></h2><p class="meta">${why} ${me ? "Sign in as a person to turn it on." : `<a href="#" id="tr-signin">Sign in</a> to turn it on.`} Agents with their own key can use the same hook: see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>.</p>`;
+  const rows = keys.map((k) => `<div class="qrow"><span class="grow">On for <b>${esc(k.agent)}</b> <span class="meta">${k.person !== me.id ? `${esc(k.personName)} · ` : ""}since ${new Date(k.createdAt).toLocaleDateString()} · ${k.lastUsed ? `last upload ${ago(k.lastUsed)}` : "nothing uploaded yet"}</span></span><button class="ghost mini" data-tk-revoke="${esc(k.id)}">Turn off</button></div>`).join("");
+  return `<h2>Session traces <small>optional</small></h2><p class="meta">${why}</p>
+    ${rows}
+    <div class="row"><input id="tk-agent" value="Claude Code" title="The agent its uploads are filed under: keep the app's name so traces line up with that agent's changes"><button class="ghost" id="tk-go">${keys.length ? "Turn on in another repository" : "Turn on"}</button></div>
+    <div id="tk-out"></div>`;
+}
+function wireTraceSection(redraw) {
+  if ($("#tr-signin")) $("#tr-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to turn on session traces for ${project}.`); };
+  if ($("#tk-go")) $("#tk-go").onclick = async () => {
+    let k;
+    try { k = await act("POST", "/trace-keys", { agent: $("#tk-agent").value.trim() || undefined }); } catch { return; }
+    const cmd = traceInstall(k);
+    $("#tk-out").innerHTML = `<div class="card fresh"><b>Run this in the root of your repository</b>
+      <p class="meta">It saves a key that can only upload traces in <span class="mono">~/.loom</span>, readable only by you, and adds a <span class="mono">SessionEnd</span> hook to <span class="mono">.claude/settings.local.json</span>. The key is shown only now. To turn it off, run <span class="mono">node ~/.loom/trace-hook.mjs --uninstall ${esc(project)}</span> or press Turn off here.</p>
+      <div class="row code-row"><pre class="diff copy grow">${esc(cmd)}</pre><button class="ghost mini" data-copy="${esc(cmd)}">Copy</button></div></div>`;
+    wireCopy($("#tk-out"));
+    $("#tk-go").disabled = true;
+  };
+  for (const b of document.querySelectorAll("[data-tk-revoke]")) b.onclick = async () => {
+    if (!await ask({ title: "Turn off session traces?", body: "Loom stops taking uploads with this key. Traces already uploaded stay. Remove the hook on your machine too with --uninstall.", ok: "Turn off", danger: true })) return;
+    try { await act("DELETE", `/trace-keys/${b.dataset.tkRevoke}`); } catch { return; }
+    toast("Session traces off for that key");
+    redraw();
+  };
+}
+
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
   <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
   <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Loom shows them as separate agents under ${esc(k.name)}.</p>

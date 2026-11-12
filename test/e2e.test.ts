@@ -1243,3 +1243,63 @@ test("a change's intent: the person's asks and decisions, the agent's acts and r
   assert.deepEqual(it.unexplained, []);
   assert.equal((await admin.change(ch.id)).status !== undefined, true, "the public change view still works");
 });
+
+test("session traces are opt-in: a person's trace key installs the hook, uploads as their agent, and can do nothing else", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const name = project("e2e-tracekey");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "opt-in traces", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const jo = admin.as((await admin.req("POST", "/agents", { name: "jo", role: "human" })).key);
+  const ann = admin.as((await admin.req("POST", "/agents", { name: "ann", role: "human" })).key);
+
+  await assert.rejects(ada.req("POST", "/trace-keys", {}), /people/, "agents upload with their own key");
+  assert.deepEqual(await jo.req("GET", "/trace-keys"), [], "off until a person turns it on");
+  const k = await jo.req("POST", "/trace-keys", {});
+  assert.match(k.key, /^loomtrace_/);
+  assert.equal(k.agent, "Claude Code");
+
+  // The installer saves the key outside the repository and adds a SessionEnd hook to the repository's personal settings.
+  const home = mkdtempSync(join(tmpdir(), "loom-home-")), repo = mkdtempSync(join(tmpdir(), "loom-repo-"));
+  const script = join(process.cwd(), "public/trace-hook.mjs");
+  const henv = { ...process.env, HOME: home, LOOM_URL: "", LOOM_PROJECT: "", LOOM_KEY: "" };
+  await run("node", [script, "--install", url!, name, k.key], { env: henv, cwd: repo });
+  const settings = JSON.parse(readFileSync(join(repo, ".claude/settings.local.json"), "utf8"));
+  const command: string = settings.hooks.SessionEnd[0].hooks[0].command;
+  assert.match(command, new RegExp(`trace-hook\\.mjs" --project ${name}$`));
+  assert.ok(!readFileSync(join(repo, ".claude/settings.local.json"), "utf8").includes(k.key), "the key stays out of the repository");
+  assert.equal(statSync(join(home, ".loom/traces", `${name}.json`)).mode & 0o777, 0o600);
+  await run("node", [script, "--install", url!, name, k.key], { env: henv, cwd: repo });
+  assert.equal(JSON.parse(readFileSync(join(repo, ".claude/settings.local.json"), "utf8")).hooks.SessionEnd.length, 1, "installing twice keeps one hook");
+
+  // Claude Code runs the hook with the session on stdin.
+  const log = join(repo, "session.jsonl");
+  writeFileSync(log, JSON.stringify({ type: "user", sessionId: "s-k", timestamp: new Date().toISOString(), message: { role: "user", content: "Trim the titles" } }) + "\n");
+  const child = (await import("node:child_process")).spawn("node", [join(home, ".loom/trace-hook.mjs"), "--project", name], { env: henv, cwd: repo });
+  child.stdin.end(JSON.stringify({ session_id: "s-k", transcript_path: log, hook_event_name: "SessionEnd" }));
+  let err = ""; child.stderr.on("data", (d) => (err += d));
+  await new Promise((r) => child.on("close", r));
+  assert.match(err, /uploaded as trace #\d+/);
+  const traces = (await jo.req("GET", "/traces")).traces;
+  assert.equal(traces.length, 1);
+  assert.equal(traces[0].agentName, "Claude Code", "filed under the person's own agent");
+  assert.equal(traces[0].runner, "claude-code SessionEnd");
+
+  // The key uploads and nothing else; only its person or an owner sees and revokes it.
+  const tk = admin.as(k.key);
+  await assert.rejects(tk.req("GET", "/traces"), /only upload/);
+  await assert.rejects(tk.req("POST", "/tasks", { title: "x" }), /only upload/);
+  assert.deepEqual(await ann.req("GET", "/trace-keys"), []);
+  await assert.rejects(ann.req("DELETE", `/trace-keys/${k.id}`), /its person or an owner/);
+  assert.equal((await admin.req("GET", "/trace-keys")).length, 1);
+  await jo.req("DELETE", `/trace-keys/${k.id}`);
+  await assert.rejects(tk.req("POST", "/traces", { text: "hello" }), /unknown agent key/);
+
+  await run("node", [join(home, ".loom/trace-hook.mjs"), "--uninstall", name], { env: henv, cwd: repo });
+  assert.equal(JSON.parse(readFileSync(join(repo, ".claude/settings.local.json"), "utf8")).hooks, undefined);
+  assert.ok(!existsSync(join(home, ".loom/traces", `${name}.json`)));
+});
