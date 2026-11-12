@@ -1635,4 +1635,16 @@ test("ask Loom about a change or an incident, cited to trace steps; the incident
   assert.ok(rep.findings.some((f: any) => f.kind === "thrash" && /b\.txt 7 times/.test(f.title)), JSON.stringify(rep.findings));
   assert.equal(rep.models.find((m: any) => m.model === "claude-test")?.landed, 3);
   assert.equal((await fetch(`${base}/report`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+
+  // Scorecards: per model and agent, with the revert counted once the revert lands.
+  const rev = await admin.req("POST", `/changes/${b.id}/revert`, {});
+  for (let i = 0; i < 60 && (await admin.change(rev.id)).status !== "merged"; i++) await sleep(250);
+  const sc = await admin.req("GET", "/scorecards?days=30");
+  const m = sc.models.find((x: any) => x.name === "claude-test");
+  assert.deepEqual([m.changes, m.landed, m.firstPassRate, m.reverted, m.revertRate, m.sessions], [3, 3, 100, 1, 33, 3]);
+  assert.equal(m.tokensPerLanded, 110);
+  assert.ok(sc.models.some((x: any) => x.name === "no trace" && x.changes === 1), "the revert has no trace");
+  const adaCard = sc.agents.find((x: any) => x.name === "ada");
+  assert.equal(adaCard.landed, 3);
+  assert.equal((await admin.req("GET", "/scorecards?agent=ada")).agents.length, 1);
 });

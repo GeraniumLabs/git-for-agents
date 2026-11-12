@@ -1025,6 +1025,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "ask" && m === "POST") { this.assertCanReadTraces(actor); return json(await this.askLoom(actor, body)); }
     if (a === "incident" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.incident(url.searchParams)); }
     if (a === "report" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.weeklyReport(Number(url.searchParams.get("days") ?? 7))); }
+    if (a === "scorecards" && m === "GET") { this.assertCanReadTraces(actor); return json(this.scorecards(Number(url.searchParams.get("days") ?? 30), url.searchParams.get("agent"))); }
     if (a === "reports" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.savedReports(b)); }
     // Opt-in trace uploads: a person's key for the hook on their own machine.
     if (a === "trace-keys" && !actor.standin) {
@@ -2702,6 +2703,69 @@ export class ProjectCoordinator extends DurableObject<Env> {
       };
     }
     return { bisect: bisectId, command, verdict, from, to, runs, changes, suspect };
+  }
+
+  // ── scorecards: how each agent and model does, from what landed and what it cost ──
+
+  /**
+   * Per agent and per model over a window: what they shipped (landed, first
+   * pass, rework, failed checks, reverts, conflicts), what it cost (tokens and
+   * dollars from their traces) and how well they review. A change's model is
+   * the model in the traces linked to it; changes with no trace count under
+   * "no trace".
+   */
+  private scorecards(days: number, only: string | null = null) {
+    days = Math.min(Math.max(Math.floor(days) || 30, 1), 365);
+    const from = Date.now() - days * 86_400_000;
+    const changes = this.sql.exec("SELECT id, agent_id, status, created_at, updated_at FROM changes WHERE created_at >= ?", from).toArray() as any[];
+    const traces = this.sql.exec(`SELECT id, agent_id, change_id, links, models, tokens_in, tokens_out, cost_usd FROM traces WHERE ${LIVE_TRACE} AND COALESCE(ended_at, created_at) >= ?`, from).toArray() as any[];
+    const modelsOf = new Map<number, Set<string>>();
+    for (const t of traces) {
+      const ids = new Set<number>([...(t.change_id ? [t.change_id as number] : []), ...(JSON.parse(t.links ?? "[]") as number[])]);
+      for (const id of ids) { const m = modelsOf.get(id) ?? new Set(); for (const x of JSON.parse(t.models ?? "[]") as string[]) m.add(x); modelsOf.set(id, m); }
+    }
+    const count = (sql: string, id: number) => this.sql.exec(sql, id).one().n as number;
+    type Card = { key: string; name: string; changes: number; landed: number; firstPass: number; reworkRounds: number; checksFailed: number; reverted: number; conflicts: number; closed: number; sessions: number; tokens: number; costUsd: number | null; hoursToLand: number[] };
+    const cards = { agent: new Map<string, Card>(), model: new Map<string, Card>() };
+    const card = (kind: "agent" | "model", key: string, name: string) => cards[kind].get(key) ?? (cards[kind].set(key, { key, name, changes: 0, landed: 0, firstPass: 0, reworkRounds: 0, checksFailed: 0, reverted: 0, conflicts: 0, closed: 0, sessions: 0, tokens: 0, costUsd: null, hoursToLand: [] }), cards[kind].get(key)!);
+    for (const c of changes) {
+      const rounds = count("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", c.id);
+      const failed = count("SELECT COUNT(*) AS n FROM events WHERE change_id = ? AND type = 'checks.failed'", c.id);
+      const conflicts = count("SELECT COUNT(*) AS n FROM events WHERE change_id = ? AND type = 'change.conflict'", c.id);
+      const reverted = c.status === "merged" && !!this.revertOf(c.id);
+      const models = [...(modelsOf.get(c.id) ?? [])];
+      for (const k of [card("agent", c.agent_id, this.agentName(c.agent_id) ?? c.agent_id), ...(models.length ? models : ["no trace"]).map((m) => card("model", m, m))]) {
+        k.changes++;
+        if (c.status === "merged") { k.landed++; if (!rounds) k.firstPass++; k.hoursToLand.push((c.updated_at - c.created_at) / 3_600_000); }
+        if (c.status === "closed") k.closed++;
+        k.reworkRounds += rounds; k.checksFailed += failed; k.conflicts += conflicts;
+        if (reverted) k.reverted++;
+      }
+    }
+    for (const t of traces) {
+      const models = JSON.parse(t.models ?? "[]") as string[];
+      for (const k of [card("agent", t.agent_id, this.agentName(t.agent_id) ?? t.agent_id), ...(models.length ? models : ["unknown"]).map((m) => card("model", m, m))]) {
+        k.sessions++;
+        k.tokens += (t.tokens_in ?? 0) + (t.tokens_out ?? 0);
+        if (t.cost_usd != null) k.costUsd = (k.costUsd ?? 0) + t.cost_usd;
+      }
+    }
+    const rate = (a: number, b: number) => (b ? Math.round((100 * a) / b) : null);
+    const median = (xs: number[]) => { if (!xs.length) return null; const s = [...xs].sort((a, b) => a - b); return Math.round(s[Math.floor(s.length / 2)] * 10) / 10; };
+    const view = (k: Card) => ({
+      key: k.key, name: k.name, changes: k.changes, landed: k.landed, closed: k.closed,
+      firstPassRate: rate(k.firstPass, k.landed), reworkPerChange: k.changes ? Math.round((10 * k.reworkRounds) / k.changes) / 10 : null,
+      checksFailed: k.checksFailed, revertRate: rate(k.reverted, k.landed), reverted: k.reverted, conflicts: k.conflicts,
+      medianHoursToLand: median(k.hoursToLand), sessions: k.sessions, tokens: k.tokens, costUsd: k.costUsd == null ? null : Math.round(k.costUsd * 100) / 100,
+      tokensPerLanded: k.landed && k.tokens ? Math.round(k.tokens / k.landed) : null, costPerLanded: k.landed && k.costUsd != null ? Math.round((100 * k.costUsd) / k.landed) / 100 : null,
+    });
+    const agents = [...cards.agent.values()].map((k) => {
+      const human = this.sql.exec("SELECT role FROM agents WHERE id = ?", k.key).toArray()[0]?.role === "human";
+      const tr = human ? null : this.trackRecord(k.key);
+      return { ...view(k), person: human, reviews: tr ? { approvalsLanded: tr.approvalsLanded, approvalsMissed: tr.approvalsMissed, objectionsUpheld: tr.objectionsUpheld, objectionsOverruled: tr.objectionsOverruled, accuracy: rate(tr.approvalsLanded + tr.objectionsUpheld, tr.approvalsLanded + tr.approvalsMissed + tr.objectionsUpheld + tr.objectionsOverruled) } : null, weight: human ? 1 : this.trustOf(k.key)?.weight ?? null };
+    }).filter((a) => !only || a.key === only || a.name === only).sort((a, b) => b.landed - a.landed || b.changes - a.changes);
+    const models = only ? [] : [...cards.model.values()].map(view).sort((a, b) => b.landed - a.landed || b.changes - a.changes);
+    return { days, from, agents, models };
   }
 
   // ── the factory report: a week of traces and changes, and what to change ──

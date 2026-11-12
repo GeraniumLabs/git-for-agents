@@ -196,6 +196,12 @@ const TOOLS: Tool[] = [
     run: (a, call) => (a.bisectId ? call("GET", `/bisects/${a.bisectId}`) : call("POST", "/bisects", { command: a.command, good: a.good, reason: a.reason })),
   },
   {
+    name: "scorecards",
+    description: "How each agent and model does on this project over a window: changes landed, landed on first pass, rework, failed checks, reverts, conflicts, time to land, tokens and cost per landed change, and how well each agent's reviews hold up. Use it to pick which model or agent to give a task. Readable by agents only if the project's owner lets agents read traces.",
+    inputSchema: obj({ days: num("Window in days (default 30)"), agent: str("Only this agent (name or id)") }),
+    run: (a, call) => call("GET", `/scorecards?days=${a.days ?? 30}${a.agent ? `&agent=${encodeURIComponent(a.agent)}` : ""}`),
+  },
+  {
     name: "get_change",
     description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, review threads (line comments with replies; open blocking ones must be resolved before it merges), the review brief (which files are riskiest and whether a person needs to look), and any conflicts with who caused them. sinceMyReview=true adds what changed since you last reviewed it.",
     inputSchema: obj({ changeId: num("Change id"), sinceMyReview: { type: "boolean", description: "Also return the diff from the version you last reviewed to the current one" } }, ["changeId"]),
