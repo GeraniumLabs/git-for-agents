@@ -5,7 +5,7 @@
 
 import { DurableObject } from "cloudflare:workers";
 import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
-import { anyOverlap, matches, normalizePattern } from "./paths";
+import { anyOverlap, matches, normalizePattern, overlaps as patternsOverlap } from "./paths";
 import { makeStore, type RepoStore } from "./store";
 import { contextBucket, artifactsNamespace, type Jurisdiction } from "./residency";
 import { subscribePushes, unsubscribe, type Push } from "./events";
@@ -102,6 +102,36 @@ export interface Agent {
   traceKey?: string;
 }
 
+/** What one agent (or every agent under one key) may do. A missing field is no limit. */
+export interface AgentLimits {
+  /** Path patterns it may write, declare intents on and change; empty or missing is everywhere. */
+  paths?: string[];
+  /** Changes it may open in 24 hours. */
+  changesPerDay?: number;
+  /** Check minutes it may use a day (UTC), on demand and in the merge queue. */
+  checkMinutesPerDay?: number;
+}
+
+export function parseLimits(x: any): AgentLimits {
+  if (!x || typeof x !== "object" || Array.isArray(x)) throw new HttpError(400, "limits is an object: {paths?, changesPerDay?, checkMinutesPerDay?}; null clears it");
+  const out: AgentLimits = {};
+  if (x.paths !== undefined && x.paths !== null) {
+    if (!Array.isArray(x.paths) || x.paths.some((p: unknown) => typeof p !== "string")) throw new HttpError(400, "limits.paths is a list of path patterns");
+    const paths = x.paths.map((p: string) => normalizePattern(p)).filter(Boolean);
+    if (paths.length > 50) throw new HttpError(400, "limits.paths takes at most 50 patterns");
+    if (paths.length) out.paths = paths;
+  }
+  for (const k of ["changesPerDay", "checkMinutesPerDay"] as const) {
+    if (x[k] === undefined || x[k] === null) continue;
+    const n = Number(x[k]);
+    if (!Number.isFinite(n) || n < 0 || n > 100_000) throw new HttpError(400, `limits.${k} is a number from 0 to 100000`);
+    out[k] = k === "changesPerDay" ? Math.floor(n) : n;
+  }
+  const unknown = Object.keys(x).filter((k) => !["paths", "changesPerDay", "checkMinutesPerDay"].includes(k));
+  if (unknown.length) throw new HttpError(400, `unknown limit ${unknown.join(", ")}; use paths, changesPerDay, checkMinutesPerDay`);
+  return out;
+}
+
 export interface LoomEvent {
   seq: number;
   ts: number;
@@ -172,6 +202,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       "ALTER TABLE traces ADD COLUMN removed_reason TEXT",
       // Which agent a trace key is for; "other" has no key and asks the person's agents to attach_trace themselves.
       "ALTER TABLE trace_keys ADD COLUMN kind TEXT",
+      // Per-agent scopes: which paths, how many changes a day and how many check minutes a day.
+      "ALTER TABLE agents ADD COLUMN limits TEXT",
+      "ALTER TABLE join_codes ADD COLUMN limits TEXT",
       "ALTER TABLE threads ADD COLUMN terms TEXT",
       "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
@@ -290,6 +323,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS agent_usage (
+        day TEXT NOT NULL, grp TEXT NOT NULL, checks_ms INTEGER DEFAULT 0, PRIMARY KEY (day, grp));
       CREATE TABLE IF NOT EXISTS trace_keys (
         id TEXT PRIMARY KEY, person TEXT NOT NULL, agent_name TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE,
         created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
@@ -781,7 +816,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "overview") return json(this.overview());
       if (a === "search") return json(this.search(url.searchParams));
       if (a === "agents" && b && c === "trust") return json(this.trustOf(this.profile(b).agent.id));
-      if (a === "agents" && b) return json(this.profile(b));
+      if (a === "agents" && b && c !== "limits") return json(this.profile(b));
       if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent"), url.searchParams.get("mine") === "1"));
       if (a === "tasks" && !b) return json(this.listTasks(url.searchParams));
       if (a === "tasks" && b && c === "context") return json(await this.handoff(Number(b)));
@@ -876,6 +911,20 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (m === "GET") return json(this.emailView(actor));
       if (m === "POST" && c === "test") return json(await this.testEmail(actor, url.origin));
       if (m === "POST") return json(this.setEmail(actor, body.email));
+    }
+    if (a === "agents" && b && c === "limits") {
+      const target = this.profile(b).agent;
+      if (m === "GET") { if (!actor.owner && actor.id !== target.id) throw new HttpError(403, "only owners and the agent itself see its limits"); return json(this.limitsView(target.id)); }
+      ownerOnly("set an agent's limits");
+      return json(this.setAgentLimits(actor, target.id, body));
+    }
+    if (a === "agent-limits") {
+      if (m === "GET") return json({ defaults: this.defaultLimits });
+      ownerOnly("set default agent limits");
+      const defaults = body.limits === null ? null : parseLimits(body.limits ?? body);
+      if (defaults) this.setMeta("agent_limits", JSON.stringify(defaults)); else this.sql.exec("DELETE FROM meta WHERE key = 'agent_limits'");
+      this.emit("limits.defaults", { actor: actor.id, data: { limits: defaults } });
+      return json({ defaults: this.defaultLimits });
     }
     if (a === "agents" && b && c === "key" && m === "POST") {
       ownerOnly("replace another agent's key");
@@ -1119,7 +1168,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── join codes: agents register themselves ──────────────────────────────
 
-  private async createJoinCode(actor: Agent, body: { label?: string; role?: string; maxUses?: number; expiresInHours?: number }) {
+  private async createJoinCode(actor: Agent, body: { label?: string; role?: string; maxUses?: number; expiresInHours?: number; limits?: unknown }) {
+    const limits = body.limits === undefined || body.limits === null ? null : parseLimits(body.limits);
     const role = body.role ?? "builder";
     if (!["builder", "reviewer"].includes(role)) throw new HttpError(400, "role is builder or reviewer");
     const maxUses = body.maxUses === undefined ? 50 : Number(body.maxUses);
@@ -1128,10 +1178,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!(hours > 0 && hours <= 24 * 90)) throw new HttpError(400, "expiresInHours is between 0 and 2160 (90 days)");
     const code = `loomjoin_${randomId(16)}`;
     const expiresAt = Date.now() + hours * 3_600_000;
-    const r = this.sql.exec("INSERT INTO join_codes (code_hash, label, role, max_uses, expires_at, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?) RETURNING id",
-      await sha256(code), body.label?.trim() || null, role, maxUses, expiresAt, actor.id, Date.now()).one();
+    const r = this.sql.exec("INSERT INTO join_codes (code_hash, label, role, max_uses, expires_at, created_by, created_at, limits) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
+      await sha256(code), body.label?.trim() || null, role, maxUses, expiresAt, actor.id, Date.now(), limits ? JSON.stringify(limits) : null).one();
     this.emit("join_code.created", { actor: actor.id, data: { id: r.id, label: body.label ?? null, role, maxUses, expiresAt } });
-    return { id: r.id, code, label: body.label ?? null, role, maxUses, expiresAt, howToJoin: `POST /api/projects/${this.project}/join {"code": "<this code>", "name": "<agent name>"} returns the agent's own key. Shown once: Loom keeps only its hash.` };
+    return { id: r.id, code, label: body.label ?? null, role, maxUses, expiresAt, limits, howToJoin: `POST /api/projects/${this.project}/join {"code": "<this code>", "name": "<agent name>"} returns the agent's own key. Shown once: Loom keeps only its hash.` };
   }
 
   /** The code itself if it is a live join code of this project, so the skill never carries anything else someone put in a link. */
@@ -1351,6 +1401,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string }) {
     const paths = (body.paths ?? []).map(normalizePattern).filter(Boolean);
     if (!paths.length) throw new HttpError(400, "paths is required");
+    this.assertInScope(actor, paths, "declare an intent on", true);
     body = { ...body, taskId: this.intentTask(actor, body) };
     const row = this.sql
       .exec("INSERT INTO intents (agent_id, task_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
@@ -1403,6 +1454,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async commitToWorkspace(actor: Agent, name: string, body: { files: unknown; message: string }) {
     const ws = this.workspaceFor(actor, name);
     const files = this.fileWrites(body.files);
+    this.assertInScope(actor, Object.keys(files), "write");
     const remote = this.remote(name, await this.token(name, "write"));
     const w = await Workspace.open(remote);
     const parent = await w.head();
@@ -1604,6 +1656,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
+    this.assertInScope(actor, analysis.files.map((f) => f.path), "change");
 
     this.adoptIntents(body.taskId, actor.id, analysis.files);
     const undeclared = this.undeclared(body.taskId, analysis.files);
@@ -1611,6 +1664,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const existing = this.sql.exec("SELECT id FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray()[0];
     if (existing) return this.updateChange(actor, existing.id as number, body);
+    this.assertChangeQuota(actor);
 
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) ? "review" : "queued";
     const row = this.sql
@@ -1643,6 +1697,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const analysis = await this.analyze(ch.workspace);
     // The merge queue may have taken the change while we were analyzing.
     if (["merged", "merging"].includes(this.change(id).status)) throw new HttpError(409, `change ${id} was merged meanwhile`);
+    const outside = this.outOfScope(actor, analysis.files.map((f) => f.path));
+    if (outside.length && via !== "push") this.assertInScope(actor, outside, "change");
+    if (outside.length) {
+      // A plain git push can't be refused, but it can't land either: back to its author.
+      this.sql.exec("UPDATE changes SET status = 'changes_requested', head = ?, files = ?, updated_at = ? WHERE id = ?", analysis.head, JSON.stringify(analysis.files), Date.now(), id);
+      this.emit("change.out_of_scope", { change: id, task: ch.task_id, to: ch.agent_id, data: { files: outside.slice(0, 20), allowed: this.limitsOf(actor).paths, advice: `Your push changes files outside the paths ${actor.name} may change (${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ", …" : ""}). Revert those files and push again, or ask an owner to widen your scope.` } });
+      return { ...this.change(id), outOfScope: outside };
+    }
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) ? "review" : "queued";
     this.adoptIntents(ch.task_id, ch.agent_id, analysis.files);
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
@@ -2241,7 +2303,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
           WHERE c.status = 'queued' AND c.updated_at <= ? AND (t.waits_for IS NULL OR EXISTS (SELECT 1 FROM tasks w WHERE w.id = t.waits_for AND w.status = 'merged'))
           ORDER BY c.updated_at, c.id LIMIT ?`, Date.now(), MERGE_BATCH).toArray().map((r) => r.id as number);
         if (!ids.length) break;
-        await this.mergeBatch(ids);
+        const due = this.checks ? this.holdOverBudget(ids) : ids;
+        if (!due.length) continue;
+        await this.mergeBatch(due);
         if (this.meta("frozen")) break;
       }
     } finally {
@@ -2384,6 +2448,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ids = landed.map((l) => l.ch.id as number);
     this.emit("checks.started", { data: { changes: ids, command: this.checks!.command } });
     const whole = await this.checkCommit(w, landed[landed.length - 1].commit);
+    this.chargeChecks(landed.map((l) => l.ch.agent_id as string), whole.ms);
     if (whole.ok) {
       for (const l of landed) this.recordChecks(l.ch, whole, l.commit);
       return { landed, tip: landed[landed.length - 1].commit };
@@ -2404,6 +2469,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         commit = await w.commit(result.tree, [tip, ch.head], this.mergeMessage(ch), MERGE_IDENTITY);
       }
       const r = await this.checkCommit(w, commit);
+      this.chargeChecks([ch.agent_id as string], r.ms);
       if (!r.ok) { this.checksFailed(ch, r, kept.map((k) => k.ch.id as number)); continue; }
       this.recordChecks(ch, r, commit);
       kept.push({ ch, before: tip, commit });
@@ -2445,7 +2511,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       commit = await w.commit(merged.tree, [main, head], "checks", MERGE_IDENTITY);
       note = "Ran on main with your workspace merged in: what would land.";
     } else if (merged) note = "Your workspace conflicts with main, so this ran on your workspace alone; sync_workspace before you submit.";
+    this.assertCheckQuota(actor);
     const r = await this.checkCommit(w, commit).catch((e) => { throw e instanceof CheckBudgetError ? new HttpError(429, e.message) : e; });
+    this.chargeChecks([actor.id], r.ms);
     this.emit("checks.ran", { actor: actor.id, task: taskId, data: { ok: r.ok, command: r.command, ms: r.ms } });
     return { ...r, note };
   }
@@ -3088,6 +3156,109 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { ok: true, id };
   }
 
+  // ── per-agent scopes and quotas ──────────────────────────────────────────
+
+  private get defaultLimits(): AgentLimits | null { return JSON.parse(this.meta("agent_limits") ?? "null"); }
+
+  /** The key an agent works under: sub-agents and a person's own agents share their key's quotas. */
+  private limitGroup(agentId: string): string {
+    return (this.sql.exec("SELECT via FROM agents WHERE id = ?", agentId).toArray()[0]?.via as string | null) ?? agentId;
+  }
+
+  /**
+   * An agent's limits, field by field: its own, then its key's (sub-agents,
+   * a person's agents), then the join code it came in with, then the
+   * project's defaults for agents. People and the admin have none.
+   */
+  private limitsOf(actor: Agent | string): AgentLimits {
+    const id = typeof actor === "string" ? actor : actor.id;
+    if (id === "admin") return {};
+    const row = this.sql.exec("SELECT role, via, limits, joined_via FROM agents WHERE id = ?", id).toArray()[0];
+    if (!row || (row.role === "human" && !row.via)) return {};
+    const key = row.via ? this.sql.exec("SELECT limits, joined_via FROM agents WHERE id = ?", row.via).toArray()[0] : null;
+    const code = (row.joined_via ?? key?.joined_via) ? this.sql.exec("SELECT limits FROM join_codes WHERE id = ?", row.joined_via ?? key?.joined_via).toArray()[0] : null;
+    const layers = [row.limits, key?.limits, code?.limits].map((l) => (l ? JSON.parse(l as string) : {})) as AgentLimits[];
+    const out: AgentLimits = {};
+    for (const l of [...layers, this.defaultLimits ?? {}]) for (const k of Object.keys(l) as (keyof AgentLimits)[]) if (out[k] === undefined && l[k] !== undefined) (out as any)[k] = l[k];
+    return out;
+  }
+
+  private usage(group: string) {
+    const day = new Date().toISOString().slice(0, 10);
+    const since = Date.now() - 86_400_000;
+    const changes = this.sql.exec("SELECT COUNT(*) AS n FROM changes WHERE created_at >= ? AND (agent_id = ? OR agent_id IN (SELECT id FROM agents WHERE via = ?))", since, group, group).one().n as number;
+    const ms = (this.sql.exec("SELECT checks_ms FROM agent_usage WHERE day = ? AND grp = ?", day, group).toArray()[0]?.checks_ms as number | undefined) ?? 0;
+    return { changesToday: changes, checkMinutesToday: Math.round(ms / 600) / 100 };
+  }
+
+  private limitsView(agentId: string) {
+    const own = this.sql.exec("SELECT limits FROM agents WHERE id = ?", agentId).toArray()[0]?.limits as string | null;
+    const group = this.limitGroup(agentId);
+    return { own: own ? JSON.parse(own) : null, effective: this.limitsOf(agentId), sharedWith: group !== agentId ? this.agentName(group) : null, usage: this.usage(group), defaults: this.defaultLimits };
+  }
+
+  private setAgentLimits(actor: Agent, agentId: string, body: any) {
+    const limits = body?.limits === null ? null : parseLimits(body?.limits ?? body);
+    this.sql.exec("UPDATE agents SET limits = ? WHERE id = ?", limits ? JSON.stringify(limits) : null, agentId);
+    this.emit("agent.limits", { actor: actor.id, to: agentId, data: { agent: agentId, limits } });
+    return this.limitsView(agentId);
+  }
+
+  private outOfScope(actor: Agent, files: string[]): string[] {
+    const paths = this.limitsOf(actor).paths;
+    if (!paths?.length) return [];
+    return files.filter((f) => !paths.some((p) => matches(p, f)));
+  }
+
+  /** Refuse paths outside an agent's scope. Intent patterns only need to reach into it. */
+  private assertInScope(actor: Agent, files: string[], what: string, patterns = false) {
+    const paths = this.limitsOf(actor).paths;
+    if (!paths?.length) return;
+    const outside = patterns ? files.filter((f) => !paths.some((p) => patternsOverlap(p, f))) : this.outOfScope(actor, files);
+    if (outside.length) throw new HttpError(403, `${actor.name} may only ${what} ${paths.join(", ")}; not ${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ` and ${outside.length - 5} more` : ""}. Ask an owner to widen your scope (Settings › Agents), or leave those files to another agent`);
+  }
+
+  private assertChangeQuota(actor: Agent) {
+    const max = this.limitsOf(actor).changesPerDay;
+    if (max === undefined) return;
+    const group = this.limitGroup(actor.id);
+    const { changesToday } = this.usage(group);
+    if (changesToday >= max) throw new HttpError(429, `${group === actor.id ? actor.name : `${this.agentName(group)}'s key`} may open ${max} change${max === 1 ? "" : "s"} a day and has opened ${changesToday} in the last 24 hours. Update an open change instead, or ask an owner to raise the limit`);
+  }
+
+  private overCheckQuota(agentId: string): number | null {
+    const max = this.limitsOf(agentId).checkMinutesPerDay;
+    if (max === undefined) return null;
+    return this.usage(this.limitGroup(agentId)).checkMinutesToday >= max ? max : null;
+  }
+
+  private assertCheckQuota(actor: Agent) {
+    const max = this.overCheckQuota(actor.id);
+    if (max !== null) throw new HttpError(429, `${actor.name} has used its ${max} check minute${max === 1 ? "" : "s"} for today (UTC). Checks run again tomorrow, or an owner can raise the limit`);
+  }
+
+  /** Check time goes to the agents whose changes were checked, split evenly. */
+  private chargeChecks(agentIds: string[], ms: number) {
+    if (!agentIds.length || !ms) return;
+    const day = new Date().toISOString().slice(0, 10);
+    const groups = agentIds.map((a) => this.limitGroup(a));
+    const share = Math.ceil(ms / groups.length);
+    for (const g of groups) this.sql.exec("INSERT INTO agent_usage (day, grp, checks_ms) VALUES (?, ?, ?) ON CONFLICT (day, grp) DO UPDATE SET checks_ms = checks_ms + excluded.checks_ms", day, g, share);
+  }
+
+  /** Changes whose agent is out of check minutes wait in the queue until tomorrow (UTC); the rest go on. */
+  private holdOverBudget(ids: number[]): number[] {
+    const tomorrow = Date.parse(`${new Date().toISOString().slice(0, 10)}T00:00:00Z`) + 86_400_000;
+    return ids.filter((id) => {
+      const ch = this.change(id);
+      const max = this.overCheckQuota(ch.agent_id as string);
+      if (max === null) return true;
+      this.sql.exec("UPDATE changes SET updated_at = ? WHERE id = ?", tomorrow, id);
+      this.emit("checks.agent_budget", { change: id, task: ch.task_id, to: ch.agent_id, data: { minutes: max, until: tomorrow, advice: `${this.agentName(ch.agent_id as string)} has used its ${max} check minutes for today, so change #${id} waits in the queue until tomorrow (UTC). An owner can raise the limit.` } });
+      return false;
+    });
+  }
+
   private standinFor(hash: string): Agent {
     const s = this.sql.exec("SELECT id, name, person, scopes FROM standins WHERE key_hash = ? AND revoked_at IS NULL", hash).toArray()[0];
     if (!s) throw new HttpError(401, "unknown agent key");
@@ -3671,7 +3842,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
@@ -4832,6 +5003,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (untaken.length && actor.role !== "human") todo.push(`${untaken.length} review task${untaken.length === 1 ? "" : "s"} nobody has taken (${untaken.slice(0, 3).map((t) => `#${t.change}`).join(", ")}${untaken.length > 3 ? ", …" : ""}): take_review one, then get_change and review_change`);
     return {
       agent: actor, mainFrozen: this.meta("frozen"), todo, directives, reviewRequests, reviewTasks, tasks, changes,
+      ...(actor.role !== "human" && actor.id !== "admin" ? { limits: this.limitsView(actor.id) } : {}),
       openTasks: this.sql.exec("SELECT COUNT(*) AS n FROM tasks WHERE status = 'open' AND assignee IS NULL").one().n,
       // How many questions for people this agent has open, against the project's limit.
       questions: { open: this.sql.exec("SELECT COUNT(*) AS n FROM threads WHERE kind = 'question' AND to_agent = 'humans' AND status = 'open' AND created_by = ?", actor.id).one().n, ...this.questionRules },

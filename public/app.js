@@ -728,12 +728,31 @@ async function showDirectory(st) {
   if (!$("#detail").open) $("#detail").showModal();
 }
 
+// ── per-agent limits: paths, changes a day, check minutes a day ──
+function limitsText(l) {
+  if (!l) return "no limits";
+  const parts = [l.paths?.length ? `only ${l.paths.join(", ")}` : "", l.changesPerDay !== undefined ? `${l.changesPerDay} change${l.changesPerDay === 1 ? "" : "s"} a day` : "", l.checkMinutesPerDay !== undefined ? `${l.checkMinutesPerDay} check minute${l.checkMinutesPerDay === 1 ? "" : "s"} a day` : ""].filter(Boolean);
+  return parts.length ? parts.join(" · ") : "no limits";
+}
+function limitsForm(p, l) {
+  return `<div class="row"><input id="${p}-paths" class="mono grow" placeholder="Paths it may change, e.g. src/ui/, docs/** (blank: all)" value="${esc((l?.paths ?? []).join(", "))}">
+    <label class="check">Changes a day <input id="${p}-changes" type="number" min="0" style="width:5em" value="${l?.changesPerDay ?? ""}" placeholder="any"></label>
+    <label class="check">Check minutes a day <input id="${p}-minutes" type="number" min="0" step="0.5" style="width:5em" value="${l?.checkMinutesPerDay ?? ""}" placeholder="any"></label>
+    <button class="ghost" id="${p}-save">Save</button></div>`;
+}
+function readLimitsForm(p) {
+  const num = (id) => { const v = $(`#${p}-${id}`).value.trim(); return v === "" ? undefined : Number(v); };
+  const l = { paths: $(`#${p}-paths`).value.split(",").map((x) => x.trim()).filter(Boolean), changesPerDay: num("changes"), checkMinutesPerDay: num("minutes") };
+  return l.paths.length || l.changesPerDay !== undefined || l.checkMinutesPerDay !== undefined ? l : null;
+}
+
 async function showAgent(id) {
   const p = await api(`/agents/${encodeURIComponent(id)}`);
   if (p.error) return toast(p.error);
   const a = p.agent;
   names[a.id] = a.name;
   if (a.under) names[a.under.id] = a.under.name;
+  const lim = a.role !== "human" && (isOwner() || me?.id === a.id) ? await api(`/agents/${encodeURIComponent(a.id)}/limits`).then((r) => (r.error ? null : r)).catch(() => null) : null;
   const ctl = isHuman() && a.role !== "human" ? `<div class="row">
       <button data-op="${a.state === "paused" ? "resume" : "pause"}" class="${a.state === "paused" ? "" : "ghost"}">${a.state === "paused" ? "Resume" : "Pause"}</button>
       <input id="dm-body" placeholder="Directive to ${esc(a.name)} only"><button id="dm-send" class="ghost">Send</button></div>` : "";
@@ -743,6 +762,8 @@ async function showAgent(id) {
     ${p.underKey?.length ? `<h2>Agents under this key <small>${p.underKey.length}</small></h2>${p.underKey.map((u) => { names[u.id] = u.name; return `<div class="qrow"><span class="dot ${u.state}"></span>${who(u.id)} <span class="grow meta ellipsis">${u.state}${u.task ? ` · #${u.task.id} ${esc(u.task.title)}` : ""}</span></div>`; }).join("")}` : ""}
     ${p.trust ? `<div class="card"><div class="qrow"><b class="grow">Track record</b><span class="pill" title="what this agent's approvals and contest votes count for">${p.trust.weight}× vote</span></div><div class="meta">${esc(p.trust.summary)}</div></div>` : ""}
     ${ctl}
+    ${lim ? `<div class="card"><div class="qrow"><b class="grow">Limits</b><span class="meta">${lim.usage.changesToday} change${lim.usage.changesToday === 1 ? "" : "s"} in 24 h · ${lim.usage.checkMinutesToday} check min today${lim.sharedWith ? ` · shared with ${esc(lim.sharedWith)}'s key` : ""}</span></div>
+      <div class="meta">${esc(limitsText(lim.effective))}${lim.own ? "" : lim.defaults ? " (the project's defaults)" : ""}</div>${isOwner() ? limitsForm("al", lim.own) + `<p class="meta">Blank fields fall back to its key's, its join code's, then the project's defaults.</p>` : ""}</div>` : ""}
     <div id="agent-grid" class="card contrib-card"></div>
     ${p.knows.length ? `<h2>Knows</h2><div class="knows">${p.knows.map((k) => `<div><span class="mono">${esc(k.path)}</span> <span class="meta">${[k.wrote && `wrote ×${k.wrote}`, k.reviewed && `reviewed ×${k.reviewed}`].filter(Boolean).join(", ")}${k.symbols.length ? ` · ${k.symbols.slice(0, 6).map(esc).join(", ")}${k.symbols.length > 6 ? "…" : ""}` : ""}</span></div>`).join("")}</div>` : ""}
     ${p.reviewQueue.length || p.reviewStats.approved + p.reviewStats.changesRequested ? `<h2>Reviews <small>${p.reviewStats.approved} approved · ${p.reviewStats.changesRequested} sent back${p.reviewStats.medianResponseMs != null ? ` · answers requests in ${dur(p.reviewStats.medianResponseMs)} (median)` : ""}</small></h2>
@@ -755,6 +776,11 @@ async function showAgent(id) {
     <h2>Recent activity</h2><ol class="feed">${p.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("")}</ol>`;
   wire($("#detail-body"));
   renderGrid($("#agent-grid"), a.id);
+  if ($("#al-save")) $("#al-save").onclick = async () => {
+    try { await act("POST", `/agents/${encodeURIComponent(a.id)}/limits`, { limits: readLimitsForm("al") }); } catch { return; }
+    toast(`Limits saved for ${a.name}`);
+    showAgent(a.id);
+  };
   for (const b of $("#detail-body").querySelectorAll("[data-op]")) b.onclick = async () => {
     const reason = b.dataset.op === "pause" ? await ask({ title: `Pause ${a.name}?`, body: "It stops taking work until you resume it. It will see your reason.", ok: "Pause", input: { label: "Reason", placeholder: "e.g. Waiting on the schema decision" } }) : undefined;
     if (b.dataset.op === "pause" && reason === null) return;
@@ -1592,6 +1618,9 @@ async function showSettings() {
     ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
       return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
         + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
+    <h2>Agent limits</h2>
+    <p class="meta">What each agent may do unless its own limits say otherwise: which paths it may change, how many changes it may open a day, and how many check minutes it may use a day. Sub-agents share their key's limits. ${state?.project?.agentLimits ? `Now: <b>${esc(limitsText(state.project.agentLimits))}</b>.` : "<b>No limits</b> beyond the project's."} Set one agent's limits from its profile.</p>
+    ${isOwner() ? limitsForm("dl", state?.project?.agentLimits) : ""}
     <h2>Review agent</h2>
     ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
@@ -1721,6 +1750,10 @@ async function showSettings() {
   if ($("#threads-toggle")) $("#threads-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { resolveThreads: state.project.resolveThreads === false }); state.project.resolveThreads = r.resolveThreads; } catch { return; }
     showSettings();
+  };
+  if ($("#dl-save")) $("#dl-save").onclick = async () => {
+    try { const r = await act("POST", "/agent-limits", { limits: readLimitsForm("dl") }); state.project.agentLimits = r.defaults; } catch { return; }
+    toast("Default agent limits saved");
   };
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }

@@ -1377,3 +1377,45 @@ test("session traces are opt-in: a person's trace key installs the hook, uploads
   assert.ok(!existsSync(plugin), "the OpenCode plugin is removed");
   assert.ok(!existsSync(join(home, ".loom/traces", `${name}.json`)));
 });
+
+test("per-agent limits: paths, changes a day and check minutes, from the agent, its key, its join code or the project", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-limits");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "limits", files: SEED, requiredApprovals: 1 });
+  const adaKey = await admin.addAgent("ada", "builder");
+  const ada = admin.as(adaKey.key);
+
+  // Paths: writes, intents and changes outside them are refused, with what's allowed.
+  await assert.rejects(ada.req("POST", `/agents/${adaKey.id}/limits`, { limits: { paths: ["src/"] } }), /owners/);
+  const set = await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: { paths: ["src/db.js"], changesPerDay: 1 } });
+  assert.deepEqual(set.effective, { paths: ["src/db.js"], changesPerDay: 1 });
+  assert.deepEqual((await ada.req("GET", "/me")).limits.effective, { paths: ["src/db.js"], changesPerDay: 1 }, "whoami says what the agent may do");
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await assert.rejects(ada.req("POST", "/intents", { taskId: t.id, paths: ["README.md"] }), /may only declare an intent on src\/db\.js/);
+  await ada.intent(t.id, ["src/"], "trim"); // reaches into its scope
+  await assert.rejects(ada.write(ws, { "src/server.js": "x" }, "nope"), /may only write src\/db\.js; not src\/server\.js/);
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", {});
+  assert.ok(ch.id);
+
+  // Changes a day count across every agent under the key.
+  const t2 = await ada.createTask("Second", "");
+  const ws2 = (await ada.claim(t2.id)).workspace.name;
+  await ada.write(ws2, { "src/db.js": (await ada.read("src/db.js", ws2)) + "\n// two\n" }, "two");
+  await assert.rejects(ada.submit(t2.id, t2.title, "Two", {}), /may open 1 change a day/);
+
+  // Project defaults apply to agents without their own; a join code's limits beat the defaults.
+  await admin.req("POST", "/agent-limits", { limits: { changesPerDay: 5, checkMinutesPerDay: 0 } });
+  const bob = await admin.addAgent("bob", "builder");
+  assert.deepEqual((await admin.req("GET", `/agents/${bob.id}/limits`)).effective, { changesPerDay: 5, checkMinutesPerDay: 0 });
+  const jc = await admin.req("POST", "/join-codes", { role: "builder", maxUses: 1, expiresInHours: 1, limits: { paths: ["docs/"] } });
+  const joined = await (await fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: jc.code, name: "outsider" }) })).json();
+  assert.deepEqual((await admin.req("GET", `/agents/${joined.id}/limits`)).effective, { paths: ["docs/"], changesPerDay: 5, checkMinutesPerDay: 0 });
+  // Clearing an agent's own limits falls back to the defaults.
+  assert.deepEqual((await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: null })).effective, { changesPerDay: 5, checkMinutesPerDay: 0 });
+  await assert.rejects(admin.req("POST", "/agent-limits", { limits: { paths: "src" } }), /list of path patterns/);
+  await assert.rejects(admin.req("POST", "/agent-limits", { limits: { speed: 3 } }), /unknown limit/);
+});
