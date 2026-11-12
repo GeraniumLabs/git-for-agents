@@ -191,3 +191,36 @@ test("a change's intent: the person's ask, and the agent's acts on its files wit
   assert.equal(it.acts[0].ask, it.asks[0].seq);
   assert.deepEqual(intentOf(parseTrace(log).steps, { paths: ["other.ts"] }), { asks: [], acts: [] });
 });
+
+const opencode = JSON.stringify({
+  info: { id: "ses_1", title: "trim titles" },
+  messages: [
+    { info: { id: "m1", sessionID: "ses_1", role: "user", time: { created: 1762938000000 } }, parts: [{ type: "text", text: "Trim titles, keep the API" }] },
+    { info: { id: "m2", sessionID: "ses_1", role: "assistant", modelID: "gpt-6", time: { created: 1762938001000, completed: 1762938009000 }, cost: 0.02, tokens: { input: 100, output: 20, reasoning: 5, cache: { read: 50, write: 0 } } },
+      parts: [
+        { type: "reasoning", text: "db.js is the one place", time: { start: 1762938001000 } },
+        { type: "text", text: "Trimming in db.js covers every caller." },
+        { type: "tool", tool: "edit", callID: "t1", state: { status: "completed", input: { filePath: "/w/src/db.js", oldString: "a", newString: "b" }, output: "ok", time: { start: 1762938002000, end: 1762938003000 } } },
+        { type: "tool", tool: "loom_submit_change", callID: "t2", state: { status: "completed", input: { taskId: 3 }, output: "change #9", time: { start: 1762938004000, end: 1762938005000 } } },
+        { type: "tool", tool: "bash", callID: "t3", state: { status: "error", input: { command: "git push" }, error: "denied", time: { start: 1762938006000, end: 1762938007000 } } },
+      ] },
+  ],
+}, null, 2);
+
+test("OpenCode sessions (as opencode export prints them) become steps, with Loom calls and thoughts", () => {
+  assert.equal(detectSource(opencode), "opencode");
+  const t = parseTrace(opencode);
+  assert.equal(t.source, "opencode");
+  assert.equal(t.sessionId, "ses_1");
+  assert.deepEqual(t.models, ["gpt-6"]);
+  assert.equal(t.tokensIn, 150);
+  assert.equal(t.tokensOut, 25);
+  assert.equal(t.costUsd, 0.02);
+  assert.deepEqual(t.steps.map((s) => s.kind), ["prompt", "thought", "message", "tool_call", "tool_result", "tool_call", "tool_result", "tool_call", "error"]);
+  assert.deepEqual(t.steps[3].files, ["/w/src/db.js"]);
+  assert.equal(t.steps[5].loomCall, "submit_change");
+  assert.equal(parseTrace(opencode.slice(0, 120), "opencode").sessionId, "ses_1", "the start of a log still names its session");
+  assert.ok(!dropThoughts(opencode, "opencode").includes("db.js is the one place"));
+  const intent = intentOf(t.steps, { paths: ["src/db.js"], changeId: 9 });
+  assert.ok(intent.acts.some((a) => a.kind === "edit" && a.what === "src/db.js"));
+});

@@ -5016,10 +5016,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** The changes an agent had open during a session: the ones it touched between the session's first and last step. */
-  private changesDuring(agentId: string, from: number | null, to: number | null): number[] {
+  private changesDuring(agentId: string, from: number | null, to: number | null, person?: string): number[] {
     if (from === null || to === null) return [];
     const slack = 10 * 60_000;
-    return this.sql.exec("SELECT id FROM changes WHERE agent_id = ? AND created_at <= ? AND updated_at >= ? ORDER BY id", agentId, to + slack, from - slack).toArray().map((r) => r.id as number);
+    // A person's trace key may name their agent differently from how the agent's
+    // MCP client named itself, so it links to the changes of any of their own agents.
+    const who = person ? "(agent_id = ? OR agent_id IN (SELECT id FROM agents WHERE via = ?))" : "agent_id = ?";
+    return this.sql.exec(`SELECT id FROM changes WHERE ${who} AND created_at <= ? AND updated_at >= ? ORDER BY id`, ...(person ? [agentId, person] : [agentId]), to + slack, from - slack).toArray().map((r) => r.id as number);
   }
 
   /**
@@ -5080,7 +5083,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       links = [changeId];
     } else {
       if (taskId !== null) this.task(taskId);
-      links = this.changesDuring(actor.id, parsed.startedAt, parsed.endedAt);
+      links = this.changesDuring(actor.id, parsed.startedAt, parsed.endedAt, actor.traceKey ? actor.under?.id : undefined);
       if (taskId !== null) links = links.filter((id) => (this.change(id).task_id as number) === taskId);
       changeId = links.length ? links[links.length - 1] : null;
       if (changeId !== null && taskId === null) taskId = this.change(changeId).task_id as number;
