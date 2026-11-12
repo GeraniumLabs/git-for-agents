@@ -225,6 +225,18 @@ async function runCheck(req, res) {
       const timer = setTimeout(() => { output += `\ntimed out after ${timeout / 1000}s`; child.kill("SIGKILL"); }, timeout);
       child.on("close", (code) => { clearTimeout(timer); ok({ exitCode: code ?? 124, output }); });
     });
+    const collect = req.headers["x-collect"] ? decodeURIComponent(req.headers["x-collect"]).replace(/^\/+/, "").replace(/\.\.(\/|$)/g, "") : null;
+    if (collect && result.exitCode === 0) {
+      // A preview build's output folder, sent back as a tar.
+      const tarred = await new Promise((ok) => {
+        const t = spawn("tar", ["-c", "-C", join(dir, collect), "."]);
+        const out = [];
+        t.stdout.on("data", (d) => out.push(d));
+        t.on("close", (code) => ok(code === 0 ? Buffer.concat(out) : null));
+      });
+      if (tarred) result.archive = tarred.toString("base64");
+      else { result.exitCode = 1; result.output += `\nno ${collect}/ folder after the build`; }
+    }
     send(res, 200, result);
   } finally {
     rmSync(dir, { recursive: true, force: true });

@@ -41,6 +41,8 @@ export interface Env {
   STRIPE_API_URL?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
+  /** Where preview links point, e.g. a separate domain routed to this Worker; defaults to Loom's own origin. */
+  LOOM_PREVIEW_ORIGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
   /** The AI Gateway that Loom's review agent calls models through. Default "default". */

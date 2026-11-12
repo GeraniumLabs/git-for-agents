@@ -448,6 +448,13 @@ export default {
     }
 
     // Local development: the Artifacts shim posts push events here, shaped like the queue's messages.
+    // A change's preview: /preview/<project>/<change>/<token>/<path>. The token is the access; no sign-in.
+    const pv = /^\/preview\/([a-z0-9][a-z0-9-]{1,40})\/(\d+)\/([0-9a-f]{20})(\/.*)?$/.exec(path);
+    if (pv && req.method === "GET") {
+      if (!pv[4]) return Response.redirect(`${url.origin}${path}/`, 301);
+      if (!(await locate(env, pv[1])).exists) return new Response("no such preview", { status: 404 });
+      return (await coordinator(env, pv[1])).fetch(`https://do/preview-serve/${pv[2]}/${pv[3]}${pv[4]}`);
+    }
     if (path === "/api/dev/artifacts-events" && req.method === "POST" && env.LOOM_DEV_LOGIN === "1") {
       for (const msg of await req.json<unknown[]>()) await deliverEvent(env, msg);
       return Response.json({ ok: true });

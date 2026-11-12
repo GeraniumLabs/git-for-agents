@@ -19,6 +19,8 @@ export interface CheckResult {
   runner: string;
   /** The command that ran. */
   command: string;
+  /** With collect: the folder it named, as a tar, when the command passed. */
+  archive?: Uint8Array;
 }
 
 /** How much output to keep: the tail, where failures and summaries are. */
@@ -30,29 +32,29 @@ const tail = (s: string) => (s.length > OUTPUT_TAIL ? `…\n${s.slice(-OUTPUT_TA
  * Run `command` over `files` and report. `secrets` become environment
  * variables in the run; their values are masked in the output it returns.
  */
-export async function runCheck(env: Env, project: string, files: Map<string, { bytes: Uint8Array; mode: string }>, command: string, timeoutSec: number, secrets: Record<string, string> = {}): Promise<CheckResult> {
+export async function runCheck(env: Env, project: string, files: Map<string, { bytes: Uint8Array; mode: string }>, command: string, timeoutSec: number, secrets: Record<string, string> = {}, collect?: string): Promise<CheckResult> {
   const archive = tar(files);
   const started = Date.now();
   if (env.CHECKS) {
-    const r = await env.CHECKS.getByName(project).run(archive, command, timeoutSec * 1000, secrets);
+    const r = await env.CHECKS.getByName(project).run(archive, command, timeoutSec * 1000, secrets, collect);
     return { ...r, output: tail(maskSecrets(r.output, secrets)), ms: Date.now() - started, runner: "container", command };
   }
   if (env.ARTIFACTS_SHIM_URL) {
     const res = await fetch(`${env.ARTIFACTS_SHIM_URL}/checks/run`, {
       method: "POST",
-      headers: { "x-command": encodeURIComponent(command), "x-timeout": String(timeoutSec), ...(Object.keys(secrets).length ? { "x-env": btoa(unescape(encodeURIComponent(JSON.stringify(secrets)))) } : {}) },
+      headers: { "x-command": encodeURIComponent(command), "x-timeout": String(timeoutSec), ...(collect ? { "x-collect": encodeURIComponent(collect) } : {}), ...(Object.keys(secrets).length ? { "x-env": btoa(unescape(encodeURIComponent(JSON.stringify(secrets)))) } : {}) },
       body: archive,
     });
     if (!res.ok) throw new Error(`local check runner: ${res.status} ${await res.text()}`);
-    const r = (await res.json()) as { exitCode: number; output: string };
-    return { ok: r.exitCode === 0, exitCode: r.exitCode, output: tail(maskSecrets(r.output, secrets)), ms: Date.now() - started, runner: "local", command };
+    const r = (await res.json()) as { exitCode: number; output: string; archive?: string };
+    return { ok: r.exitCode === 0, exitCode: r.exitCode, output: tail(maskSecrets(r.output, secrets)), ms: Date.now() - started, runner: "local", command, ...(r.archive ? { archive: Uint8Array.from(atob(r.archive), (c) => c.charCodeAt(0)) } : {}) };
   }
   throw new Error("no check runner: deploy with the CHECKS container binding, or run the Artifacts shim locally");
 }
 
 /** One container per project. Runs are serialized by the coordinator's merge queue; each gets a fresh directory. */
 export class CheckRunner extends DurableObject<Env> {
-  async run(archive: Uint8Array, command: string, timeoutMs: number, secrets: Record<string, string> = {}): Promise<{ ok: boolean; exitCode: number; output: string }> {
+  async run(archive: Uint8Array, command: string, timeoutMs: number, secrets: Record<string, string> = {}, collect?: string): Promise<{ ok: boolean; exitCode: number; output: string; archive?: Uint8Array }> {
     const c = this.ctx.container;
     if (!c) throw new Error("the CHECKS Durable Object has no container configured");
     if (!c.running) {
@@ -77,7 +79,13 @@ export class CheckRunner extends DurableObject<Env> {
     try {
       const p = await c.exec(["sh", "-c", command], { cwd: dir, stderr: "combined", signal: abort, env: { ...secrets, CI: "1", HOME: "/root" } });
       const out = await p.output();
-      return { ok: out.exitCode === 0, exitCode: out.exitCode, output: new TextDecoder().decode(out.stdout) };
+      const result = { ok: out.exitCode === 0, exitCode: out.exitCode, output: new TextDecoder().decode(out.stdout) };
+      if (!collect || !result.ok) return result;
+      // A preview's build output, as a tar: the folder must stay inside the run's directory.
+      const sub = collect.replace(/^\/+/, "").replace(/\.\.(\/|$)/g, "");
+      const t = await (await c.exec(["tar", "-c", "-C", `${dir}/${sub}`, "."], { stderr: "pipe" })).output();
+      if (t.exitCode !== 0) return { ...result, ok: false, output: `${result.output}\nno ${sub}/ folder after the build: ${new TextDecoder().decode(t.stderr ?? new Uint8Array())}` };
+      return { ...result, archive: new Uint8Array(t.stdout) };
     } catch (e: any) {
       if (abort.aborted) return { ok: false, exitCode: 124, output: `timed out after ${Math.round(timeoutMs / 1000)}s` };
       throw e;
@@ -88,6 +96,31 @@ export class CheckRunner extends DurableObject<Env> {
 }
 
 // ── a minimal ustar writer: enough to ship a repository's files ─────────────
+
+/** Read a tar's regular files (ustar and GNU long names), as a build's output comes back. */
+export function untar(bytes: Uint8Array): Map<string, Uint8Array> {
+  const out = new Map<string, Uint8Array>();
+  const dec = new TextDecoder();
+  const str = (b: Uint8Array) => { const z = b.indexOf(0); return dec.decode(z < 0 ? b : b.subarray(0, z)); };
+  let at = 0, longName: string | null = null;
+  while (at + 512 <= bytes.length) {
+    const h = bytes.subarray(at, at + 512);
+    if (h.every((x) => x === 0)) break;
+    const size = parseInt(str(h.subarray(124, 136)).trim() || "0", 8);
+    const type = String.fromCharCode(h[156] || 0x30);
+    const prefix = str(h.subarray(345, 500));
+    let name = longName ?? (prefix ? `${prefix}/${str(h.subarray(0, 100))}` : str(h.subarray(0, 100)));
+    longName = null;
+    const data = bytes.subarray(at + 512, at + 512 + size);
+    if (type === "L") longName = str(data);
+    else if (type === "0" || type === "\0") {
+      name = name.replace(/^\.\//, "");
+      if (name && !name.split("/").includes("..")) out.set(name, data.slice());
+    }
+    at += 512 + Math.ceil(size / 512) * 512;
+  }
+  return out;
+}
 
 const enc = new TextEncoder();
 

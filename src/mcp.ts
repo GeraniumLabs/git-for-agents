@@ -232,6 +232,12 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("POST", `/changes/${a.changeId}/evals/${encodeURIComponent(a.eval)}`, { score: a.score, notes: a.notes }),
   },
   {
+    name: "preview_change",
+    description: "Build (again) the preview of a change: a link where people and agents can open what it builds, before it lands. Previews build by themselves on every version when the project has them on; get_change shows the link under preview.url, and preview.ready announces it.",
+    inputSchema: obj({ changeId: num("The change") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/preview`),
+  },
+  {
     name: "get_change",
     description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, review threads (line comments with replies; open blocking ones must be resolved before it merges), the review brief (which files are riskiest and whether a person needs to look), and any conflicts with who caused them. sinceMyReview=true adds what changed since you last reviewed it.",
     inputSchema: obj({ changeId: num("Change id"), sinceMyReview: { type: "boolean", description: "Also return the diff from the version you last reviewed to the current one" } }, ["changeId"]),

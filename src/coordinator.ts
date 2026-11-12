@@ -15,7 +15,7 @@ import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
 import { FilesShapeError, normalizeFiles } from "./files";
-import { runCheck, type CheckResult } from "./checks";
+import { runCheck, untar, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
 import { buildBrief, countTests, fileStats, isTest, suggestCheck } from "./brief";
@@ -67,6 +67,11 @@ export function scoreOf(output: string, ok: boolean): number {
   return Math.max(0, Math.min(1, Math.round(v * 1000) / 1000));
 }
 
+const WEB_TYPES: Record<string, string> = { js: "text/javascript", mjs: "text/javascript", css: "text/css", html: "text/html; charset=utf-8", htm: "text/html; charset=utf-8", map: "application/json", ico: "image/x-icon", woff: "font/woff", woff2: "font/woff2", ttf: "font/ttf", txt: "text/plain; charset=utf-8", webmanifest: "application/manifest+json" };
+const previewType = (path: string) => WEB_TYPES[path.split(".").pop()?.toLowerCase() ?? ""] ?? typeOf(path);
+/** A preview is at most this big. */
+const MAX_PREVIEW_FILES = 2000;
+const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 /** A bisect runs the checks at most this many times, and is taken for dead after this long. */
 const MAX_BISECT_RUNS = 16;
 /** Questions a project's people may ask Loom a day: each is one model call. */
@@ -369,6 +374,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
         id INTEGER PRIMARY KEY AUTOINCREMENT, started_by TEXT, reason TEXT, command TEXT, auto INTEGER DEFAULT 0,
         status TEXT NOT NULL DEFAULT 'running', steps TEXT DEFAULT '[]', culprit INTEGER, verdict TEXT, error TEXT,
         created_at INTEGER, done_at INTEGER);
+      CREATE TABLE IF NOT EXISTS previews (
+        change_id INTEGER PRIMARY KEY, head TEXT, status TEXT NOT NULL, files INTEGER DEFAULT 0, bytes INTEGER DEFAULT 0, error TEXT, ms INTEGER, built_at INTEGER);
       CREATE TABLE IF NOT EXISTS evals (
         name TEXT PRIMARY KEY, kind TEXT NOT NULL, command TEXT, rubric TEXT, blocking INTEGER DEFAULT 0, threshold REAL DEFAULT 0.5,
         created_by TEXT, created_at INTEGER, updated_at INTEGER);
@@ -857,6 +864,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
     if (a === "artifacts-event" && m === "POST") return json(await this.onPush(body));
 
+    // A preview is reached by its link alone (it carries a token), so it works in a private project too.
+    if (a === "preview-serve" && m === "GET" && url.hostname === "do") return await this.servePreview(Number(b), c ?? "", parts.slice(3).join("/"));
     // A private project shows nothing, not even that it exists, to anyone
     // who isn't a member, an owner or one of its agents.
     if (a === "visible") return json({ visible: await this.canRead(req) });
@@ -1024,6 +1033,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
       if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.autoBisect !== undefined) this.setMeta("auto_bisect", body.autoBisect ? "on" : "off");
+      if (body.preview !== undefined) this.setPreview(body.preview);
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
@@ -1033,7 +1043,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -1105,6 +1115,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(await this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
+    if (a === "changes" && b && c === "preview" && m === "POST") return json(await this.requestPreview(actor, Number(b)));
     if (a === "evals" && !b && m === "GET") return json(this.evalsView());
     if (a === "evals" && m === "POST" && !b) { ownerOnly("define evals"); return json(this.saveEval(actor, body)); }
     if (a === "evals" && b && m === "DELETE") { ownerOnly("remove evals"); return json(this.removeEval(actor, decodeURIComponent(b))); }
@@ -1956,7 +1967,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const text = patch ? await patch.text() : "";
     return {
       ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
-      reverts: task.reverts ?? null, revertedBy: ch.status === "merged" ? this.revertOf(id) : null, evals: this.changeEvals(id),
+      reverts: task.reverts ?? null, revertedBy: ch.status === "merged" ? this.revertOf(id) : null, evals: this.changeEvals(id), preview: await this.previewView(id),
       patch: text, context: ctx ? await ctx.json() : null,
       threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
       traceCount: this.traceCount(id),
@@ -2933,6 +2944,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** A new version of a change: every eval gets a run for it, and command evals start. */
   private queueEvals(id: number) {
+    if (this.previewSettings) this.queuePreview(id);
     const evals = this.sql.exec("SELECT * FROM evals").toArray() as any[];
     if (!evals.length) return;
     const ch = this.change(id);
@@ -3055,6 +3067,128 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .map((n) => ({ id: n.id, text: n.text, kind: n.kind, paths: JSON.parse(n.paths as string) as string[] }))
       .filter((n) => !pre || n.paths.some((p) => p.startsWith(pre) || pre.startsWith(p.replace(/\*+$/, ""))))
       .slice(0, 20);
+  }
+
+  // ── previews: a link per change to see what it builds, before it lands ──
+
+  get previewSettings(): { command: string | null; dir: string } | null {
+    const raw = this.meta("preview");
+    return raw ? JSON.parse(raw) : null;
+  }
+
+  private setPreview(p: any) {
+    if (!p) { this.sql.exec("DELETE FROM meta WHERE key = 'preview'"); return; }
+    const command = typeof p.command === "string" && p.command.trim() ? p.command.trim().slice(0, 2000) : null;
+    const dir = String(p.dir ?? "").trim().replace(/^\/+|\/+$/g, "");
+    if (dir.split("/").includes("..")) throw new HttpError(400, "the preview folder is a path inside the repository");
+    if (command && !this.checks) throw new HttpError(409, "a preview with a build command runs in the check container: set a check command first");
+    this.setMeta("preview", JSON.stringify({ command, dir }));
+  }
+
+  /** The link's token: who has the link can see the preview, as with an unlisted page. */
+  private async previewToken(id: number): Promise<string> {
+    const secret = this.env.LOOM_SECRET_KEY ?? this.env.LOOM_ADMIN_TOKEN ?? "loom-dev";
+    const key = await crypto.subtle.importKey("raw", new TextEncoder().encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
+    const mac = new Uint8Array(await crypto.subtle.sign("HMAC", key, new TextEncoder().encode(`preview:${this.project}:${id}`)));
+    return [...mac.subarray(0, 10)].map((b) => b.toString(16).padStart(2, "0")).join("");
+  }
+
+  private async previewUrl(id: number): Promise<string> {
+    const origin = this.env.LOOM_PREVIEW_ORIGIN ?? this.meta("origin") ?? "";
+    return `${origin}/preview/${this.project}/${id}/${await this.previewToken(id)}/`;
+  }
+
+  private async previewView(id: number) {
+    const r = this.sql.exec("SELECT * FROM previews WHERE change_id = ?", id).toArray()[0] as any;
+    if (!r) return this.previewSettings ? { status: "none" } : null;
+    return { status: r.status, head: r.head, files: r.files, bytes: r.bytes, error: r.error, ms: r.ms, builtAt: r.built_at, url: r.status === "ready" ? await this.previewUrl(id) : null, current: r.head === this.change(id).head };
+  }
+
+  private async requestPreview(actor: Agent, id: number) {
+    if (!this.previewSettings) throw new HttpError(409, "this project has no previews; an owner turns them on in Settings");
+    const ch = this.change(id);
+    if (["merged", "closed", "abandoned"].includes(ch.status as string)) throw new HttpError(409, `change ${id} is ${ch.status}`);
+    this.queuePreview(id);
+    return { ...(await this.previewView(id)), note: "Building; preview.ready says when it's up" };
+  }
+
+  private queuePreview(id: number) {
+    const ch = this.change(id);
+    this.sql.exec("INSERT INTO previews (change_id, head, status) VALUES (?, ?, 'building') ON CONFLICT (change_id) DO UPDATE SET head = excluded.head, status = 'building', error = NULL", id, ch.head);
+    this.evalChain = this.evalChain.then(() => this.buildPreview(id, ch.head as string)).catch((e) => {
+      this.sql.exec("UPDATE previews SET status = 'failed', error = ? WHERE change_id = ?", String(e?.message ?? e).slice(0, 500), id);
+    });
+    this.ctx.waitUntil(this.evalChain);
+  }
+
+  /** What a change would land as: main with its workspace merged in (or the workspace alone when they conflict). */
+  private async landingCommit(w: Workspace, ch: any): Promise<string> {
+    const main = (await w.head())!;
+    const fetched = await w.fetchFrom("ws", this.remote(ch.workspace, await this.token(ch.workspace, "read")));
+    const merged = await w.isAncestor(main, fetched) ? null : await w.merge(main, fetched);
+    return merged?.tree ? w.commit(merged.tree, [main, fetched], "preview", MERGE_IDENTITY) : fetched;
+  }
+
+  private async buildPreview(id: number, head: string) {
+    const ch = this.change(id);
+    const settings = this.previewSettings;
+    if (!settings || ch.head !== head) return;
+    const started = Date.now();
+    const w = await Workspace.open(await this.mainRemote("read"));
+    const commit = await this.landingCommit(w, ch);
+    const flat = await w.flatten(commit);
+    let files = new Map<string, Uint8Array>();
+    if (settings.command) {
+      const all = new Map<string, { bytes: Uint8Array; mode: string }>();
+      for (const [path, { oid, mode }] of flat) all.set(path, { bytes: await w.readBytes(oid), mode });
+      const r = await runCheck(this.env, this.project, all, settings.command, this.checks?.timeoutSec ?? 600, await this.secretsFor(true), settings.dir || ".");
+      this.chargeChecks([ch.agent_id], r.ms);
+      if (!r.ok || !r.archive) throw new Error(`the build failed:\n${r.output.slice(-1200)}`);
+      files = untar(r.archive);
+    } else {
+      const pre = settings.dir ? `${settings.dir}/` : "";
+      for (const [path, { oid }] of flat) if (!pre || path.startsWith(pre)) files.set(path.slice(pre.length), await w.readBytes(oid));
+    }
+    let bytes = 0;
+    for (const b of files.values()) bytes += b.byteLength;
+    if (files.size > MAX_PREVIEW_FILES) throw new Error(`a preview is at most ${MAX_PREVIEW_FILES} files; this one has ${files.size}`);
+    if (bytes > MAX_PREVIEW_BYTES) throw new Error(`a preview is at most ${MAX_PREVIEW_BYTES / 1024 / 1024} MB; this one is ${(bytes / 1024 / 1024).toFixed(1)} MB`);
+    const base = `${this.project}/previews/${id}/${head}/`;
+    for (const [path, b] of files) await this.context.put(base + path, b, { httpMetadata: { contentType: previewType(path) } });
+    if (this.change(id).head !== head) return; // a newer version is on its way
+    // The previous version's files go.
+    const old = await this.context.list({ prefix: `${this.project}/previews/${id}/` });
+    const stale = old.objects.map((o) => o.key).filter((k) => !k.startsWith(base));
+    if (stale.length) await this.context.delete(stale.slice(0, 1000));
+    this.sql.exec("UPDATE previews SET status = 'ready', head = ?, files = ?, bytes = ?, error = NULL, ms = ?, built_at = ? WHERE change_id = ?", head, files.size, bytes, Date.now() - started, Date.now(), id);
+    this.emit("preview.ready", { change: id, task: ch.task_id, to: ch.agent_id, data: { url: await this.previewUrl(id), files: files.size } });
+  }
+
+  /**
+   * Serve a preview's file. It's code an agent wrote, so it gets an opaque
+   * origin (a sandbox CSP): it can't read Loom's cookies or act as the viewer.
+   * Set LOOM_PREVIEW_ORIGIN to serve previews from a separate domain as well.
+   */
+  private async servePreview(id: number, token: string, path: string): Promise<Response> {
+    if (!id || token !== (await this.previewToken(id))) return new Response("no such preview", { status: 404 });
+    const r = this.sql.exec("SELECT head, status FROM previews WHERE change_id = ?", id).toArray()[0] as any;
+    if (!r || r.status !== "ready") return new Response(r?.status === "building" ? "This preview is still building; reload in a moment." : "no preview for this change yet", { status: r?.status === "building" ? 503 : 404, headers: { "retry-after": "5" } });
+    const base = `${this.project}/previews/${id}/${r.head}/`;
+    const clean = decodeURIComponent(path).replace(/^\/+/, "");
+    if (clean.split("/").includes("..")) return new Response("bad path", { status: 400 });
+    const tries = !clean || clean.endsWith("/") ? [`${clean}index.html`] : [clean, `${clean}/index.html`, `${clean}.html`];
+    let obj: R2ObjectBody | null = null;
+    for (const t of tries) if ((obj = await this.context.get(base + t))) break;
+    // A single-page app routes on the client: unknown paths get its index.html.
+    if (!obj && !/\.[a-z0-9]+$/i.test(clean)) obj = await this.context.get(`${base}index.html`);
+    if (!obj) return new Response("not found in this preview", { status: 404 });
+    return new Response(obj.body, {
+      headers: {
+        "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream",
+        "content-security-policy": "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads",
+        "x-robots-tag": "noindex", "cache-control": "private, max-age=30", "x-content-type-options": "nosniff",
+      },
+    });
   }
 
   // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──
@@ -4659,7 +4793,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },

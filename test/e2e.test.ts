@@ -1730,3 +1730,39 @@ test("the code map: a project's files, exports and imports over HTTP and MCP, re
   const file = await mcp("code_map", { path: "src/slug.js" });
   assert.deepEqual(file.files[0].importedBy, ["src/use.js"]);
 });
+
+test("a preview link per change: static files or a build's output, sandboxed, behind an unguessable link", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-preview");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "preview", requiredApprovals: 1, private: true });
+  await admin.req("POST", "/settings", { checks: { command: "true" }, preview: { dir: "site" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Landing page", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "site/index.html": "<h1>Hello v1</h1>", "site/app.js": "console.log(1)", "README.md": "not served" }, "page");
+  const ch = await ada.submit(t.id, t.title, "page", {});
+  let pv: any;
+  for (let i = 0; i < 60 && pv?.status !== "ready"; i++) { await sleep(250); pv = (await ada.change(ch.id)).preview; }
+  assert.equal(pv.status, "ready", JSON.stringify(pv));
+  assert.equal(pv.files, 2);
+  const page = await fetch(pv.url);
+  assert.equal(page.status, 200, "a private project's preview opens with the link alone");
+  assert.match(await page.text(), /Hello v1/);
+  assert.match(page.headers.get("content-security-policy") ?? "", /^sandbox/);
+  assert.match((await fetch(`${pv.url}app.js`)).headers.get("content-type") ?? "", /javascript/);
+  assert.equal((await fetch(`${pv.url}README.md`)).status, 404, "only the preview folder is served");
+  assert.match(await (await fetch(`${pv.url}some/route`)).text(), /Hello v1/, "unknown routes get the app's index.html");
+  assert.equal((await fetch(pv.url.replace(/\/[0-9a-f]{20}\//, "/00000000000000000000/"))).status, 404);
+
+  // With a build command, the preview is the build's output folder; a new version replaces it.
+  await admin.req("POST", "/settings", { preview: { command: "mkdir -p out && sed 's/v1/v2/' site/index.html > out/index.html && echo ok > out/built.txt", dir: "out" } });
+  await ada.write(ws, { "site/index.html": "<h1>Hello v1 again</h1>" }, "again");
+  await ada.update(ch.id, "again");
+  const before = pv.head;
+  for (let i = 0; i < 60; i++) { await sleep(250); pv = (await ada.change(ch.id)).preview; if (pv.status === "ready" && pv.head !== before) break; }
+  assert.equal(pv.status, "ready", JSON.stringify(pv));
+  assert.match(await (await fetch(pv.url)).text(), /Hello v2 again/);
+  assert.equal(await (await fetch(`${pv.url}built.txt`)).text(), "ok\n");
+  assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "preview.ready"));
+});
