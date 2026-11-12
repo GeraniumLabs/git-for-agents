@@ -1496,3 +1496,83 @@ test("check secrets: the merge queue's checks get them, agents' run_checks only 
   assert.ok(!JSON.stringify(done).includes(value), "nothing about the change shows the value");
   assert.deepEqual((await admin.req("DELETE", "/check-secrets/NPM_TOKEN")).secrets, []);
 });
+
+test("bisect finds the change that broke a command, and one call reverts it through the merge queue", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-bisect");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "bisect", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const land = async (file: string) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await ada.submit(t.id, t.title, file, {});
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+    assert.equal((await ada.change(ch.id)).status, "merged");
+    return ch.id as number;
+  };
+  const a = await land("a.txt"), b = await land("b.txt"), c = await land("c.txt");
+
+  const started = await ada.req("POST", "/bisects", { command: "test ! -f b.txt", reason: "b.txt must not exist" });
+  assert.equal(started.status, "running");
+  await assert.rejects(ada.req("POST", "/bisects", {}), /already running/);
+  let done: any;
+  for (let i = 0; i < 120 && (!done || done.status === "running"); i++) { await sleep(500); done = await ada.req("GET", `/bisects/${started.id}`); }
+  assert.equal(done.status, "done", JSON.stringify(done));
+  assert.equal(done.culprit?.id, b, done.verdict);
+  assert.ok(done.steps.length <= 4, `found in ${done.steps.length} runs`);
+  assert.ok(done.steps.some((s: any) => s.change === a && s.ok), "stepped back to a change that passes");
+  assert.ok(!done.steps.some((s: any) => s.change === c && s.ok));
+  assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "bisect.done"));
+
+  // A person's revert goes straight to the queue and takes b.txt back out.
+  await assert.rejects(admin.req("POST", `/changes/${a + 1000}/revert`, {}), /no change|not found|404/i);
+  const rev = await admin.req("POST", `/changes/${b}/revert`, { reason: "bisect blamed it" });
+  assert.equal(rev.reverts, b);
+  assert.match(rev.title, new RegExp(`^Revert #${b}`));
+  for (let i = 0; i < 60 && (await admin.change(rev.id)).status !== "merged"; i++) await sleep(250);
+  assert.equal((await admin.change(rev.id)).status, "merged");
+  await assert.rejects(admin.read("b.txt"), /not found|no file|404/i);
+  assert.equal(await admin.read("a.txt"), "a.txt\n");
+  assert.equal((await admin.change(b)).revertedBy, rev.id);
+  await assert.rejects(admin.req("POST", `/changes/${b}/revert`, {}), /already reverts/);
+
+  // An agent's revert needs review like any change.
+  await admin.req("POST", "/settings", { requiredApprovals: 1 });
+  const agentRev = await ada.req("POST", `/changes/${c}/revert`, {});
+  assert.equal(agentRev.status, "review");
+});
+
+test("when changes by different agents keep failing the checks, Loom bisects main by itself", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-autobisect");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "auto bisect", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const bob = admin.as((await admin.addAgent("bob", "builder")).key);
+  const submit = async (who: any, file: string) => {
+    const t = await who.createTask(`Add ${file}`, "");
+    const ws = (await who.claim(t.id)).workspace.name;
+    await who.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await who.submit(t.id, t.title, file, {});
+    for (let i = 0; i < 60 && ["queued", "merging"].includes((await who.change(ch.id)).status); i++) await sleep(250);
+    return ch.id as number;
+  };
+  await submit(ada, "ok.txt");
+  const bad = await submit(ada, "bad.txt");
+  assert.equal((await ada.change(bad)).status, "merged");
+  // A stricter check that main (because of bad.txt) now fails: every change after this fails too.
+  await admin.req("POST", "/settings", { checks: { command: "test ! -f bad.txt" } });
+  for (const [who, f] of [[ada, "x1.txt"], [bob, "x2.txt"], [bob, "x3.txt"]] as const) {
+    const id = await submit(who, f);
+    assert.equal((await who.change(id)).status, "checks_failed");
+  }
+  let b: any;
+  for (let i = 0; i < 120 && b?.status !== "done"; i++) { await sleep(500); b = (await admin.req("GET", "/bisects")).bisects[0]; }
+  assert.ok(b, "a bisect started");
+  assert.equal(b.auto, true);
+  assert.equal(b.culprit?.id, bad, JSON.stringify(b));
+});

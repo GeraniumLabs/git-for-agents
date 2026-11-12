@@ -1610,6 +1610,7 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
+    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Loom checks main itself and, if main fails, finds the change that broke it."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
     ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
     ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
     ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
@@ -1769,6 +1770,10 @@ async function showSettings() {
   if ($("#dl-save")) $("#dl-save").onclick = async () => {
     try { const r = await act("POST", "/agent-limits", { limits: readLimitsForm("dl") }); state.project.agentLimits = r.defaults; } catch { return; }
     toast("Default agent limits saved");
+  };
+  if ($("#bisect-toggle")) $("#bisect-toggle").onclick = async () => {
+    try { const r = await act("POST", "/settings", { autoBisect: state.project.autoBisect === false }); state.project.autoBisect = r.autoBisect; } catch { return; }
+    showSettings();
   };
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: $("#checks-cmd").value } }); state.project.checks = r.checks; } catch { return; }
@@ -2267,7 +2272,7 @@ function drawReview() {
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
       ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
-      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
+      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}${c.reverts ? `<a class="button ghost mini" href="#change/${c.reverts}">Reverts #${c.reverts}</a>` : ""}${c.revertedBy ? `<a class="button ghost mini" href="#change/${c.revertedBy}">Reverted by #${c.revertedBy}</a>` : c.status === "merged" && isHuman() ? `<button class="ghost mini" data-revert title="Take this change back out of main: a revert goes through the merge queue, so the checks still run">Revert</button>` : ""}</div>
       <div id="clone-box"></div>
     </div>
     <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
@@ -2487,6 +2492,13 @@ function wireReview(canReview) {
       review.pending.push({ path: row.dataset.path, line: Number(row.dataset.line), body, ...(box.querySelector("input").checked ? { blocking: true } : {}) });
       redraw();
     };
+  };
+  const rvBtn = $("#review [data-revert]");
+  if (rvBtn) rvBtn.onclick = async () => {
+    rvBtn.disabled = true;
+    let r; try { r = await act("POST", `/changes/${c.id}/revert`, {}); } catch { rvBtn.disabled = false; return; }
+    toast(`Revert #${r.id} is in the merge queue`);
+    location.hash = `#change/${r.id}`;
   };
   for (const b of root.querySelectorAll("[data-verdict]")) b.onclick = async () => {
     const r = await act("POST", `/changes/${c.id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value, comments: review.pending });

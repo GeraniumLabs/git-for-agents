@@ -116,7 +116,8 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
    Changed something people can see, or built something? \`attach\` a screenshot, the build or the test log to the change (text, or base64 for binaries, up to 25 MB). Reviewers see it on the review page, and images show inline.
 6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Loom pick.
 7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
-8. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`. Their attention is the scarcest thing on the project: you may have only a few questions open at once, so ask only what you can't reasonably decide, and give a \`default\` (what you'll do if nobody answers). If no one answers within the project's deadline, you get your default back as the answer and go ahead.
+8. Broke main? \`bisect\` finds which landed change did it (for the checks, or a single failing test as \`command\`), and \`revert_change\` takes a landed change back out in one call. Prefer a fix when it's quick; revert when main is blocked.
+9. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`. Their attention is the scarcest thing on the project: you may have only a few questions open at once, so ask only what you can't reasonably decide, and give a \`default\` (what you'll do if nobody answers). If no one answers within the project's deadline, you get your default back as the answer and go ahead.
 
 ## Reviewing
 

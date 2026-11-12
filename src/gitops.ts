@@ -261,7 +261,32 @@ export class Workspace {
    * conflicts when the two sides touched the same lines.
    */
   async merge(ours: string, theirs: string, resolutions: Record<string, string | null> = {}) {
-    const base = await this.mergeBase(ours, theirs);
+    return this.threeWay(await this.mergeBase(ours, theirs), ours, theirs, resolutions);
+  }
+
+  /**
+   * Undo `commit` on top of `ours`: a three-way merge whose base is the
+   * commit and whose other side is `before`, what main was without it.
+   */
+  async revert(commit: string, before: string | null, ours: string) {
+    await this.ensure(commit);
+    if (before) await this.ensure(before);
+    return this.threeWay(commit, ours, before);
+  }
+
+  /** Make sure a commit older than what was fetched is here, deepening if it isn't. */
+  async ensure(oid: string): Promise<void> {
+    try { await git.readCommit({ fs: this.fs, dir: DIR, oid }); return; } catch { /* not fetched */ }
+    await this.deepen();
+    await git.readCommit({ fs: this.fs, dir: DIR, oid });
+  }
+
+  async parents(oid: string): Promise<string[]> {
+    await this.ensure(oid);
+    return (await git.readCommit({ fs: this.fs, dir: DIR, oid })).commit.parent;
+  }
+
+  private async threeWay(base: string | null, ours: string, theirs: string | null, resolutions: Record<string, string | null> = {}) {
     const [B, O, T] = await Promise.all([this.flatten(base), this.flatten(ours), this.flatten(theirs)]);
     const merged: FlatTree = new Map();
     const conflicts: FileConflict[] = [];

@@ -184,6 +184,18 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("POST", `/tasks/${a.taskId}/checks`),
   },
   {
+    name: "revert_change",
+    description: "Take a landed change back out of main in one call. Opens a task and a change that undo it, through the merge queue like anything else (the checks still run). A person's revert goes straight to the queue; yours needs review, so request_review after. Refused, with the later changes in the way, when it can't be undone cleanly.",
+    inputSchema: obj({ changeId: num("The landed change to revert"), reason: str("Why it has to come out, for the record") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/revert`, { reason: a.reason }),
+  },
+  {
+    name: "bisect",
+    description: "Find which landed change made the project's checks (or another command) start failing. Loom checks main, steps back until they pass, then halves the range, one check run per step; it runs in the background and bisect.done names the change. Call with bisectId to follow one. Costs check minutes.",
+    inputSchema: obj({ bisectId: num("Follow a bisect already started"), command: str("A command to bisect instead of the project's checks, e.g. one failing test"), good: num("A landed change known to pass, to start from"), reason: str("What's broken") }),
+    run: (a, call) => (a.bisectId ? call("GET", `/bisects/${a.bisectId}`) : call("POST", "/bisects", { command: a.command, good: a.good, reason: a.reason })),
+  },
+  {
     name: "get_change",
     description: "Read a change: its patch, the author's summary and context, declared intents, files touched outside those intents, reviews, review threads (line comments with replies; open blocking ones must be resolved before it merges), the review brief (which files are riskiest and whether a person needs to look), and any conflicts with who caused them. sinceMyReview=true adds what changed since you last reviewed it.",
     inputSchema: obj({ changeId: num("Change id"), sinceMyReview: { type: "boolean", description: "Also return the diff from the version you last reviewed to the current one" } }, ["changeId"]),

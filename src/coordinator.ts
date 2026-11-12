@@ -56,6 +56,11 @@ const DIRECTIVE_ACK_MS = 5 * 60_000;
 /** Shortest approach a contest attempt may explain itself with. */
 const MIN_APPROACH = 60;
 /** Longest: it's read side by side with the other attempts', by a person, at a glance. */
+/** A bisect runs the checks at most this many times, and is taken for dead after this long. */
+const MAX_BISECT_RUNS = 16;
+const BISECT_STALE_MS = 60 * 60_000;
+/** Changes by different agents failing the checks in a row before Loom checks main itself. */
+const AUTO_BISECT_AFTER = 3;
 const MAX_APPROACH = 280;
 /** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
 export const DIRECTIVES_HEADER = "x-loom-directives";
@@ -225,6 +230,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // Per-agent scopes: which paths, how many changes a day and how many check minutes a day.
       "ALTER TABLE agents ADD COLUMN limits TEXT",
       "ALTER TABLE join_codes ADD COLUMN limits TEXT",
+      // Reverts and bisects: what main was just before a change landed, and which task undoes which change.
+      "ALTER TABLE changes ADD COLUMN merged_before TEXT",
+      "ALTER TABLE tasks ADD COLUMN reverts INTEGER",
       "ALTER TABLE threads ADD COLUMN terms TEXT",
       "ALTER TABLE tasks ADD COLUMN waits_for INTEGER",
       "ALTER TABLE tasks ADD COLUMN parent INTEGER",
@@ -343,6 +351,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS standins (
         id TEXT PRIMARY KEY, name TEXT NOT NULL, person TEXT NOT NULL, key_hash TEXT NOT NULL UNIQUE, scopes TEXT NOT NULL DEFAULT '[]',
         webhook TEXT, webhook_secret TEXT, seen TEXT DEFAULT '[]', last_delivery TEXT, created_by TEXT, created_at INTEGER, last_used INTEGER, revoked_at INTEGER);
+      CREATE TABLE IF NOT EXISTS bisects (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, started_by TEXT, reason TEXT, command TEXT, auto INTEGER DEFAULT 0,
+        status TEXT NOT NULL DEFAULT 'running', steps TEXT DEFAULT '[]', culprit INTEGER, verdict TEXT, error TEXT,
+        created_at INTEGER, done_at INTEGER);
       CREATE TABLE IF NOT EXISTS check_secrets (
         name TEXT PRIMARY KEY, ct TEXT NOT NULL, iv TEXT NOT NULL, sealed_by TEXT NOT NULL, on_demand INTEGER DEFAULT 0,
         created_by TEXT, created_at INTEGER, updated_at INTEGER);
@@ -982,6 +994,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
       if (body.checks !== undefined) this.setChecks(body.checks);
+      if (body.autoBisect !== undefined) this.setMeta("auto_bisect", body.autoBisect ? "on" : "off");
       if (body.resolveThreads !== undefined) this.setMeta("resolve_threads", body.resolveThreads ? "on" : "off");
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
@@ -991,7 +1004,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -1057,6 +1070,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(await this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
+    if (a === "changes" && b && c === "revert" && m === "POST") return json(await this.revertChange(actor, Number(b), body));
+    if (a === "bisects" && m === "POST" && !b) return json(await this.startBisect(actor, body));
+    if (a === "bisects" && m === "GET") return json(b ? this.bisectView(Number(b)) : { bisects: this.sql.exec("SELECT id FROM bisects ORDER BY id DESC LIMIT 20").toArray().map((r) => this.bisectView(r.id as number)) });
     if (a === "changes" && b && c === "sync") return json(await this.sync(actor, { changeId: Number(b) }, body.resolutions));
     if (a === "tasks" && b && c === "checks" && m === "POST") return json(await this.checkWorkspace(actor, Number(b)));
     if (a === "tasks" && b && c === "sync") return json(await this.sync(actor, { taskId: Number(b) }, body.resolutions));
@@ -1897,6 +1913,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const text = patch ? await patch.text() : "";
     return {
       ...ch, agentName: this.agentName(ch.agent_id), task, intents, reviews, approval: this.approval(id), contest: task.attempt ? task.parent : null,
+      reverts: task.reverts ?? null, revertedBy: ch.status === "merged" ? this.revertOf(id) : null,
       patch: text, context: ctx ? await ctx.json() : null,
       threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
       traceCount: this.traceCount(id),
@@ -2455,7 +2472,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const files = await w.changes(before, commit);
       if (commit !== before) version++;
       const t = now();
-      this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, updated_at = ? WHERE id = ?", commit, version, t, ch.id);
+      this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, merged_before = ?, updated_at = ? WHERE id = ?", commit, version, before, t, ch.id);
       this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?", t, ch.task_id);
       this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE winner = ?", t, ch.id);
       this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", t, ch.task_id);
@@ -2551,11 +2568,191 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return env;
   }
 
-  private async checkCommit(w: Workspace, commit: string, onDemand = false): Promise<CheckResult> {
+  // ── reverts and bisects: undo a landed change in one call, and find which one broke main ──
+
+  /** What main was just before a change landed. Older changes didn't record it: the merge commit's first parent, or the change landed before it. */
+  private async mergedBefore(w: Workspace, ch: any): Promise<string | null> {
+    if (ch.merged_before) return ch.merged_before as string;
+    const parents = await w.parents(ch.merged_commit as string);
+    if (parents.length > 1) return parents[0];
+    const prev = this.sql.exec("SELECT merged_commit FROM changes WHERE merged_version < ? AND merged_commit IS NOT NULL AND merged_commit != ? ORDER BY merged_version DESC, id DESC LIMIT 1", ch.merged_version, ch.merged_commit).toArray()[0];
+    return (prev?.merged_commit as string | undefined) ?? (ch.base as string | null) ?? null;
+  }
+
+  /**
+   * Undo a landed change: a task and a change that take it back out of main,
+   * through the merge queue like anything else, so the checks still run. A
+   * person's revert goes straight to the queue; an agent's needs review.
+   */
+  private async revertChange(actor: Agent, id: number, body: { reason?: string }) {
+    const ch = this.change(id);
+    if (ch.status !== "merged" || !ch.merged_commit) throw new HttpError(409, `change ${id} hasn't landed (${ch.status}); close it instead`);
+    const open = this.sql.exec("SELECT t.id, c.id AS change FROM tasks t LEFT JOIN changes c ON c.task_id = t.id AND c.status NOT IN ('abandoned','closed') WHERE t.reverts = ? AND t.status NOT IN ('closed','abandoned')", id).toArray()[0];
+    if (open) throw new HttpError(409, open.change ? `change #${open.change} already reverts #${id}` : `task #${open.id} already reverts #${id}`);
+    const reason = String(body?.reason ?? "").trim();
+    const w = await Workspace.open(await this.mainRemote("read"));
+    const main = (await w.head())!;
+    const before = await this.mergedBefore(w, ch);
+    const trial = await w.revert(ch.merged_commit as string, before, main);
+    if (!trial.tree) {
+      const paths = trial.conflicts.map((c) => c.path);
+      const later = this.sql.exec("SELECT id, title, files FROM changes WHERE status = 'merged' AND merged_version > ? ORDER BY merged_version", ch.merged_version).toArray()
+        .filter((c) => (JSON.parse((c.files as string) ?? "[]") as FileChange[]).some((f) => paths.includes(f.path))).map((c) => `#${c.id} ${c.title}`);
+      throw new HttpError(409, `change ${id} can't be reverted cleanly: later changes edited the same lines in ${paths.join(", ")}${later.length ? ` (${later.join("; ")})` : ""}. Revert those first, or file a task to undo it by hand.`);
+    }
+    if (!diffFlat(await w.flatten(main), await w.flattenTree(trial.tree)).length) throw new HttpError(409, `change ${id} is already undone on main`);
+    const task = this.createTask(actor, { title: `Revert #${id}: ${ch.title}`, description: `Takes change #${id} (by ${this.agentName(ch.agent_id)}) back out of main.${reason ? `\n\nWhy: ${reason}` : ""}` }) as any;
+    const taskId = (task.id ?? task.task?.id) as number;
+    this.sql.exec("UPDATE tasks SET reverts = ? WHERE id = ?", id, taskId);
+    const claimed = await this.claim(actor, taskId);
+    const ws = claimed.workspace.name;
+    const remote = this.remote(ws, await this.token(ws, "write"));
+    const head = await w.fetchFrom("ws", remote);
+    const result = await w.revert(ch.merged_commit as string, before, head);
+    if (!result.tree) throw new HttpError(409, `main moved while reverting change ${id}; try again`);
+    const commit = await w.commit(result.tree, [head], `Revert "${ch.title}"\n\nThis reverts change #${id} (${ch.merged_commit}).${reason ? `\n\n${reason}` : ""}`, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    this.setMeta(`pushed:${ws}`, commit);
+    await w.push(remote, commit);
+    const files = await w.changes(head, commit);
+    this.sql.exec("INSERT INTO intents (task_id, agent_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?)", taskId, actor.id, JSON.stringify(files.map((f) => f.path)), `Revert change #${id}`, Date.now());
+    const submitted = await this.submitChange(actor, { taskId, title: `Revert #${id}: ${ch.title}`, summary: `Reverts change #${id}, "${ch.title}", by ${this.agentName(ch.agent_id)}.${reason ? ` ${reason}` : ""}`, context: { revertOf: id, reason: reason || undefined } });
+    const rid = (submitted as any).id as number;
+    const byPerson = actor.role === "human" || actor.id === "admin";
+    if (byPerson && this.change(rid).status === "review") await this.enqueue(rid);
+    this.emit("change.reverting", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { revert: rid, title: ch.title, reason, queued: byPerson } });
+    return { ...this.change(rid), reverts: id, note: byPerson ? "A person asked for it, so it goes straight to the merge queue; the checks still run." : "It needs review like any change: request_review." };
+  }
+
+  /** The landed history of main, oldest first: one entry per commit that moved it. */
+  private landedHistory(): { change: number; title: string; commit: string; version: number; agent: string }[] {
+    const seen = new Set<string>();
+    return this.sql.exec("SELECT id, title, merged_commit, merged_version, agent_id FROM changes WHERE status = 'merged' AND merged_commit IS NOT NULL ORDER BY merged_version, id").toArray()
+      .filter((r) => (seen.has(r.merged_commit as string) ? false : (seen.add(r.merged_commit as string), true)))
+      .map((r) => ({ change: r.id as number, title: r.title as string, commit: r.merged_commit as string, version: r.merged_version as number, agent: r.agent_id as string }));
+  }
+
+  /**
+   * Find the change that made the checks (or another command) start failing:
+   * check main, step back until they pass, then halve the range. Runs in the
+   * background; bisect.done says which change it was.
+   */
+  private async startBisect(actor: Agent, body: { command?: string; good?: number; reason?: string }, auto = false) {
+    if (!this.checks) throw new HttpError(409, "this project has no check command; an owner sets one in Settings");
+    if (this.sql.exec("SELECT 1 FROM bisects WHERE status = 'running' AND created_at > ?", Date.now() - BISECT_STALE_MS).toArray().length) throw new HttpError(409, "a bisect is already running; GET /bisects to follow it");
+    const command = typeof body?.command === "string" && body.command.trim() ? body.command.trim() : null;
+    if (command && command.length > 2000) throw new HttpError(400, "command is at most 2000 characters");
+    if (!auto) this.assertCheckQuota(actor);
+    const good = body?.good != null ? Number(body.good) : null;
+    if (good != null && this.change(good).status !== "merged") throw new HttpError(400, `good must be a landed change; #${good} is ${this.change(good).status}`);
+    const row = this.sql.exec("INSERT INTO bisects (started_by, reason, command, auto, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id", actor.id, String(body?.reason ?? "").slice(0, 500) || null, command, auto ? 1 : 0, Date.now()).one();
+    const id = row.id as number;
+    this.emit("bisect.started", { actor: actor.id, data: { bisect: id, command: command ?? this.checks.command, auto } });
+    this.ctx.waitUntil(this.runBisect(id, actor, command, good).catch((e) => {
+      this.sql.exec("UPDATE bisects SET status = 'failed', error = ?, done_at = ? WHERE id = ?", String(e?.message ?? e).slice(0, 1000), Date.now(), id);
+      this.emit("bisect.failed", { actor: actor.id, data: { bisect: id, error: String(e?.message ?? e).slice(0, 300) } });
+    }));
+    return this.bisectView(id);
+  }
+
+  private async runBisect(id: number, actor: Agent, command: string | null, goodChange: number | null) {
+    const history = this.landedHistory();
+    const w = await Workspace.open(await this.mainRemote("read"));
+    const main = (await w.head())!;
+    // The point before the first landed change, so a project broken by its first change still finds it.
+    const first = history[0] ? this.change(history[0].change) : null;
+    const root = first ? await this.mergedBefore(w, first) : null;
+    const points = [...(root ? [{ change: 0, title: "before any change landed", commit: root, version: 0, agent: "" }] : []), ...history];
+    if (!points.length || points[points.length - 1].commit !== main) points.push({ change: 0, title: "main", commit: main, version: this.mainVersion, agent: "" });
+    // An agent's own command only gets the secrets agents' runs get.
+    const onDemand = !!command && actor.role !== "human" && actor.id !== "admin";
+    const steps: { change: number; title: string; version: number; ok: boolean; ms: number; output?: string }[] = [];
+    const results = new Map<number, boolean>();
+    const test = async (i: number) => {
+      if (results.has(i)) return results.get(i)!;
+      if (steps.length >= MAX_BISECT_RUNS) throw new Error(`gave up after ${MAX_BISECT_RUNS} runs`);
+      const p = points[i];
+      const r = await this.checkCommit(w, p.commit, onDemand, command ?? undefined);
+      this.chargeChecks([actor.id], r.ms);
+      steps.push({ change: p.change, title: p.title, version: p.version, ok: r.ok, ms: r.ms, ...(r.ok ? {} : { output: r.output.slice(-800) }) });
+      this.sql.exec("UPDATE bisects SET steps = ? WHERE id = ?", JSON.stringify(steps), id);
+      results.set(i, r.ok);
+      return r.ok;
+    };
+    const finish = (verdict: string, culprit: number | null) => {
+      this.sql.exec("UPDATE bisects SET status = 'done', verdict = ?, culprit = ?, done_at = ? WHERE id = ?", verdict, culprit, Date.now(), id);
+      const ch = culprit ? this.change(culprit) : null;
+      this.emit("bisect.done", {
+        actor: actor.id, change: culprit ?? undefined, task: ch?.task_id, to: ch?.agent_id,
+        data: { bisect: id, verdict, culprit, title: ch?.title, author: ch ? this.agentName(ch.agent_id) : undefined, runs: steps.length,
+          advice: ch ? `Change #${culprit} is where \`${command ?? this.checks!.command}\` started failing. Fix it with a new task, or revert_change #${culprit}.` : undefined },
+      });
+    };
+    let bad = points.length - 1;
+    if (await test(bad)) return finish("main passes: nothing to bisect", null);
+    let good = -1;
+    if (goodChange != null) {
+      good = points.findIndex((p) => p.change === goodChange);
+      if (!(await test(good))) return finish(`fails at #${goodChange} too, which was given as good`, null);
+    } else {
+      for (let step = 1; ; step *= 2) {
+        const i = Math.max(bad - step, 0);
+        if (await test(i)) { good = i; break; }
+        bad = i;
+        if (i === 0) return finish("fails at every point back to the first, so no single change broke it", null);
+      }
+    }
+    while (bad - good > 1) {
+      const mid = Math.floor((good + bad) / 2);
+      if (await test(mid)) good = mid; else bad = mid;
+    }
+    const culprit = points[bad];
+    if (!culprit.change) return finish("main fails, but no landed change is to blame", null);
+    return finish(`#${culprit.change} broke it`, culprit.change);
+  }
+
+  private bisectView(id: number) {
+    const b = this.sql.exec("SELECT * FROM bisects WHERE id = ?", id).toArray()[0] as any;
+    if (!b) throw new HttpError(404, `no bisect ${id}`);
+    const stale = b.status === "running" && Date.now() - b.created_at > BISECT_STALE_MS;
+    const culprit = b.culprit ? this.change(b.culprit) : null;
+    return {
+      id, status: stale ? "failed" : b.status, command: b.command ?? this.checks?.command ?? null, auto: !!b.auto, reason: b.reason,
+      startedBy: this.agentName(b.started_by) ?? b.started_by, createdAt: b.created_at, doneAt: b.done_at,
+      steps: JSON.parse(b.steps ?? "[]"), verdict: b.verdict ?? (stale ? "stopped before it finished" : null), error: b.error,
+      culprit: culprit ? { id: culprit.id, title: culprit.title, author: this.agentName(culprit.agent_id), revertedBy: this.revertOf(culprit.id) } : null,
+    };
+  }
+
+  private lastBisect() {
+    const r = this.sql.exec("SELECT id FROM bisects ORDER BY id DESC LIMIT 1").toArray()[0];
+    return r ? this.bisectView(r.id as number) : null;
+  }
+
+  private revertOf(id: number): number | null {
+    return (this.sql.exec("SELECT c.id FROM tasks t JOIN changes c ON c.task_id = t.id WHERE t.reverts = ? AND c.status NOT IN ('abandoned','closed') ORDER BY c.id DESC LIMIT 1", id).toArray()[0]?.id as number | undefined) ?? null;
+  }
+
+  /**
+   * Main looks broken when the checks keep failing for changes by different
+   * agents with nothing passing in between. Then Loom checks main itself and,
+   * if it fails, bisects to find the change that broke it.
+   */
+  private maybeAutoBisect() {
+    if (this.meta("auto_bisect") === "off" || !this.checks) return;
+    const since = this.sql.exec("SELECT MAX(seq) AS s FROM events WHERE type IN ('checks.passed','bisect.started')").one().s as number | null;
+    const failed = this.sql.exec("SELECT DISTINCT e.change_id, c.agent_id FROM events e JOIN changes c ON c.id = e.change_id WHERE e.type = 'checks.failed' AND e.seq > ?", since ?? 0).toArray();
+    if (failed.length < AUTO_BISECT_AFTER || new Set(failed.map((f) => f.agent_id)).size < 2) return;
+    const loom = { id: "admin", name: "Loom", role: "human", owner: true } as unknown as Agent;
+    this.startBisect(loom, { reason: `${failed.length} changes by different agents failed the checks in a row` }, true).catch((e) => console.error("auto bisect", e));
+  }
+
+  private async checkCommit(w: Workspace, commit: string, onDemand = false, commandOverride?: string): Promise<CheckResult> {
+    await w.ensure(commit);
     const flat = await w.flatten(commit);
     const files = new Map<string, { bytes: Uint8Array; mode: string }>();
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
-    const { command, timeoutSec } = this.checks!;
+    const { timeoutSec } = this.checks!;
+    const command = commandOverride ?? this.checks!.command;
     const day = new Date().toISOString().slice(0, 10);
     const budget = this.limits.checkMinutes * 60_000;
     const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
@@ -2621,6 +2818,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         advice: `The project's checks fail with your change on main${alongside.length ? ` (after ${alongside.map((id) => `#${id}`).join(", ")}, which land first)` : ""}. sync_workspace, fix it, run_checks to see it pass, then update_change.`,
       },
     });
+    if (!alongside.length) this.maybeAutoBisect();
   }
 
   /** Run the checks on what would land from a task's workspace: main with the workspace merged in. */
@@ -3969,7 +4167,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human").length, byState },
