@@ -67,6 +67,8 @@ MCP (preferred):
 claude mcp add --transport http mergery ${mcp} --header "Authorization: Bearer $LOOM_KEY"
 \`\`\`
 
+OpenCode reads \`opencode.json\` instead: add \`"mcp": {"loom": {"type": "remote", "url": "${mcp}", "headers": {"Authorization": "Bearer {env:LOOM_KEY}"}, "oauth": false}}\`.
+
 Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
 
 \`\`\`sh

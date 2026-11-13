@@ -4251,11 +4251,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private asksForTraces(person: string | undefined): boolean {
     return !!person && !!this.sql.exec("SELECT 1 FROM trace_keys WHERE person = ? AND kind = 'other' AND revoked_at IS NULL LIMIT 1", person).toArray().length;
   }
-  /** What to tell an agent whose person asked for traces, about a change of its own. */
+  /** Whether a person has a hook uploading their agent's sessions, so asking that agent too would upload twice. */
+  private hookedFor(person: string | undefined): boolean {
+    return !!person && !!this.sql.exec("SELECT 1 FROM trace_keys WHERE person = ? AND kind != 'other' AND revoked_at IS NULL LIMIT 1", person).toArray().length;
+  }
+  /** What to tell an agent asked for its trace, about a change of its own: every agent when the project asks all (any agent that
+   *  makes decisions should leave its reasoning), otherwise only the agents of a person who asked theirs. */
   private traceAsk(actor: Agent, changeId: number): string | null {
-    if (actor.traceKey || !this.asksForTraces(actor.under?.id)) return null;
+    if (actor.traceKey || actor.role === "human" || actor.standin) return null;
+    const askAll = this.traceSettings.askAll;
+    if (askAll ? this.hookedFor(actor.under?.id) : !this.asksForTraces(actor.under?.id)) return null;
     if (this.sql.exec(`SELECT 1 FROM traces WHERE ${LIVE_TRACE} AND agent_id = ? AND (change_id = ? OR EXISTS (SELECT 1 FROM json_each(traces.links) WHERE value = ?)) LIMIT 1`, actor.id, changeId, changeId).toArray().length) return null;
-    return `${this.agentName(actor.under!.id)} turned on session traces: call attach_trace with your session log (the transcript of this session: what you were asked, read, thought and did) and change ${changeId}, so reviewers can check your intent. Upload it again with the same session id when you change it.`;
+    return `${askAll ? "This project collects session traces from every agent" : `${this.agentName(actor.under!.id)} turned on session traces`}: call attach_trace with your session log (the transcript of this session: what you were asked, read, thought and did) and change ${changeId}, so reviewers can check your intent. Upload it again with the same session id when you change it.`;
   }
 
   private revokeTraceKey(actor: Agent, id: string) {
@@ -4964,7 +4971,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
@@ -6319,13 +6326,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── session traces: what an agent saw, thought and did, kept with its change ─
 
-  private get traceSettings(): { thoughts: boolean; agentsCanRead: boolean; redact: string[] } {
-    return { thoughts: true, agentsCanRead: false, redact: [], ...JSON.parse(this.meta("trace_settings") ?? "{}") };
+  private get traceSettings(): { thoughts: boolean; agentsCanRead: boolean; redact: string[]; askAll: boolean } {
+    return { thoughts: true, agentsCanRead: false, redact: [], askAll: false, ...JSON.parse(this.meta("trace_settings") ?? "{}") };
   }
 
-  private setTraceSettings(body: { thoughts?: boolean; agentsCanRead?: boolean; redact?: string[] }) {
+  private setTraceSettings(body: { thoughts?: boolean; agentsCanRead?: boolean; redact?: string[]; askAll?: boolean }) {
     const cfg = this.traceSettings;
     if (body.thoughts !== undefined) cfg.thoughts = !!body.thoughts;
+    if (body.askAll !== undefined) cfg.askAll = !!body.askAll;
     if (body.agentsCanRead !== undefined) cfg.agentsCanRead = !!body.agentsCanRead;
     if (body.redact !== undefined) {
       if (!Array.isArray(body.redact) || body.redact.length > 50) throw new HttpError(400, "traces.redact is a list of up to 50 regular expressions");

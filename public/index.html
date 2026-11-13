@@ -19,8 +19,8 @@
     <button id="tasks-open" class="ghost menu-only" title="Every task, by stage">Tasks</button>
     <button id="code-open" class="ghost" title="Browse main and any change's files and history; download a zip or check out locally">Code</button>
     <button id="work-open" class="ghost" hidden title="Take a task yourself: get a workspace, declare what you'll touch and submit it for review, like an agent">My work</button>
-    <button id="skill-open" class="ghost" title="Copy a skill that tells an agent how to work on this project. Owners can add a join code so agents register themselves">Connect an agent</button>
-    <button id="settings-open" class="ghost" title="Visibility, approvals, checks, limits on questions for people, members and keys">Settings</button>
+    <button id="skill-open" class="ghost" title="Connect your own agent with one command, or let agents that run on their own register with a join code">Connect an agent</button>
+    <button id="settings-open" class="ghost" title="Visibility, approvals, checks, limits on questions for people, members, your stand-in and model keys">Settings</button>
     <button id="help-open" class="ghost help-btn" title="How Mergery works: the ideas behind each part of this page" aria-label="Help"><span class="menu-hide">?</span><span class="menu-only">Help</span></button>
   </nav>
   <div class="proj">
@@ -135,7 +135,7 @@
 
 <section id="review" class="rv-page" hidden></section>
 
-<dialog id="detail"><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
+<dialog id="detail"><form method="dialog" class="corner-close"><button aria-label="Close" title="Close (Esc)">×</button></form><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
 
 <dialog id="jev">
   <form id="jev-form" method="dialog" class="jev-form">
