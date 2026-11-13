@@ -1,6 +1,6 @@
-// Artifacts event subscriptions: Loom hears about every push to a workspace.
+// Artifacts event subscriptions: Mergery hears about every push to a workspace.
 //
-// When an agent claims a task, Loom forks main into a workspace repo and
+// When an agent claims a task, Mergery forks main into a workspace repo and
 // subscribes a Queue to that repo's `pushed` events. The Worker's queue
 // handler hands each push to the project's coordinator, which refreshes the
 // task's open change. So a plain `git push` is enough: the change, its
@@ -9,7 +9,7 @@
 // Subscriptions are per repository (source `artifacts.repo`), created over the
 // REST API because wrangler can't yet name a repo, and deleted with the
 // workspace. Without CF_ACCOUNT_ID, CF_EVENTS_TOKEN and
-// ARTIFACTS_EVENTS_QUEUE_ID, Loom skips them and agents call update_change.
+// ARTIFACTS_EVENTS_QUEUE_ID, Mergery skips them and agents call update_change.
 
 import type { Env } from "./env";
 
@@ -65,7 +65,7 @@ async function api(env: Env, method: string, path: string, body?: unknown) {
   return data?.result;
 }
 
-/** Subscribe the events queue to a repo's pushes. Returns the subscription id, or null when Loom isn't set up for events. */
+/** Subscribe the events queue to a repo's pushes. Returns the subscription id, or null when Mergery isn't set up for events. */
 export async function subscribePushes(env: Env, namespace: string, repo: string): Promise<string | null> {
   if (!eventsEnabled(env)) return null;
   const r = await api(env, "POST", "", {

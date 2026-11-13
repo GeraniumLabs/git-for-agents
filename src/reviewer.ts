@@ -1,5 +1,5 @@
-// Loom's review agent: when a change has waited for a reviewer and none is
-// around, Loom reviews it itself. Agents are sessions that finish and exit,
+// Mergery's review agent: when a change has waited for a reviewer and none is
+// around, Mergery reviews it itself. Agents are sessions that finish and exit,
 // so a project can't count on one being there when a change comes in.
 //
 // The call goes through Cloudflare AI Gateway, so every review is logged,
@@ -13,7 +13,7 @@ import Anthropic from "@anthropic-ai/sdk";
 
 export interface ReviewAgentConfig {
   enabled: boolean;
-  /** How long a change waits for a reviewer before Loom reviews it. */
+  /** How long a change waits for a reviewer before Mergery reviews it. */
   afterMinutes: number;
 }
 
@@ -107,7 +107,7 @@ export function reviewPrompt(i: ReviewInput, limit: number): string {
     `Task: ${i.task.title}${i.task.description ? `\n${i.task.description}` : ""}`,
     `Change: ${i.title}${i.summary ? `\n${i.summary}` : ""}`,
     `Declared intent: ${i.intent || "(none)"}`,
-    i.brief.length ? `Loom's brief already notes:\n${i.brief.map((b) => `- ${b}`).join("\n")}` : "",
+    i.brief.length ? `Mergery's brief already notes:\n${i.brief.map((b) => `- ${b}`).join("\n")}` : "",
     truncated ? "The diff below is truncated, so don't approve: comment on what you saw and say the rest needs a look." : "",
     `Diff (each line starts with its line number in the new file; removed lines have none):\n${patch}`,
   ].filter(Boolean).join("\n\n");

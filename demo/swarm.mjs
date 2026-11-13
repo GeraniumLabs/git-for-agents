@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // A scripted swarm: five agents and a reviewer work on one small codebase at
-// the same time, through Loom. No LLM needed, so it is repeatable; it runs
+// the same time, through Mergery. No LLM needed, so it is repeatable; it runs
 // the same API an LLM agent uses over MCP. Watch it in the dashboard.
 //
 //   LOOM_URL=http://127.0.0.1:8787 LOOM_ADMIN_TOKEN=dev-admin node demo/swarm.mjs [project]
@@ -22,7 +22,7 @@ import { execFileSync } from "node:child_process";
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Loom, sleep } from "./client.mjs";
+import { Mergery, sleep } from "./client.mjs";
 import { SEED } from "./seed.mjs";
 
 const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
@@ -136,7 +136,7 @@ test("accepts a title", () => assert.equal(validateTodo({ title: "ship it" }), n
 };
 
 // A second wave: fen starts after ada's work has landed, on the same files.
-// Loom's memory tells fen what ada did and why, and that ada is still around.
+// Mergery's memory tells fen what ada did and why, and that ada is still around.
 const FOLLOW_PLAN = {
   agent: "fen", task: "Add a priority level and a priority filter", dependsOnAgent: "ada",
   paths: ["src/db.js", "src/routes/todos.js"],
@@ -248,7 +248,7 @@ async function builder(admin, keys, plan, taskId) {
       writeFileSync(join(dir, p), c);
     }
     execFileSync("git", ["-C", dir, "add", "-A"]);
-    execFileSync("git", ["-C", dir, "-c", `user.name=${plan.agent}`, "-c", `user.email=${id}@agents.loom.dev`, "commit", "-qm", plan.task]);
+    execFileSync("git", ["-C", dir, "-c", `user.name=${plan.agent}`, "-c", `user.email=${id}@agents.mergery.dev`, "commit", "-qm", plan.task]);
     execFileSync("git", ["-C", dir, ...auth, "push", "-q", "origin", "main"]);
     rmSync(dir, { recursive: true, force: true });
     log(plan.agent, `pushed with git: ${Object.keys(files).join(", ")}`);
@@ -472,7 +472,7 @@ async function human(admin, key, done) {
 }
 
 async function main() {
-  const admin = new Loom(BASE, PROJECT, ADMIN);
+  const admin = new Mergery(BASE, PROJECT, ADMIN);
   await admin.createProject({ name: PROJECT, description: "A tiny todo service, built by a swarm", files: SEED, requiredApprovals: 1 });
   console.log(`project ${PROJECT}: open ${BASE}/?project=${PROJECT}`);
   await pause(3);

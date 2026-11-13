@@ -1,14 +1,14 @@
 #!/usr/bin/env node
-// Uploads an agent's session log to Loom, so reviewers can see what was asked
+// Uploads an agent's session log to Mergery, so reviewers can see what was asked
 // and why the agent did what it did. Optional: nothing is uploaded unless you
 // install it. Works with Claude Code, Codex and OpenCode, and sends any other
 // agent's log by hand.
 //
-// Turn it on for one repository (run in the repository's root). Loom's
+// Turn it on for one repository (run in the repository's root). Mergery's
 // "Connect an agent" page gives you this line with a trace key filled in:
 //
-//   mkdir -p ~/.loom && curl -fsS https://<loom>/trace-hook.mjs -o ~/.loom/trace-hook.mjs \
-//     && node ~/.loom/trace-hook.mjs --install https://<loom> <project> <trace key> --for claude-code
+//   mkdir -p ~/.loom && curl -fsS https://<mergery>/trace-hook.mjs -o ~/.loom/trace-hook.mjs \
+//     && node ~/.loom/trace-hook.mjs --install https://<mergery> <project> <trace key> --for claude-code
 //
 // The key is saved in ~/.loom/traces/<project>.json, readable only by you; it
 // never goes in the repository. Then, by agent:
@@ -26,13 +26,13 @@
 //
 //   node ~/.loom/trace-hook.mjs --uninstall <project> [--for <agent>] [--global]
 //
-// Or revoke the key in Loom. Any other agent, by hand, after installing:
+// Or revoke the key in Mergery. Any other agent, by hand, after installing:
 //
 //   node ~/.loom/trace-hook.mjs --project <project> --file <session log> [--session <id>] [--change 12]
 //
 // Without --project it reads LOOM_URL, LOOM_PROJECT and LOOM_KEY (a trace key
 // or an agent key). LOOM_AGENT, if set, uploads as that named agent under the
-// key, which is what recipes/runner.mjs sets for each agent it starts. Loom
+// key, which is what recipes/runner.mjs sets for each agent it starts. Mergery
 // removes secrets before storing anything, and uploading the same session
 // again adds a new version.
 //
@@ -128,7 +128,7 @@ function uninstallClaude(project) {
 }
 
 // ── Codex: `notify` in ~/.codex/config.toml ─────────────────────────────
-const NOTIFY_LINE = () => `notify = ["node", ${JSON.stringify(SCRIPT)}, "--codex-notify"] # Loom session traces`;
+const NOTIFY_LINE = () => `notify = ["node", ${JSON.stringify(SCRIPT)}, "--codex-notify"] # Mergery session traces`;
 function installCodex() {
   const text = existsSync(CODEX_CONFIG) ? readFileSync(CODEX_CONFIG, "utf8") : "";
   // notify is a top-level key: only lines before the first [table] count.
@@ -172,7 +172,7 @@ function codexNotify() {
   if (!hit) return;
   const thread = String(event["thread-id"] ?? "latest");
   const file = codexRollout(event["thread-id"]);
-  if (!file) return console.error("loom trace: couldn't find this Codex session's log");
+  if (!file) return console.error("mergery trace: couldn't find this Codex session's log");
   const pending = join(HOME, "pending", `${thread.replace(/[^\w.-]/g, "_")}.json`);
   const at = Date.now();
   mkdirSync(dirname(pending), { recursive: true });
@@ -193,7 +193,7 @@ async function flush() {
 }
 
 // ── OpenCode: a plugin that reads the session through OpenCode's own client ──
-const OPENCODE_SOURCE = `// Loom session traces for OpenCode, installed by ~/.loom/trace-hook.mjs.
+const OPENCODE_SOURCE = `// Mergery session traces for OpenCode, installed by ~/.loom/trace-hook.mjs.
 // For repositories where you turned traces on; remove with --uninstall.
 import { existsSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
@@ -225,8 +225,8 @@ export const LoomTrace = async ({ client, directory }) => {
       const headers = { authorization: "Bearer " + hit.r.key, "content-type": "application/x-ndjson" };
       if (hit.r.agent) headers["x-loom-agent"] = hit.r.agent;
       const res = await fetch(hit.cfg.url + "/api/projects/" + hit.cfg.project + "/traces?" + q, { method: "POST", headers, body: JSON.stringify({ info, messages }) });
-      if (!res.ok) console.error("loom trace: " + res.status + " " + ((await res.json().catch(() => ({}))).error ?? ""));
-    } catch (e) { console.error("loom trace: " + e.message); }
+      if (!res.ok) console.error("mergery trace: " + res.status + " " + ((await res.json().catch(() => ({}))).error ?? ""));
+    } catch (e) { console.error("mergery trace: " + e.message); }
   };
   return {
     event: async ({ event }) => {
@@ -250,7 +250,7 @@ function install() {
   const i = process.argv.indexOf("--install");
   const [url, project, key] = process.argv.slice(i + 1, i + 4);
   const agent = arg("for") ?? "claude-code";
-  if (!url || !project || !key || key.startsWith("--")) throw new Error("usage: --install <loom url> <project> <trace key> [--for claude-code|codex|opencode] [--agent <name>] [--global]");
+  if (!url || !project || !key || key.startsWith("--")) throw new Error("usage: --install <mergery url> <project> <trace key> [--for claude-code|codex|opencode] [--agent <name>] [--global]");
   if (!AGENTS.includes(agent)) throw new Error(`--for is one of ${AGENTS.join(", ")}; any other agent can send its log with --file`);
   mkdirSync(join(HOME, "traces"), { recursive: true });
   const self = fileURLToPath(import.meta.url);
@@ -266,7 +266,7 @@ function install() {
   cfg.repos.push({ path: repo, for: agent, key, ...(arg("agent") ? { agent: arg("agent") } : {}) });
   saveConfig(cfg);
   const when = agent === "claude-code" ? "when they end" : `once they've been idle for ${Math.round(IDLE / 60000)} minutes`;
-  console.log(`loom trace: on. ${agent} sessions ${repo ? `in ${repo}` : "on this machine"} upload to ${project} ${when}.`);
+  console.log(`mergery trace: on. ${agent} sessions ${repo ? `in ${repo}` : "on this machine"} upload to ${project} ${when}.`);
   console.log(`  hook: ${where}\n  key:  ${configPath(project)}`);
   console.log(`  turn off: node "${SCRIPT}" --uninstall ${project} --for ${agent}${flag("global") ? " --global" : ""}`);
 }
@@ -287,19 +287,19 @@ function uninstall() {
   const left = allConfigs().flatMap((c) => c.repos);
   if (!left.some((r) => r.for === "codex")) uninstallCodex();
   if (!left.some((r) => r.for === "opencode")) rmSync(OPENCODE_PLUGIN, { force: true });
-  console.log(`loom trace: off for ${project}${only ? ` (${only})` : ""} in ${repo ?? "your global settings"}. Revoke the key in Loom too if you won't turn it back on.`);
+  console.log(`mergery trace: off for ${project}${only ? ` (${only})` : ""} in ${repo ?? "your global settings"}. Revoke the key in Mergery too if you won't turn it back on.`);
 }
 
 // ── uploading ───────────────────────────────────────────────────────────
 async function upload(to, body, params) {
-  if (body.length > MAX) return console.error(`loom trace: the log is ${(body.length / 1024 / 1024).toFixed(1)} MB; Loom takes up to 25 MB`);
+  if (body.length > MAX) return console.error(`mergery trace: the log is ${(body.length / 1024 / 1024).toFixed(1)} MB; Mergery takes up to 25 MB`);
   const q = new URLSearchParams(Object.entries(params).filter(([, v]) => v !== undefined && v !== null));
   const headers = { authorization: `Bearer ${to.key}`, "content-type": "application/x-ndjson" };
   if (to.agent) headers["x-loom-agent"] = to.agent;
   const res = await fetch(`${to.url.replace(/\/$/, "")}/api/projects/${to.project}/traces?${q}`, { method: "POST", headers, body });
   const out = await res.json().catch(() => ({}));
-  if (!res.ok) return console.error(`loom trace: ${res.status} ${out.error ?? ""}`);
-  console.error(`loom trace: uploaded as trace #${out.id} (${out.steps} steps${out.change ? `, change #${out.change}` : ""}${out.redactions ? `, ${out.redactions} secrets removed` : ""})`);
+  if (!res.ok) return console.error(`mergery trace: ${res.status} ${out.error ?? ""}`);
+  console.error(`mergery trace: uploaded as trace #${out.id} (${out.steps} steps${out.change ? `, change #${out.change}` : ""}${out.redactions ? `, ${out.redactions} secrets removed` : ""})`);
 }
 
 async function hookUpload() {
@@ -307,17 +307,17 @@ async function hookUpload() {
   const hook = arg("file") ? {} : await readStdin();
   if (arg("project")) {
     const cfg = loadConfig(arg("project"));
-    if (!cfg) return console.error(`loom trace: no saved key for ${arg("project")}; run --install again`);
+    if (!cfg) return console.error(`mergery trace: no saved key for ${arg("project")}; run --install again`);
     const dir = resolve(hook.cwd ?? process.cwd());
     const kind = arg("file") ? null : "claude-code";
     const r = cfg.repos.filter((x) => (!kind || x.for === kind) && (x.path === null || inside(dir, x.path))).sort((a, b) => (b.path?.length ?? 0) - (a.path?.length ?? 0))[0] ?? cfg.repos[0];
-    if (!r) return console.error(`loom trace: no saved key for ${arg("project")}; run --install again`);
+    if (!r) return console.error(`mergery trace: no saved key for ${arg("project")}; run --install again`);
     to = { url: cfg.url, project: cfg.project, key: r.key, agent: process.env.LOOM_AGENT || r.agent };
   }
-  if (!to.url || !to.project || !to.key) return console.error("loom trace: set LOOM_URL, LOOM_PROJECT and LOOM_KEY to upload session traces, or run --install");
+  if (!to.url || !to.project || !to.key) return console.error("mergery trace: set LOOM_URL, LOOM_PROJECT and LOOM_KEY to upload session traces, or run --install");
   const file = arg("file") ?? hook.transcript_path;
-  if (!file) return console.error("loom trace: no transcript; pass --file <log>");
-  if (statSync(file).size > MAX) return console.error(`loom trace: ${file} is ${(statSync(file).size / 1024 / 1024).toFixed(1)} MB; Loom takes up to 25 MB`);
+  if (!file) return console.error("mergery trace: no transcript; pass --file <log>");
+  if (statSync(file).size > MAX) return console.error(`mergery trace: ${file} is ${(statSync(file).size / 1024 / 1024).toFixed(1)} MB; Mergery takes up to 25 MB`);
   await upload(to, readFileSync(file), {
     session: arg("session") ?? hook.session_id,
     change: arg("change"),
@@ -335,4 +335,4 @@ async function main() {
   return hookUpload();
 }
 
-main().catch((e) => { console.error(`loom trace: ${e.message}`); if (flag("install") || flag("uninstall")) process.exitCode = 1; }).finally(() => process.exit(process.exitCode ?? 0));
+main().catch((e) => { console.error(`mergery trace: ${e.message}`); if (flag("install") || flag("uninstall")) process.exitCode = 1; }).finally(() => process.exit(process.exitCode ?? 0));

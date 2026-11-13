@@ -42,7 +42,7 @@ export const PERSON_AGENT_HEADER = "x-loom-person-agent";
 /** How many named agents one key may carry. */
 const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
-/** Loom's own review agent, which reviews a change nobody else is around to (src/reviewer.ts). */
+/** Mergery's own review agent, which reviews a change nobody else is around to (src/reviewer.ts). */
 const REVIEW_AGENT_ID = "loom-reviewer";
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
@@ -75,16 +75,16 @@ const MAX_PREVIEW_FILES = 2000;
 const MAX_PREVIEW_BYTES = 50 * 1024 * 1024;
 /** A bisect runs the checks at most this many times, and is taken for dead after this long. */
 const MAX_BISECT_RUNS = 16;
-/** Questions a project's people may ask Loom a day: each is one model call. */
+/** Questions a project's people may ask Mergery a day: each is one model call. */
 const ASKS_PER_DAY = 100;
 const WEEK_MS = 7 * 86_400_000;
 const BISECT_STALE_MS = 60 * 60_000;
-/** Changes by different agents failing the checks in a row before Loom checks main itself. */
+/** Changes by different agents failing the checks in a row before Mergery checks main itself. */
 const AUTO_BISECT_AFTER = 3;
 const MAX_APPROACH = 280;
 /** Sent on every response to an agent that has directives it hasn't acknowledged (URI-encoded JSON). */
 export const DIRECTIVES_HEADER = "x-loom-directives";
-const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev" };
+const MERGE_IDENTITY = { name: "Mergery merge queue", email: "merge-queue@mergery.dev" };
 /** Project-wide events every agent hears about, whatever it is working on. */
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
@@ -492,7 +492,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const cap = this.limits.privateProjects;
     if (visibility === "private" && cap > 0) {
       const r = await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch(`https://do/registry/private-count?name=${encodeURIComponent(this.project)}`).then((r) => r.json<{ count: number }>());
-      if (r.count >= cap) throw new HttpError(403, `the ${this.meta("plan") === "free" ? "free plan" : "plan"} has ${cap} private project${cap === 1 ? "" : "s"}, and its owner has ${r.count}. Loom Pro has no limit on private projects.`);
+      if (r.count >= cap) throw new HttpError(403, `the ${this.meta("plan") === "free" ? "free plan" : "plan"} has ${cap} private project${cap === 1 ? "" : "s"}, and its owner has ${r.count}. Mergery Pro has no limit on private projects.`);
     }
     this.setMeta("visibility", visibility);
     await this.env.PROJECT.get(this.env.PROJECT.idFromName("__registry")).fetch("https://do/registry/visibility", { method: "PUT", body: JSON.stringify({ name: this.project, private: visibility === "private" }) });
@@ -707,7 +707,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private remoteUrl(repo: string): string {
     return this.meta(`remote:${repo}`) ?? "";
   }
-  /** Short-lived tokens for Loom's own git operations, reused while fresh. */
+  /** Short-lived tokens for Mergery's own git operations, reused while fresh. */
   private tokens = new Map<string, { token: string; until: number }>();
   private async token(repo: string, scope: "read" | "write"): Promise<string> {
     const key = `${repo}:${scope}`;
@@ -779,7 +779,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     // Registry (singleton instance)
     if (a === "registry" && b === "github") {
-      // The GitHub app Loom created for itself (sign-in), sealed like project keys.
+      // The GitHub app Mergery created for itself (sign-in), sealed like project keys.
       if (m === "GET") {
         const row = this.meta("github_app");
         const plain = row ? await unseal(this.env, "__github", JSON.parse(row)) : null;
@@ -954,7 +954,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // A stand-in reaches only what its person allowed, and never settings, people or keys.
     if (actor.standin) {
       const need = scopeFor(m, parts);
-      if (!need) throw new HttpError(403, `a stand-in key can't ${m} /${parts.join("/")}; ask ${actor.name} to do it in Loom`);
+      if (!need) throw new HttpError(403, `a stand-in key can't ${m} /${parts.join("/")}; ask ${actor.name} to do it in Mergery`);
       if (need !== "watch" && !actor.standin.scopes.includes(need)) throw new HttpError(403, `this stand-in key doesn't have the "${need}" right (${SCOPES[need].toLowerCase()}); ${actor.name} can grant it in Settings`);
       if (need !== "watch") this.standinActs.set(req, { id: actor.standin.id, name: actor.standin.name, person: actor.id, action: `${m} /${parts.join("/")}` });
     }
@@ -1071,7 +1071,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.assertCanReadTraces(actor);
       return json(await this.changeIntent(Number(b)));
     }
-    // Asking Loom about what it holds, the incident view and the factory report: people only, like traces.
+    // Asking Mergery about what it holds, the incident view and the factory report: people only, like traces.
     if (a === "ask" && m === "POST") { this.assertCanReadTraces(actor); return json(await this.askLoom(actor, body)); }
     if (a === "incident" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.incident(url.searchParams)); }
     if (a === "report" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.reportView(actor, Number(url.searchParams.get("days") ?? 7), url.searchParams.get("summary") === "1")); }
@@ -1294,7 +1294,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const r = this.sql.exec("INSERT INTO join_codes (code_hash, label, role, max_uses, expires_at, created_by, created_at, limits) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
       await sha256(code), body.label?.trim() || null, role, maxUses, expiresAt, actor.id, Date.now(), limits ? JSON.stringify(limits) : null).one();
     this.emit("join_code.created", { actor: actor.id, data: { id: r.id, label: body.label ?? null, role, maxUses, expiresAt } });
-    return { id: r.id, code, label: body.label ?? null, role, maxUses, expiresAt, limits, howToJoin: `POST /api/projects/${this.project}/join {"code": "<this code>", "name": "<agent name>"} returns the agent's own key. Shown once: Loom keeps only its hash.` };
+    return { id: r.id, code, label: body.label ?? null, role, maxUses, expiresAt, limits, howToJoin: `POST /api/projects/${this.project}/join {"code": "<this code>", "name": "<agent name>"} returns the agent's own key. Shown once: Mergery keeps only its hash.` };
   }
 
   /** The code itself if it is a live join code of this project, so the skill never carries anything else someone put in a link. */
@@ -1353,7 +1353,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const max = this.limits.agents;
     if (!(max > 0)) return;
     const n = this.sql.exec("SELECT COUNT(*) AS n FROM agents WHERE role != 'human' AND id NOT IN (?, ?)", DELEGATE_ID, REVIEW_AGENT_ID).one().n as number;
-    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most its plan allows; reuse an agent's key${this.meta("plan") === "free" ? ", or its owner can move to Loom Pro" : ", or ask whoever runs this server"}`);
+    if (n >= max) throw new HttpError(429, `this project has ${n} agents, the most its plan allows; reuse an agent's key${this.meta("plan") === "free" ? ", or its owner can move to Mergery Pro" : ", or ask whoever runs this server"}`);
   }
 
   /** What this project may use: from its owner's plan, or the server's limits. */
@@ -1580,7 +1580,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const parent = await w.head();
     const task = ws.task_id ? this.sql.exec("SELECT title FROM tasks WHERE id = ?", ws.task_id).toArray()[0] : null;
     const message = body.message?.trim() || (task ? `${task.title} (task #${ws.task_id})` : `Update ${Object.keys(files).slice(0, 3).join(", ")}${Object.keys(files).length > 3 ? ` and ${Object.keys(files).length - 3} more` : ""}`);
-    const commit = await w.commitFiles(parent, files, message, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const commit = await w.commitFiles(parent, files, message, { name: actor.name, email: `${actor.id}@agents.mergery.dev` });
     this.setMeta(`pushed:${name}`, commit);
     await w.push(remote, commit);
     this.emit("workspace.committed", { actor: actor.id, task: ws.task_id, data: { workspace: name, commit, files: Object.keys(files), message: body.message } });
@@ -1664,7 +1664,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     } else if (repo !== this.mainRepo) mainHead = await w.fetchFrom("loom-main", await this.mainRemote("read"));
     const byCommit = new Map(this.sql.exec("SELECT id, title, merged_commit FROM changes WHERE merged_commit IS NOT NULL").toArray().map((c) => [c.merged_commit as string, c]));
     const agentByEmail = (email: string) => {
-      const m = /^(.+)@agents\.loom\.dev$/.exec(email);
+      const m = /^(.+)@agents\.(?:mergery|loom)\.dev$/.exec(email);
       return m ? m[1] : null;
     };
     const out = [];
@@ -1735,7 +1735,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Artifacts says someone pushed to a workspace. Loom's own pushes (API
+   * Artifacts says someone pushed to a workspace. Mergery's own pushes (API
    * commits, syncs) are already handled where they happen; any other push
    * shows in the activity, and an open change follows its workspace.
    */
@@ -1743,7 +1743,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ws = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", p.repo).toArray()[0] as any;
     if (!ws || ws.status === "deleted") return { ignored: "not a workspace of this project" };
     if (p.ref && p.ref !== "refs/heads/main") return { ignored: `only pushes to main count (got ${p.ref})` };
-    if (p.after && this.meta(`pushed:${p.repo}`) === p.after) return { ignored: "Loom's own push" };
+    if (p.after && this.meta(`pushed:${p.repo}`) === p.after) return { ignored: "Mergery's own push" };
     this.emit("workspace.pushed", { actor: ws.agent_id, task: ws.task_id, data: { workspace: p.repo, head: p.after, before: p.before, commits: p.commits } });
     const ch = this.sql.exec("SELECT id, agent_id, head FROM changes WHERE task_id = ? AND workspace = ? AND status NOT IN ('merged','merging','abandoned','closed')", ws.task_id, p.repo).toArray()[0];
     if (!ch) return await this.submitOnPush(ws, p);
@@ -1935,7 +1935,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private requestReview(id: number, author: string) {
     const reviewers = this.sql.exec("SELECT id FROM agents WHERE role = 'reviewer' AND id NOT IN (?, ?)", author, REVIEW_AGENT_ID).toArray();
-    // If nobody takes it in time, Loom's review agent will.
+    // If nobody takes it in time, Mergery's review agent will.
     if (this.reviewAgent.enabled) void this.armAlarm(Date.now() + this.reviewAgent.afterMinutes * 60_000 + 1000);
     this.emit("review.requested", { actor: author, change: id, task: this.change(id).task_id, data: { reviewers: reviewers.map((r) => r.id) } });
     const ch = this.change(id);
@@ -2100,7 +2100,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!from) return { available: false, why: "nothing to compare with: no earlier review of this change by that reviewer" };
     if (from === to) return { available: true, from, to, files: [], patch: "", note: "Nothing changed since that review." };
     const [a, b] = await Promise.all([this.snapshotOf(id, from), this.snapshotOf(id, to)]);
-    if (!a || !b) return { available: false, from, to, why: "Loom didn't keep that version of the change (it predates per-version history)" };
+    if (!a || !b) return { available: false, from, to, why: "Mergery didn't keep that version of the change (it predates per-version history)" };
     let patch = "";
     const files: string[] = [];
     for (const path of [...new Set([...Object.keys(a.after), ...Object.keys(b.after)])].sort()) {
@@ -2180,7 +2180,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const next = now.status === "queued" || now.status === "merging" ? "In the merge queue; it lands on its own."
       : now.status === "changes_requested" ? "Sent back to the author."
       : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
-      : approval.humanNeeded ? (approval.guarded.length ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).` : "Waiting for a person to approve: Loom opened this revert by itself after a bisect.")
+      : approval.humanNeeded ? (approval.guarded.length ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).` : "Waiting for a person to approve: Mergery opened this revert by itself after a bisect.")
       : approval.reviewing.length && approval.weight >= approval.needed ? `Approved; it merges once ${approval.reviewing.join(", ")} finish${approval.reviewing.length === 1 ? "es" : ""} reviewing (or their time runs out).`
       : approval.openThreads && approval.weight >= approval.needed ? `Approved, but ${approval.openThreads} review thread${approval.openThreads === 1 ? "" : "s"} must be resolved before it merges.`
       : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
@@ -2611,7 +2611,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async saveCheckSecret(actor: Agent, body: any) {
     const name = typeof body.name === "string" ? body.name.trim() : "";
     if (!/^[A-Z_][A-Z0-9_]*$/.test(name) || name.length > 64) throw new HttpError(400, "a secret's name is an env var name: capitals, digits and _, up to 64 characters (e.g. NPM_TOKEN)");
-    if (["CI", "HOME", "PATH"].includes(name)) throw new HttpError(400, `${name} is set by Loom`);
+    if (["CI", "HOME", "PATH"].includes(name)) throw new HttpError(400, `${name} is set by Mergery`);
     const existing = this.sql.exec("SELECT name FROM check_secrets WHERE name = ?", name).toArray()[0];
     const value = body.value;
     if (existing && value === undefined) {
@@ -2650,7 +2650,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return env;
   }
 
-  // ── asking Loom: answers cited to the steps and events they came from ──
+  // ── asking Mergery: answers cited to the steps and events they came from ──
 
   private eventSources(where: string, ...args: unknown[]): Source[] {
     return this.sql.exec(`SELECT * FROM events WHERE ${where} ORDER BY seq LIMIT 400`, ...args).toArray().map((e: any) => {
@@ -2687,7 +2687,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async askLoom(actor: Agent, body: { question?: string; change?: number; bisect?: number; trace?: number }) {
-    if (actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "asking Loom is for the project's people");
+    if (actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "asking Mergery is for the project's people");
     const question = String(body?.question ?? "").trim();
     if (question.length < 3 || question.length > 1000) throw new HttpError(400, "ask a question of 3 to 1000 characters");
     const day = new Date().toISOString().slice(0, 10);
@@ -2918,7 +2918,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * runs in the check container (its last line may say `score: 0.8`; otherwise
    * passing is 1 and failing 0) and costs check minutes. A review eval is a job
    * for an agent: any agent but the author takes it, reads the change against
-   * the rubric and scores it. Loom never runs that agent; runners do.
+   * the rubric and scores it. Mergery never runs that agent; runners do.
    */
   private saveEval(actor: Agent, body: any) {
     const name = String(body?.name ?? "").trim();
@@ -3038,7 +3038,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private takeEval(actor: Agent, id: number, name: string) {
     const e = this.evalRow(name);
     const ch = this.change(id);
-    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Loom runs it`);
+    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Mergery runs it`);
     if (ch.agent_id === actor.id) throw new HttpError(403, "you wrote this change; another agent scores it");
     const r = this.sql.exec("SELECT * FROM eval_runs WHERE eval = ? AND change_id = ? AND head = ?", name, id, ch.head).toArray()[0] as any;
     if (!r) throw new HttpError(404, `no ${name} eval waiting on change ${id}'s current version`);
@@ -3052,7 +3052,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async scoreEval(actor: Agent, id: number, name: string, body: any) {
     const e = this.evalRow(name);
     const ch = this.change(id);
-    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Loom runs it`);
+    if (e.kind !== "review") throw new HttpError(409, `${name} is a command eval; Mergery runs it`);
     if (ch.agent_id === actor.id) throw new HttpError(403, "you wrote this change; another agent scores it");
     const score = body?.score === "pass" ? 1 : body?.score === "fail" ? 0 : Number(body?.score);
     if (!(score >= 0 && score <= 1)) throw new HttpError(400, "score is a number from 0 to 1 (or pass / fail)");
@@ -3217,7 +3217,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /**
    * Serve a preview's file. It's code an agent wrote, so it gets an opaque
-   * origin (a sandbox CSP): it can't read Loom's cookies or act as the viewer.
+   * origin (a sandbox CSP): it can't read Mergery's cookies or act as the viewer.
    * Set LOOM_PREVIEW_ORIGIN to serve previews from a separate domain as well.
    */
   private async servePreview(id: number, token: string, path: string): Promise<Response> {
@@ -3278,13 +3278,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * through the merge queue like anything else, so the checks still run. A
    * person's revert goes straight to the queue; an agent's needs review.
    */
-  /** A change only a person can approve, whatever the approval count: a revert Loom opened by itself. */
+  /** A change only a person can approve, whatever the approval count: a revert Mergery opened by itself. */
   private personApproves(id: number): boolean {
     const task = this.sql.exec("SELECT task_id FROM changes WHERE id = ?", id).toArray()[0]?.task_id;
     return task != null && this.meta(`person_approves:t${task}`) === "1";
   }
 
-  /** hold: a revert Loom opens by itself, which waits for a person's approval instead of going straight to the queue. */
+  /** hold: a revert Mergery opens by itself, which waits for a person's approval instead of going straight to the queue. */
   private async revertChange(actor: Agent, id: number, body: { reason?: string }, hold = false) {
     const ch = this.change(id);
     if (ch.status !== "merged" || !ch.merged_commit) throw new HttpError(409, `change ${id} hasn't landed (${ch.status}); close it instead`);
@@ -3311,7 +3311,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const head = await w.fetchFrom("ws", remote);
     const result = await w.revert(ch.merged_commit as string, before, head);
     if (!result.tree) throw new HttpError(409, `main moved while reverting change ${id}; try again`);
-    const commit = await w.commit(result.tree, [head], `Revert "${ch.title}"\n\nThis reverts change #${id} (${ch.merged_commit}).${reason ? `\n\n${reason}` : ""}`, { name: actor.name, email: `${actor.id}@agents.loom.dev` });
+    const commit = await w.commit(result.tree, [head], `Revert "${ch.title}"\n\nThis reverts change #${id} (${ch.merged_commit}).${reason ? `\n\n${reason}` : ""}`, { name: actor.name, email: `${actor.id}@agents.mergery.dev` });
     this.setMeta(`pushed:${ws}`, commit);
     await w.push(remote, commit);
     const files = await w.changes(head, commit);
@@ -3322,11 +3322,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const rid = (submitted as any).id as number;
     const byPerson = !hold && (actor.role === "human" || actor.id === "admin");
     if (hold) {
-      this.emit("approval.needs_human", { change: rid, task: taskId, data: { paths: [], reason: `Loom found that change #${id} broke the checks and opened this revert; a person decides whether it lands` } });
+      this.emit("approval.needs_human", { change: rid, task: taskId, data: { paths: [], reason: `Mergery found that change #${id} broke the checks and opened this revert; a person decides whether it lands` } });
     }
     if (byPerson && this.change(rid).status === "review") await this.enqueue(rid);
     this.emit("change.reverting", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { revert: rid, title: ch.title, reason, queued: byPerson, auto: hold } });
-    return { ...this.change(rid), reverts: id, note: hold ? "Loom opened it by itself, so it waits for a person to approve." : byPerson ? "A person asked for it, so it goes straight to the merge queue; the checks still run." : "It needs review like any change: request_review." };
+    return { ...this.change(rid), reverts: id, note: hold ? "Mergery opened it by itself, so it waits for a person to approve." : byPerson ? "A person asked for it, so it goes straight to the merge queue; the checks still run." : "It needs review like any change: request_review." };
   }
 
   /** The landed history of main, oldest first: one entry per commit that moved it. */
@@ -3397,7 +3397,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.emit("bisect.done", {
         actor: actor.id, change: culprit ?? undefined, task: ch?.task_id, to: ch?.agent_id,
         data: { bisect: id, verdict, culprit, title: ch?.title, author: ch ? this.agentName(ch.agent_id) : undefined, runs: steps.length, revert,
-          advice: ch ? `Change #${culprit} is where \`${command ?? this.checks!.command}\` started failing. ${revert ? `Loom opened revert #${revert}; a person approves it, or fix it with a new task first.` : `Fix it with a new task, or revert_change #${culprit}.`}` : undefined },
+          advice: ch ? `Change #${culprit} is where \`${command ?? this.checks!.command}\` started failing. ${revert ? `Mergery opened revert #${revert}; a person approves it, or fix it with a new task first.` : `Fix it with a new task, or revert_change #${culprit}.`}` : undefined },
       });
     };
     let bad = points.length - 1;
@@ -3447,7 +3447,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /**
    * Main looks broken when the checks keep failing for changes by different
-   * agents with nothing passing in between. Then Loom checks main itself and,
+   * agents with nothing passing in between. Then Mergery checks main itself and,
    * if it fails, bisects to find the change that broke it.
    */
   private maybeAutoBisect() {
@@ -3455,7 +3455,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const since = this.sql.exec("SELECT MAX(seq) AS s FROM events WHERE type IN ('checks.passed','bisect.started')").one().s as number | null;
     const failed = this.sql.exec("SELECT DISTINCT e.change_id, c.agent_id FROM events e JOIN changes c ON c.id = e.change_id WHERE e.type = 'checks.failed' AND e.seq > ?", since ?? 0).toArray();
     if (failed.length < AUTO_BISECT_AFTER || new Set(failed.map((f) => f.agent_id)).size < 2) return;
-    const loom = { id: "admin", name: "Loom", role: "human", owner: true } as unknown as Agent;
+    const loom = { id: "admin", name: "Mergery", role: "human", owner: true } as unknown as Agent;
     this.startBisect(loom, { reason: `${failed.length} changes by different agents failed the checks in a row` }, true).catch((e) => console.error("auto bisect", e));
   }
 
@@ -3566,7 +3566,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       const t = typeof v === "string" ? v : JSON.stringify(v);
       return t.length > n ? `${t.slice(0, n)}…` : t;
     };
-    const lines = [`Loom change #${id}: ${ch.title}`, `Task #${task.id}: ${task.title}`, `Author: ${this.agentName(ch.agent_id)}`];
+    const lines = [`Mergery change #${id}: ${ch.title}`, `Task #${task.id}: ${task.title}`, `Author: ${this.agentName(ch.agent_id)}`];
     if (ch.summary) lines.push("", ch.summary);
     const context = saved?.context && typeof saved.context === "object" ? saved.context : {};
     for (const [k, v] of Object.entries(context).slice(0, 8)) lines.push(`${k}: ${clip(v)}`);
@@ -3821,7 +3821,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         instructions: "For each path, write the full merged file content and call again with resolutions: { path: content }. Use null to delete a file.",
       };
     }
-    const author = actor.id === "admin" ? { name: "admin", email: "admin@loom.dev" } : { name: actor.name, email: `${actor.id}@agents.loom.dev` };
+    const author = actor.id === "admin" ? { name: "admin", email: "admin@mergery.dev" } : { name: actor.name, email: `${actor.id}@agents.mergery.dev` };
     const commit = await w.commit(result.tree, [ours, main], `Merge main into workspace${resolutions ? " (conflicts resolved)" : ""}`, author);
     this.setMeta(`pushed:${task.workspace}`, commit);
     await w.push(wsRemote, commit);
@@ -4239,7 +4239,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (agent.length > 40) throw new HttpError(400, "an agent name is 40 characters at most");
     if ((this.sql.exec("SELECT COUNT(*) AS n FROM trace_keys WHERE person = ? AND revoked_at IS NULL", actor.id).one().n as number) >= 10) throw new HttpError(429, "you have 10 trace keys; revoke one first");
     const id = `tk_${randomId(6)}`;
-    // "other": no hook to give a key to; Loom asks the person's agents to upload their own sessions instead.
+    // "other": no hook to give a key to; Mergery asks the person's agents to upload their own sessions instead.
     const key = kind === "other" ? null : `loomtrace_${randomId(20)}`;
     if (kind === "other" && this.asksForTraces(actor.id)) throw new HttpError(409, "your agents are already asked to attach their traces");
     this.sql.exec("INSERT INTO trace_keys (id, person, agent_name, key_hash, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)", id, actor.id, agent, await sha256(key ?? `unused_${randomId(20)}`), Date.now(), kind);
@@ -4247,7 +4247,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { ...this.traceKeyView(this.sql.exec("SELECT * FROM trace_keys WHERE id = ?", id).one()), ...(key ? { key } : {}) };
   }
 
-  /** Whether a person asked their agents to upload their own session traces (an agent with no hook Loom can install). */
+  /** Whether a person asked their agents to upload their own session traces (an agent with no hook Mergery can install). */
   private asksForTraces(person: string | undefined): boolean {
     return !!person && !!this.sql.exec("SELECT 1 FROM trace_keys WHERE person = ? AND kind = 'other' AND revoked_at IS NULL LIMIT 1", person).toArray().length;
   }
@@ -4448,7 +4448,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...this.standinView(this.sql.exec("SELECT * FROM standins WHERE id = ?", id).one()),
       key, webhookSecret: hook?.secret ?? null,
       skill: `${origin}/api/projects/${this.project}/standin-skill`,
-      howTo: `Give your agent the skill and this key as LOOM_STANDIN_KEY. Shown once: Loom keeps only its hash.${hook ? " Check webhook deliveries with the secret: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>." : ""}`,
+      howTo: `Give your agent the skill and this key as LOOM_STANDIN_KEY. Shown once: Mergery keeps only its hash.${hook ? " Check webhook deliveries with the secret: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>." : ""}`,
     };
   }
 
@@ -4604,7 +4604,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /**
    * Work an agent could pick up now, whoever starts it: reviews nobody is on,
    * contests ready to judge, changes sent back to an author who has gone, and
-   * open tasks nobody holds. Loom doesn't start agents; runners read this.
+   * open tasks nobody holds. Mergery doesn't start agents; runners read this.
    */
   private work(origin: string) {
     this.releaseQuietTasks();
@@ -4669,13 +4669,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * A webhook for runners: Loom POSTs new work (and any event types asked for)
+   * A webhook for runners: Mergery POSTs new work (and any event types asked for)
    * to it. authorization is sent as that header, sealed at rest, so a hook can
    * call an API that needs a token, such as GitHub's repository_dispatch.
    */
   private async createHook(actor: Agent, body: { url?: unknown; events?: unknown; authorization?: unknown }) {
     const url = this.webhookUrl(body.url);
-    if (!url) throw new HttpError(400, "send url: where Loom should POST");
+    if (!url) throw new HttpError(400, "send url: where Mergery should POST");
     let events: string[];
     try { events = validHookEvents(body.events); } catch (e: any) { throw new HttpError(400, e.message); }
     if (this.sql.exec("SELECT COUNT(*) AS n FROM runner_hooks WHERE revoked_at IS NULL").one().n as number >= 10) throw new HttpError(429, "a project has at most 10 webhooks; delete one first");
@@ -4707,7 +4707,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async testHook(id: string, origin: string) {
     const h = this.sql.exec("SELECT * FROM runner_hooks WHERE id = ? AND revoked_at IS NULL", id).toArray()[0];
     if (!h) throw new HttpError(404, `no webhook ${id}`);
-    return this.deliverHook(h, "work", { work: [{ key: "test", id: shortKey("test"), kind: "test", text: `Test from Loom: runners for ${this.project} will hear here when there's work.`, since: Date.now(), url: `${origin}/?project=${this.project}` }] }, origin);
+    return this.deliverHook(h, "work", { work: [{ key: "test", id: shortKey("test"), kind: "test", text: `Test from Mergery: runners for ${this.project} will hear here when there's work.`, since: Date.now(), url: `${origin}/?project=${this.project}` }] }, origin);
   }
 
   /** Whether any webhook is live: cached, since every event asks. */
@@ -4794,7 +4794,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { email: (r?.email as string) ?? null, lastSent: (r?.emailed_at as number) ?? null, sending: !!this.mailer };
   }
 
-  /** Where to email a person: the address on their Loom account, else the one they gave this project. */
+  /** Where to email a person: the address on their Mergery account, else the one they gave this project. */
   private async addressOf(identity: string | null, fallback: string): Promise<string> {
     const login = identity?.startsWith("github:") ? identity.slice(7) : null;
     if (!login) return fallback;
@@ -4826,7 +4826,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const mail = needsYouEmail(this.project, actor.name, fresh, items.length, origin);
     try {
       const to = await this.addressOf((p.identity as string) ?? null, p.email as string);
-      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to, ...mail });
+      await this.mailer!.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Mergery" }, to, ...mail });
       this.sql.exec("UPDATE agents SET email_seen = ?, emailed_at = ? WHERE id = ?", JSON.stringify(items.map((i) => i.id)), Date.now(), actor.id);
     } catch (e: any) {
       console.error("email", String(e?.message ?? e));
@@ -4838,9 +4838,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!own) throw new HttpError(400, "set your email first");
     const to = await this.addressOf(actor.identity ?? null, own);
     if (!this.mailer) throw new HttpError(503, "this server can't send email yet: it needs a send_email binding named EMAIL and LOOM_EMAIL_FROM");
-    const item = { id: "test", kind: "test", text: `Test from Loom: you'll hear here when something on ${this.project} needs you.`, url: `${origin}/?project=${this.project}`, youCan: null, detail: {} };
+    const item = { id: "test", kind: "test", text: `Test from Mergery: you'll hear here when something on ${this.project} needs you.`, url: `${origin}/?project=${this.project}`, youCan: null, detail: {} };
     try {
-      const r = await this.mailer.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Loom" }, to, ...needsYouEmail(this.project, actor.name, [item], 1, origin) });
+      const r = await this.mailer.send({ from: { email: this.env.LOOM_EMAIL_FROM!, name: "Mergery" }, to, ...needsYouEmail(this.project, actor.name, [item], 1, origin) });
       return { sent: true, to, messageId: (r as any)?.messageId ?? null };
     } catch (e: any) {
       throw new HttpError(502, `couldn't send: ${String(e?.message ?? e).slice(0, 200)}`);
@@ -4850,7 +4850,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private async testStandin(actor: Agent, id: string, origin: string) {
     const r = this.standinRow(id, actor);
     if (!r.webhook) throw new HttpError(400, "that stand-in has no webhook");
-    const item = { key: "test", id: shortKey("test"), kind: "test", text: `Test from Loom: ${r.name} will hear here when something on ${this.project} needs ${this.agentName(r.person as string)}.`, since: Date.now(), url: `${origin}/?project=${this.project}`, youCan: null, detail: {}, new: true };
+    const item = { key: "test", id: shortKey("test"), kind: "test", text: `Test from Mergery: ${r.name} will hear here when something on ${this.project} needs ${this.agentName(r.person as string)}.`, since: Date.now(), url: `${origin}/?project=${this.project}`, youCan: null, detail: {}, new: true };
     return this.deliver(r, [item], origin);
   }
 
@@ -5116,7 +5116,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status = 'changes_requested' LIMIT 1", a.task.id).toArray().length;
     for (const a of agents.filter((a) => (a.state === "quiet" || (a.state === "paused" && a.task)) && !waitingOnReview(a))) {
       const freeIn = a.state === "quiet" ? a.lastSeen + RELEASE_MS - now : 0;
-      items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}${freeIn > 0 ? ` (Loom frees it in ${since(freeIn)} unless the agent comes back)` : ""}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
+      items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}${freeIn > 0 ? ` (Mergery frees it in ${since(freeIn)} unless the agent comes back)` : ""}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
       items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
@@ -5412,9 +5412,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { taken: id, requested: this.reviewRequests(id), next: "get_change (start with its brief), then review_change" };
   }
 
-  // ── Loom's own review agent ───────────────────────────────────────────────
+  // ── Mergery's own review agent ───────────────────────────────────────────────
 
-  /** Changes waiting on review that nobody around is reviewing, and when each is due for Loom's review agent. */
+  /** Changes waiting on review that nobody around is reviewing, and when each is due for Mergery's review agent. */
   private agentReviewQueue() {
     if (!this.reviewAgent.enabled) return [];
     const after = this.reviewAgent.afterMinutes * 60_000;
@@ -5433,7 +5433,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return due.length ? Math.min(...due) : null;
   }
 
-  /** Start Loom's review agent on every change that has waited long enough; returns when the next one is due. */
+  /** Start Mergery's review agent on every change that has waited long enough; returns when the next one is due. */
   /** Tasks held by agents, with what the release rules need to know. */
   private holdings() {
     return this.sql.exec(`SELECT t.id, t.title, t.status, t.assignee, a.name, a.last_seen, a.paused,
@@ -5476,7 +5476,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /**
-   * Review evals nobody took in the review agent's wait: Loom's review agent
+   * Review evals nobody took in the review agent's wait: Mergery's review agent
    * scores them, so a project without runners still gets its scores. Returns
    * when the next one comes due.
    */
@@ -5493,7 +5493,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.agentEvalDue();
   }
 
-  /** When the next review eval comes due for Loom's review agent. */
+  /** When the next review eval comes due for Mergery's review agent. */
   private agentEvalDue(): number | null {
     if (!this.reviewAgent.enabled) return null;
     const t = this.sql.exec(`SELECT MIN(r.created_at) AS t FROM eval_runs r JOIN evals e ON e.name = r.eval WHERE e.kind = 'review' AND r.status = 'pending' AND r.created_at > ?`, Date.now() - this.reviewAgent.afterMinutes * 60_000).one().t as number | null;
@@ -5510,7 +5510,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const row = this.sql.exec("SELECT status FROM eval_runs WHERE id = ?", runId).toArray()[0];
     if (this.change(id).head !== head || row?.status !== "pending") return; // moved on, or an agent scored it meanwhile
     if (!r.ok) return this.emit("eval.failed_to_run", { change: id, data: { eval: name, error: r.reason } });
-    const notes = `${r.notes}\n\n(Loom's review agent, ${r.model}. No agent took this eval in time.)`;
+    const notes = `${r.notes}\n\n(Mergery's review agent, ${r.model}. No agent took this eval in time.)`;
     this.sql.exec("UPDATE eval_runs SET status = 'done', score = ?, notes = ?, by = ?, done_at = ? WHERE id = ?", r.score, notes, REVIEW_AGENT_ID, Date.now(), runId);
     this.evalScored(id, name, r.score, notes, REVIEW_AGENT_ID);
   }
@@ -5519,7 +5519,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.env.LOOM_AI_GATEWAY || "default";
   }
 
-  /** What Loom's review agent reviews with: Claude with an Anthropic key, otherwise Workers AI; both through AI Gateway. */
+  /** What Mergery's review agent reviews with: Claude with an Anthropic key, otherwise Workers AI; both through AI Gateway. */
   private async reviewModel(): Promise<ReviewModel | null> {
     if (this.env.LOOM_REVIEW_MODEL_URL) return { kind: "claude", apiKey: (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY ?? "dev", baseURL: this.env.LOOM_REVIEW_MODEL_URL };
     const key = (await this.projectKey("anthropic")) ?? this.env.ANTHROPIC_API_KEY;
@@ -5559,7 +5559,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const agent: Agent = { id: REVIEW_AGENT_ID, name: REVIEW_AGENT_ID, role: "reviewer" };
     await this.review(agent, id, { verdict: r.verdict, body: `${r.body}
 
-(Loom's review agent, ${r.model} through AI Gateway. Nobody else was around to review this.)`, comments: r.comments });
+(Mergery's review agent, ${r.model} through AI Gateway. Nobody else was around to review this.)`, comments: r.comments });
   }
 
   /** Ask the next best-placed agent, preferring ones who are around now. */
@@ -6425,7 +6425,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (raw && declared > MAX_TRACE_BYTES) throw new HttpError(413, `a trace is at most ${MAX_TRACE_BYTES / 1024 / 1024} MB`);
     let text = raw ? await req.text() : typeof body.text === "string" ? body.text : "";
     if (!text.trim()) throw new HttpError(400, "send the session log as the request body, or as text");
-    // Whoever holds the original log can show it's the one Loom received, though Loom only keeps it redacted.
+    // Whoever holds the original log can show it's the one Mergery received, though Mergery only keeps it redacted.
     const originalSha = await sha256Hex(text);
     const wanted = body.source ? String(body.source) : null;
     if (wanted && !TRACE_SOURCES.includes(wanted as TraceSource)) throw new HttpError(400, `source is one of ${TRACE_SOURCES.join(", ")}`);

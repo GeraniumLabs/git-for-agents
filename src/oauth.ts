@@ -1,6 +1,6 @@
 // Sign-in for MCP clients, so connecting an agent is one line:
-//   claude mcp add --transport http loom https://<loom>/mcp
-// Loom is its own OAuth 2.1 authorization server, as the MCP spec describes:
+//   claude mcp add --transport http mergery https://<mergery>/mcp
+// Mergery is its own OAuth 2.1 authorization server, as the MCP spec describes:
 // a client finds it from the 401 on /mcp (protected resource metadata),
 // registers itself (dynamic client registration), sends the person here to
 // sign in with GitHub and allow it, and trades the code for a token (PKCE).
@@ -53,16 +53,16 @@ function okRedirect(u: unknown): u is string {
 /** The 401 an MCP client gets before it signs in: it says where to learn how. */
 export function signInFirst(req: Request): Response {
   const url = new URL(req.url);
-  return Response.json({ error: "sign in: connect this MCP client to Loom (it will open a browser), or send an agent key as a bearer token" }, {
+  return Response.json({ error: "sign in: connect this MCP client to Mergery (it will open a browser), or send an agent key as a bearer token" }, {
     status: 401,
     headers: { "www-authenticate": `Bearer resource_metadata="${url.origin}/.well-known/oauth-protected-resource${url.pathname}"` },
   });
 }
 
-/** The person behind a bearer token, if it is an MCP sign-in token Loom issued. */
+/** The person behind a bearer token, if it is an MCP sign-in token Mergery issued. */
 export async function mcpGrant(env: Env, req: Request): Promise<McpGrant | null> {
   const token = (req.headers.get("authorization") ?? "").replace(/^Bearer\s+/i, "");
-  // Agent keys and the admin token are opaque strings; only Loom's signed tokens have a dot.
+  // Agent keys and the admin token are opaque strings; only Mergery's signed tokens have a dot.
   if (!token.includes(".")) return null;
   return verified<McpGrant>(env, token, ACCESS);
 }
@@ -102,7 +102,7 @@ export async function handleOAuth(env: Env, req: Request): Promise<Response | nu
   if (path === "/.well-known/oauth-protected-resource" || path.startsWith("/.well-known/oauth-protected-resource/")) {
     const rest = path.slice("/.well-known/oauth-protected-resource".length);
     const resource = /^\/mcp(\/[a-z0-9-]+)?$/.test(rest) ? `${origin}${rest}` : `${origin}/mcp`;
-    return json({ resource, authorization_servers: [origin], bearer_methods_supported: ["header"], resource_name: "Loom", scopes_supported: ["loom"] });
+    return json({ resource, authorization_servers: [origin], bearer_methods_supported: ["header"], resource_name: "Mergery", scopes_supported: ["loom"] });
   }
 
   // RFC 8414: how to sign in.
@@ -143,7 +143,7 @@ export async function handleOAuth(env: Env, req: Request): Promise<Response | nu
     const client = await verified<Client>(env, p.get("client_id") ?? undefined, CLIENT);
     const redirect = p.get("redirect_uri") ?? client?.redirects[0] ?? "";
     // Without a known client and one of its redirects, there is nowhere safe to send an error.
-    if (!client) return page("Unknown app", `<p>This app hasn't registered with Loom. Try connecting it again.</p>`);
+    if (!client) return page("Unknown app", `<p>This app hasn't registered with Mergery. Try connecting it again.</p>`);
     if (!client.redirects.includes(redirect)) return page("Unknown return address", `<p>${escHtml(client.name)} asked to come back to an address it didn't register.</p>`);
     const back = (q: Record<string, string>) => {
       const to = new URL(redirect);
@@ -160,12 +160,12 @@ export async function handleOAuth(env: Env, req: Request): Promise<Response | nu
       const dev = devLogin(env)
         ? `<form method="get" action="/auth/dev"><input type="hidden" name="return" value="${escHtml(here)}"><label>Local sign-in as <input name="login" placeholder="a GitHub login" required></label> <button>Sign in</button></form>`
         : "";
-      return page(`Connect ${escHtml(client.name)} to Loom`, `<p>Sign in first. Then you'll choose whether <b>${escHtml(client.name)}</b> may work on Loom for you.</p>
+      return page(`Connect ${escHtml(client.name)} to Mergery`, `<p>Sign in first. Then you'll choose whether <b>${escHtml(client.name)}</b> may work on Mergery for you.</p>
 <p><a class="button" href="/auth/github?return=${encodeURIComponent(here)}">Sign in with GitHub</a></p>${dev}`);
     }
     const ask = await signed(env, { client: p.get("client_id")!, name: client.name, redirect, challenge: p.get("code_challenge")!, state: p.get("state"), user: user.id, exp: Date.now() + 15 * 60_000 } satisfies Ask, ASK);
-    return page(`Connect ${escHtml(client.name)} to Loom`, `<p>Signed in as <b>${escHtml(user.login)}</b>.</p>
-<p><b>${escHtml(client.name)}</b> will work as your agent in the Loom projects you're a member of: claim tasks, write to its own workspaces, submit and review changes, and create projects for you. It can't change settings, people or keys.</p>
+    return page(`Connect ${escHtml(client.name)} to Mergery`, `<p>Signed in as <b>${escHtml(user.login)}</b>.</p>
+<p><b>${escHtml(client.name)}</b> will work as your agent in the Mergery projects you're a member of: claim tasks, write to its own workspaces, submit and review changes, and create projects for you. It can't change settings, people or keys.</p>
 <p>It goes back to <code>${escHtml(new URL(redirect).origin)}</code>.</p>
 <form method="post" action="/oauth/authorize"><input type="hidden" name="ask" value="${escHtml(ask)}">
 <p><button name="allow" value="1">Allow</button> <button name="allow" value="0" class="secondary">Cancel</button></p></form>`);

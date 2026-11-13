@@ -131,7 +131,7 @@ async function mayCreate(env: Env, user: User, org: string | null = null, wantsP
   const r = await registry(env).fetch(`https://do/registry/creator?login=${encodeURIComponent(login)}&account=${encodeURIComponent(account)}`).then((r) => r.json<{ approved: boolean; owns: number; ownsPrivate: number }>());
   if (!list.includes("*") && !list.includes(login) && !r.approved) {
     await registry(env).fetch("https://do/registry/waitlist", { method: "POST", body: JSON.stringify({ login, name: user.name }) });
-    return { ok: false, error: `Loom is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
+    return { ok: false, error: `Mergery is invite-only for now. You're on the waitlist as ${user.login}, and you'll be able to create projects once you're let in. You can still join projects you're added to.` };
   }
   if (!billingOn(env)) {
     const cap = serverLimits(env).projects;
@@ -145,8 +145,8 @@ async function mayCreate(env: Env, user: User, org: string | null = null, wantsP
   const privateCap = PLANS[plan].privateProjects;
   if (wantsPrivate && privateCap > 0 && r.ownsPrivate >= privateCap) return { ok: false, error: `The ${PLANS[plan].name === "Free" ? "free plan" : PLANS[plan].name} has ${privateCap} private project${privateCap === 1 ? "" : "s"}, and ${whose} ${r.ownsPrivate}. Make this one public, or upgrade to ${PLANS.pro.name} (${PLANS.pro.price}) for as many private projects as you like.` };
   if (r.owns >= cap) return { ok: false, error: plan === "free"
-    ? `The free plan has ${cap} project${cap === 1 ? "" : "s"}, and ${whose} ${r.owns}. Loom Pro (${PLANS.pro.price}) gives ${PLANS.pro.projects}: upgrade on ${org ? `${org}'s page` : "your account page"}, or delete one in its Settings.`
-    : `${org ? `${org} owns` : "You own"} ${r.owns} projects, the most Loom Pro allows. Delete one in its Settings to make room.` };
+    ? `The free plan has ${cap} project${cap === 1 ? "" : "s"}, and ${whose} ${r.owns}. Mergery Pro (${PLANS.pro.price}) gives ${PLANS.pro.projects}: upgrade on ${org ? `${org}'s page` : "your account page"}, or delete one in its Settings.`
+    : `${org ? `${org} owns` : "You own"} ${r.owns} projects, the most Mergery Pro allows. Delete one in its Settings to make room.` };
   return { ok: true, plan };
 }
 
@@ -284,7 +284,7 @@ export default {
       const ret = typeof body.back === "string" && body.back.startsWith("/") && !body.back.startsWith("//") ? body.back : "/";
       try {
         if (path === "/api/billing/checkout" && req.method === "POST") {
-          if (p.plan === "pro") return Response.json({ error: `${org ?? "you"} ${org ? "is" : "are"} already on Loom Pro` }, { status: 409 });
+          if (p.plan === "pro") return Response.json({ error: `${org ?? "you"} ${org ? "is" : "are"} already on Mergery Pro` }, { status: 409 });
           if (effective === "unlimited" && !testMode(env)) return Response.json({ error: "the server's owners have no limits, so there's nothing to buy" }, { status: 409 });
           return Response.json({ url: await checkoutSession(env, user.login.toLowerCase(), account, p.customer, url.origin, ret) });
         }

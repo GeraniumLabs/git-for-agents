@@ -30,28 +30,28 @@ export interface Env {
   LOOM_TRACE_BYTES?: string;
   /** Days a session trace is kept when the server takes no payments (default 90; 0 is forever). */
   LOOM_TRACE_DAYS?: string;
-  /** Stripe: with both set, people get the free plan and can pay for Loom Pro (src/billing.ts). */
+  /** Stripe: with both set, people get the free plan and can pay for Mergery Pro (src/billing.ts). */
   STRIPE_SECRET_KEY?: string;
   STRIPE_WEBHOOK_SECRET?: string;
-  /** A Stripe price for Loom Pro; without one, Checkout uses $10 a month. */
+  /** A Stripe price for Mergery Pro; without one, Checkout uses $10 a month. */
   STRIPE_PRICE_ID?: string;
-  /** A customer portal configuration for Loom, when the account's default isn't the one to show. */
+  /** A customer portal configuration for Mergery, when the account's default isn't the one to show. */
   STRIPE_PORTAL_CONFIGURATION?: string;
   /** Tests point this at a stand-in. Defaults to https://api.stripe.com. */
   STRIPE_API_URL?: string;
   /** "1" in local development: /auth/dev?login=x signs in without GitHub. */
   LOOM_DEV_LOGIN?: string;
-  /** Where preview links point, e.g. a separate domain routed to this Worker; defaults to Loom's own origin. */
+  /** Where preview links point, e.g. a separate domain routed to this Worker; defaults to Mergery's own origin. */
   LOOM_PREVIEW_ORIGIN?: string;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
-  /** The AI Gateway that Loom's review agent calls models through. Default "default". */
+  /** The AI Gateway that Mergery's review agent calls models through. Default "default". */
   LOOM_AI_GATEWAY?: string;
   /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
   LOOM_REVIEW_MODEL_URL?: string;
   /** Cloudflare Email Service: emails people when something needs them. Needs LOOM_EMAIL_FROM on a domain onboarded to Email Service. */
   EMAIL?: SendEmail;
-  /** The address Loom sends from, e.g. loom@example.com. */
+  /** The address Mergery sends from, e.g. loom@example.com. */
   LOOM_EMAIL_FROM?: string;
   TYPESAFE_API_KEY?: string;
   /** Where issues are imported from; tests point it at a stand-in. Defaults to https://api.github.com. */

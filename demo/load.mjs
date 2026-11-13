@@ -12,7 +12,7 @@
 // Numbers from `wrangler dev` are only indicative; production Durable Objects
 // and Artifacts behave differently.
 
-import { Loom, sleep } from "./client.mjs";
+import { Mergery, sleep } from "./client.mjs";
 
 const arg = (name, dflt) => {
   const i = process.argv.indexOf(`--${name}`);
@@ -163,7 +163,7 @@ async function reviewer(admin, key, stop, index) {
 }
 
 async function main() {
-  const admin = new Loom(BASE, PROJECT, ADMIN);
+  const admin = new Mergery(BASE, PROJECT, ADMIN);
   console.log(`project ${PROJECT}: ${N} agents, ${REVIEWERS} reviewers, ${Math.round(SHARE * 100)}% on shared files. Watch: ${BASE}/?project=${PROJECT}`);
   const files = seed();
   const created = performance.now();

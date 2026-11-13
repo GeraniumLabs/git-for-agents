@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// Real Claude agents working one Loom project at the same time. Each agent
-// talks to Loom only through its MCP endpoint (POST /mcp/<project>), exactly
+// Real Claude agents working one Mergery project at the same time. Each agent
+// talks to Mergery only through its MCP endpoint (POST /mcp/<project>), exactly
 // as any MCP-capable agent would. Needs ANTHROPIC_API_KEY (or an `ant auth login` profile).
 //
 //   LOOM_URL=http://127.0.0.1:8787 LOOM_ADMIN_TOKEN=dev-admin \
@@ -16,7 +16,7 @@
 // Claude, to test the setup for free.
 
 import Anthropic from "@anthropic-ai/sdk";
-import { Loom } from "./client.mjs";
+import { Mergery } from "./client.mjs";
 
 const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
 const ADMIN = process.env.LOOM_ADMIN_TOKEN ?? "dev-admin";
@@ -86,7 +86,7 @@ async function runAgent(project, agent, goal, log) {
   const init = await mcp.rpc("initialize", { protocolVersion: "2025-06-18", capabilities: {}, clientInfo: { name: "claude-swarm", version: "0.1.0" } });
   const { tools } = await mcp.rpc("tools/list");
   if (CHECK) { log(agent.name, `connected over MCP; ${tools.length} tools: ${tools.map((t) => t.name).join(", ")}`); return; }
-  const system = `You are ${agent.name}, a ${agent.role} agent on the Loom project "${project}", working alongside other agents at the same time. Your agent id is ${agent.id}.
+  const system = `You are ${agent.name}, a ${agent.role} agent on the Mergery project "${project}", working alongside other agents at the same time. Your agent id is ${agent.id}.
 
 ${init.instructions}
 
@@ -147,7 +147,7 @@ async function main() {
   if (!CHECK) client = new Anthropic();
   const log = (who, msg) => console.log(`${new Date().toISOString().slice(11, 19)}  ${who.padEnd(6)} ${msg}`);
   let project = arg("project");
-  const admin = new Loom(BASE, project ?? "", ADMIN);
+  const admin = new Mergery(BASE, project ?? "", ADMIN);
   if (!project) {
     const { SEED } = await import("./seed.mjs");
     project = `claude-${Date.now().toString(36).slice(-5)}`;

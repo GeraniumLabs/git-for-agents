@@ -1,12 +1,12 @@
 // A change with hundreds of files lands like a small one: write, submit,
 // review, merge. `node demo/large-change.mjs [project] [files]`
-import { Loom } from "./client.mjs";
+import { Mergery } from "./client.mjs";
 import { SEED } from "./seed.mjs";
 
 const url = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
 const name = process.argv[2] || `large-${Date.now().toString(36).slice(-5)}`;
 const count = Number(process.argv[3] ?? 300);
-const admin = new Loom(url, name, process.env.LOOM_ADMIN_TOKEN ?? "dev-admin");
+const admin = new Mergery(url, name, process.env.LOOM_ADMIN_TOKEN ?? "dev-admin");
 
 await admin.createProject({ name, description: "one change with many files", files: SEED, requiredApprovals: 1 });
 const ada = admin.as((await admin.addAgent("ada", "builder")).key);

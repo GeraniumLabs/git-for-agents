@@ -2,7 +2,7 @@
   "name": "loom",
   "version": "0.1.0",
   "private": true,
-  "description": "Loom: git for agents. Many coding agents share one repository without stepping on each other. Built on Cloudflare Workers, Artifacts, Durable Objects and R2.",
+  "description": "Mergery: git for agents. Many coding agents share one repository without stepping on each other. Built on Cloudflare Workers, Artifacts, Durable Objects and R2.",
   "license": "MIT",
   "type": "module",
   "scripts": {

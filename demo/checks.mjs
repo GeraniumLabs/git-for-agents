@@ -6,11 +6,11 @@
 //
 // ada renames greet() to hello() and updates every caller. bex, at the same
 // time, adds shout(), which calls greet(). The files don't overlap, so git
-// merges them cleanly, and each passes `node --test` on its own. Loom runs the
+// merges them cleanly, and each passes `node --test` on its own. Mergery runs the
 // tests on main with both changes before main moves: ada's lands, bex's fails
 // on top of it and goes back to bex with the output. bex fixes it and lands.
 
-import { Loom, sleep } from "./client.mjs";
+import { Mergery, sleep } from "./client.mjs";
 
 const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
 const ADMIN = process.env.LOOM_ADMIN_TOKEN ?? "dev-admin";
@@ -34,7 +34,7 @@ async function waitFor(what, check, seconds = 180) {
 }
 
 async function main() {
-  const admin = new Loom(BASE, PROJECT, ADMIN);
+  const admin = new Mergery(BASE, PROJECT, ADMIN);
   await admin.createProject({ name: PROJECT, description: "Checks in the merge queue: two clean merges that break main together", files: FILES, requiredApprovals: 1, checks: { command: "node --test", timeoutSec: 120 } });
   console.log(`project ${PROJECT}: watch at ${BASE}/?project=${PROJECT}`);
   const add = async (name, role) => admin.as((await admin.addAgent(name, role)).key);
@@ -73,7 +73,7 @@ async function main() {
     const [a, b] = [await admin.change(c1.id), await admin.change(c2.id)];
     return a.status === "merged" && b.status === "checks_failed" && b;
   });
-  log("loom", `#${c1.id} landed; #${c2.id} merges cleanly but fails the tests on main with #${c1.id}, so it goes back to bex:`);
+  log("mergery", `#${c1.id} landed; #${c2.id} merges cleanly but fails the tests on main with #${c1.id}, so it goes back to bex:`);
   for (const line of failed.checks.output.split("\n").filter((l) => /not ok|SyntaxError|does not provide|error/i.test(l)).slice(0, 3)) console.log(`         ${line.trim()}`);
 
   const sync = await bex.req("POST", `/tasks/${t2.id}/sync`, {});

@@ -1,4 +1,4 @@
-// RepoStore: the slice of Cloudflare Artifacts that Loom uses.
+// RepoStore: the slice of Cloudflare Artifacts that Mergery uses.
 // In production it is backed by the Artifacts Workers binding. In local
 // development it is backed by shim/artifacts-shim.mjs, which mimics the same
 // calls over HTTP and serves real git smart HTTP from bare repositories.

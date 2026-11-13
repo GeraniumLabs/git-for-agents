@@ -10,7 +10,7 @@
 // never declared and ada is working on, without tests: the brief says a person
 // should look. cyd's README fix is left to the agents.
 
-import { Loom } from "./client.mjs";
+import { Mergery } from "./client.mjs";
 import { SEED } from "./seed.mjs";
 
 const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
@@ -20,7 +20,7 @@ const log = (who, msg) => console.log(`${new Date().toISOString().slice(11, 19)}
 const lineOf = (text, needle) => text.split("\n").findIndex((l) => l.includes(needle)) + 1;
 
 async function main() {
-  const admin = new Loom(BASE, PROJECT, ADMIN);
+  const admin = new Mergery(BASE, PROJECT, ADMIN);
   await admin.createProject({ name: PROJECT, description: "Code review with agents: briefs, threads, and what changed since", files: SEED, requiredApprovals: 1 });
   console.log(`project ${PROJECT}: watch at ${BASE}/?project=${PROJECT}`);
   const add = async (name, role) => admin.as((await admin.addAgent(name, role)).key);

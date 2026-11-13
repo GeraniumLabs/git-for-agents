@@ -777,7 +777,7 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
 .step.error .k { color: var(--del, #c0392b); }
 .step.loom .k code { font-weight: 700; }
 
-/* Asking Loom, the incident view and the factory report */
+/* Asking Mergery, the incident view and the factory report */
 .ask-box { margin: 8px 0; }
 .ask-box .ask-out p { margin: 6px 0; }
 .ask-box .cite { font-size: var(--fs-11_5); padding: 0 3px; border-radius: 3px; background: var(--line); text-decoration: none; }

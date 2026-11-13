@@ -243,11 +243,11 @@ async function runCheck(req, res) {
   }
 }
 
-// A stand-in for the Messages API, for Loom's review agent in local
+// A stand-in for the Messages API, for Mergery's review agent in local
 // development: it approves, unless the diff contains LOOM-TEST-BUG, which it
 // asks to fix in a blocking comment on that line.
-// A stand-in for the two Stripe calls Loom makes (Checkout and the billing
-// portal). Tests then post signed webhooks to Loom themselves.
+// A stand-in for the two Stripe calls Mergery makes (Checkout and the billing
+// portal). Tests then post signed webhooks to Mergery themselves.
 async function stripeStandIn(req, res, url) {
   const chunks = [];
   for await (const c of req) chunks.push(c);
@@ -276,14 +276,14 @@ async function reviewStandIn(req, res) {
       content: [{ type: "text", text: JSON.stringify(result) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
   }
   if (body.output_config?.format?.schema?.properties?.answer) {
-    // A question about what Loom holds: answer from the first trace step, else the first source.
+    // A question about what Mergery holds: answer from the first trace step, else the first source.
     const refs = [...prompt.matchAll(/^\[([A-Z]\d+(?:\.\d+)?)\] (.*)$/gm)];
     const pick = refs.find((r) => r[1].startsWith("T")) ?? refs[0];
     const answer = pick ? `From the sources: ${pick[2].slice(0, 120)} [${pick[1]}]` : "The sources don't say.";
     return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
       content: [{ type: "text", text: JSON.stringify({ answer, citations: pick ? [pick[1]] : [] }) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
   }
-  // Loom numbers each diff line by its line in the new file.
+  // Mergery numbers each diff line by its line in the new file.
   let file = null, bug = null;
   for (const l of prompt.split("\n")) {
     const f = l.match(/^\+\+\+ b\/(.+)$/);

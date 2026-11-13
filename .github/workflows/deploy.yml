@@ -1,4 +1,4 @@
-# Deploys Loom to Cloudflare whenever main changes (a merged pull request),
+# Deploys Mergery to Cloudflare whenever main changes (a merged pull request),
 # after the typecheck and tests pass. Also runs by hand from the Actions tab.
 #
 # Set in the repository's settings (Settings > Secrets and variables > Actions):
@@ -9,7 +9,7 @@
 #                                   zone policy, and add Queues, Cloudchamber
 #                                   and Artifacts edit (Containers and Workers
 #                                   R2 Storage edit come with the template).
-#            CLOUDFLARE_ACCOUNT_ID  the account Loom runs in
+#            CLOUDFLARE_ACCOUNT_ID  the account Mergery runs in
 #   variable LOOM_URL               where it answers, for the check after the
 #                                   deploy (default loom.geraniumlabs.workers.dev)
 #

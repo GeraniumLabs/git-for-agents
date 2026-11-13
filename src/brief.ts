@@ -1,6 +1,6 @@
 // The review brief: where a reviewer should look in a change, and whether a
 // person needs to look at all. With dozens of agents shipping, nobody reads
-// every diff; the brief ranks files by risk from what Loom already knows.
+// every diff; the brief ranks files by risk from what Mergery already knows.
 
 import { matches } from "./paths";
 

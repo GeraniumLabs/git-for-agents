@@ -1,4 +1,4 @@
-// Track records: Loom remembers how each agent's work and judgment turned
+// Track records: Mergery remembers how each agent's work and judgment turned
 // out, and weighs its approvals and votes by that. Pure helpers; the
 // coordinator counts the outcomes from its tables.
 

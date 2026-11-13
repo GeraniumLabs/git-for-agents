@@ -5,7 +5,7 @@
 // Each tool is a thin call into the project's coordinator.
 
 type Call = ((method: string, path: string, body?: unknown) => Promise<any>) & {
-  /** Directives the agent hasn't acknowledged, from the last response (Loom sends them on every one). */
+  /** Directives the agent hasn't acknowledged, from the last response (Mergery sends them on every one). */
   directives?: () => { seq: number; from: string; body: string }[];
 };
 /** The coordinator of a project (the endpoint's own, or the one a tool call names), called as the named agent under the key (or as the key's own agent). */
@@ -66,7 +66,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "ack_directive",
-    description: "Acknowledge a directive from a person: you've read it and are following it over your own plan. Until you do, every Loom response carries it and whoami lists it first; people see who hasn't acknowledged. Leave out seq to acknowledge every directive waiting for you. Add a note if it changes what you're doing (\"stopping the refactor, switching to the fix\").",
+    description: "Acknowledge a directive from a person: you've read it and are following it over your own plan. Until you do, every Mergery response carries it and whoami lists it first; people see who hasn't acknowledged. Leave out seq to acknowledge every directive waiting for you. Add a note if it changes what you're doing (\"stopping the refactor, switching to the fix\").",
     inputSchema: obj({ seq: num("The directive's number (whoami todo, or the notice on any response)"), note: str("What you're doing about it") }),
     run: (a, call) => a.seq == null ? call("POST", "/directives/ack", { note: a.note }) : call("POST", `/directives/${a.seq}/ack`, { note: a.note }),
   },
@@ -78,13 +78,13 @@ const TOOLS: Tool[] = [
   },
   {
     name: "claim_task",
-    description: "Claim a task. You get your own workspace (a fork of main): pass its name (workspace.name) to read_file, list_files and write_files; the git commands and tokens are only for agents that use git directly. If the task was started by another agent, you also get their full context so you can pick up where they left off. A task held by an agent that has gone quiet (not seen for 10 minutes) can be claimed too: you take over its workspace, intents and open change. Loom frees tasks on its own after 30 minutes of silence. Claiming a contest task gives you your own attempt (a separate task id); change ids and task ids are different numbers.",
+    description: "Claim a task. You get your own workspace (a fork of main): pass its name (workspace.name) to read_file, list_files and write_files; the git commands and tokens are only for agents that use git directly. If the task was started by another agent, you also get their full context so you can pick up where they left off. A task held by an agent that has gone quiet (not seen for 10 minutes) can be claimed too: you take over its workspace, intents and open change. Mergery frees tasks on its own after 30 minutes of silence. Claiming a contest task gives you your own attempt (a separate task id); change ids and task ids are different numbers.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),
     run: (a, call) => call("POST", `/tasks/${a.taskId}/claim`),
   },
   {
     name: "declare_intent",
-    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why, for the task you claimed (taskId). Files your change touches outside its task's intents are flagged to reviewers, so include every file, deletes too; declare again if the plan grows. Loom tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too. It also returns memory: decisions the humans already made about these paths (follow them), earlier changes there with their reasons and objections, and which of those agents is still around to consult.",
+    description: "Before editing, declare which paths you will touch (files, directories ending in /, or globs) and why, for the task you claimed (taskId). Files your change touches outside its task's intents are flagged to reviewers, so include every file, deletes too; declare again if the plan grows. Mergery tells you right away if another agent has declared overlapping paths or has a pending change there, and notifies them too. It also returns memory: decisions the humans already made about these paths (follow them), earlier changes there with their reasons and objections, and which of those agents is still around to consult.",
     inputSchema: obj({ taskId: num("Your task"), paths: { type: "array", items: { type: "string" } }, description: str("What you are about to do in these paths") }, ["taskId", "paths"]),
     run: (a, call) => call("POST", "/intents", a),
   },
@@ -155,13 +155,13 @@ const TOOLS: Tool[] = [
   },
   {
     name: "attach_trace",
-    description: "Upload your session log (the transcript of what you read, thought and did) so people can review your decisions later. Usually a hook does this for you; call it yourself if no hook is set up, or when submit_change or whoami asks you to (your person turned traces on). Loom removes secrets before storing anything, works out the format (Claude Code, Codex, OpenCode, OpenTelemetry JSON, or plain text) and links it to the changes you had open during the session. Uploading the same session again adds a new version; earlier ones stay on record, fingerprinted. Up to 25 MB; for larger logs, POST the raw file to /api/projects/<project>/traces?session=<id> with your key.",
+    description: "Upload your session log (the transcript of what you read, thought and did) so people can review your decisions later. Usually a hook does this for you; call it yourself if no hook is set up, or when submit_change or whoami asks you to (your person turned traces on). Mergery removes secrets before storing anything, works out the format (Claude Code, Codex, OpenCode, OpenTelemetry JSON, or plain text) and links it to the changes you had open during the session. Uploading the same session again adds a new version; earlier ones stay on record, fingerprinted. Up to 25 MB; for larger logs, POST the raw file to /api/projects/<project>/traces?session=<id> with your key.",
     inputSchema: obj({ text: str("The session log"), session: str("Your session id, so later uploads replace this one"), change: num("Change it belongs to, if you know"), task: num("Task it belongs to, if you know"), source: str("claude-code, codex, opencode, otel or text; leave it out to detect"), model: str("Model you ran as, if the log doesn't say"), append: { type: "boolean", description: "Add to the earlier upload of this session instead of replacing it" } }, ["text"]),
     run: (a, call) => call("POST", "/traces", a),
   },
   {
     name: "list_traces",
-    description: "List session traces on a change, a task or an agent, newest first, with models, tokens and how many Loom calls each made. Only works if the project's owners let agents read traces.",
+    description: "List session traces on a change, a task or an agent, newest first, with models, tokens and how many Mergery calls each made. Only works if the project's owners let agents read traces.",
     inputSchema: obj({ change: num("Change id"), task: num("Task id"), agent: str("Agent name or id") }),
     run: (a, call) => call("GET", `/traces${a.change ? `?change=${a.change}` : a.task ? `?task=${a.task}` : a.agent ? `?agent=${encodeURIComponent(a.agent)}` : ""}`),
   },
@@ -173,7 +173,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "respond_to_review_request",
-    description: "Answer a review request (review.assigned): accept and you have 30 minutes to review, or decline with a reason and Loom asks someone else. Unanswered requests go to someone else after 5 minutes. You don't have to accept before reviewing: review_change answers the request too. For an attempt in a contest, compare_attempts and vote answer it.",
+    description: "Answer a review request (review.assigned): accept and you have 30 minutes to review, or decline with a reason and Mergery asks someone else. Unanswered requests go to someone else after 5 minutes. You don't have to accept before reviewing: review_change answers the request too. For an attempt in a contest, compare_attempts and vote answer it.",
     inputSchema: obj({ changeId: num("Change id"), accept: { type: "boolean" }, reason: str("Why, if declining (or a note if accepting)") }, ["changeId", "accept"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/reviewers/respond`, { accept: a.accept, reason: a.reason }),
   },
@@ -209,7 +209,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "bisect",
-    description: "Find which landed change made the project's checks (or another command) start failing. Loom checks main, steps back until they pass, then halves the range, one check run per step; it runs in the background and bisect.done names the change. Call with bisectId to follow one. Costs check minutes.",
+    description: "Find which landed change made the project's checks (or another command) start failing. Mergery checks main, steps back until they pass, then halves the range, one check run per step; it runs in the background and bisect.done names the change. Call with bisectId to follow one. Costs check minutes.",
     inputSchema: obj({ bisectId: num("Follow a bisect already started"), command: str("A command to bisect instead of the project's checks, e.g. one failing test"), good: num("A landed change known to pass, to start from"), reason: str("What's broken") }),
     run: (a, call) => (a.bisectId ? call("GET", `/bisects/${a.bisectId}`) : call("POST", "/bisects", { command: a.command, good: a.good, reason: a.reason })),
   },
@@ -301,7 +301,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "update_change",
-    description: "Refresh your change after pushing more commits to your workspace (for example to address review), so it goes back to review. Loom usually does this on every git push by itself (a workspace.pushed event, then change.updated); call it to change the summary or context, or if no change.updated followed your push.",
+    description: "Refresh your change after pushing more commits to your workspace (for example to address review), so it goes back to review. Mergery usually does this on every git push by itself (a workspace.pushed event, then change.updated); call it to change the summary or context, or if no change.updated followed your push.",
     inputSchema: obj({ changeId: num("Change id"), summary: str("Updated summary"), context: { type: "object" } }, ["changeId"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/update`, a),
   },
@@ -430,7 +430,7 @@ const TOOLS: Tool[] = [
 // at connect time can't tell them apart: every tool also takes `as`.
 const AS = {
   type: "string",
-  description: "Your own agent name, if other agents use this key too (for example the sub-agents of one session). Send the same name on every call: Loom treats each name as its own agent under the key, with its own tasks, workspaces and track record. Leave it out when the key is yours alone.",
+  description: "Your own agent name, if other agents use this key too (for example the sub-agents of one session). Send the same name on every call: Mergery treats each name as its own agent under the key, with its own tasks, workspaces and track record. Leave it out when the key is yours alone.",
 };
 const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
 
@@ -443,13 +443,13 @@ const PROJECT = { type: "string", description: "The project to act in (list_proj
 const ACCOUNT_TOOLS: (Omit<Tool, "run"> & { run: (args: any, account: Account) => Promise<any> })[] = [
   {
     name: "list_projects",
-    description: "The Loom projects you can work in: the ones you own or were added to. Pass a name as `project` to every other tool.",
+    description: "The Mergery projects you can work in: the ones you own or were added to. Pass a name as `project` to every other tool.",
     inputSchema: obj({}),
     run: (_a, account) => account.projects(),
   },
   {
     name: "create_project",
-    description: "Create a Loom project for the person you work for, optionally starting from a git repository they already have (any URL you'd git clone; Loom copies the branch with its history, and it becomes main). Loom becomes the code's home: nothing is written back. Give a check command (e.g. `npm test`) so the merge queue runs it before main moves; for a repository it recognizes, Loom suggests one.",
+    description: "Create a Mergery project for the person you work for, optionally starting from a git repository they already have (any URL you'd git clone; Mergery copies the branch with its history, and it becomes main). Mergery becomes the code's home: nothing is written back. Give a check command (e.g. `npm test`) so the merge queue runs it before main moves; for a repository it recognizes, Mergery suggests one.",
     inputSchema: obj({
       name: str("Lowercase letters, digits and dashes, e.g. the repository's name"),
       description: str("One line on what the project is"),
@@ -478,9 +478,9 @@ export async function handleMcp(req: Request, call: CallAs, opts: McpOptions = {
   return Response.json(Array.isArray(msg) ? out : out[0]);
 }
 
-const INSTRUCTIONS = "Loom coordinates many agents and humans on one codebase. If you start sub-agents that also use Loom, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Loom sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Heartbeat: while you hold a task, call Loom at least every 10 minutes (whoami or wait_for_events will do), even during long builds. After 10 minutes of silence any agent may take your task over, and after 30 Loom frees it for anyone. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.";
+const INSTRUCTIONS = "Mergery coordinates many agents and humans on one codebase. If you start sub-agents that also use Mergery, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Mergery sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Heartbeat: while you hold a task, call Mergery at least every 10 minutes (whoami or wait_for_events will do), even during long builds. After 10 minutes of silence any agent may take your task over, and after 30 Mergery frees it for anyone. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.";
 
-const ACCOUNT_INSTRUCTIONS = "You're signed in to Loom as the person you work for, and you act as their agent. Call list_projects first, and pass `project` on every other tool call. To bring a repository the person already has, create_project with importUrl. ";
+const ACCOUNT_INSTRUCTIONS = "You're signed in to Mergery as the person you work for, and you act as their agent. Call list_projects first, and pass `project` on every other tool call. To bring a repository the person already has, create_project with importUrl. ";
 
 async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
   const reply = (result: unknown) => ({ jsonrpc: "2.0", id: m.id, result });
@@ -500,8 +500,8 @@ async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
       return reply({
         protocolVersion: m.params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
-        serverInfo: { name: "loom", version: "0.1.0" },
-        instructions: (account ? ACCOUNT_INSTRUCTIONS : "") + INSTRUCTIONS + (core ? " Only the core tools are listed; call any other Loom tool named here through loom_tool." : ""),
+        serverInfo: { name: "mergery", version: "0.1.0" },
+        instructions: (account ? ACCOUNT_INSTRUCTIONS : "") + INSTRUCTIONS + (core ? " Only the core tools are listed; call any other Mergery tool named here through loom_tool." : ""),
       });
     case "ping":
       return reply({});
@@ -510,7 +510,7 @@ async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
       if (hidden.length) {
         tools.push({
           name: LOOM_TOOL.name,
-          description: `Call any other Loom tool by name, with the arguments it takes (\`as\`${account ? " and `project`" : ""} go in arguments too). They are:\n${hidden.map((t) => `- ${t.name}: ${t.description.split(/(?<=\.)\s/)[0]}`).join("\n")}`,
+          description: `Call any other Mergery tool by name, with the arguments it takes (\`as\`${account ? " and `project`" : ""} go in arguments too). They are:\n${hidden.map((t) => `- ${t.name}: ${t.description.split(/(?<=\.)\s/)[0]}`).join("\n")}`,
           inputSchema: LOOM_TOOL.inputSchema,
         });
       }

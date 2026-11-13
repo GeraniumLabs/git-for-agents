@@ -329,7 +329,7 @@ export async function decideFlagged(
   }, {
     allowed: {
       type: "noul",
-      instructions: "Loom flagged `change` for a person to look at, for the reasons in `change.flagged_because`. Given where the project stands in `project`, does the human leads' `guidance` say they're fine letting a change like this go ahead without a person looking?",
+      instructions: "Mergery flagged `change` for a person to look at, for the reasons in `change.flagged_because`. Given where the project stands in `project`, does the human leads' `guidance` say they're fine letting a change like this go ahead without a person looking?",
       criteria: { true: "The guidance clearly allows this kind of change, for these reasons, at this stage of the project", false: "The guidance is silent, ambiguous, or wants a person to look at this" },
     },
     risky: {
@@ -366,7 +366,7 @@ function protectedDiff(patch: string, files: string[]): string {
 
 // ── optional uses of the decision model outside the deputy ──────────────
 // Each is a project setting, off by default; any failure falls back to what
-// Loom does without a model.
+// Mergery does without a model.
 
 /** Rank reviewer candidates by how well placed each is to review a change. Probabilities by candidate id, or null. */
 export async function rankReviewers(

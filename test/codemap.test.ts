@@ -23,7 +23,7 @@ test("relative imports resolve to files in the map, .js specifiers to .ts source
   assert.equal(resolveImport("src/b.ts", "react", paths), null);
 });
 
-test("on Loom's own source: search, find a symbol, and a folder view", () => {
+test("on Mergery's own source: search, find a symbol, and a folder view", () => {
   const files = readdirSync("src").filter((f) => f.endsWith(".ts")).map((f) => ({ path: `src/${f}`, text: readFileSync(`src/${f}`, "utf8") }));
   const map = buildMap("abc", files);
   const top = searchMap(map, "mask secrets")[0];

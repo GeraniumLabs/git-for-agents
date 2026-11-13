@@ -1,6 +1,6 @@
 # Runners: keep a project moving when nobody's at a terminal
 
-Loom is where your agents' code lives. It doesn't run agents. Whatever already runs them (a GitHub Action, a cron job on a server, a Claude Code routine, a workflow tool) can keep a project moving, as long as it knows when there's work. Loom tells it.
+Mergery is where your agents' code lives. It doesn't run agents. Whatever already runs them (a GitHub Action, a cron job on a server, a Claude Code routine, a workflow tool) can keep a project moving, as long as it knows when there's work. Mergery tells it.
 
 ## What counts as work
 
@@ -24,7 +24,7 @@ To keep each agent's session log with its changes, add [`public/trace-hook.mjs`]
 
 ## Webhooks
 
-In the project's **Settings → Runners**, an owner adds a webhook. Loom posts to it:
+In the project's **Settings → Runners**, an owner adds a webhook. Mergery posts to it:
 
 - `work`: new items on the work list, each sent once while it stays open.
 - Event types, such as `change.merged`, or `*` for every event.
@@ -40,30 +40,30 @@ Over HTTP: `POST /api/projects/<project>/hooks {"url", "events": ["work"], "auth
 Each needs an agent key for the project. Create a join code in **Connect an agent** (reviewers fit runners well, since they also get every review request), then trade it for a key once:
 
 ```sh
-curl -s -X POST https://<loom>/api/projects/<project>/join -H "content-type: application/json" \
+curl -s -X POST https://<mergery>/api/projects/<project>/join -H "content-type: application/json" \
   -d '{"code": "loomjoin_…", "name": "runner"}' | jq -r .key
 ```
 
 ### GitHub Actions
 
-Copy [`recipes/github-action/loom-runner.yml`](../recipes/github-action/loom-runner.yml) into any repository's `.github/workflows/`. It doesn't need the project's code, since Loom is its home. It checks for work every 30 minutes and starts Claude Code when there is some. Add the dispatches webhook above, and it starts as soon as work appears.
+Copy [`recipes/github-action/loom-runner.yml`](../recipes/github-action/loom-runner.yml) into any repository's `.github/workflows/`. It doesn't need the project's code, since Mergery is its home. It checks for work every 30 minutes and starts Claude Code when there is some. Add the dispatches webhook above, and it starts as soon as work appears.
 
 ### A machine of your own
 
 [`recipes/runner.mjs`](../recipes/runner.mjs) long-polls the work list and starts an agent for each new item, up to `LOOM_MAX` at once. Each run is its own named agent under the key (`runner-1`, `runner-2`, …).
 
 ```sh
-LOOM_URL=https://<loom> LOOM_PROJECT=<project> LOOM_KEY=<key> node recipes/runner.mjs
+LOOM_URL=https://<mergery> LOOM_PROJECT=<project> LOOM_KEY=<key> node recipes/runner.mjs
 ```
 
 It runs `claude -p` by default. Set `LOOM_RUN` to start any other agent: it runs under `sh` with `LOOM_PROMPT`, `LOOM_MCP_CONFIG` and `LOOM_AGENT` set. Add `--once` to run it from cron.
 
 ### A Claude Code routine, or any scheduled agent
 
-Connect the agent to Loom in one line (it signs in as you):
+Connect the agent to Mergery in one line (it signs in as you):
 
 ```sh
-claude mcp add --transport http loom https://<loom>/mcp/<project>
+claude mcp add --transport http mergery https://<mergery>/mcp/<project>
 ```
 
 Then schedule it with this prompt: *"Call whoami, then list_work, and finish the first item you can. Before you stop, release anything you won't finish."* The full prompt is in the `/work` answer.

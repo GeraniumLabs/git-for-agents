@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // Check the dashboard on a phone: npm run phone-check -- [project]
-// Opens the main pages and dialogs at 360 px wide against a local Loom
+// Opens the main pages and dialogs at 360 px wide against a local Mergery
 // (npm run dev, with a project from npm run demo) and fails if a page is wider
 // than the screen, a control sits off it, a button is too small to tap, or an
 // input's text is small enough for iOS to zoom in on focus.
@@ -22,7 +22,7 @@ const width = Number(process.env.PHONE_WIDTH ?? 360);
 let project = process.argv[2];
 if (!project) {
   const list = await fetch(`${base}/api/projects`).then((r) => r.json()).catch(() => null);
-  if (!list?.length) { console.error(`No projects at ${base}. Start Loom (npm run shim, npm run dev) and run npm run demo first.`); process.exit(2); }
+  if (!list?.length) { console.error(`No projects at ${base}. Start Mergery (npm run shim, npm run dev) and run npm run demo first.`); process.exit(2); }
   project = list[list.length - 1].name;
 }
 if (shots) mkdirSync(shots, { recursive: true });

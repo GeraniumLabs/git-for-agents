@@ -1,12 +1,12 @@
 #!/usr/bin/env node
-// Check a running Loom: npm run doctor -- https://loom.example.dev
+// Check a running Mergery: npm run doctor -- https://loom.example.dev
 // With the admin token (LOOM_ADMIN_TOKEN, or .loom-admin-token from setup) it
 // also checks what the server has set up. It changes nothing.
 
 import { existsSync, readFileSync } from "node:fs";
 
 const base = (process.argv[2] ?? process.env.LOOM_URL ?? "").replace(/\/$/, "");
-if (!base) { console.error("usage: npm run doctor -- https://<your loom>"); process.exit(1); }
+if (!base) { console.error("usage: npm run doctor -- https://<your mergery>"); process.exit(1); }
 const admin = process.env.LOOM_ADMIN_TOKEN ?? (existsSync(".loom-admin-token") ? readFileSync(".loom-admin-token", "utf8").trim() : "");
 let problems = 0;
 const line = (good, what, fix) => {
@@ -19,7 +19,7 @@ const get = async (path, headers = {}) => {
 };
 
 const projects = await get("/api/projects");
-line(projects.status === 200, `Loom answers at ${base}`, projects.error ?? `GET /api/projects returned ${projects.status}`);
+line(projects.status === 200, `Mergery answers at ${base}`, projects.error ?? `GET /api/projects returned ${projects.status}`);
 if (projects.status !== 200) process.exit(1);
 console.log(`    ${projects.json.length} project${projects.json.length === 1 ? "" : "s"} listed`);
 
@@ -28,7 +28,7 @@ line(!!me.json?.github, "GitHub sign-in is set up", `open ${base}/auth/setup and
 line(!!me.json?.githubInstall, "people can import private GitHub repositories", "the GitHub app from /auth/setup does this; an OAuth app needs GITHUB_APP_SLUG for its install link");
 
 const as = await get("/.well-known/oauth-authorization-server");
-line(as.status === 200 && !!as.json?.registration_endpoint, "MCP clients can sign in (one-line connect)", "is this server running the latest Loom?");
+line(as.status === 200 && !!as.json?.registration_endpoint, "MCP clients can sign in (one-line connect)", "is this server running the latest Mergery?");
 const mcp = await fetch(`${base}/mcp`, { method: "POST", headers: { "content-type": "application/json" }, body: "{}" }).catch(() => null);
 line(mcp?.status === 401 && /resource_metadata/.test(mcp.headers.get("www-authenticate") ?? ""), "/mcp asks unsigned clients to sign in");
 

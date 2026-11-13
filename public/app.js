@@ -1,4 +1,4 @@
-// Loom dashboard. People don't watch agents here: the page is about the work,
+// Mergery dashboard. People don't watch agents here: the page is about the work,
 // what needs a person, and what is stuck. Agents are found by search.
 
 const $ = (s) => document.querySelector(s);
@@ -20,7 +20,7 @@ const color = (id) => {
   for (const c of id) h = (h * 31 + c.charCodeAt(0)) >>> 0;
   return PALETTE[h % PALETTE.length];
 };
-const name = (id) => names[id] ?? (id ? String(id).replace(/-[0-9a-f]{4}$/, "") : "loom");
+const name = (id) => names[id] ?? (id ? String(id).replace(/-[0-9a-f]{4}$/, "") : "mergery");
 const who = (id) => `<a class="who" data-agent="${esc(id)}">${esc(name(id))}</a>`;
 const ago = (ts) => {
   const s = Math.max(0, Math.round((Date.now() - ts) / 1000));
@@ -55,7 +55,7 @@ $("#theme").onclick = () => {
   store.set("loom-theme", next === "auto" ? null : next);
   applyTheme(next);
 };
-/** A call to Loom's site-wide API (accounts, orgs, invites), toasting what goes wrong. */
+/** A call to Mergery's site-wide API (accounts, orgs, invites), toasting what goes wrong. */
 async function site(method, path, body) {
   const res = await fetch(`/api${path}`, { method, headers: { "content-type": "application/json" }, body: body === undefined ? undefined : JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
@@ -194,7 +194,7 @@ async function boot() {
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
     $("main").innerHTML = `<div class="empty"><p>No projects yet. Bring a repository you already have, and connect your agents to it in one line.</p>
-      <form id="empty-import" class="row"><input id="empty-url" class="grow" placeholder="https://github.com/owner/repo"><button>Bring it to Loom</button></form>
+      <form id="empty-import" class="row"><input id="empty-url" class="grow" placeholder="https://github.com/owner/repo"><button>Bring it to Mergery</button></form>
       <p class="meta">Or <a href="#" id="np-empty">start an empty project</a>.</p></div>`;
     $("#more").hidden = true;
     $("#np-empty").onclick = (e) => { e.preventDefault(); showNewProject(); };
@@ -218,16 +218,16 @@ async function boot() {
   renderTour(projects, showcase);
 }
 
-/** For a first-time, signed-out visitor: what Loom is, and the projects worth opening. */
+/** For a first-time, signed-out visitor: what Mergery is, and the projects worth opening. */
 function renderTour(projects, showcase) {
   let dismissed = false;
   try { dismissed = localStorage.getItem("loom-tour") === "off"; } catch {}
   if (dismissed || user || store.get(keyName()) || !showcase.length) return;
   const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
   $("#tour").innerHTML = `
-    <span class="tour-text"><b>Loom is git for agents:</b> many coding agents share one repository without stepping on each other. These projects were built by agents working at the same time:</span>
+    <span class="tour-text"><b>Mergery is git for agents:</b> many coding agents share one repository without stepping on each other. These projects were built by agents working at the same time:</span>
     ${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}" title="${esc(desc(n))}">${esc(n)}</a>`).join("")}
-    <form id="tour-import" class="tour-import"><input id="tour-url" placeholder="Paste a git URL to bring your own repository" aria-label="Git URL"><button class="mini">Bring it to Loom</button></form><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
+    <form id="tour-import" class="tour-import"><input id="tour-url" placeholder="Paste a git URL to bring your own repository" aria-label="Git URL"><button class="mini">Bring it to Mergery</button></form><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
   $("#tour").hidden = false;
   $("#tour-import").onsubmit = (e) => { e.preventDefault(); startImport($("#tour-url").value.trim()); };
   $("#tour-close").onclick = () => { try { localStorage.setItem("loom-tour", "off"); } catch {} $("#tour").hidden = true; };
@@ -318,7 +318,7 @@ const STATE_HELP = {
   working: "Holding a task and seen recently",
   waiting: "Blocked on a question to a person",
   conflict: "Its change hit a conflict it has to resolve",
-  quiet: "Holding a task but not seen for 10 minutes; another agent can take it over now, and after 30 minutes Loom frees the task for anyone",
+  quiet: "Holding a task but not seen for 10 minutes; another agent can take it over now, and after 30 minutes Mergery frees the task for anyone",
   paused: "Paused by a person: it can still talk, but can't change code",
   idle: "Around, with no task",
   away: "Not seen recently, with no task",
@@ -540,7 +540,7 @@ async function showTraces(box, changeId) {
   try { r = await traceFetch(`/traces?change=${changeId}`); } catch (e) { box.innerHTML = `<p class="meta">${esc(e.message)}</p>`; return; }
   box.innerHTML = r.traces.length ? `<ul class="traces">${r.traces.map((t) => `<li data-trace="${t.id}">
       <div><b>${who(t.agent)}</b> · ${esc(t.source)}${t.models.length ? ` · ${t.models.map(esc).join(", ")}` : ""}
-        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Loom call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}${t.version > 1 ? ` · version ${t.version}` : ""}${t.sha256 ? ` · <span title="SHA-256 of the stored log: ${esc(t.sha256)}">sha256 ${esc(t.sha256.slice(0, 12))}</span>` : ""}</span></div>
+        <span class="meta">· ${plural(t.steps, ["step", "steps"])}, ${t.loomCalls} Mergery call${t.loomCalls === 1 ? "" : "s"} · ${tokens(t.tokensIn)} in / ${tokens(t.tokensOut)} out${t.costUsd != null ? ` · $${t.costUsd.toFixed(2)}` : ""}${t.startedAt ? ` · ${ago(t.startedAt)} ago` : ""}${t.redactions ? ` · ${t.redactions} secret${t.redactions === 1 ? "" : "s"} removed` : ""}${t.version > 1 ? ` · version ${t.version}` : ""}${t.sha256 ? ` · <span title="SHA-256 of the stored log: ${esc(t.sha256)}">sha256 ${esc(t.sha256.slice(0, 12))}</span>` : ""}</span></div>
       <div class="row"><button class="ghost mini" data-steps="${t.id}">Steps</button><button class="ghost mini" data-raw="${t.id}">Full log</button></div>
       <ol class="steps" id="steps-${t.id}"></ol></li>`).join("")}</ul>` : `<p class="meta">No traces yet.</p>`;
   wire(box);
@@ -562,7 +562,7 @@ async function showTraces(box, changeId) {
   }));
 }
 
-const ACT_LABEL = { edit: "Edited", loom: "Loom", command: "Ran", refused: "Refused", failed: "Failed" };
+const ACT_LABEL = { edit: "Edited", loom: "Mergery", command: "Ran", refused: "Refused", failed: "Failed" };
 const PERSON_LABEL = { ask: "Asked", decision: "Decided", review: "Reviewed" };
 
 const samePathUi = (a, b) => a === b || a.endsWith(`/${b}`) || b.endsWith(`/${a}`);
@@ -1130,7 +1130,7 @@ function drawCodeTree() {
 }
 $("#code-open").onclick = () => showCode();
 
-// ── connect an agent: the Loom skill, ready to copy ──────────────────────
+// ── connect an agent: the Mergery skill, ready to copy ──────────────────────
 /** Right after creating a project: the join code made with it, shown once. */
 function showNewJoinCode() {
   let fresh = null;
@@ -1156,8 +1156,8 @@ async function showSkill(joinCode, fresh = false) {
       <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   const mcpUrl = `${location.origin}/mcp/${project}`;
-  const firstAsk = `Use the loom MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Loom's merge queue.`;
-  const oneLine = [`claude mcp add --transport http loom ${mcpUrl}`, `codex mcp add loom --url ${mcpUrl}`];
+  const firstAsk = `Use the mergery MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Mergery's merge queue.`;
+  const oneLine = [`claude mcp add --transport http mergery ${mcpUrl}`, `codex mcp add mergery --url ${mcpUrl}`];
   const p = state?.project ?? (fresh ? (await api("/overview").catch(() => ({}))).project ?? {} : {});
   const ready = fresh ? `<div class="card fresh"><b>${esc(project)} is ready${p.importedFrom ? `, with the history of <span class="mono">${esc(p.importedFrom.url)}</span>` : ""}.</b>
     <p class="meta">Three steps to the first change landing: connect your agent below; ${p.checks ? `checks are on (<span class="mono">${esc(p.checks.command)}</span>);` : p.suggestedCheck ? `turn on checks so main is tested before it moves <button class="ghost mini" id="fresh-check">Use <span class="mono">${esc(p.suggestedCheck)}</span></button>;` : `set a check command in Settings so main is tested before it moves;`} then ask your agent:</p>
@@ -1172,7 +1172,7 @@ async function showSkill(joinCode, fresh = false) {
     <p class="meta">For agents you won't sign in for, such as a swarm or a runner on a server, use a join code:</p>
     ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
       : `<h2>1. Get a join code</h2>
-      <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Loom shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
+      <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Mergery shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
       <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (loomjoin_…)"><button id="jc-use">Use code</button></div>
       <p class="meta">${user ? `${me ? `You aren't an owner of ${esc(project)}: ask one for a join code.` : `Ask an owner of ${esc(project)} for a join code.`} Or <a href="#" id="jc-new-project">create your own project</a>: it comes with a join code.`
         : `Own ${esc(project)}? <a href="#" id="jc-signin">Sign in</a> to make one. Want your own? Sign in and create a project: it comes with a join code.`}</p>`}
@@ -1249,7 +1249,7 @@ function traceSection(keys) {
   return `<h2>Session traces <small>optional</small></h2><p class="meta">${why}</p>
     ${rows}
     <div class="row"><select id="tk-kind" title="The agent you run in this repository">${Object.entries(TRACE_AGENTS).map(([k, n]) => `<option value="${k}">${n}</option>`).join("")}${keys.some((k) => k.kind === "other") ? "" : `<option value="other">Another agent</option>`}</select><button class="ghost" id="tk-go">${keys.length ? "Turn on in another repository" : "Turn on"}</button></div>
-    <p class="meta">For another agent, Loom asks your agents to upload their own session with the <span class="mono">attach_trace</span> tool when they submit a change. Loom reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
+    <p class="meta">For another agent, Mergery asks your agents to upload their own session with the <span class="mono">attach_trace</span> tool when they submit a change. Mergery reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
     <div id="tk-out"></div>`;
 }
 function wireTraceSection(redraw) {
@@ -1272,7 +1272,7 @@ function wireTraceSection(redraw) {
     $("#tk-go").disabled = true;
   };
   for (const b of document.querySelectorAll("[data-tk-revoke]")) b.onclick = async () => {
-    if (!await ask({ title: "Turn off session traces?", body: "Loom stops taking uploads with this key. Traces already uploaded stay. Remove the hook on your machine too with --uninstall.", ok: "Turn off", danger: true })) return;
+    if (!await ask({ title: "Turn off session traces?", body: "Mergery stops taking uploads with this key. Traces already uploaded stay. Remove the hook on your machine too with --uninstall.", ok: "Turn off", danger: true })) return;
     try { await act("DELETE", `/trace-keys/${b.dataset.tkRevoke}`); } catch { return; }
     toast("Session traces off for that key");
     redraw();
@@ -1281,7 +1281,7 @@ function wireTraceSection(redraw) {
 
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
   <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
-  <p class="meta">Shown once: Loom keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Loom shows them as separate agents under ${esc(k.name)}.</p>
+  <p class="meta">Shown once: Mergery keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Mergery shows them as separate agents under ${esc(k.name)}.</p>
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
@@ -1342,15 +1342,15 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
     <label>Description <input id="np-desc" placeholder="What is being built"></label>
     <h2>Start from</h2>
     <label class="check"><input type="radio" name="np-from" value="new" checked> An empty repository with a README</label>
-    <label class="check"><input type="radio" name="np-from" value="import"> A repository you already have: Loom copies its history and becomes its home</label>
+    <label class="check"><input type="radio" name="np-from" value="import"> A repository you already have: Mergery copies its history and becomes its home</label>
     <div id="np-import" hidden>
       <label>Git URL <input id="np-url" placeholder="https://github.com/owner/repo"></label>
       <label>Branch <input id="np-branch" placeholder="its default branch"></label>
-      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="${auth.github ? "not needed on GitHub: Loom asks GitHub for you" : "used once to read it, never stored"}"></label>
+      <label>Token, for a private repository <input id="np-token" type="password" autocomplete="off" placeholder="${auth.github ? "not needed on GitHub: Mergery asks GitHub for you" : "used once to read it, never stored"}"></label>
       <label class="check"><input id="np-issues" type="checkbox" checked> Bring its open GitHub issues in as tasks</label>
       <p class="meta">The branch lands as main. Other branches, tags and pull requests stay where they are.</p>
     </div>
-    <label>Check command, run on main with each change before main moves <input id="np-checks" class="mono" placeholder="e.g. npm ci && npm test; leave empty and Loom suggests one if it recognizes the repository"></label>
+    <label>Check command, run on main with each change before main moves <input id="np-checks" class="mono" placeholder="e.g. npm ci && npm test; leave empty and Mergery suggests one if it recognizes the repository"></label>
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
@@ -1375,7 +1375,7 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
     $("#np-import").hidden = !importing();
   }
   const isGitHub = () => /^https:\/\/(www\.)?github\.com\//.test($("#np-url").value.trim());
-  // A private GitHub repository: go to GitHub for what Loom needs (the person's OK, then Loom's app on the
+  // A private GitHub repository: go to GitHub for what Mergery needs (the person's OK, then Mergery's app on the
   // repository), and finish creating the project when GitHub sends them back.
   const toGitHub = (step) => {
     const fields = Object.fromEntries(["#np-name", "#np-desc", "#np-url", "#np-branch", "#np-checks", "#np-org"].filter((id) => $(id)).map((id) => [id, $(id).value]));
@@ -1420,12 +1420,12 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
         if (resumed !== a.access) return toGitHub(a.access);
         // Back from GitHub and it still can't be read: say what to do instead of going round again.
         stuck(a.access === "install"
-          ? `Loom still can't see <b>${esc(a.repo)}</b>. On GitHub, add it to the repositories Loom can read, or check the URL. <button class="ghost mini" id="np-again">Open GitHub</button>`
-          : `GitHub didn't give Loom your access. <button class="ghost mini" id="np-again">Try again</button>`);
+          ? `Mergery still can't see <b>${esc(a.repo)}</b>. On GitHub, add it to the repositories Mergery can read, or check the URL. <button class="ghost mini" id="np-again">Open GitHub</button>`
+          : `GitHub didn't give Mergery your access. <button class="ghost mini" id="np-again">Try again</button>`);
         $("#np-again").onclick = () => toGitHub(a.access);
         return;
       }
-      if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
+      if (a.access === "missing") return stuck(`Mergery can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
     const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-where")?.value ? { jurisdiction: $("#np-where").value } : {}), ...($("#np-place")?.value ? { placement: $("#np-place").value } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
@@ -1460,7 +1460,7 @@ if (new URLSearchParams(location.search).get("new") === "1") {
 if (new URLSearchParams(location.search).get("billing") === "done") {
   const q = new URLSearchParams(location.search); q.delete("billing");
   history.replaceState(null, "", `${location.pathname}${q.size ? `?${q}` : ""}${location.hash}`);
-  setTimeout(() => toast("Thanks: you're on Loom Pro"), 500);
+  setTimeout(() => toast("Thanks: you're on Mergery Pro"), 500);
 }
 try { const t = sessionStorage.getItem("loom-toast"); if (t) { sessionStorage.removeItem("loom-toast"); setTimeout(() => toast(t), 500); } } catch {}
 
@@ -1471,7 +1471,7 @@ function openDetail(html) {
 }
 const projectLink = (n) => `<a href="/?project=${encodeURIComponent(n)}">${esc(n)}</a>`;
 
-/** What belongs to a person rather than a project: where Loom emails them, their plan, their orgs. */
+/** What belongs to a person rather than a project: where Mergery emails them, their plan, their orgs. */
 async function showAccount() {
   if (!user) return showSignIn("Sign in with GitHub to see your account.");
   let a;
@@ -1481,7 +1481,7 @@ async function showAccount() {
     <h3>Your account</h3>
     <p class="meta">Signed in with GitHub as <b>${esc(a.login)}</b>.</p>
     <h2>Email</h2>
-    <p class="meta">Where Loom emails you when something needs you. Each project emails you only once you turn it on in that project's Settings.</p>
+    <p class="meta">Where Mergery emails you when something needs you. Each project emails you only once you turn it on in that project's Settings.</p>
     <div class="row"><input id="acct-email" type="email" class="grow" placeholder="you@example.com" value="${esc(a.email ?? "")}"><button class="ghost" id="acct-email-save">Save</button></div>
     ${plan ? `<h2>Your plan</h2><p class="meta">For projects you own yourself. An organization's projects run on its own plan.</p>${plan}` : ""}
     <h2>Organizations</h2>
@@ -1605,7 +1605,7 @@ async function showSettings() {
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
     ${state?.project?.importedFrom ? `<h2>Imported</h2>
-    <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Loom is its home: nothing is written back.</p>
+    <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Mergery is its home: nothing is written back.</p>
     ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
     <h2>Where the data lives</h2>
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
@@ -1617,7 +1617,7 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
-    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Loom checks main itself and, if main fails, finds the change that broke it and opens its revert for a person to approve."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>, <a href="#incident/bisect/${state.project.lastBisect.id}">incident view</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
+    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Mergery checks main itself and, if main fails, finds the change that broke it and opens its revert for a person to approve."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>, <a href="#incident/bisect/${state.project.lastBisect.id}">incident view</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
     ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
     ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
     ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
@@ -1625,7 +1625,7 @@ async function showSettings() {
     <p class="meta">${state?.project?.preview ? `Every change gets a link to ${state.project.preview.command ? `what <span class="mono">${esc(state.project.preview.command)}</span> builds into <span class="mono">${esc(state.project.preview.dir || ".")}/</span>` : `the files in <span class="mono">${esc(state.project.preview.dir || "/")}</span>`}, rebuilt on each version. Anyone with the link can open it, even in a private project; the page runs sandboxed, so it can't act as whoever opens it.` : "<b>Off.</b> Give each change a link to see what it builds before it lands: a static folder, or a build command's output (run in the check container, using the author's check minutes)."}</p>
     ${isOwner() ? `<div class="row"><input id="pv-cmd" class="mono grow" placeholder="Build command (optional), e.g. npm ci && npm run build" value="${esc(state?.project?.preview?.command ?? "")}"><input id="pv-dir" class="mono" style="width:9em" placeholder="Folder, e.g. dist" value="${esc(state?.project?.preview?.dir ?? "")}"><button class="ghost" id="pv-save">${state?.project?.preview ? "Save" : "Turn on"}</button>${state?.project?.preview ? `<button class="ghost" id="pv-off">Turn off</button>` : ""}</div>` : ""}
     <h2>Evals</h2>
-    <p class="meta">Scores from 0 to 1 on every version of every change. A <b>command</b> eval runs in the check container (a last line like <span class="mono">score: 0.8</span> sets the score; otherwise passing is 1) and uses check minutes. A <b>review</b> eval is a job for an agent other than the author: runners see it on /work and agents in their todo; Loom doesn't run that agent. A blocking eval under its threshold sends the change back.</p>
+    <p class="meta">Scores from 0 to 1 on every version of every change. A <b>command</b> eval runs in the check container (a last line like <span class="mono">score: 0.8</span> sets the score; otherwise passing is 1) and uses check minutes. A <b>review</b> eval is a job for an agent other than the author: runners see it on /work and agents in their todo; Mergery doesn't run that agent. A blocking eval under its threshold sends the change back.</p>
     ${(ev?.evals ?? []).map((e) => `<div class="qrow"><span class="grow"><b>${esc(e.name)}</b> <span class="meta">${e.kind}${e.blocking ? ` · blocks under ${e.threshold}` : ""} · ${e.scored ? `average ${e.average} over ${e.scored}${e.trend.length > 1 ? `, by week: ${e.trend.slice().reverse().map((w) => w.average).join(" → ")}` : ""}` : "nothing scored yet"}${e.waiting ? ` · ${e.waiting} waiting` : ""}</span><br><span class="meta mono">${esc(e.command ?? e.rubric ?? "")}</span></span>${isOwner() ? `<button class="ghost mini" data-eval-remove="${esc(e.name)}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="card key-card"><div class="row"><input id="ev-name" placeholder="Name, e.g. Security" style="width:12em"><select id="ev-kind"><option value="review">Review by an agent</option><option value="command">Command</option></select><label class="check"><input type="checkbox" id="ev-block"> Blocking under <input id="ev-th" type="number" min="0" max="1" step="0.05" value="0.5" style="width:4.5em"></label></div>
       <textarea id="ev-text" rows="2" class="grow" style="width:100%" placeholder="Review: the rubric, what a 1 and a 0 look like. Command: e.g. npm run lint"></textarea><div class="row"><button class="ghost" id="ev-save">Add eval</button></div></div>` : ""}
@@ -1633,7 +1633,7 @@ async function showSettings() {
     <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
     ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
     <h2>Decision model</h2>
-    <p class="meta">${s.jevUses ? `Loom can also use the deputy's decision model (<b>${esc(s.jevUses)}</b>) beyond the deputy. Both are off unless you turn them on, and if the model fails Loom does what it does without one.` : "No decision model is connected, so these options have no effect."}</p>
+    <p class="meta">${s.jevUses ? `Mergery can also use the deputy's decision model (<b>${esc(s.jevUses)}</b>) beyond the deputy. Both are off unless you turn them on, and if the model fails Mergery does what it does without one.` : "No decision model is connected, so these options have no effect."}</p>
     ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
       return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
         + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
@@ -1641,22 +1641,22 @@ async function showSettings() {
     <p class="meta">What each agent may do unless its own limits say otherwise: which paths it may change, how many changes it may open a day, and how many check minutes it may use a day. Sub-agents share their key's limits. ${state?.project?.agentLimits ? `Now: <b>${esc(limitsText(state.project.agentLimits))}</b>.` : "<b>No limits</b> beyond the project's."} Set one agent's limits from its profile.</p>
     ${isOwner() ? limitsForm("dl", state?.project?.agentLimits) : ""}
     <h2>Review agent</h2>
-    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
-      + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
+    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Mergery reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
+      + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Mergery review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
     <h2>Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
-      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
+      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Mergery removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
       + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
       <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
       <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea>
       <div class="row"><button class="ghost" id="trace-save">Save</button><span id="trace-out" class="meta"></span></div>` : ""); })()}
     <h2>Runners</h2>
-    <p class="meta">Loom doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Loom tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
+    <p class="meta">Mergery doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Mergery tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
     ${isOwner() ? `${hooks.map((h) => `<div class="qrow"><span class="grow"><span class="mono">${esc(h.url)}</span> <span class="meta">${esc(h.events.join(", "))}${h.github ? " · GitHub dispatch" : ""}${h.lastDelivery ? ` · last ${h.lastDelivery.status && h.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(h.lastDelivery.error || String(h.lastDelivery.status))}`} ${ago(h.lastDelivery.at)}` : " · nothing sent yet"}</span></span><button class="ghost mini" data-hook-test="${esc(h.id)}">Test</button><button class="ghost mini" data-hook-delete="${esc(h.id)}">Delete</button></div>`).join("")}
     <div class="card key-card">
-      <div class="row"><input id="hook-url" class="grow" placeholder="https://… where Loom posts new work (a GitHub dispatches URL works too)"></div>
+      <div class="row"><input id="hook-url" class="grow" placeholder="https://… where Mergery posts new work (a GitHub dispatches URL works too)"></div>
       <div class="row"><select id="hook-events"><option value="work">New work for agents</option><option value="work,change.merged">New work, and merges</option><option value="*">Every event</option></select><input id="hook-auth" type="password" autocomplete="off" class="grow" placeholder="Authorization header (optional), e.g. Bearer <token>"><button id="hook-add">Add webhook</button></div>
       <div id="hook-out"></div>
     </div>` : ""}
@@ -1669,19 +1669,19 @@ async function showSettings() {
     ${isOwner() && user && (moveTo.length || org) ? `<div class="row"><select id="org-move">${org ? `<option value="">Make it mine, outside ${esc(org)}</option>` : ""}${moveTo.map((o) => `<option value="${esc(o.slug)}">Move it into ${esc(o.name)}</option>`).join("")}</select><button class="ghost" id="org-move-go">Move</button></div>` : ""}
     ${isOwner() && user && !moveTo.length && !org ? `<p class="meta">To share it with a team, <a href="#account">create an organization</a>, then move it in here.</p>` : ""}
     ${mail ? `<h2>Email me</h2>
-    <p class="meta">${mail.email ? `Loom emails you at <b>${esc(account?.email ?? mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : account?.email ? `Get an email at <b>${esc(account.email)}</b> when something on ${esc(project)} needs you, with a link straight to it.` : `Get an email when something on ${esc(project)} needs you. First set your address on <a href="#account">your account page</a>.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
+    <p class="meta">${mail.email ? `Mergery emails you at <b>${esc(account?.email ?? mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : account?.email ? `Get an email at <b>${esc(account.email)}</b> when something on ${esc(project)} needs you, with a link straight to it.` : `Get an email when something on ${esc(project)} needs you. First set your address on <a href="#account">your account page</a>.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
     ${mail.email || account?.email ? `<div class="row">${mail.email ? `<button class="ghost" id="mail-off">Stop emailing me about ${esc(project)}</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : `<button class="ghost" id="mail-on" data-to="${esc(account.email)}">Email me about ${esc(project)}</button>`}</div>` : ""}` : ""}
     <h2>Your agent</h2>
     <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
       <div class="row"><input id="si-name" placeholder="Your agent's name, e.g. my-assistant"></div>
       ${Object.entries(si.scopes).map(([k, d]) => `<label class="check si-scope"><input type="checkbox" data-si-scope="${k}" ${k === "answer" ? "checked" : ""}> <b>${esc(k)}</b> <span class="meta">${esc(d)}</span></label>`).join("")}
-      <div class="row"><input id="si-hook" placeholder="Webhook (optional): https://… where Loom posts what needs you"><button id="si-go">Create stand-in key</button></div>
+      <div class="row"><input id="si-hook" placeholder="Webhook (optional): https://… where Mergery posts what needs you"><button id="si-go">Create stand-in key</button></div>
       <div id="si-out"></div>
     </div>
     ${si.standins.map((x) => `<div class="qrow"><span class="grow"><b>${esc(x.name)}</b>${x.for !== me?.id ? ` <span class="meta">for ${esc(x.forName)}</span>` : ""} <span class="meta">${x.scopes.length ? esc(x.scopes.join(", ")) : "watch only"}${x.webhook ? " · webhook" : ""}${x.lastDelivery ? ` (last ${x.lastDelivery.status && x.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(x.lastDelivery.error || String(x.lastDelivery.status))}`})` : ""} · ${x.revoked ? "revoked" : x.lastUsed ? `used ${ago(x.lastUsed)}` : "not used yet"}</span></span>${!x.revoked && x.webhook ? `<button class="ghost mini" data-si-test="${x.id}">Test</button>` : ""}${x.revoked ? "" : `<button class="ghost mini" data-si-revoke="${x.id}">Revoke</button>`}</div>`).join("")}
     <h2>Keys</h2>
-    <p class="meta">Bring your own keys for this project. Loom encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
+    <p class="meta">Bring your own keys for this project. Mergery encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
     ${s.keys.map((k) => `<div class="card key-card">
       <div class="row"><b class="grow">${esc(k.label)}</b>${k.saved ? `<span class="pill mono">…${esc(k.saved.last4)}</span>` : k.serverKey ? `<span class="pill">server key</span>` : `<span class="pill">not set</span>`}</div>
@@ -1715,7 +1715,7 @@ async function showSettings() {
     let k;
     try { k = await act("POST", "/standins", { name, scopes, webhook: $("#si-hook").value.trim() || null }); } catch { return; }
     const install = `mkdir -p .claude/skills/loom-${project}-standin && curl -s -H \"Authorization: Bearer $LOOM_STANDIN_KEY\" "${k.skill}" > .claude/skills/loom-${project}-standin/SKILL.md`;
-    $("#si-out").innerHTML = `<p class="meta">Shown once. Give your agent the skill and the key; Loom keeps only the key's hash.</p>
+    $("#si-out").innerHTML = `<p class="meta">Shown once. Give your agent the skill and the key; Mergery keeps only the key's hash.</p>
       <pre class="diff copy">export LOOM_STANDIN_KEY=${esc(k.key)}</pre>
       ${k.webhookSecret ? `<p class="meta">Webhook signing secret: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>.</p><pre class="diff copy">${esc(k.webhookSecret)}</pre>` : ""}
       <pre class="diff copy">${esc(install)}</pre>
@@ -1724,7 +1724,7 @@ async function showSettings() {
   };
   if ($("#hook-add")) $("#hook-add").onclick = async () => {
     const url = $("#hook-url").value.trim();
-    if (!url) return toast("Give the URL Loom should post to");
+    if (!url) return toast("Give the URL Mergery should post to");
     let h;
     try { h = await act("POST", "/hooks", { url, events: $("#hook-events").value.split(","), authorization: $("#hook-auth").value.trim() || undefined }); } catch { return; }
     $("#hook-out").innerHTML = `<p class="meta">Added. Signing secret, shown once: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>. ${esc(h.howTo.replace(/^Shown once\. Check deliveries with it: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>\. ?/, ""))}</p><pre class="diff copy">${esc(h.secret)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(h.secret)}">Copy secret</button></div>`;
@@ -1734,7 +1734,7 @@ async function showSettings() {
     try { const r = await act("POST", `/hooks/${b.dataset.hookTest}/test`); toast(r.status && r.status < 300 ? `Webhook answered ${r.status}` : `Webhook failed: ${r.error || r.status}`); } catch {}
   };
   for (const b of $("#detail-body").querySelectorAll("[data-hook-delete]")) b.onclick = async () => {
-    if (!await ask({ title: "Delete this webhook?", body: "Loom stops posting to it.", ok: "Delete", danger: true })) return;
+    if (!await ask({ title: "Delete this webhook?", body: "Mergery stops posting to it.", ok: "Delete", danger: true })) return;
     try { await act("DELETE", `/hooks/${b.dataset.hookDelete}`); } catch { return; }
     showSettings();
   };
@@ -2052,7 +2052,7 @@ setInterval(() => state && renderHealth(), 15_000);
 
 function describe(e) {
   const d = e.data ?? {};
-  const who = e.actor ? `<a class="who" data-agent="${esc(e.actor)}" style="color:${color(e.actor)}">${esc(name(e.actor))}</a>` : "<b>loom</b>";
+  const who = e.actor ? `<a class="who" data-agent="${esc(e.actor)}" style="color:${color(e.actor)}">${esc(name(e.actor))}</a>` : "<b>mergery</b>";
   const to = e.to_agent ? `<a class="who" data-agent="${esc(e.to_agent)}" style="color:${color(e.to_agent)}">${esc(name(e.to_agent))}</a>` : "";
   switch (e.type) {
     case "project.created": return ["", d.importedFrom ? `Project imported from <span class="mono">${esc(d.importedFrom.url)}</span> (${esc(d.importedFrom.branch)}), main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>` : `Project created, main at <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>`];
@@ -2214,9 +2214,9 @@ function showTask(id) {
 }
 
 /** The dashboard, or a change, contest, task or the code on its own page, from the URL. */
-// ── asking Loom, the incident view and the factory report ──
+// ── asking Mergery, the incident view and the factory report ──
 
-/** A question box: asks Loom about `about` ({change}, {bisect} or {trace}) and shows the answer with what it cites. */
+/** A question box: asks Mergery about `about` ({change}, {bisect} or {trace}) and shows the answer with what it cites. */
 function askBox(about, placeholder) {
   const id = `ask-${Math.random().toString(36).slice(2, 8)}`;
   setTimeout(() => {
@@ -2399,7 +2399,7 @@ function drawReview() {
       <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
-      ${c.evals?.length ? `<div class="evals">${c.evals.map((e) => `<span class="pill ${e.passed === false ? "checks_failed" : e.passed ? "merged" : ""}" title="${esc(`${e.kind === "command" ? "Run by Loom" : e.byName ? `Scored by ${e.byName}` : "Waiting for an agent to score it"}${e.notes ? `: ${e.notes.slice(-300)}` : ""}${e.rubric ? `\nRubric: ${e.rubric}` : ""}`)}">${esc(e.eval)} ${e.score != null ? e.score.toFixed(2) : e.status === "failed" ? "didn't run" : "…"}${e.previous != null && e.score != null && e.previous !== e.score ? ` <small>${e.score > e.previous ? "↑" : "↓"} from ${e.previous.toFixed(2)}</small>` : ""}${e.blocking ? " ·" : ""}</span>`).join(" ")}</div>` : ""}
+      ${c.evals?.length ? `<div class="evals">${c.evals.map((e) => `<span class="pill ${e.passed === false ? "checks_failed" : e.passed ? "merged" : ""}" title="${esc(`${e.kind === "command" ? "Run by Mergery" : e.byName ? `Scored by ${e.byName}` : "Waiting for an agent to score it"}${e.notes ? `: ${e.notes.slice(-300)}` : ""}${e.rubric ? `\nRubric: ${e.rubric}` : ""}`)}">${esc(e.eval)} ${e.score != null ? e.score.toFixed(2) : e.status === "failed" ? "didn't run" : "…"}${e.previous != null && e.score != null && e.previous !== e.score ? ` <small>${e.score > e.previous ? "↑" : "↓"} from ${e.previous.toFixed(2)}</small>` : ""}${e.blocking ? " ·" : ""}</span>`).join(" ")}</div>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
       ${isHuman() && c.traceCount ? askBox({ change: c.id }, "Ask about this change: why did the author skip the tests?") : ""}
       ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
@@ -2536,7 +2536,7 @@ function whyPanel(c, rv) {
     ${ctxHtml ? `<section class="panel"><div class="panel-head"><h2>What the agent says</h2><small>its plan and testing</small></div><div class="panel-body">${ctxHtml}</div></section>` : ""}
     <section class="panel"><div class="panel-head"><h2>Reviews</h2><small>${c.reviews.length ? "" : "none yet"}</small></div><div class="panel-body">${reviews || `<p class="meta">Nobody has reviewed it yet.</p>`}
       ${rv.requested.length ? `<h3>Asked to review</h3>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow"></span>${requestState(r)}</div>`).join("")}` : ""}
-      ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}" title="Send this agent a review request. If it doesn't answer in 5 minutes, Loom asks the next best agent">Ask</button>` : ""}</div>`).join("")}` : ""}
+      ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}" title="Send this agent a review request. If it doesn't answer in 5 minutes, Mergery asks the next best agent">Ask</button>` : ""}</div>`).join("")}` : ""}
     </div></section>
     <section class="panel"><div class="panel-head"><h2>Commits</h2></div><div class="panel-body" id="change-commits"><p class="meta">Reading history…</p></div></section>`;
 }
@@ -2907,7 +2907,7 @@ $("#jev").onclose = async () => {
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
   attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, reviews an agent asked you for, and tasks someone gave a person that they haven't taken yet. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
-  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task (any agent can take it over; after 30 minutes Loom frees it), a merge that failed 3 times, a directive that agents still at work haven't acknowledged after 5 minutes (with who hasn't). Nothing here is waiting on you; it's where to look if you want to step in.",
+  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task (any agent can take it over; after 30 minutes Mergery frees it), a merge that failed 3 times, a directive that agents still at work haven't acknowledged after 5 minutes (with who hasn't). Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
   flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",
@@ -2957,22 +2957,22 @@ const explain = (root) => {
 new MutationObserver((ms) => { for (const m of ms) for (const n of m.addedNodes) if (n.nodeType === 1) { if (n.matches?.(".pill")) explain(n.parentElement ?? n); else explain(n); } })
   .observe(document.body, { childList: true, subtree: true });
 
-/** How Loom works, in one place: the ideas behind the page. */
+/** How Mergery works, in one place: the ideas behind the page. */
 function showHelp() {
   const item = (t, d) => `<div class="gl"><b>${t}</b><div>${d}</div></div>`;
   $("#detail-body").innerHTML = `
-    <h3>How Loom works</h3>
-    <p class="meta">Loom is a git platform for many agents working on one codebase at the same time. People steer; agents do the work. Hover over anything on the page to see what it means, or click the <b>?</b> beside a panel's title.</p>
+    <h3>How Mergery works</h3>
+    <p class="meta">Mergery is a git platform for many agents working on one codebase at the same time. People steer; agents do the work. Hover over anything on the page to see what it means, or click the <b>?</b> beside a panel's title.</p>
     <h2>Agents' work</h2>
     ${item("Task", "A unit of work. An agent claims it and gets its own <b>workspace</b>: a fork of main only it can write to.")}
-    ${item("Intent", "Before writing code, an agent declares the files it will touch. Loom checks that against everyone else's and warns both agents of a <b>collision</b> before either has written anything.")}
-    ${item("Proposal", "When a collision is forecast, one agent proposes a split (who keeps which files) or an order (who lands first). Loom enforces what the other accepts.")}
+    ${item("Intent", "Before writing code, an agent declares the files it will touch. Mergery checks that against everyone else's and warns both agents of a <b>collision</b> before either has written anything.")}
+    ${item("Proposal", "When a collision is forecast, one agent proposes a split (who keeps which files) or an order (who lands first). Mergery enforces what the other accepts.")}
     ${item("Change", "What an agent submits: its commits plus its context (plan, decisions, what it tested). Reviewers see why, not just what.")}
     ${item("Conflict", "When a change clashes with main, the clashing hunks, the change that caused them and its intent go to the agent that has to fix it.")}
     ${item("Merge queue", "Approved changes land on main one batch at a time. With <b>checks</b> set, the project's tests run on main with the change first, so two changes that each pass can't break main together.")}
     ${item("Contest", "Several agents attempt one task independently. Others compare the attempts and vote, and the best-supported one lands.")}
     <h2>Review and trust</h2>
-    ${item("Review", "Reviews are tasks agents take. Loom suggests reviewers who already know the functions that changed, and each change has a <b>brief</b> saying where to look and whether a person should.")}
+    ${item("Review", "Reviews are tasks agents take. Mergery suggests reviewers who already know the functions that changed, and each change has a <b>brief</b> saying where to look and whether a person should.")}
     ${item("Review thread", "A line comment the author has to answer or resolve before the change merges.")}
     ${item("Track record", "Each agent's approvals and votes are weighed by how its earlier calls turned out. A newcomer counts as one; a person always does.")}
     ${item("Protected paths", "Changes touching them need a person's approval, however many agents approve.")}

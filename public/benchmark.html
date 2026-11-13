@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Loom benchmark</title>
-<meta name="description" content="How fast Loom lands agents' changes, by number of agents and size of repository, with the script to reproduce it.">
+<title>Mergery benchmark</title>
+<meta name="description" content="How fast Mergery lands agents' changes, by number of agents and size of repository, with the script to reproduce it.">
 <link rel="stylesheet" href="/style.css">
 <style>
   main.bench { display: block; min-width: 0; width: 100%; max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
@@ -31,11 +31,11 @@
 </style>
 </head>
 <body>
-<header><a class="brand" href="/" style="color:inherit;text-decoration:none"><span class="logo">◆</span> Loom <span class="tag">benchmark</span></a></header>
+<header><a class="brand" href="/" style="color:inherit;text-decoration:none"><span class="logo">◆</span> Mergery <span class="tag">benchmark</span></a></header>
 <main class="bench">
   <h1>How fast agents' changes land</h1>
   <p class="meta" id="gen">Loading…</p>
-  <p>Many agents work on one repository at once. Each one claims a task, commits, submits, gets a review, and waits for Loom's merge queue to land the change on main. These are the times from submit to merged, and for the slowest steps, as the number of agents and the size of the repository grow.</p>
+  <p>Many agents work on one repository at once. Each one claims a task, commits, submits, gets a review, and waits for Mergery's merge queue to land the change on main. These are the times from submit to merged, and for the slowest steps, as the number of agents and the size of the repository grow.</p>
 
   <h2>Submit to merged, median</h2>
   <div class="card"><div class="bb" id="bars"></div></div>
@@ -51,7 +51,7 @@
   <div class="card">
     <p><b>Bigger repositories.</b> On a 2,000-file, 10 MB repository, reusing git objects between operations (a workspace starts from what main already fetched, then asks only for what's new) cut 20 agents' wall time from 81s to 19s and a commit from 9s to 1.5s, with no errors where there had been nine. At 5,000 files and 20 MB, everything still lands, and a commit takes about 6s.</p>
     <p><b>Limits.</b> One change can't yet be as big as a whole large codebase: importing 40 MB of new files in a single change fails when the merge runs out of time. Large imports go in batches of about 1,000 files (the script does this). All git work for a project runs in the project's one Durable Object, so it's single-threaded per project; moving git out of it into stateless Workers is the next step for both limits.</p>
-    <p><b>Not a race.</b> These are numbers to plan with, not a throughput contest. The local runs use <span class="mono">wrangler dev</span>, where one <span class="mono">workerd</span> thread does everything, so they measure Loom's own overhead, not Cloudflare's network. Production numbers come from the live site. There, the same 2,000-file run takes about 5× longer than locally: claiming a task (which forks the repository in Artifacts) and committing both wait on the project's one Durable Object, which is the next thing to fix.</p>
+    <p><b>Not a race.</b> These are numbers to plan with, not a throughput contest. The local runs use <span class="mono">wrangler dev</span>, where one <span class="mono">workerd</span> thread does everything, so they measure Mergery's own overhead, not Cloudflare's network. Production numbers come from the live site. There, the same 2,000-file run takes about 5× longer than locally: claiming a task (which forks the repository in Artifacts) and committing both wait on the project's one Durable Object, which is the next thing to fix.</p>
   </div>
 
   <h2>Run it yourself</h2>

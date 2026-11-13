@@ -1,4 +1,4 @@
-// End to end: the scripted demos against a running Loom. Skipped unless
+// End to end: the scripted demos against a running Mergery. Skipped unless
 // LOOM_E2E_URL is set, e.g. with `npm run shim` and `npm run dev` running:
 //   LOOM_E2E_URL=http://127.0.0.1:8787 npm test
 import { test } from "node:test";
@@ -24,10 +24,10 @@ test("a contest is decided by weighted votes, the winner lands and leaves a note
 });
 
 test("updating a change without new context keeps the context it was submitted with", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-ctx");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "context survives updates", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Trim titles", "");
@@ -52,9 +52,9 @@ test("the merge queue runs the project's tests: two clean merges that break main
 });
 
 test("agents register themselves with a join code from the skill, and keep who they are when their key is replaced", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-join");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "self-registration", requiredApprovals: 1 });
   const jc = await admin.req("POST", "/join-codes", { role: "reviewer", maxUses: 2, expiresInHours: 1 });
   const skill = await (await fetch(`${url}/api/projects/${name}/skill?code=${jc.code}`)).text();
@@ -76,9 +76,9 @@ test("agents register themselves with a join code from the skill, and keep who t
 });
 
 test("sub-agents sharing one key each get their own identity, grouped under the key", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-subagents");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "one key, many agents", requiredApprovals: 1 });
   const key = await admin.addAgent("builders", "builder");
   // Sub-agents share one MCP connection, so each names itself on every call.
@@ -124,10 +124,10 @@ test("sub-agents sharing one key each get their own identity, grouped under the 
 });
 
 test("review threads: the author must answer line comments before the change merges, and reviewers see what changed since", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-threads");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "review threads", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
@@ -171,10 +171,10 @@ test("review threads: the author must answer line comments before the change mer
 });
 
 test("reviews are agent tasks: an untaken review shows up in whoami and loom_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-rtasks");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "review tasks", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const bex = admin.as((await admin.addAgent("bex", "builder")).key);
@@ -197,10 +197,10 @@ test("reviews are agent tasks: an untaken review shows up in whoami and loom_sta
 });
 
 test("a review no other agent can take is stuck right away, and stops being stuck once someone could take it", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-rstuck");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "lonely review", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Comment db.js", "");
@@ -217,9 +217,9 @@ test("a review no other agent can take is stuck right away, and stops being stuc
 });
 
 test("questions for people: similar ones share a card, each agent has a limit, and a default wins when nobody answers in time", { skip: !url, timeout: 150_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-questions");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "questions for people", requiredApprovals: 1 });
   const rules = await admin.req("POST", "/settings", { questions: { maxOpen: 2, deadlineMinutes: 1 } });
   assert.deepEqual(rules.questions, { maxOpen: 2, deadlineMinutes: 1 });
@@ -252,10 +252,10 @@ test("questions for people: similar ones share a card, each agent has a limit, a
 });
 
 test("decision model options: off by default, owners turn them on, and without a model reviews still route", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-model");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "model options", files: SEED, requiredApprovals: 1 });
   assert.deepEqual((await admin.req("GET", "/overview")).project.model, { reviewers: false, intent: false });
   const on = await admin.req("POST", "/settings", { model: { reviewers: true, intent: true, other: true } });
@@ -277,11 +277,11 @@ test("decision model options: off by default, owners turn them on, and without a
 });
 
 test("stand-ins: a person's own agent watches what needs them, hears by webhook, and acts only within the rights it was given", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const { createServer } = await import("node:http");
   const { createHmac } = await import("node:crypto");
   const name = project("e2e-standin");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "stand-ins", requiredApprovals: 1 });
   await admin.req("POST", "/members", { login: "jo" });
 
@@ -340,9 +340,9 @@ test("stand-ins: a person's own agent watches what needs them, hears by webhook,
 });
 
 test("filing a task for someone: people assign, agents file open tasks, a person hears it under Needs a person", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-file");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "issues", requiredApprovals: 1 });
   await admin.req("POST", "/members", { login: "jo" });
   const ada = admin.as((await admin.addAgent("ada")).key);
@@ -375,9 +375,9 @@ test("filing a task for someone: people assign, agents file open tasks, a person
 });
 
 test("a plain git push to a workspace updates its change, through Artifacts push events", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-push");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "push events", requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Say hello", "");
@@ -408,14 +408,14 @@ test("a plain git push to a workspace updates its change, through Artifacts push
   const events = (await admin.req("GET", "/events?after=0")).events;
   assert.ok(events.some((e: any) => e.type === "workspace.pushed" && e.data.head === head));
   assert.ok(events.some((e: any) => e.type === "change.updated" && e.data.via === "push"));
-  // Loom's own commit (v1, over the API) was not announced as a push.
+  // Mergery's own commit (v1, over the API) was not announced as a push.
   assert.equal(events.filter((e: any) => e.type === "workspace.pushed").length, 1);
 });
 
 test("a project can ask for its coordinator near its agents, and FedRAMP only where the server has it", { skip: !url, timeout: 60_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-place");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await assert.rejects(admin.createProject({ name, placement: "moon" }), /400/);
   // This server has no FedRAMP namespace and bucket, so it says it can't.
   await assert.rejects(admin.createProject({ name, jurisdiction: "fedramp" }), /503/);
@@ -426,9 +426,9 @@ test("a project can ask for its coordinator near its agents, and FedRAMP only wh
 });
 
 test("a project created in the EU says so, and its name can't be reused elsewhere", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-eu");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await assert.rejects(admin.createProject({ name, jurisdiction: "mars" }), /400/);
   await admin.createProject({ name, description: "kept in the EU", jurisdiction: "eu", requiredApprovals: 0 });
   assert.equal((await admin.state()).project.jurisdiction, "eu");
@@ -447,10 +447,10 @@ test("a project created in the EU says so, and its name can't be reused elsewher
 });
 
 test("agents attach files to a change; they show on the change and task, and stay private in a private project", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-attach");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "attachments", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Restyle", "");
@@ -476,9 +476,9 @@ test("agents attach files to a change; they show on the change and task, and sta
 });
 
 test("a directive reaches busy agents on every call until they acknowledge it, and people see who hasn't", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-directive");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "directives", requiredApprovals: 1 });
   const ada = await admin.addAgent("ada", "builder");
   const bo = await admin.addAgent("bo", "builder");
@@ -515,10 +515,10 @@ test("a directive reaches busy agents on every call until they acknowledge it, a
 });
 
 test("an intent declared without its task still counts for that task's change", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-intent");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "intents find their task", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   // Declared before claiming: no task yet, so the change adopts it.
@@ -538,10 +538,10 @@ test("an intent declared without its task still counts for that task's change", 
 });
 
 test("contest attempts don't flag each other for a person; flagged attempts are one card to pick from", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-contest-card");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "contest attempts in Needs a person", files: SEED, requiredApprovals: 1 });
   const files = ["src/db.js", "src/routes/todos.js", "src/server.js"];
   const contest = await admin.req("POST", "/tasks", { title: "Log every request", description: "", attempts: 3 });
@@ -578,7 +578,7 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
 });
 
 test("a project imported from a git URL keeps its history, lands its branch as main, and work merges on top", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { mkdtemp } = await import("node:fs/promises");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
@@ -599,7 +599,7 @@ test("a project imported from a git URL keeps its history, lands its branch as m
   await g("push", "-q", src.remote.replace("://", `://x:${token}@`), "trunk:trunk", "trunk~1:refs/heads/main");
 
   const name = project("e2e-import");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await assert.rejects(admin.createProject({ name, import: { url: src.remote, branch: "trunk" } }), /needs a token/, "a private source without a token says so");
   const made = await admin.createProject({ name, import: { url: src.remote, branch: "trunk", token } });
   assert.deepEqual(made.importedFrom, { url: src.remote, branch: "trunk" });
@@ -649,11 +649,11 @@ test("a merge whose base is older than the history a workspace fetches still fin
 });
 
 test("an owner deletes a project: its repositories, attachments and listing go, and the name can be used again", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
   const name = project("e2e-delete");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "to be deleted", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Restyle", "");
@@ -687,11 +687,11 @@ test("an owner deletes a project: its repositories, attachments and listing go, 
 });
 
 test("an owner deletes a task: its open change, workspace and attachments go, its holder is told, landed tasks stay", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
   const name = project("e2e-taskdel");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "task delete", files: SEED, requiredApprovals: 0 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Restyle", "");
@@ -726,10 +726,10 @@ test("an owner deletes a task: its open change, workspace and attachments go, it
 });
 
 test("a write with no message is committed under the task's title, not a generic one", { skip: !url, timeout: 60_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-commitmsg");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "commit messages", files: SEED });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Add a health route", "");
@@ -739,11 +739,11 @@ test("a write with no message is committed under the task's title, not a generic
   assert.equal(log.commits[0].message.split("\n")[0], `Add a health route (task #${t.id})`);
 });
 
-test("with no reviewer around, Loom's review agent reviews the change: an approval lands it, a blocking comment sends it back", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+test("with no reviewer around, Mergery's review agent reviews the change: an approval lands it, a blocking comment sends it back", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-reviewagent");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "review agent", files: SEED, requiredApprovals: 1 });
   const settings = await admin.req("POST", "/settings", { reviewAgent: { afterMinutes: 0 } });
   assert.deepEqual(settings.reviewAgent, { enabled: true, afterMinutes: 0 }, "on by default");
@@ -768,7 +768,7 @@ test("with no reviewer around, Loom's review agent reviews the change: an approv
   const merged = await until(good.id, (c) => c.status === "merged");
   assert.equal(merged.status, "merged", "the review agent's approval lands it");
   assert.equal(merged.reviews[0].reviewer, "loom-reviewer");
-  assert.match(merged.reviews[0].body, /Loom's review agent/);
+  assert.match(merged.reviews[0].body, /Mergery's review agent/);
 
   const bad = await land("Add a broken helper", "export const broken = () => null; // LOOM-TEST-BUG");
   const sent = await until(bad.id, (c) => c.status === "changes_requested");
@@ -787,10 +787,10 @@ test("with no reviewer around, Loom's review agent reviews the change: an approv
 });
 
 test("a change doesn't merge while an agent who took its review is still reviewing, and a merged change can't be reviewed", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-reviewhold");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "review hold", files: SEED, requiredApprovals: 1 });
   await admin.req("POST", "/settings", { reviewAgent: { enabled: false } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
@@ -818,10 +818,10 @@ test("a change doesn't merge while an agent who took its review is still reviewi
 });
 
 test("a person who turns on email hears when something needs them, once, with a link to approve it", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-email");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "email", files: SEED, requiredApprovals: 1 });
   await admin.req("POST", "/settings", { protectedPaths: ["src/db.js"], reviewAgent: { enabled: false } });
   await admin.req("POST", "/members", { login: "mia" });
@@ -850,10 +850,10 @@ test("a person who turns on email hears when something needs them, once, with a 
   assert.equal(off.email, null);
 });
 
-test("a project created from a repository Loom recognizes gets a suggested check, and says once that main has no tests", { skip: !url, timeout: 60_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+test("a project created from a repository Mergery recognizes gets a suggested check, and says once that main has no tests", { skip: !url, timeout: 60_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
   const name = project("e2e-nochecks");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "no checks", files: { "package.json": '{"scripts":{"test":"node --test"}}', "src/a.js": "export const a = 1;\n" }, requiredApprovals: 1 });
   const ov = await admin.req("GET", "/overview");
   assert.equal(ov.project.checks, null);
@@ -1023,7 +1023,7 @@ test("an organization: people invited once are members of all its projects, its 
   assert.equal((await (await A("GET", `/api/projects/${shared}/overview`)).json()).project.limits.checkMinutes, 300);
   assert.equal((await A("POST", "/api/projects", { name: project("e2e-org3"), org: slug })).status, 200);
 
-  // Where Loom emails a person lives on their account.
+  // Where Mergery emails a person lives on their account.
   assert.equal((await B("POST", "/api/account/email", { email: "bob@example.com" })).status, 200);
   assert.equal((await (await B("GET", "/api/account")).json()).email, "bob@example.com");
   assert.equal((await B("POST", "/api/account/email", { email: "nope" })).status, 400);
@@ -1097,7 +1097,7 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
   // The project's own URL works with the same sign-in, and a project they aren't in refuses.
   assert.equal((await tool("whoami", {}, `/mcp/${name}`)).agent.name, "Claude Code");
 
-  // Session traces for an agent Loom has no hook for: the person turns them on, and Loom asks their agent to attach its own.
+  // Session traces for an agent Mergery has no hook for: the person turns them on, and Mergery asks their agent to attach its own.
   const person = (m: string, p: string, b?: unknown) => fetch(`${url}/api/projects/${name}${p}`, { method: m, headers: { cookie, "content-type": "application/json" }, body: b ? JSON.stringify(b) : undefined }).then((r) => r.json());
   const ws = claimed.workspace.name;
   await tool("write_files", { project: name, workspace: ws, files: { "hello.txt": "hello\n" }, message: "hello" });
@@ -1112,7 +1112,7 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
   assert.ok(!((await tool("whoami", { project: name })).todo as string[]).some((t) => t.includes("attach_trace")), "and stops once it's there");
   await person("DELETE", `/trace-keys/${asked.id}`);
   const other = project("e2e-mcp-other");
-  const admin = new (await import("../demo/client.mjs")).Loom(url, other, env.LOOM_ADMIN_TOKEN);
+  const admin = new (await import("../demo/client.mjs")).Mergery(url, other, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name: other, description: "not theirs" });
   await assert.rejects(tool("whoami", { project: other }), /isn't a member/);
 
@@ -1123,12 +1123,12 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
 });
 
 test("runners: the work list shows what any agent could pick up, long-polls for more, and webhooks hear new work once", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const { createServer } = await import("node:http");
   const { createHmac } = await import("node:crypto");
   const name = project("e2e-runners");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "runners", files: SEED, requiredApprovals: 1 });
   const got: { body: any; raw: string; sig: string; kind: string }[] = [];
   const server = createServer((req, res) => { let b = ""; req.on("data", (c) => (b += c)); req.on("end", () => { got.push({ raw: b, body: JSON.parse(b), sig: String(req.headers["x-loom-signature"] ?? ""), kind: String(req.headers["x-loom-event"] ?? "") }); res.end("ok"); }); });
@@ -1196,10 +1196,10 @@ test("a change with hundreds of files is submitted, reviewed and merged", { skip
 });
 
 test("agents upload session traces: secrets removed, linked to the change, readable by people only", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-traces");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "traces", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Trim", "");
@@ -1273,10 +1273,10 @@ test("agents upload session traces: secrets removed, linked to the change, reada
 });
 
 test("a change's intent: the person's asks and decisions, the agent's acts and reasons, pinned to traces", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-intent");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "intent", files: SEED, requiredApprovals: 2 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Trim titles", "");
@@ -1312,13 +1312,13 @@ test("a change's intent: the person's asks and decisions, the agent's acts and r
 });
 
 test("session traces are opt-in: a person's trace key installs the hook, uploads as their agent, and can do nothing else", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const { mkdtempSync, writeFileSync, readFileSync, existsSync, statSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const name = project("e2e-tracekey");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "opt-in traces", files: SEED, requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const jo = admin.as((await admin.req("POST", "/agents", { name: "jo", role: "human" })).key);
@@ -1431,10 +1431,10 @@ test("session traces are opt-in: a person's trace key installs the hook, uploads
 });
 
 test("per-agent limits: paths, changes a day and check minutes, from the agent, its key, its join code or the project", { skip: !url, timeout: 180_000 }, async () => {
-  const { Loom } = await import("../demo/client.mjs");
+  const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-limits");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "limits", files: SEED, requiredApprovals: 1 });
   const adaKey = await admin.addAgent("ada", "builder");
   const ada = admin.as(adaKey.key);
@@ -1475,9 +1475,9 @@ test("per-agent limits: paths, changes a day and check minutes, from the agent, 
 });
 
 test("submit on push: a commit with a Loom-Submit trailer opens the change, no MCP needed", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-pushsubmit");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "submit on push", requiredApprovals: 1 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const t = await ada.createTask("Say hello", "");
@@ -1512,9 +1512,9 @@ test("submit on push: a commit with a Loom-Submit trailer opens the change, no M
 });
 
 test("check secrets: the merge queue's checks get them, agents' run_checks only when allowed, and output never shows them", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-secrets");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "check secrets", requiredApprovals: 1 });
   await admin.req("POST", "/settings", { checks: { command: `echo "token is $NPM_TOKEN"; [ -n "$NPM_TOKEN" ]` } });
   const adaKey = await admin.addAgent("ada", "builder");
@@ -1552,9 +1552,9 @@ test("check secrets: the merge queue's checks get them, agents' run_checks only 
 });
 
 test("bisect finds the change that broke a command, and one call reverts it through the merge queue", { skip: !url, timeout: 180_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-bisect");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "bisect", requiredApprovals: 0 });
   await admin.req("POST", "/settings", { checks: { command: "true" } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
@@ -1599,10 +1599,10 @@ test("bisect finds the change that broke a command, and one call reverts it thro
   assert.equal(agentRev.status, "review");
 });
 
-test("when changes by different agents keep failing the checks, Loom bisects main by itself", { skip: !url, timeout: 180_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+test("when changes by different agents keep failing the checks, Mergery bisects main by itself", { skip: !url, timeout: 180_000 }, async () => {
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-autobisect");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "auto bisect", requiredApprovals: 0 });
   await admin.req("POST", "/settings", { checks: { command: "true" } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
@@ -1634,7 +1634,7 @@ test("when changes by different agents keep failing the checks, Loom bisects mai
   for (let i = 0; i < 40 && !rid; i++) { rid = (await admin.req("GET", "/bisects")).bisects[0].culprit?.revertedBy ?? undefined; if (!rid) await sleep(250); }
   assert.ok(rid, "an automatic bisect opens the revert");
   await sleep(1000);
-  assert.equal((await admin.change(rid!)).status, "review", "Loom's own revert doesn't land without a person");
+  assert.equal((await admin.change(rid!)).status, "review", "Mergery's own revert doesn't land without a person");
   await bob.review(rid!, "approve", "looks right");
   assert.equal((await admin.change(rid!)).status, "review", "an agent's approval isn't enough");
   await admin.req("POST", "/settings", { checks: { command: "true" } });
@@ -1645,10 +1645,10 @@ test("when changes by different agents keep failing the checks, Loom bisects mai
   assert.equal(st, "merged", "a person's approval lands it");
 });
 
-test("ask Loom about a change or an incident, cited to trace steps; the incident view and the factory report", { skip: !url, timeout: 180_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+test("ask Mergery about a change or an incident, cited to trace steps; the incident view and the factory report", { skip: !url, timeout: 180_000 }, async () => {
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-ask");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "ask", requiredApprovals: 0 });
   await admin.req("POST", "/settings", { checks: { command: "true" } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
@@ -1722,10 +1722,10 @@ test("ask Loom about a change or an incident, cited to trace steps; the incident
   assert.equal((await admin.req("GET", "/scorecards?agent=ada")).agents.length, 1);
 });
 
-test("with no agent around to score a review eval, Loom's review agent scores it", { skip: !url, timeout: 90_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+test("with no agent around to score a review eval, Mergery's review agent scores it", { skip: !url, timeout: 90_000 }, async () => {
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-agenteval");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "evals without runners", requiredApprovals: 1 });
   await admin.req("POST", "/settings", { reviewAgent: { afterMinutes: 0 } });
   await admin.req("POST", "/evals", { name: "Done", rubric: "1 if the work is finished; 0 if it leaves TODOs.", blocking: true, threshold: 0.5 });
@@ -1743,7 +1743,7 @@ test("with no agent around to score a review eval, Loom's review agent scores it
   };
   const good = await scored(await submit("ok.txt", "finished\n"));
   assert.equal(good.score, 0.9, JSON.stringify(good));
-  assert.match(good.notes, /Loom's review agent/);
+  assert.match(good.notes, /Mergery's review agent/);
   const id = await submit("todo.txt", "TODO: finish\n");
   const bad = await scored(id);
   assert.equal(bad.score, 0.2);
@@ -1751,9 +1751,9 @@ test("with no agent around to score a review eval, Loom's review agent scores it
 });
 
 test("evals score every version of a change: command evals in the check container, review evals by an agent off the work list", { skip: !url, timeout: 180_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-evals");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "evals", requiredApprovals: 1 });
   await admin.req("POST", "/settings", { checks: { command: "true" } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
@@ -1801,10 +1801,10 @@ test("evals score every version of a change: command evals in the check containe
 });
 
 test("the code map: a project's files, exports and imports over HTTP and MCP, rebuilt when main moves", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-codemap");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "code map", files: SEED, requiredApprovals: 0 });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);
   const root = await ada.req("GET", "/codemap");
@@ -1833,9 +1833,9 @@ test("the code map: a project's files, exports and imports over HTTP and MCP, re
 });
 
 test("a preview link per change: static files or a build's output, sandboxed, behind an unguessable link", { skip: !url, timeout: 120_000 }, async () => {
-  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { Mergery, sleep } = await import("../demo/client.mjs");
   const name = project("e2e-preview");
-  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
   await admin.createProject({ name, description: "preview", requiredApprovals: 1, private: true });
   await admin.req("POST", "/settings", { checks: { command: "true" }, preview: { dir: "site" } });
   const ada = admin.as((await admin.addAgent("ada", "builder")).key);

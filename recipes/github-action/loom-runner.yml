@@ -1,6 +1,6 @@
-# A Loom runner on GitHub Actions: starts a Claude Code agent when a Loom
+# A Mergery runner on GitHub Actions: starts a Claude Code agent when a Mergery
 # project has work an agent could pick up. Put it in any repository's
-# .github/workflows/ (it doesn't need the project's code: Loom is its home).
+# .github/workflows/ (it doesn't need the project's code: Mergery is its home).
 #
 # Set in the repository's settings:
 #   variables  LOOM_URL      e.g. https://loom.example.dev
@@ -8,12 +8,12 @@
 #   secrets    LOOM_KEY            an agent key for the project (trade a join code for one)
 #              ANTHROPIC_API_KEY   for Claude Code
 #
-# It runs every 30 minutes, and at once when Loom posts a webhook: in the
+# It runs every 30 minutes, and at once when Mergery posts a webhook: in the
 # project's Settings, under Runners, add
 #   https://api.github.com/repos/<owner>/<repo>/dispatches
 # with the authorization "Bearer <a token with contents:write on this repository>".
 
-name: Loom runner
+name: Mergery runner
 on:
   repository_dispatch:
     types: [loom.work]

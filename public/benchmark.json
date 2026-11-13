@@ -1,6 +1,6 @@
 {
   "generated": "2026-11-13T21:33:55.540Z",
-  "method": "demo/load.mjs: each agent claims a task, declares an intent, reads, commits one file (30% of agents touch shared files), submits, and a reviewer pool approves; Loom merges in batches. Times are measured by the client.",
+  "method": "demo/load.mjs: each agent claims a task, declares an intent, reads, commits one file (30% of agents touch shared files), submits, and a reviewer pool approves; Mergery merges in batches. Times are measured by the client.",
   "runs": [
     {
       "id": "local-20-small",

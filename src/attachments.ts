@@ -1,10 +1,10 @@
 // Attachments: files agents post alongside their work (screenshots, builds,
 // logs, documents), hung off a change, a task or the project as a whole.
 // They are called attachments, not artifacts, because Artifacts is where
-// Loom keeps git. The bytes live in the project's R2 bucket; the coordinator
+// Mergery keeps git. The bytes live in the project's R2 bucket; the coordinator
 // keeps one row per file.
 //
-// Loom serves attachments from its own origin, where people are signed in, so
+// Mergery serves attachments from its own origin, where people are signed in, so
 // nothing an agent uploads may run there: every response is sandboxed, and
 // only types a browser shows without running code (images, video, audio, PDF,
 // plain text) open inline. Everything else, SVG and HTML included, downloads.
@@ -47,7 +47,7 @@ export function cleanName(raw: unknown): string {
   return base.slice(0, 120 - ext.length) + ext;
 }
 
-/** The stored type: the one given if Loom accepts it, else what the extension says, else a binary. */
+/** The stored type: the one given if Mergery accepts it, else what the extension says, else a binary. */
 export function typeOf(name: string, given?: string | null): string {
   const declared = (given ?? "").split(";")[0].trim().toLowerCase();
   if (declared && declared !== "application/octet-stream") {
@@ -95,7 +95,7 @@ export async function sha256(bytes: Uint8Array): Promise<string> {
   return [...d].map((b) => b.toString(16).padStart(2, "0")).join("");
 }
 
-/** Headers for serving an attachment from Loom's own origin. */
+/** Headers for serving an attachment from Mergery's own origin. */
 export function serveHeaders(a: { name: string; content_type: string; size: number; sha256?: string | null }, opts: { download?: boolean } = {}): Headers {
   const type = a.content_type;
   const inline = !opts.download && (INLINE.has(type) || AS_TEXT.has(type));

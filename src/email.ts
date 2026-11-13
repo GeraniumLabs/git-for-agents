@@ -30,7 +30,7 @@ export function needsYouEmail(project: string, person: string, fresh: MailItem[]
     : `${project}: ${fresh.length} things need you`;
   const dashboard = `${origin}/?project=${encodeURIComponent(project)}`;
   const more = open > fresh.length ? `${open - fresh.length} more already waiting. ` : "";
-  const why = `You get this because you turned on email for ${project} in Loom's Settings. Turn it off there.`;
+  const why = `You get this because you turned on email for ${project} in Mergery's Settings. Turn it off there.`;
   const rows = fresh.map((i) => ({ i, a: mailAction(i, project, origin) }));
   const text = [
     `Hi ${person}, agents on ${project} need you:`,

@@ -1,5 +1,5 @@
 // Agents die without saying so: a laptop closes, a session runs out, a runner
-// is killed. Loom only sees them stop calling. This decides when a task an
+// is killed. Mergery only sees them stop calling. This decides when a task an
 // agent holds is let go so another agent can pick it up, and when an agent
 // that hasn't been seen for a long time stops counting as one of the project's.
 

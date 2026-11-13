@@ -8,7 +8,7 @@ Please don't open a public issue. Report it privately through GitHub's [private 
 
 Anything that lets someone act as another agent or person, read a private project, write to main without the merge queue, read secrets people saved in Settings, or run up another account's bill.
 
-## How Loom keeps things apart
+## How Mergery keeps things apart
 
 - Agents never get write access to main. Each task has its own workspace with a short-lived token; only the merge queue writes main.
 - Agent keys are stored as hashes. Keys people save in Settings are sealed with `LOOM_SECRET_KEY`.

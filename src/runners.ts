@@ -1,5 +1,5 @@
 // Runners: whatever starts agents for a project (a GitHub Action, a cron job,
-// a Claude Code routine, a workflow tool). Loom doesn't run agents itself; it
+// a Claude Code routine, a workflow tool). Mergery doesn't run agents itself; it
 // says when there is work an agent could pick up, and lets the runner start one.
 //
 // Two ways to hear it: GET /work, which long-polls like the attention feed, and
@@ -22,7 +22,7 @@ export function isGitHubDispatch(url: string): boolean {
   return /^https:\/\/api\.github\.com\/repos\/[^/]+\/[^/]+\/dispatches$/.test(url);
 }
 
-/** A webhook's body: Loom's own shape, or GitHub's repository_dispatch shape (at most 10 payload keys). */
+/** A webhook's body: Mergery's own shape, or GitHub's repository_dispatch shape (at most 10 payload keys). */
 export function hookBody(url: string, kind: "work" | "events", payload: { project: string; dashboard: string; mcp: string; work?: unknown[]; events?: unknown[] }) {
   if (isGitHubDispatch(url)) return { event_type: `loom.${kind}`, client_payload: { kind, ...payload } };
   return { kind, ...payload };
@@ -30,7 +30,7 @@ export function hookBody(url: string, kind: "work" | "events", payload: { projec
 
 /** What a runner tells the agent it starts: where it is, and how to find and finish one piece of work. */
 export function runnerPrompt(origin: string, project: string): string {
-  return `You are a runner agent for the Loom project "${project}" (${origin}/?project=${project}). Loom is where the code lives; you reach it through the "loom" MCP server.
+  return `You are a runner agent for the Mergery project "${project}" (${origin}/?project=${project}). Mergery is where the code lives; you reach it through the "loom" MCP server.
 
 1. Call whoami and do anything on its todo first (directives, review requests, changes sent back to you).
 2. Call list_work. Take the first item you can finish in this session:

@@ -1,7 +1,7 @@
-// Loom analyzing what it already holds: answers to people's questions about a
+// Mergery analyzing what it already holds: answers to people's questions about a
 // change, an incident or a session, cited to the trace steps and events they
 // came from; and the factory report, which turns a week of traces and changes
-// into what a team should change. Loom doesn't run agents to do this: one
+// into what a team should change. Mergery doesn't run agents to do this: one
 // model call per question, through the same models as the review agent.
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -105,7 +105,7 @@ export function stepSources(traceId: number, agentName: string, steps: Step[], k
     .filter((s) => (keep ? keep(s) : s.kind !== "tool_result" || s.error) && s.kind !== "context")
     .map((s) => ({
       ref: `T${traceId}.${s.seq}`,
-      text: `${agentName} ${s.kind === "prompt" ? "was asked" : s.kind === "thought" ? "thought" : s.kind === "message" ? "said" : s.kind === "tool_call" ? `called ${s.loomCall ? `Loom ${s.loomCall}` : s.tool ?? "a tool"}` : s.kind === "error" || s.error ? "hit an error" : "got"}${s.files.length ? ` (${s.files.slice(0, 4).join(", ")})` : ""}: ${s.preview.slice(0, 400)}`,
+      text: `${agentName} ${s.kind === "prompt" ? "was asked" : s.kind === "thought" ? "thought" : s.kind === "message" ? "said" : s.kind === "tool_call" ? `called ${s.loomCall ? `Mergery ${s.loomCall}` : s.tool ?? "a tool"}` : s.kind === "error" || s.error ? "hit an error" : "got"}${s.files.length ? ` (${s.files.slice(0, 4).join(", ")})` : ""}: ${s.preview.slice(0, 400)}`,
     }));
 }
 
@@ -148,7 +148,7 @@ export function factoryReport(from: number, to: number, traces: ReportTrace[], c
     findings.push({ kind: "mistakes", title: `${ids.size} changes failed the checks the same way`, detail: sig, suggest: "Record a project decision or a note on the files involved, so agents avoid it before they submit.", refs: [...ids].slice(0, 8).map((id) => `#${id}`) });
   }
 
-  // Ignored instructions: sessions that worked with Loom but edited files before declaring an intent.
+  // Ignored instructions: sessions that worked with Mergery but edited files before declaring an intent.
   const loomSessions = traces.filter((t) => t.steps.some((s) => s.loomCall));
   const skipped = loomSessions.filter((t) => {
     const firstEdit = t.steps.find((s) => s.kind === "tool_call" && (EDIT_TOOLS.test(s.tool ?? "") || s.loomCall === "write_files"));
