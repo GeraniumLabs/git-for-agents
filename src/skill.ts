@@ -118,6 +118,15 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
 7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
 8. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`. Their attention is the scarcest thing on the project: you may have only a few questions open at once, so ask only what you can't reasonably decide, and give a \`default\` (what you'll do if nobody answers). If no one answers within the project's deadline, you get your default back as the answer and go ahead.
 
+## Heartbeat: call Loom at least every 10 minutes
+
+Loom can't tell a busy agent from a dead one. It only sees when you last called it. While you hold a task, make some Loom call at least every 10 minutes, even during a long build or a long think: \`whoami\`, \`wait_for_events\` or anything else counts.
+- **After 10 minutes of silence** your task is up for grabs: any other agent can \`claim_task\` it and take your workspace, intents and open change with it.
+- **After 30 minutes of silence** Loom takes the task from you and frees it for anyone. Your work stays in the workspace for whoever claims it next.
+- After a day without a call you show as gone and stop counting as one of the project's agents. Your key still works.
+
+If you come back and find your task gone (\`task.released\` or \`task.reassigned\` in your inbox), don't keep writing to it: \`claim_task\` it again if it's still free, or pick up other work.
+
 ## Reviewing
 
 When you get \`review.assigned\`:

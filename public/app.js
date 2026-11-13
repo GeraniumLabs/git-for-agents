@@ -310,16 +310,17 @@ try { const t = localStorage.getItem("loom-tab"); if (t && document.querySelecto
 // ── health: is the work moving? ─────────────────────────────────────────
 const STATES = [
   ["working", "working", "ok"], ["waiting", "waiting on a person", "warn"], ["conflict", "in conflict", "bad"],
-  ["quiet", "quiet holding a task", "bad"], ["paused", "paused", "warn"], ["idle", "idle", ""], ["away", "away", ""],
+  ["quiet", "quiet holding a task", "bad"], ["paused", "paused", "warn"], ["idle", "idle", ""], ["away", "away", ""], ["gone", "gone", ""],
 ];
 const STATE_HELP = {
   working: "Holding a task and seen recently",
   waiting: "Blocked on a question to a person",
   conflict: "Its change hit a conflict it has to resolve",
-  quiet: "Holding a task but not seen for a while; listed under Stuck",
+  quiet: "Holding a task but not seen for 10 minutes; another agent can take it over now, and after 30 minutes Loom frees the task for anyone",
   paused: "Paused by a person: it can still talk, but can't change code",
   idle: "Around, with no task",
   away: "Not seen recently, with no task",
+  gone: "Not seen for a day: not counted in the total. Its key still works if it comes back",
 };
 function renderHealth() {
   const h = state.health;
@@ -661,7 +662,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -1976,6 +1977,7 @@ function describe(e) {
     case "task.created": return ["", `${who} created task #${e.task_id} “${esc(d.title)}”`];
     case "task.claimed": return ["", `${who} ${d.resumed ? "took over" : "claimed"} task #${e.task_id} in workspace <span class="mono">${esc(d.workspace)}</span>`];
     case "task.reassigned": return ["stale", `Task #${e.task_id} reassigned: ${esc(d.reason)}`];
+    case "task.released": return ["stale", d.expired ? `Task #${e.task_id} freed: ${esc(d.reason)}` : `Task #${e.task_id} released${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "intent.declared": return ["", `${who} intends to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.description ? `: ${esc(d.description)}` : ""}`];
     case "collision.forecast": return ["collision", `Collision forecast: ${who} and ${to} both plan to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>. Both notified before any code was written.`];
     case "intent.released": return ["", `${who} released an intent`];
@@ -2703,7 +2705,7 @@ $("#jev").onclose = async () => {
 // ── help: what each part of the page is for ─────────────────────────────
 const HELP = {
   attention: "What only a person can settle: questions agents asked people, disputes the deputy couldn't rule on, changes to protected paths, reviews whose brief says a person should look, reviews an agent asked you for, and tasks someone gave a person that they haven't taken yet. Similar questions share one card, and those blocking the most agents come first. Your answer goes to every agent that asked and is kept as a decision.",
-  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task, a merge that failed 3 times, a directive that agents still at work haven't acknowledged after 5 minutes (with who hasn't). Nothing here is waiting on you; it's where to look if you want to step in.",
+  stuck: "Work that isn't moving and that nobody has asked about: a proposal unanswered for 10 minutes, a conflict unresolved for 5, a review no other agent can take (right away), a review nobody has taken for 5 minutes or a requested one unanswered for 10, an agent that went quiet holding a task (any agent can take it over; after 30 minutes Loom frees it), a merge that failed 3 times, a directive that agents still at work haven't acknowledged after 5 minutes (with who hasn't). Nothing here is waiting on you; it's where to look if you want to step in.",
   discussions: "Open conversations between agents: discussions anchored to a task, change or file; consults, where an agent asks one who worked on the code before; and contracts, an interface an agent published so others can build against it before it lands.",
   contrib: "Activity in the GitHub style: commits, changes submitted and reviews per square. A young project gets small squares, so the grid shows something on day one. Each agent's profile has its own.",
   flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",
