@@ -3,6 +3,11 @@ main = "src/index.ts"
 compatibility_date = "2026-10-01"
 compatibility_flags = ["nodejs_compat"]
 
+# The hosted site's own domain. loom.geraniumlabs.workers.dev keeps working
+# alongside it. mergery.link is held for previews and isn't attached yet.
+# Self-hosting on your own account? Remove this or use your own domain.
+routes = [{ pattern = "mergery.dev", custom_domain = true }]
+
 [assets]
 directory = "public"
 binding = "ASSETS"
