@@ -1,5 +1,5 @@
 {
-  "generated": "2026-11-12T04:43:14.240Z",
+  "generated": "2026-11-13T21:33:55.540Z",
   "method": "demo/load.mjs: each agent claims a task, declares an intent, reads, commits one file (30% of agents touch shared files), submits, and a reviewer pool approves; Loom merges in batches. Times are measured by the client.",
   "runs": [
     {
@@ -365,6 +365,78 @@
           "p50": 92,
           "p95": 436,
           "max": 436,
+          "n": 20
+        }
+      },
+      "conflicts": 0,
+      "syncs": 0,
+      "retries": 0,
+      "errors": {}
+    },
+    {
+      "id": "prod-20-2k",
+      "label": "20 agents, 2,000 files / 10 MB",
+      "at": "2026-11-13T21:33:04.526Z",
+      "target": "production",
+      "agents": 20,
+      "reviewers": 2,
+      "shared": 0.3,
+      "repo": {
+        "files": 2041,
+        "mb": 10.1,
+        "seededMs": 8081
+      },
+      "merged": 20,
+      "failed": 0,
+      "wallSeconds": 103.5,
+      "mergesPerHour": 696,
+      "submitToMerged": {
+        "p50": 37225,
+        "p95": 49420,
+        "max": 49420,
+        "n": 20
+      },
+      "requests": {
+        "claim": {
+          "p50": 8158,
+          "p95": 21718,
+          "max": 21718,
+          "n": 20
+        },
+        "intent": {
+          "p50": 258,
+          "p95": 5010,
+          "max": 5010,
+          "n": 20
+        },
+        "read": {
+          "p50": 1874,
+          "p95": 7275,
+          "max": 7275,
+          "n": 7
+        },
+        "commit": {
+          "p50": 10406,
+          "p95": 21479,
+          "max": 21479,
+          "n": 20
+        },
+        "events": {
+          "p50": 3505,
+          "p95": 20469,
+          "max": 21026,
+          "n": 159
+        },
+        "submit": {
+          "p50": 16597,
+          "p95": 25577,
+          "max": 25577,
+          "n": 20
+        },
+        "review": {
+          "p50": 156,
+          "p95": 4752,
+          "max": 4752,
           "n": 20
         }
       },
