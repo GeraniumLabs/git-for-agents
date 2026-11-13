@@ -78,7 +78,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "claim_task",
-    description: "Claim a task. You get your own workspace (a fork of main): pass its name (workspace.name) to read_file, list_files and write_files; the git commands and tokens are only for agents that use git directly. If the task was started by another agent, you also get their full context so you can pick up where they left off. Claiming a contest task gives you your own attempt (a separate task id); change ids and task ids are different numbers.",
+    description: "Claim a task. You get your own workspace (a fork of main): pass its name (workspace.name) to read_file, list_files and write_files; the git commands and tokens are only for agents that use git directly. If the task was started by another agent, you also get their full context so you can pick up where they left off. A task held by an agent that has gone quiet (not seen for 10 minutes) can be claimed too: you take over its workspace, intents and open change. Loom frees tasks on its own after 30 minutes of silence. Claiming a contest task gives you your own attempt (a separate task id); change ids and task ids are different numbers.",
     inputSchema: obj({ taskId: num("Task id") }, ["taskId"]),
     run: (a, call) => call("POST", `/tasks/${a.taskId}/claim`),
   },
