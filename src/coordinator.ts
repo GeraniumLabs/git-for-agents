@@ -12,6 +12,7 @@ import { subscribePushes, unsubscribe, type Push } from "./events";
 import type { Env } from "./env";
 import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge, type ProjectContext } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
+import { GONE_MS, RELEASE_MS, canTakeOver, nextRelease, releaseNow, type Holding } from "./presence";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
 import { FilesShapeError, normalizeFiles } from "./files";
@@ -88,7 +89,7 @@ const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev"
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
 const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made", "task.assigned"]);
@@ -953,6 +954,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (need !== "watch" && !actor.standin.scopes.includes(need)) throw new HttpError(403, `this stand-in key doesn't have the "${need}" right (${SCOPES[need].toLowerCase()}); ${actor.name} can grant it in Settings`);
       if (need !== "watch") this.standinActs.set(req, { id: actor.standin.id, name: actor.standin.name, person: actor.id, action: `${m} /${parts.join("/")}` });
     }
+    if (a === "tasks" && b && !c && m === "DELETE") {
+      ownerOnly("delete tasks");
+      return json(await this.deleteTask(actor, Number(b)));
+    }
     if (a === "project" && m === "DELETE") {
       ownerOnly("delete the project");
       return json(await this.deleteProject(url.searchParams.get("confirm") ?? body.confirm ?? ""));
@@ -1439,13 +1444,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (task.attempt && this.contestAttempts(task.parent).some((t) => t.assignee === actor.id && t.id !== taskId)) throw new HttpError(409, `you already hold an attempt at task ${task.parent}; one attempt per agent`);
     if (task.status === "closed") throw new HttpError(409, `task ${taskId} was closed`);
     if (task.status === "merged") throw new HttpError(409, `task ${taskId} already landed; create a new task for follow-up work`);
-    // A person handed this task to someone in particular; only a person can hand it on.
-    if (task.assignee && task.assignee !== actor.id && task.status === "open") throw new HttpError(409, `task ${taskId} was assigned to ${this.agentName(task.assignee)}; a person can reassign it`);
+    // Someone else holds it. A live holder keeps it; one that went quiet doesn't: its
+    // work stays in the workspace and its change, and both pass to whoever claims it.
+    // A person's assignment holds for a day, so an agent can't take a task meant for another.
     if (task.assignee && task.assignee !== actor.id) {
-      const holder = this.sql.exec("SELECT last_seen FROM agents WHERE id = ?", task.assignee).toArray()[0];
-      const stale = !holder || Date.now() - (holder.last_seen as number) > 10 * 60_000;
-      if (!stale) throw new HttpError(409, `task ${taskId} is held by ${this.agentName(task.assignee)}`);
-      this.emit("task.reassigned", { actor: actor.id, task: taskId, data: { from: task.assignee, reason: "previous agent went quiet" } });
+      const holder = this.sql.exec("SELECT last_seen, role FROM agents WHERE id = ?", task.assignee).toArray()[0];
+      if ((holder?.role === "human" && task.status === "open") || !canTakeOver(task.status as string, holder ? holder.last_seen as number : null, Date.now(), PRESENT_MS)) {
+        throw new HttpError(409, task.status === "open"
+          ? `task ${taskId} was assigned to ${this.agentName(task.assignee)}; a person can reassign it`
+          : `task ${taskId} is held by ${this.agentName(task.assignee)}, seen ${since(Date.now() - (holder.last_seen as number))} ago; you can take it over once it has been quiet for ${PRESENT_MS / 60_000} minutes`);
+      }
+      this.emit("task.reassigned", { actor: actor.id, task: taskId, to: task.assignee, data: { from: task.assignee, fromName: this.agentName(task.assignee), reason: `${this.agentName(task.assignee)} went quiet (last seen ${since(Date.now() - ((holder?.last_seen as number) ?? 0))} ago); ${actor.name} took it over` } });
     }
     for (const dep of task.depends_on as number[]) {
       if (this.task(dep).status !== "merged") throw new HttpError(409, `task ${taskId} waits on task ${dep}`);
@@ -1473,14 +1482,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     this.sql.exec("UPDATE tasks SET assignee = ?, workspace = ?, status = CASE WHEN status = 'open' THEN 'claimed' ELSE status END, updated_at = ? WHERE id = ?",
       actor.id, ws, Date.now(), taskId);
-    // Move the previous holder's intents to the new holder.
+    // Move the previous holder's intents, and its open change, to the new holder.
     this.sql.exec("UPDATE intents SET agent_id = ? WHERE task_id = ? AND released_at IS NULL", actor.id, taskId);
+    this.sql.exec("UPDATE changes SET agent_id = ? WHERE task_id = ? AND status NOT IN ('merged','abandoned') AND agent_id != ?", actor.id, taskId, actor.id);
 
     const [wsToken, mainToken] = await Promise.all([
       this.store.token(ws, "write", TOKEN_TTL),
       this.store.token(this.mainRepo, "read", TOKEN_TTL),
     ]);
     this.emit("task.claimed", { actor: actor.id, task: taskId, data: { workspace: ws, resumed } });
+    // Come back to let go of it if this agent stops calling.
+    void this.armAlarm(Date.now() + RELEASE_MS + 1000);
     return {
       task: this.task(taskId),
       workspace: { name: ws, remote: this.remoteUrl(ws), token: wsToken },
@@ -2432,7 +2444,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
-    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity);
+    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity, this.releaseQuietTasks() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
     await this.maybeWeeklyReport().catch((e) => console.error("weekly report", e));
@@ -2465,7 +2477,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
     const done = this.sql.exec("SELECT MIN(done_at) AS t FROM workspaces WHERE status IN ('merged','closed') AND done_at IS NOT NULL").one().t as number | null;
     const asked = this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
-    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, this.agentReviewDue() ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
+    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, this.agentReviewDue() ?? Infinity, nextRelease(this.holdings(), Date.now()) ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
     if (next < Infinity) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 100));
   }
 
@@ -3562,6 +3574,79 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /**
+   * Delete a task that hasn't landed, with the work done for it: its open
+   * changes and their reviews, its threads, intents and attachments. Its
+   * workspace is closed and swept like any finished one. A task whose change
+   * landed is part of main's history and stays. A contest goes with all of its
+   * attempts; one attempt alone can't be deleted. Whoever held the task hears
+   * about it; tasks that waited on it stop waiting. Notes, decisions and traces
+   * outlive it, unlinked.
+   */
+  private async deleteTask(actor: Agent, taskId: number) {
+    const task = this.task(taskId);
+    if (task.attempt) throw new HttpError(409, `task ${taskId} is one attempt in contest #${task.parent}; delete the contest instead`);
+    const tasks = [task, ...(task.attempts ? this.contestAttempts(taskId) : [])];
+    const ids = tasks.map((t) => t.id as number);
+    const inIds = (col: string) => `${col} IN (${ids.map(() => "?").join(",")})`;
+    const changes = this.sql.exec(`SELECT id, status FROM changes WHERE ${inIds("task_id")}`, ...ids).toArray();
+    if (tasks.some((t) => t.status === "merged") || changes.some((c) => c.status === "merged"))
+      throw new HttpError(409, `task ${taskId} already landed; its change is part of main's history, so it stays`);
+    if (changes.some((c) => c.status === "merging")) throw new HttpError(409, `task ${taskId}'s change is merging right now; try again once it lands or fails`);
+    const changeIds = changes.map((c) => c.id as number);
+    const inChanges = (col: string) => changeIds.length ? `${col} IN (${changeIds.map(() => "?").join(",")})` : "0";
+
+    // Stored context and attachments first: if storage fails, nothing is gone yet.
+    const files = this.sql.exec(`SELECT id FROM attachments WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds).toArray().map((r) => r.id as number);
+    const keys = files.map((id) => `${this.project}/attachments/${id}`);
+    for (const id of changeIds) {
+      for (let cursor: string | undefined, more = true; more; ) {
+        const page = await this.context.list({ prefix: `${this.project}/changes/${id}/`, cursor });
+        keys.push(...page.objects.map((o) => o.key));
+        more = page.truncated;
+        cursor = page.truncated ? page.cursor : undefined;
+      }
+    }
+    for (let i = 0; i < keys.length; i += 1000) await this.context.delete(keys.slice(i, i + 1000));
+
+    const now = Date.now();
+    const threads = this.sql.exec(`SELECT id FROM threads WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds).toArray().map((r) => r.id as number);
+    if (threads.length) {
+      const q = threads.map(() => "?").join(",");
+      this.sql.exec(`DELETE FROM posts WHERE thread_id IN (${q})`, ...threads);
+      this.sql.exec(`DELETE FROM threads WHERE id IN (${q})`, ...threads);
+      this.sql.exec(`UPDATE decisions SET thread_id = NULL WHERE thread_id IN (${q})`, ...threads);
+    }
+    if (changeIds.length) {
+      this.sql.exec(`DELETE FROM reviews WHERE ${inChanges("change_id")}`, ...changeIds);
+      this.sql.exec(`DELETE FROM review_requests WHERE ${inChanges("change_id")}`, ...changeIds);
+      this.sql.exec(`DELETE FROM changes WHERE ${inChanges("id")}`, ...changeIds);
+    }
+    this.sql.exec(`DELETE FROM attachments WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds);
+    this.sql.exec(`DELETE FROM intents WHERE ${inIds("task_id")}`, ...ids);
+    this.sql.exec("DELETE FROM contest_votes WHERE contest = ?", taskId);
+    for (const table of ["decisions", "notes", "traces"]) {
+      this.sql.exec(`UPDATE ${table} SET task_id = NULL WHERE ${inIds("task_id")}`, ...ids);
+      if (changeIds.length) this.sql.exec(`UPDATE ${table} SET change_id = NULL WHERE ${inChanges("change_id")}`, ...changeIds);
+    }
+    // Close the workspaces; the sweep deletes their repos on its next pass.
+    this.sql.exec(`UPDATE workspaces SET status = 'closed', done_at = 0 WHERE ${inIds("task_id")} AND status = 'active'`, ...ids);
+    // Tasks that waited on this one no longer do.
+    for (const r of this.sql.exec("SELECT id, depends_on FROM tasks WHERE depends_on != '[]'").toArray()) {
+      const deps = JSON.parse(r.depends_on as string) as number[];
+      if (deps.some((d) => ids.includes(d))) this.sql.exec("UPDATE tasks SET depends_on = ? WHERE id = ?", JSON.stringify(deps.filter((d) => !ids.includes(d))), r.id);
+    }
+    this.sql.exec(`UPDATE tasks SET waits_for = NULL WHERE ${inIds("waits_for")}`, ...ids);
+    this.sql.exec(`UPDATE tasks SET parent = NULL WHERE ${inIds("parent")} AND COALESCE(attempt, 0) = 0`, ...ids);
+    this.sql.exec(`DELETE FROM tasks WHERE ${inIds("id")}`, ...ids);
+
+    const holders = [...new Set(tasks.map((t) => t.assignee as string | null).filter((a): a is string => !!a && a !== actor.id))];
+    for (const to of holders) this.emit("task.deleted", { actor: actor.id, task: taskId, to, data: { title: task.title, changes: changeIds } });
+    if (!holders.length) this.emit("task.deleted", { actor: actor.id, task: taskId, data: { title: task.title, changes: changeIds } });
+    void this.armAlarm(now + 1000);
+    return { deleted: taskId, tasks: ids, changes: changeIds, threads: threads.length, attachments: files.length };
+  }
+
+  /**
    * Delete the project for good: its repositories (main and every workspace),
    * change context and attachments, its place in the list, and everything the
    * coordinator holds. The name has to be typed back to confirm. If a
@@ -4472,6 +4557,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * open tasks nobody holds. Loom doesn't start agents; runners read this.
    */
   private work(origin: string) {
+    this.releaseQuietTasks();
     const now = Date.now();
     const present = new Set(this.sql.exec("SELECT id FROM agents WHERE role != 'human' AND last_seen > ?", now - PRESENT_MS).toArray().map((r) => r.id as string));
     const items: { key: string; kind: string; text: string; since: number; url: string; change?: number; task?: number }[] = [];
@@ -4487,7 +4573,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     for (const c of this.sql.exec("SELECT id, task_id, title, agent_id, status, updated_at FROM changes WHERE status IN ('conflict','changes_requested','checks_failed')").toArray()) {
       if (present.has(c.agent_id as string)) continue;
-      items.push({ key: `fix:${c.id}:${c.status}`, kind: "fix", change: c.id as number, task: c.task_id as number, text: `Change #${c.id} "${c.title}" is ${String(c.status).replace("_", " ")} and ${this.agentName(c.agent_id as string)} is away`, since: c.updated_at as number, url: link(`#change/${c.id}`) });
+      items.push({ key: `fix:${c.id}:${c.status}`, kind: "fix", change: c.id as number, task: c.task_id as number, text: `Change #${c.id} "${c.title}" is ${String(c.status).replace("_", " ")} and ${this.agentName(c.agent_id as string)} is away: claim_task #${c.task_id} to take it over`, since: c.updated_at as number, url: link(`#change/${c.id}`) });
     }
     for (const r of this.openEvalRuns()) {
       items.push({ key: `eval:${r.id}`, kind: "eval", change: r.change_id, text: `Score change #${r.change_id} "${r.title}" on the ${r.eval} eval: ${r.rubric}`, since: r.created_at, url: link(`#change/${r.change_id}`) });
@@ -4789,6 +4875,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
         : st === "conflict" ? "conflict"
         : st && quiet ? "quiet"
         : st ? "working"
+        // Not seen for a day: still on the project (its key works if it comes back), but no longer counted.
+        : now - (r.last_seen as number) > GONE_MS ? "gone"
         : quiet ? "away" : "idle";
       return { id: r.id as string, name: r.name as string, role: r.role as string, state, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null,
         under: r.via ? { id: r.via as string, name: r.via_name as string } : null };
@@ -4802,6 +4890,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private overview() {
+    // Projects whose agents died before an alarm was set catch up here.
+    this.releaseQuietTasks();
     const now = Date.now();
     const agents = this.agentStates();
     const byState: Record<string, number> = {};
@@ -4827,7 +4917,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
-        agents: { total: agents.filter((a) => a.state !== "human").length, byState },
+        agents: { total: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
         tasks: taskCounts, changes: changeCounts,
         reviewTasks: this.reviewTasks().reduce((n: Record<string, number>, t) => ({ ...n, [t.status]: (n[t.status] ?? 0) + 1 }), { open: 0, assigned: 0, in_progress: 0 }),
         queue: { depth: queued.length, oldestWaitMs: queued.length ? now - Math.min(...queued.slice(0, 50).map((q) => waitedFor(q.id as number))) : 0 },
@@ -4975,7 +5065,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitingOnReview = (a: { task: { id: number; status: string | null } | null }) => a.task?.status === "in_review"
       && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status = 'changes_requested' LIMIT 1", a.task.id).toArray().length;
     for (const a of agents.filter((a) => (a.state === "quiet" || (a.state === "paused" && a.task)) && !waitingOnReview(a))) {
-      items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
+      const freeIn = a.state === "quiet" ? a.lastSeen + RELEASE_MS - now : 0;
+      items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}${freeIn > 0 ? ` (Loom frees it in ${since(freeIn)} unless the agent comes back)` : ""}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
       items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
@@ -5025,7 +5116,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...(text ? [like, like, like, num || -1, like, num || -1] : []),
     ).filter((a) => a.state !== "human" || !state);
     // "present": every agent that isn't away, the ones a person might steer right now.
-    if (state === "present") agents = agents.filter((a) => a.state !== "human" && a.state !== "away");
+    if (state === "present") agents = agents.filter((a) => a.state !== "human" && a.state !== "away" && a.state !== "gone");
     else if (state) agents = agents.filter((a) => a.state === state);
     agents.sort((a, b) => b.lastSeen - a.lastSeen);
     const total = agents.length;
@@ -5293,6 +5384,37 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** Start Loom's review agent on every change that has waited long enough; returns when the next one is due. */
+  /** Tasks held by agents, with what the release rules need to know. */
+  private holdings() {
+    return this.sql.exec(`SELECT t.id, t.title, t.status, t.assignee, a.name, a.last_seen, a.paused,
+        (SELECT k.paused FROM agents k WHERE k.id = a.via) AS via_paused,
+        (SELECT c.status FROM changes c WHERE c.task_id = t.id AND c.status NOT IN ('merged','abandoned') ORDER BY c.id DESC LIMIT 1) AS change_status
+      FROM tasks t JOIN agents a ON a.id = t.assignee
+      WHERE t.status NOT IN ('merged','closed') AND a.role != 'human' AND a.id NOT IN (?, ?)`, DELEGATE_ID, REVIEW_AGENT_ID).toArray()
+      .map((r) => ({ id: r.id as number, title: r.title as string, agent: r.assignee as string, name: r.name as string,
+        taskStatus: r.status as string, changeStatus: r.change_status as string | null, lastSeen: (r.last_seen as number) ?? 0, paused: !!(r.paused || r.via_paused) } satisfies Holding & Record<string, unknown>));
+  }
+
+  /**
+   * Let go of tasks whose agents stopped calling. Agents die without saying so;
+   * without this their tasks stay held forever and nobody else can find them.
+   * The work stays: the workspace, intents and any change pass to whoever claims it next.
+   * Returns when the next one comes due.
+   */
+  private releaseQuietTasks(): number | null {
+    const now = Date.now();
+    const held = this.holdings();
+    for (const h of held) {
+      const status = releaseNow(h, now);
+      if (!status) continue;
+      this.sql.exec("UPDATE tasks SET assignee = NULL, status = ?, updated_at = ? WHERE id = ? AND assignee = ?", status, now, h.id, h.agent);
+      const quiet = since(now - h.lastSeen);
+      this.emit("task.released", { task: h.id, to: h.agent, data: { expired: true, from: h.agent, fromName: h.name, quietMs: now - h.lastSeen, status,
+        reason: `${h.name} hasn't been seen for ${quiet}; the task is free for another agent to claim${status === "open" ? "" : " and take its change over"}` } });
+    }
+    return nextRelease(held.filter((h) => !releaseNow(h, now)), now);
+  }
+
   private sweepAgentReviews(): number | null {
     const now = Date.now();
     for (const c of this.agentReviewQueue().filter((c) => c.due <= now)) {
