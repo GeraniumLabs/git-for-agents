@@ -1460,14 +1460,16 @@ test("per-agent limits: paths, changes a day and check minutes, from the agent, 
   await assert.rejects(ada.submit(t2.id, t2.title, "Two", {}), /may open 1 change a day/);
 
   // Project defaults apply to agents without their own; a join code's limits beat the defaults.
-  await admin.req("POST", "/agent-limits", { limits: { changesPerDay: 5, checkMinutesPerDay: 0 } });
+  await admin.req("POST", "/agent-limits", { limits: { changesPerDay: 5, checkMinutesPerDay: 3 } });
   const bob = await admin.addAgent("bob", "builder");
-  assert.deepEqual((await admin.req("GET", `/agents/${bob.id}/limits`)).effective, { changesPerDay: 5, checkMinutesPerDay: 0 });
+  assert.deepEqual((await admin.req("GET", `/agents/${bob.id}/limits`)).effective, { changesPerDay: 5, checkMinutesPerDay: 3 });
   const jc = await admin.req("POST", "/join-codes", { role: "builder", maxUses: 1, expiresInHours: 1, limits: { paths: ["docs/"] } });
   const joined = await (await fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: jc.code, name: "outsider" }) })).json();
-  assert.deepEqual((await admin.req("GET", `/agents/${joined.id}/limits`)).effective, { paths: ["docs/"], changesPerDay: 5, checkMinutesPerDay: 0 });
+  assert.deepEqual((await admin.req("GET", `/agents/${joined.id}/limits`)).effective, { paths: ["docs/"], changesPerDay: 5, checkMinutesPerDay: 3 });
   // Clearing an agent's own limits falls back to the defaults.
-  assert.deepEqual((await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: null })).effective, { changesPerDay: 5, checkMinutesPerDay: 0 });
+  assert.deepEqual((await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: null })).effective, { changesPerDay: 5, checkMinutesPerDay: 3 });
+  // 0 is no limit, and beats the default instead of falling back to it.
+  assert.deepEqual((await admin.req("POST", `/agents/${bob.id}/limits`, { limits: { checkMinutesPerDay: 0 } })).effective, { changesPerDay: 5 });
   await assert.rejects(admin.req("POST", "/agent-limits", { limits: { paths: "src" } }), /list of path patterns/);
   await assert.rejects(admin.req("POST", "/agent-limits", { limits: { speed: 3 } }), /unknown limit/);
 });
@@ -1627,6 +1629,20 @@ test("when changes by different agents keep failing the checks, Loom bisects mai
   assert.ok(b, "a bisect started");
   assert.equal(b.auto, true);
   assert.equal(b.culprit?.id, bad, JSON.stringify(b));
+  // It also opened the revert, which waits for a person even though the project needs no approvals.
+  let rid: number | undefined;
+  for (let i = 0; i < 40 && !rid; i++) { rid = (await admin.req("GET", "/bisects")).bisects[0].culprit?.revertedBy ?? undefined; if (!rid) await sleep(250); }
+  assert.ok(rid, "an automatic bisect opens the revert");
+  await sleep(1000);
+  assert.equal((await admin.change(rid!)).status, "review", "Loom's own revert doesn't land without a person");
+  await bob.review(rid!, "approve", "looks right");
+  assert.equal((await admin.change(rid!)).status, "review", "an agent's approval isn't enough");
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const jo = admin.as((await admin.req("POST", "/agents", { name: "jo", role: "human" })).key);
+  await jo.review(rid!, "approve", "yes, take it out");
+  let st = "";
+  for (let i = 0; i < 60 && st !== "merged"; i++) { await sleep(250); st = (await admin.change(rid!)).status; }
+  assert.equal(st, "merged", "a person's approval lands it");
 });
 
 test("ask Loom about a change or an incident, cited to trace steps; the incident view and the factory report", { skip: !url, timeout: 180_000 }, async () => {
@@ -1687,6 +1703,11 @@ test("ask Loom about a change or an incident, cited to trace steps; the incident
   assert.ok(rep.findings.some((f: any) => f.kind === "thrash" && /b\.txt 7 times/.test(f.title)), JSON.stringify(rep.findings));
   assert.equal(rep.models.find((m: any) => m.model === "claude-test")?.landed, 3);
   assert.equal((await fetch(`${base}/report`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+  // A person can ask for a short summary at the top, cited to the report's own findings and rows.
+  assert.equal(rep.summary, undefined, "no model call unless asked");
+  const summed = await admin.req("GET", "/report?days=7&summary=1");
+  assert.ok(summed.summary?.text, JSON.stringify(summed.summary));
+  assert.ok(summed.summary.citations.every((c: any) => /^[SFMA]\d+$/.test(c.ref)), JSON.stringify(summed.summary.citations));
 
   // Scorecards: per model and agent, with the revert counted once the revert lands.
   const rev = await admin.req("POST", `/changes/${b.id}/revert`, {});
@@ -1699,6 +1720,34 @@ test("ask Loom about a change or an incident, cited to trace steps; the incident
   const adaCard = sc.agents.find((x: any) => x.name === "ada");
   assert.equal(adaCard.landed, 3);
   assert.equal((await admin.req("GET", "/scorecards?agent=ada")).agents.length, 1);
+});
+
+test("with no agent around to score a review eval, Loom's review agent scores it", { skip: !url, timeout: 90_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-agenteval");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "evals without runners", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { reviewAgent: { afterMinutes: 0 } });
+  await admin.req("POST", "/evals", { name: "Done", rubric: "1 if the work is finished; 0 if it leaves TODOs.", blocking: true, threshold: 0.5 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const submit = async (file: string, text: string) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: text }, file);
+    return (await ada.submit(t.id, t.title, file, {})).id as number;
+  };
+  const scored = async (id: number) => {
+    let e: any;
+    for (let i = 0; i < 60 && e?.status !== "done"; i++) { await sleep(250); e = (await admin.change(id)).evals.find((x: any) => x.eval === "Done"); }
+    return e;
+  };
+  const good = await scored(await submit("ok.txt", "finished\n"));
+  assert.equal(good.score, 0.9, JSON.stringify(good));
+  assert.match(good.notes, /Loom's review agent/);
+  const id = await submit("todo.txt", "TODO: finish\n");
+  const bad = await scored(id);
+  assert.equal(bad.score, 0.2);
+  assert.equal((await admin.change(id)).status, "changes_requested", "a blocking eval under its threshold sends it back, whoever scored it");
 });
 
 test("evals score every version of a change: command evals in the check container, review evals by an agent off the work list", { skip: !url, timeout: 180_000 }, async () => {
@@ -1802,6 +1851,10 @@ test("a preview link per change: static files or a build's output, sandboxed, be
   assert.equal(page.status, 200, "a private project's preview opens with the link alone");
   assert.match(await page.text(), /Hello v1/);
   assert.match(page.headers.get("content-security-policy") ?? "", /^sandbox/);
+  // Unlisted: search engines don't keep it, and its tokened link doesn't leak as a referrer.
+  assert.match(page.headers.get("x-robots-tag") ?? "", /noindex.*nofollow/);
+  assert.equal(page.headers.get("referrer-policy"), "no-referrer");
+  assert.match((await fetch(pv.url.replace(/\/[0-9a-f]{20}\//, "/00000000000000000000/"))).headers.get("x-robots-tag") ?? "", /noindex/, "a wrong link is unlisted too");
   assert.match((await fetch(`${pv.url}app.js`)).headers.get("content-type") ?? "", /javascript/);
   assert.equal((await fetch(`${pv.url}README.md`)).status, 404, "only the preview folder is served");
   assert.match(await (await fetch(`${pv.url}some/route`)).text(), /Hello v1/, "unknown routes get the app's index.html");

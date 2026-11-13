@@ -196,3 +196,81 @@ export function factoryReport(from: number, to: number, traces: ReportTrace[], c
     agents: rows((x) => [x.agent]).map((r) => ({ ...r, agent: r.model, model: changes.find((c) => c.agent === r.model)?.agentName ?? traces.find((t) => t.agent === r.model)?.agentName ?? r.model })),
   };
 }
+
+// ── the report's summary: a few sentences a person reads first ───────────
+
+export const SUMMARY_QUESTION = "In two or three sentences, what happened this period and the one thing the team should change first? Cite the findings and rows you rely on.";
+
+/** The report as sources for its summary: each finding (F1…), model row (M1…) and agent row (A1…). */
+export function reportSources(r: Report): Source[] {
+  const row = (m: ModelRow) => `${m.sessions} sessions, ${m.tokens} tokens, ${m.changes} changes, ${m.landed} landed, ${m.reworkRounds} rework rounds, ${m.checksFailed} failed checks, ${m.reverted} reverted${m.tokensPerLanded != null ? `, ${m.tokensPerLanded} tokens per landed change` : ""}`;
+  return [
+    { ref: "S1", text: `Totals: ${r.sessions} sessions, ${r.changes} changes, ${r.landed} landed.` },
+    ...r.findings.map((f, i) => ({ ref: `F${i + 1}`, text: `Finding (${f.kind}): ${f.title}. ${f.detail} Suggested: ${f.suggest}` })),
+    ...r.models.map((m, i) => ({ ref: `M${i + 1}`, text: `Model ${m.model}: ${row(m)}` })),
+    ...r.agents.map((m, i) => ({ ref: `A${i + 1}`, text: `Agent ${m.model}: ${row(m)}` })),
+  ];
+}
+
+// ── scoring a review eval when no agent is around to ─────────────────────
+
+const EVAL_SYSTEM = `You score one change to a software project against a rubric, as a careful reviewer would.
+You get the rubric, the change's title and summary, and its diff. Score from 0 (fails the rubric) to 1 (fully meets it). Judge only what the rubric asks.
+In notes, say in two or three sentences what in the change earned the score, naming files and lines.`;
+
+const EVAL_SCHEMA = {
+  type: "object",
+  properties: {
+    score: { type: "number", description: "From 0 to 1." },
+    notes: { type: "string", description: "What in the change earned the score." },
+  },
+  required: ["score", "notes"],
+  additionalProperties: false,
+} as const;
+
+export interface EvalInput { rubric: string; title: string; summary: string; patch: string }
+export type EvalScore = { ok: true; score: number; notes: string; model: string } | { ok: false; reason: string };
+
+export function evalPrompt(i: EvalInput, limit: number): string {
+  const patch = i.patch.length > limit ? `${i.patch.slice(0, limit)}\n… (diff cut at ${limit} characters)` : i.patch;
+  return `Rubric: ${i.rubric}\n\nChange: ${i.title}\n${i.summary}\n\nDiff:\n${patch}`;
+}
+
+export function parseScore(raw: unknown): { score: number; notes: string } | null {
+  const r = raw as { score?: unknown; notes?: unknown };
+  const score = Number(r?.score);
+  if (!r || !(score >= 0 && score <= 1) || typeof r.notes !== "string" || r.notes.trim().length < 5) return null;
+  return { score: Math.round(score * 100) / 100, notes: r.notes.trim().slice(0, 4000) };
+}
+
+export async function scoreWithModel(m: ReviewModel, i: EvalInput): Promise<EvalScore> {
+  const prompt = evalPrompt(i, SOURCE_LIMIT[m.kind]);
+  let raw: unknown, model: string;
+  try {
+    if (m.kind === "claude") {
+      model = "Claude";
+      const client = new Anthropic({ apiKey: m.apiKey, baseURL: m.baseURL });
+      const res = await client.beta.messages.create({
+        model: CLAUDE_REVIEW_MODEL, max_tokens: 2000, betas: ["server-side-fallback-2026-07-01"], fallbacks: "default",
+        output_config: { effort: "medium", format: { type: "json_schema", schema: EVAL_SCHEMA } },
+        system: EVAL_SYSTEM, messages: [{ role: "user", content: prompt }],
+      });
+      if (res.stop_reason === "refusal") return { ok: false, reason: "Claude declined to score it" };
+      const text = res.content.find((b) => b.type === "text");
+      if (!text || text.type !== "text") return { ok: false, reason: "Claude returned no score" };
+      raw = JSON.parse(text.text);
+    } else {
+      model = "Workers AI";
+      const out = await m.ai.run(WORKERS_AI_REVIEW_MODEL as any, {
+        messages: [{ role: "system", content: EVAL_SYSTEM }, { role: "user", content: prompt }],
+        response_format: { type: "json_schema", json_schema: EVAL_SCHEMA }, max_tokens: 1024,
+      } as any, m.gateway ? { gateway: { id: m.gateway, metadata: { loom: "eval" } } } : undefined) as { response?: unknown };
+      raw = typeof out?.response === "string" ? JSON.parse(out.response) : out?.response;
+    }
+  } catch (e: any) {
+    if (e instanceof SyntaxError) return { ok: false, reason: "the model's score wasn't valid JSON" };
+    return { ok: false, reason: `the model is unavailable (${String(e?.message ?? e).slice(0, 80)})` };
+  }
+  const parsed = parseScore(raw);
+  return parsed ? { ok: true, ...parsed, model } : { ok: false, reason: `${model} returned no usable score` };
+}

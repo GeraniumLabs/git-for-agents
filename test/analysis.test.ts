@@ -40,3 +40,12 @@ test("the factory report finds waste, repeated mistakes, skipped intents and thr
   assert.deepEqual([big.sessions, big.tokens, big.landed, big.reverted, big.reworkRounds, big.tokensPerLanded], [1, 1100, 1, 1, 2, 1100]);
   assert.equal(r.agents.find((a) => a.agent === "b")!.model, "bob");
 });
+
+test("a report's summary sources: totals, then each finding, model and agent row, numbered", async () => {
+  const { reportSources } = await import("../src/analysis.ts");
+  const row = { sessions: 2, tokens: 300, costUsd: null, changes: 2, landed: 1, reworkRounds: 1, checksFailed: 0, reverted: 0, tokensPerLanded: 300 };
+  const s = reportSources({ from: 0, to: 1, sessions: 2, changes: 2, landed: 1, findings: [{ kind: "thrash", title: "b.txt edited 7 times", detail: "d", suggest: "s", refs: [] }], models: [{ model: "m1", ...row }], agents: [{ model: "ada", agent: "a1", ...row }] });
+  assert.deepEqual(s.map((x) => x.ref), ["S1", "F1", "M1", "A1"]);
+  assert.match(s[1].text, /thrash.*b\.txt edited 7 times/);
+  assert.match(s[3].text, /^Agent ada: 2 sessions/);
+});

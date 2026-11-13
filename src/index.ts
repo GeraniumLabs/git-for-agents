@@ -55,6 +55,20 @@ function registry(env: Env) {
   return env.PROJECT.get(env.PROJECT.idFromName("__registry"));
 }
 
+/**
+ * A preview is unlisted: whoever has the link can open it, but search engines
+ * shouldn't keep it, and its link (which carries the token) shouldn't leak to
+ * the sites it links to. robots.txt doesn't block /preview/: a crawler that
+ * isn't allowed to fetch a page never sees its noindex, and can still list the
+ * bare link.
+ */
+function unlisted(res: Response): Response {
+  const r = new Response(res.body, res);
+  r.headers.set("x-robots-tag", "noindex, nofollow, noarchive, nosnippet");
+  r.headers.set("referrer-policy", "no-referrer");
+  return r;
+}
+
 /** Where each project's coordinator lives. A project never moves, so this isolate keeps what it learns. */
 const located = new Map<string, Jurisdiction | null>();
 
@@ -455,9 +469,9 @@ export default {
     // A change's preview: /preview/<project>/<change>/<token>/<path>. The token is the access; no sign-in.
     const pv = /^\/preview\/([a-z0-9][a-z0-9-]{1,40})\/(\d+)\/([0-9a-f]{20})(\/.*)?$/.exec(path);
     if (pv && req.method === "GET") {
-      if (!pv[4]) return Response.redirect(`${url.origin}${path}/`, 301);
-      if (!(await locate(env, pv[1])).exists) return new Response("no such preview", { status: 404 });
-      return (await coordinator(env, pv[1])).fetch(`https://do/preview-serve/${pv[2]}/${pv[3]}${pv[4]}`);
+      if (!pv[4]) return unlisted(Response.redirect(`${url.origin}${path}/`, 301));
+      if (!(await locate(env, pv[1])).exists) return unlisted(new Response("no such preview", { status: 404 }));
+      return unlisted(await (await coordinator(env, pv[1])).fetch(`https://do/preview-serve/${pv[2]}/${pv[3]}${pv[4]}`));
     }
     if (path === "/api/dev/artifacts-events" && req.method === "POST" && env.LOOM_DEV_LOGIN === "1") {
       for (const msg of await req.json<unknown[]>()) await deliverEvent(env, msg);

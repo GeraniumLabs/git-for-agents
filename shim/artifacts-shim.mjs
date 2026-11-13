@@ -268,6 +268,13 @@ async function reviewStandIn(req, res) {
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const prompt = String(body.messages?.[0]?.content ?? "");
+  if (body.output_config?.format?.schema?.properties?.score) {
+    // Scoring a review eval: a diff that adds a TODO scores low, anything else high.
+    const low = /^\+.*TODO/m.test(prompt);
+    const result = { score: low ? 0.2 : 0.9, notes: low ? "The diff adds a TODO, so the work isn't finished." : "The diff does what the rubric asks." };
+    return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "text", text: JSON.stringify(result) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
+  }
   if (body.output_config?.format?.schema?.properties?.answer) {
     // A question about what Loom holds: answer from the first trace step, else the first source.
     const refs = [...prompt.matchAll(/^\[([A-Z]\d+(?:\.\d+)?)\] (.*)$/gm)];

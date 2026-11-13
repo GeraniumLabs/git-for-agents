@@ -28,7 +28,7 @@ import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzi
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { MAX_FILE_BYTES, SKIP, buildMap, findSymbol, mapView, searchMap, type CodeMap } from "./codemap";
-import { ask, factoryReport, stepSources, type ReportChange, type ReportTrace, type Source } from "./analysis";
+import { ask, factoryReport, reportSources, scoreWithModel, stepSources, SUMMARY_QUESTION, type Report, type ReportChange, type ReportTrace, type Source } from "./analysis";
 import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
@@ -147,7 +147,11 @@ export function submitTrailers(message: string): { title: string; summary: strin
   return { title: title || "Change", summary, ...(approach ? { approach } : {}) };
 }
 
-/** What one agent (or every agent under one key) may do. A missing field is no limit. */
+/**
+ * What one agent (or every agent under one key) may do. A missing field is no
+ * limit there, and falls back to the next layer; 0 is no limit, and stops
+ * there (an owner's way to exempt one agent from the project's default).
+ */
 export interface AgentLimits {
   /** Path patterns it may write, declare intents on and change; empty or missing is everywhere. */
   paths?: string[];
@@ -1070,7 +1074,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Asking Loom about what it holds, the incident view and the factory report: people only, like traces.
     if (a === "ask" && m === "POST") { this.assertCanReadTraces(actor); return json(await this.askLoom(actor, body)); }
     if (a === "incident" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.incident(url.searchParams)); }
-    if (a === "report" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.weeklyReport(Number(url.searchParams.get("days") ?? 7))); }
+    if (a === "report" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.reportView(actor, Number(url.searchParams.get("days") ?? 7), url.searchParams.get("summary") === "1")); }
     if (a === "scorecards" && m === "GET") { this.assertCanReadTraces(actor); return json(this.scorecards(Number(url.searchParams.get("days") ?? 30), url.searchParams.get("agent"))); }
     if (a === "reports" && m === "GET") { this.assertCanReadTraces(actor); return json(await this.savedReports(b)); }
     // Opt-in trace uploads: a person's key for the hook on their own machine.
@@ -1815,7 +1819,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (existing) return this.updateChange(actor, existing.id as number, body);
     this.assertChangeQuota(actor);
 
-    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) ? "review" : "queued";
+    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) || this.meta(`person_approves:t${body.taskId}`) === "1" ? "review" : "queued";
     const row = this.sql
       .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, symbols, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
@@ -1855,7 +1859,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.emit("change.out_of_scope", { change: id, task: ch.task_id, to: ch.agent_id, data: { files: outside.slice(0, 20), allowed: this.limitsOf(actor).paths, advice: `Your push changes files outside the paths ${actor.name} may change (${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ", …" : ""}). Revert those files and push again, or ask an owner to widen your scope.` } });
       return { ...this.change(id), outOfScope: outside };
     }
-    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) ? "review" : "queued";
+    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) || this.personApproves(id) ? "review" : "queued";
     this.adoptIntents(ch.task_id, ch.agent_id, analysis.files);
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
@@ -2176,7 +2180,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const next = now.status === "queued" || now.status === "merging" ? "In the merge queue; it lands on its own."
       : now.status === "changes_requested" ? "Sent back to the author."
       : this.openContest(now.task_id) ? "An attempt in an open contest: it lands only if it wins (compare_attempts, then vote)."
-      : approval.humanNeeded ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).`
+      : approval.humanNeeded ? (approval.guarded.length ? `Waiting for a person to approve: it touches protected paths (${approval.guarded.join(", ")}).` : "Waiting for a person to approve: Loom opened this revert by itself after a bisect.")
       : approval.reviewing.length && approval.weight >= approval.needed ? `Approved; it merges once ${approval.reviewing.join(", ")} finish${approval.reviewing.length === 1 ? "es" : ""} reviewing (or their time runs out).`
       : approval.openThreads && approval.weight >= approval.needed ? `Approved, but ${approval.openThreads} review thread${approval.openThreads === 1 ? "" : "s"} must be resolved before it merges.`
       : `Waiting for more approval: ${approval.weight} of ${approval.needed} needed.`;
@@ -2233,7 +2237,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const weight = Math.round(approvers.reduce((sum, a) => sum + a.weight, 0) * 100) / 100;
     const needed = this.requiredApprovals;
     const guarded = this.guardedFiles(ch.files);
-    const humanNeeded = guarded.length > 0 && !approvers.some((a) => a.human);
+    const humanNeeded = (guarded.length > 0 || this.personApproves(id)) && !approvers.some((a) => a.human);
     const openThreads = this.threadsMustResolve ? this.openBlockingThreads(id) : 0;
     // An agent that said it's reviewing gets to finish (until its deadline):
     // in gemma-4-kaggle a change merged a second after its first approval
@@ -2444,7 +2448,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   async alarm() {
-    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity, this.releaseQuietTasks() ?? Infinity);
+    const nextDeadline = Math.min(this.sweepReviewRequests() ?? Infinity, this.sweepQuestions() ?? Infinity, this.sweepAgentReviews() ?? Infinity, this.sweepAgentEvals() ?? Infinity, this.releaseQuietTasks() ?? Infinity);
     if (nextDeadline < Infinity) await this.ctx.storage.setAlarm(Math.max(nextDeadline, Date.now() + 1000));
     await this.sweepWorkspaces();
     await this.maybeWeeklyReport().catch((e) => console.error("weekly report", e));
@@ -2477,7 +2481,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const deadline = this.sql.exec("SELECT MIN(deadline) AS t FROM review_requests WHERE status IN ('open','accepted') AND deadline IS NOT NULL").one().t as number | null;
     const done = this.sql.exec("SELECT MIN(done_at) AS t FROM workspaces WHERE status IN ('merged','closed') AND done_at IS NOT NULL").one().t as number | null;
     const asked = this.sql.exec("SELECT MIN(deadline) AS t FROM threads WHERE kind = 'question' AND status = 'open' AND deadline IS NOT NULL").one().t as number | null;
-    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, this.agentReviewDue() ?? Infinity, nextRelease(this.holdings(), Date.now()) ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
+    const next = Math.min(retry ?? Infinity, deadline ?? Infinity, asked ?? Infinity, this.agentReviewDue() ?? Infinity, this.agentEvalDue() ?? Infinity, nextRelease(this.holdings(), Date.now()) ?? Infinity, done != null ? done + WORKSPACE_GRACE_MS : Infinity);
     if (next < Infinity) await this.ctx.storage.setAlarm(Math.max(next, Date.now() + 100));
   }
 
@@ -2854,17 +2858,40 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { days, ...factoryReport(from, to, traces, changes, failures) };
   }
 
+  /** A few sentences at the top of a report, from its own findings and rows. One model call; null when no model or nothing to say. */
+  private async summarizeReport(r: Report): Promise<{ text: string; citations: { ref: string; text: string }[]; model: string } | null> {
+    if (!r.sessions && !r.changes) return null;
+    const model = await this.reviewModel();
+    if (!model) return null;
+    const a = await ask(model, SUMMARY_QUESTION, `the factory report for ${this.project}`, reportSources(r));
+    return a.ok ? { text: a.answer, citations: a.citations, model: a.model } : null;
+  }
+
+  /** The report on demand; with summary, a person can ask for its summary, counted as a question. */
+  private async reportView(actor: Agent, days: number, summary: boolean) {
+    const r = await this.weeklyReport(days);
+    if (!summary) return r;
+    if (actor.role !== "human" && actor.id !== "admin") throw new HttpError(403, "a report's summary is for the project's people");
+    const day = new Date().toISOString().slice(0, 10);
+    const asked = Number(this.meta(`asks:${day}`) ?? 0);
+    if (asked >= ASKS_PER_DAY) throw new HttpError(429, `this project has asked ${ASKS_PER_DAY} questions today; ask again tomorrow (UTC)`);
+    if (!(await this.reviewModel())) throw new HttpError(503, "no model connected: an owner adds an Anthropic key in Settings");
+    this.setMeta(`asks:${day}`, String(asked + 1));
+    return { ...r, summary: await this.summarizeReport(r) };
+  }
+
   /** Once a week, while the project is active, the report is saved and announced. */
   private async maybeWeeklyReport() {
     const last = Number(this.meta("report_at") ?? 0);
     if (Date.now() - last < WEEK_MS) return;
     if (!last) { this.setMeta("report_at", String(Date.now())); return; } // the first report covers a whole week
     this.setMeta("report_at", String(Date.now()));
-    const r = await this.weeklyReport(7);
-    if (!r.sessions && !r.changes) return;
+    const report = await this.weeklyReport(7);
+    if (!report.sessions && !report.changes) return;
+    const r = { ...report, summary: await this.summarizeReport(report).catch(() => null) };
     const day = new Date().toISOString().slice(0, 10);
     await this.context.put(`${this.project}/reports/${day}.json`, JSON.stringify(r), { httpMetadata: { contentType: "application/json" } });
-    this.emit("report.weekly", { data: { date: day, sessions: r.sessions, changes: r.changes, landed: r.landed, findings: r.findings.slice(0, 5).map((f) => f.title) } });
+    this.emit("report.weekly", { data: { date: day, sessions: r.sessions, changes: r.changes, landed: r.landed, summary: r.summary?.text ?? null, findings: r.findings.slice(0, 5).map((f) => f.title) } });
   }
 
   private async savedReports(date?: string) {
@@ -2973,6 +3000,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const ch = this.change(id);
     this.sql.exec("UPDATE eval_runs SET status = 'stale' WHERE change_id = ? AND head != ? AND status IN ('pending','taken')", id, ch.head);
     for (const e of evals) this.sql.exec("INSERT OR IGNORE INTO eval_runs (eval, change_id, head, created_at) VALUES (?, ?, ?, ?)", e.name, id, ch.head, Date.now());
+    if (evals.some((e) => e.kind === "review") && this.reviewAgent.enabled) void this.armAlarm(Date.now() + this.reviewAgent.afterMinutes * 60_000 + 1000);
     if (evals.some((e) => e.kind === "review")) this.emit("eval.requested", { change: id, task: ch.task_id, data: { title: ch.title, evals: evals.filter((e) => e.kind === "review").map((e) => e.name), advice: "take_eval, read the change against the rubric, then score_eval" } });
     if (evals.some((e) => e.kind === "command")) {
       this.evalChain = this.evalChain.then(() => this.runCommandEvals(id, ch.head as string)).catch((e) => console.error("evals", e));
@@ -3209,7 +3237,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       headers: {
         "content-type": obj.httpMetadata?.contentType ?? "application/octet-stream",
         "content-security-policy": "sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads",
-        "x-robots-tag": "noindex", "cache-control": "private, max-age=30", "x-content-type-options": "nosniff",
+        "x-robots-tag": "noindex, nofollow, noarchive, nosnippet", "referrer-policy": "no-referrer", "cache-control": "private, max-age=30", "x-content-type-options": "nosniff",
       },
     });
   }
@@ -3250,7 +3278,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * through the merge queue like anything else, so the checks still run. A
    * person's revert goes straight to the queue; an agent's needs review.
    */
-  private async revertChange(actor: Agent, id: number, body: { reason?: string }) {
+  /** A change only a person can approve, whatever the approval count: a revert Loom opened by itself. */
+  private personApproves(id: number): boolean {
+    const task = this.sql.exec("SELECT task_id FROM changes WHERE id = ?", id).toArray()[0]?.task_id;
+    return task != null && this.meta(`person_approves:t${task}`) === "1";
+  }
+
+  /** hold: a revert Loom opens by itself, which waits for a person's approval instead of going straight to the queue. */
+  private async revertChange(actor: Agent, id: number, body: { reason?: string }, hold = false) {
     const ch = this.change(id);
     if (ch.status !== "merged" || !ch.merged_commit) throw new HttpError(409, `change ${id} hasn't landed (${ch.status}); close it instead`);
     const open = this.sql.exec("SELECT t.id, c.id AS change FROM tasks t LEFT JOIN changes c ON c.task_id = t.id AND c.status NOT IN ('abandoned','closed') WHERE t.reverts = ? AND t.status NOT IN ('closed','abandoned')", id).toArray()[0];
@@ -3281,12 +3316,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
     await w.push(remote, commit);
     const files = await w.changes(head, commit);
     this.sql.exec("INSERT INTO intents (task_id, agent_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?)", taskId, actor.id, JSON.stringify(files.map((f) => f.path)), `Revert change #${id}`, Date.now());
+    // Marked before submitting, so a project that needs no approvals doesn't queue it on the spot.
+    if (hold) this.setMeta(`person_approves:t${taskId}`, "1");
     const submitted = await this.submitChange(actor, { taskId, title: `Revert #${id}: ${ch.title}`, summary: `Reverts change #${id}, "${ch.title}", by ${this.agentName(ch.agent_id)}.${reason ? ` ${reason}` : ""}`, context: { revertOf: id, reason: reason || undefined } });
     const rid = (submitted as any).id as number;
-    const byPerson = actor.role === "human" || actor.id === "admin";
+    const byPerson = !hold && (actor.role === "human" || actor.id === "admin");
+    if (hold) {
+      this.emit("approval.needs_human", { change: rid, task: taskId, data: { paths: [], reason: `Loom found that change #${id} broke the checks and opened this revert; a person decides whether it lands` } });
+    }
     if (byPerson && this.change(rid).status === "review") await this.enqueue(rid);
-    this.emit("change.reverting", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { revert: rid, title: ch.title, reason, queued: byPerson } });
-    return { ...this.change(rid), reverts: id, note: byPerson ? "A person asked for it, so it goes straight to the merge queue; the checks still run." : "It needs review like any change: request_review." };
+    this.emit("change.reverting", { actor: actor.id, change: id, task: ch.task_id, to: ch.agent_id, data: { revert: rid, title: ch.title, reason, queued: byPerson, auto: hold } });
+    return { ...this.change(rid), reverts: id, note: hold ? "Loom opened it by itself, so it waits for a person to approve." : byPerson ? "A person asked for it, so it goes straight to the merge queue; the checks still run." : "It needs review like any change: request_review." };
   }
 
   /** The landed history of main, oldest first: one entry per commit that moved it. */
@@ -3344,13 +3384,20 @@ export class ProjectCoordinator extends DurableObject<Env> {
       results.set(i, r.ok);
       return r.ok;
     };
-    const finish = (verdict: string, culprit: number | null) => {
+    const finish = async (verdict: string, culprit: number | null) => {
       this.sql.exec("UPDATE bisects SET status = 'done', verdict = ?, culprit = ?, done_at = ? WHERE id = ?", verdict, culprit, Date.now(), id);
+      // An automatic bisect also opens the revert, for a person to approve. A failed revert (say, later changes touched the same lines) leaves the finding.
+      let revert: number | null = null;
+      const auto = !!this.sql.exec("SELECT auto FROM bisects WHERE id = ?", id).one().auto;
+      if (auto && culprit && !this.revertOf(culprit)) {
+        try { revert = ((await this.revertChange(actor, culprit, { reason: `Auto-bisect #${id}: ${verdict}.` }, true)) as any).id; }
+        catch (e: any) { this.sql.exec("UPDATE bisects SET error = ? WHERE id = ?", `couldn't open the revert: ${String(e?.message ?? e).slice(0, 500)}`, id); }
+      }
       const ch = culprit ? this.change(culprit) : null;
       this.emit("bisect.done", {
         actor: actor.id, change: culprit ?? undefined, task: ch?.task_id, to: ch?.agent_id,
-        data: { bisect: id, verdict, culprit, title: ch?.title, author: ch ? this.agentName(ch.agent_id) : undefined, runs: steps.length,
-          advice: ch ? `Change #${culprit} is where \`${command ?? this.checks!.command}\` started failing. Fix it with a new task, or revert_change #${culprit}.` : undefined },
+        data: { bisect: id, verdict, culprit, title: ch?.title, author: ch ? this.agentName(ch.agent_id) : undefined, runs: steps.length, revert,
+          advice: ch ? `Change #${culprit} is where \`${command ?? this.checks!.command}\` started failing. ${revert ? `Loom opened revert #${revert}; a person approves it, or fix it with a new task first.` : `Fix it with a new task, or revert_change #${culprit}.`}` : undefined },
       });
     };
     let bad = points.length - 1;
@@ -4244,6 +4291,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const layers = [row.limits, key?.limits, code?.limits].map((l) => (l ? JSON.parse(l as string) : {})) as AgentLimits[];
     const out: AgentLimits = {};
     for (const l of [...layers, this.defaultLimits ?? {}]) for (const k of Object.keys(l) as (keyof AgentLimits)[]) if (out[k] === undefined && l[k] !== undefined) (out as any)[k] = l[k];
+    // 0 reads as "no limit": nobody means an agent that can never open a change or run a check.
+    if (out.changesPerDay === 0) delete out.changesPerDay;
+    if (out.checkMinutesPerDay === 0) delete out.checkMinutesPerDay;
     return out;
   }
 
@@ -4989,7 +5039,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const c of this.sql.exec("SELECT id, title, agent_id, files, updated_at FROM changes WHERE status = 'review'").toArray()) {
       if (!asked.has(c.id)) continue;
       const files = (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path);
-      if (!this.guardedFiles(files.map((path) => ({ path } as FileChange))).length) continue;
+      if (!this.guardedFiles(files.map((path) => ({ path } as FileChange))).length && !this.personApproves(c.id as number)) continue;
       const why = this.sql.exec("SELECT data FROM events WHERE type = 'delegate.escalated' AND change_id = ? ORDER BY seq DESC LIMIT 1", c.id).toArray()[0];
       items.push({ kind: "approval", change: c.id, title: c.title, agent: c.agent_id, files, escalated: why ? JSON.parse(why.data as string).reason : null, since: c.updated_at });
     }
@@ -5423,6 +5473,46 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.ctx.waitUntil(this.runAgentReview(c.id, c.head).catch((e) => this.emit("review.agent_failed", { change: c.id, data: { reason: String(e?.message ?? e).slice(0, 200) } })));
     }
     return this.agentReviewDue();
+  }
+
+  /**
+   * Review evals nobody took in the review agent's wait: Loom's review agent
+   * scores them, so a project without runners still gets its scores. Returns
+   * when the next one comes due.
+   */
+  private sweepAgentEvals(): number | null {
+    if (!this.reviewAgent.enabled) return null;
+    const after = this.reviewAgent.afterMinutes * 60_000, now = Date.now();
+    const waiting = this.sql.exec(`SELECT r.id, r.eval, r.change_id, r.head, r.created_at FROM eval_runs r JOIN evals e ON e.name = r.eval JOIN changes c ON c.id = r.change_id
+      WHERE e.kind = 'review' AND r.status = 'pending' AND c.head = r.head AND c.status NOT IN ('merged','closed','abandoned')`).toArray() as any[];
+    for (const r of waiting.filter((r) => r.created_at + after <= now)) {
+      if (this.meta(`agent_eval:${r.id}`)) continue; // one try each; a failure shows in the eval's notes
+      this.setMeta(`agent_eval:${r.id}`, "1");
+      this.ctx.waitUntil(this.runAgentEval(r.id, r.eval, r.change_id, r.head).catch((e) => this.emit("eval.failed_to_run", { change: r.change_id, data: { eval: r.eval, error: String(e?.message ?? e).slice(0, 300) } })));
+    }
+    return this.agentEvalDue();
+  }
+
+  /** When the next review eval comes due for Loom's review agent. */
+  private agentEvalDue(): number | null {
+    if (!this.reviewAgent.enabled) return null;
+    const t = this.sql.exec(`SELECT MIN(r.created_at) AS t FROM eval_runs r JOIN evals e ON e.name = r.eval WHERE e.kind = 'review' AND r.status = 'pending' AND r.created_at > ?`, Date.now() - this.reviewAgent.afterMinutes * 60_000).one().t as number | null;
+    return t == null ? null : t + this.reviewAgent.afterMinutes * 60_000;
+  }
+
+  private async runAgentEval(runId: number, name: string, id: number, head: string) {
+    const model = await this.reviewModel();
+    if (!model) return this.emit("eval.failed_to_run", { change: id, data: { eval: name, error: "no model connected: set an Anthropic key in Settings, or bind Workers AI" } });
+    const e = this.evalRow(name);
+    const ch = this.change(id);
+    const patch = (await (await this.context.get(`${this.project}/changes/${id}/patch.diff`))?.text()) ?? "";
+    const r = await scoreWithModel(model, { rubric: String(e.rubric ?? ""), title: ch.title as string, summary: String(ch.summary ?? ""), patch });
+    const row = this.sql.exec("SELECT status FROM eval_runs WHERE id = ?", runId).toArray()[0];
+    if (this.change(id).head !== head || row?.status !== "pending") return; // moved on, or an agent scored it meanwhile
+    if (!r.ok) return this.emit("eval.failed_to_run", { change: id, data: { eval: name, error: r.reason } });
+    const notes = `${r.notes}\n\n(Loom's review agent, ${r.model}. No agent took this eval in time.)`;
+    this.sql.exec("UPDATE eval_runs SET status = 'done', score = ?, notes = ?, by = ?, done_at = ? WHERE id = ?", r.score, notes, REVIEW_AGENT_ID, Date.now(), runId);
+    this.evalScored(id, name, r.score, notes, REVIEW_AGENT_ID);
   }
 
   private get aiGateway() {
