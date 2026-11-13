@@ -662,7 +662,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -1977,6 +1977,7 @@ function describe(e) {
     case "task.created": return ["", `${who} created task #${e.task_id} “${esc(d.title)}”`];
     case "task.claimed": return ["", `${who} ${d.resumed ? "took over" : "claimed"} task #${e.task_id} in workspace <span class="mono">${esc(d.workspace)}</span>`];
     case "task.reassigned": return ["stale", `Task #${e.task_id} reassigned: ${esc(d.reason)}`];
+    case "task.deleted": return ["stale", `${who} deleted task #${e.task_id} “${esc(d.title)}”${d.changes?.length ? ` and its ${d.changes.length === 1 ? "change" : "changes"}` : ""}`];
     case "task.released": return ["stale", d.expired ? `Task #${e.task_id} freed: ${esc(d.reason)}` : `Task #${e.task_id} released${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "intent.declared": return ["", `${who} intends to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>${d.description ? `: ${esc(d.description)}` : ""}`];
     case "collision.forecast": return ["collision", `Collision forecast: ${who} and ${to} both plan to touch <span class="mono">${d.paths.map(esc).join(", ")}</span>. Both notified before any code was written.`];
@@ -2524,7 +2525,7 @@ async function loadTask(id) {
       <h1>${esc(t.title)} <span class="meta">task #${t.id}</span> ${taskStatus(t.status)}</h1>
       <div class="meta">${t.assignee ? t.status === "open" ? `Assigned to ${who(t.assignee)}, not taken yet` : `Held by ${who(t.assignee)}` : "Nobody holds it"} · created ${t.created_by ? `by ${who(t.created_by)} ` : ""}${ago(t.created_at)} ago · updated ${ago(t.updated_at)} ago${(() => { const m = (t.source ?? "").match(/^github:([^#]+)#(\d+)$/); return m ? ` · from <a href="https://github.com/${esc(m[1])}/issues/${m[2]}" target="_blank" rel="noopener">${esc(m[1])}#${m[2]}</a>` : ""; })()}</div>
       ${t.description ? `<p class="rv-summary">${esc(t.description)}</p>` : ""}
-      <div class="row">${isHuman() && !t.attempts && !["merged", "closed"].includes(t.status) ? `<button class="ghost mini" id="task-assign">${t.assignee ? "Reassign…" : "Assign…"}</button>` : ""}${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}</div>
+      <div class="row">${isHuman() && !t.attempts && !["merged", "closed"].includes(t.status) ? `<button class="ghost mini" id="task-assign">${t.assignee ? "Reassign…" : "Assign…"}</button>` : ""}${t.attempts ? `<a class="button ghost mini" href="#contest/${t.id}">Compare the ${t.attempts} attempts</a>` : ""}${v.parent ? `<span class="meta">Attempt in ${v.parent.attempts ? `<a href="#contest/${v.parent.id}">contest #${v.parent.id}</a>` : taskLink(v.parent)}</span>` : ""}${isOwner() && !t.attempt && t.status !== "merged" && !v.changes.some((c) => c.status === "merged") ? `<button class="ghost mini bad-text" id="task-delete">Delete…</button>` : ""}</div>
     </div>
     <div class="task-page">
       <div class="task-main">
@@ -2548,6 +2549,19 @@ async function loadTask(id) {
     if (to === null) return;
     try { await act("POST", `/tasks/${t.id}/assign`, { agent: to.trim() || null }); } catch { return; }
     loadTask(t.id);
+  };
+  if ($("#task-delete")) $("#task-delete").onclick = async () => {
+    const open = v.changes.filter((c) => !["merged", "abandoned"].includes(c.status));
+    const lines = [
+      t.attempts ? `All ${t.attempts} attempts in this contest go with it.` : "",
+      t.assignee && t.status !== "open" ? `${name(t.assignee)} holds it and will be told to stop.` : "",
+      open.length ? `Its ${open.length === 1 ? "change" : "changes"} (${open.map((c) => `#${c.id}`).join(", ")}), with reviews and conversations, will be deleted, and the workspace closed.` : "",
+      v.attachments?.length ? `${plural(v.attachments.length, ["attachment", "attachments"])} will be deleted.` : "",
+      "Notes and decisions made along the way stay. This can't be undone.",
+    ].filter(Boolean).join(" ");
+    if (!(await ask({ title: `Delete task #${t.id}?`, body: lines, ok: "Delete task", danger: true }))) return;
+    try { await act("DELETE", `/tasks/${t.id}`); } catch { return; }
+    location.hash = "";
   };
 }
 

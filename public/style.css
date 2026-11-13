@@ -98,6 +98,7 @@ pre.diff { background: var(--code); border: 1px solid var(--line); border-radius
 button { background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: var(--fs-13); }
 button.ghost { background: var(--chip); color: var(--ink); border-color: var(--line); }
 button.bad { background: var(--bad); border-color: var(--bad); }
+button.ghost.bad-text { color: var(--bad); }
 button.mini, select.mini { padding: 2px 8px; font-size: var(--fs-11_5); margin-top: 4px; }
 input, textarea { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; font-size: var(--fs-13); min-width: 0; }
 textarea { width: 100%; }
