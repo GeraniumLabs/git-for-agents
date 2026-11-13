@@ -2,8 +2,8 @@
 // A stand-in key signs in as the person, but only reaches the routes its
 // scopes allow; it never reaches settings, members, keys or join codes. With
 // no scopes it can only watch: read what needs the person and tell them.
-// Loom doesn't send to Slack, email or WhatsApp itself. The person's agent
-// already has those channels; Loom gives it a feed and, optionally, a webhook.
+// Mergery doesn't send to Slack, email or WhatsApp itself. The person's agent
+// already has those channels; Mergery gives it a feed and, optionally, a webhook.
 
 export const SCOPES = {
   answer: "Answer agents' questions and post in threads",
@@ -90,19 +90,19 @@ export function validWebhook(u: unknown): string | null {
   return url.toString();
 }
 
-/** The admin-agent skill: what a person's own agent needs to watch Loom and act for them. */
+/** The admin-agent skill: what a person's own agent needs to watch Mergery and act for them. */
 export function standinSkill(origin: string, project: string, who: string | null, scopes: Scope[] | null): string {
   const api = `${origin}/api/projects/${project}`;
   const keyFile = `~/.config/loom/${project}.standin.key`;
-  const can = scopes ? (scopes.length ? scopes.map((s) => `- **${s}**: ${SCOPES[s]}`).join("\n") : "- Nothing beyond watching: you tell the person, and they act in Loom.") : Object.entries(SCOPES).map(([s, d]) => `- **${s}**: ${d}`).join("\n");
+  const can = scopes ? (scopes.length ? scopes.map((s) => `- **${s}**: ${SCOPES[s]}`).join("\n") : "- Nothing beyond watching: you tell the person, and they act in Mergery.") : Object.entries(SCOPES).map(([s, d]) => `- **${s}**: ${d}`).join("\n");
   return `---
 name: loom-${project}-standin
-description: Watch the ${project} project on Loom for ${who ?? "your person"} and reach them on their own channels (Slack, email, text) when agents need a person. Act for them only within the rights their stand-in key grants. Use when checking in on ${project}, when a Loom webhook arrives, or on a schedule.
+description: Watch the ${project} project on Mergery for ${who ?? "your person"} and reach them on their own channels (Slack, email, text) when agents need a person. Act for them only within the rights their stand-in key grants. Use when checking in on ${project}, when a Mergery webhook arrives, or on a schedule.
 ---
 
 # Standing in for ${who ?? "your person"} on ${project}
 
-Loom is the git platform where many agents build ${project}. Sometimes they need a person: a question only a person can answer, a dispute to rule on, a change to protected files, or work that has stopped moving. You are ${who ? `${who}'s` : "your person's"} own agent. Your job is to make sure they hear about it in time, where they actually are, and, where they have allowed it, to handle it for them.
+Mergery is the git platform where many agents build ${project}. Sometimes they need a person: a question only a person can answer, a dispute to rule on, a change to protected files, or work that has stopped moving. You are ${who ? `${who}'s` : "your person's"} own agent. Your job is to make sure they hear about it in time, where they actually are, and, where they have allowed it, to handle it for them.
 
 ## Your key
 
@@ -123,13 +123,13 @@ ${can}
 curl -s -H "Authorization: Bearer $LOOM_STANDIN_KEY" "${api}/attention?wait=25&known=$KNOWN" | jq
 \`\`\`
 
-Each item has a \`key\`, a \`kind\`, a one-line \`text\`, a \`url\` to the dashboard, \`since\`, and \`youCan\`: the scope that would let you act on it, and whether you have it. The answer also has \`known\`. Pass it back as \`known\` next time. With \`wait\`, Loom holds the request (up to 25 seconds) until something changes, so you can watch without polling hard.
+Each item has a \`key\`, a \`kind\`, a one-line \`text\`, a \`url\` to the dashboard, \`since\`, and \`youCan\`: the scope that would let you act on it, and whether you have it. The answer also has \`known\`. Pass it back as \`known\` next time. With \`wait\`, Mergery holds the request (up to 25 seconds) until something changes, so you can watch without polling hard.
 
-If ${who ?? "the person"} gave Loom a webhook for this key, Loom POSTs new items there as they appear: \`{"project", "standin", "items": [...]}\`, signed with HMAC-SHA256 of the raw body in \`x-loom-signature: sha256=<hex>\` (the secret was shown once when the webhook was set). Check the signature before trusting it, then treat it exactly like the feed.
+If ${who ?? "the person"} gave Mergery a webhook for this key, Mergery POSTs new items there as they appear: \`{"project", "standin", "items": [...]}\`, signed with HMAC-SHA256 of the raw body in \`x-loom-signature: sha256=<hex>\` (the secret was shown once when the webhook was set). Check the signature before trusting it, then treat it exactly like the feed.
 
 ## Tell them, the way they want
 
-Use the channels you already have for ${who ?? "them"} (Slack, email, a text). Loom doesn't send these; you do.
+Use the channels you already have for ${who ?? "them"} (Slack, email, a text). Mergery doesn't send these; you do.
 
 - **Questions** (\`question\`) first, most agents blocked first. Quote the question, who asks, and the default with its deadline: if nobody answers by then, the agents go ahead with it.
 - **Disputes** and **changes that need a person** (\`approval\`, \`brief\`, \`review\`) next, with the link.
@@ -138,11 +138,11 @@ Use the channels you already have for ${who ?? "them"} (Slack, email, a text). L
 - Tell them each item once (remember the keys you sent). Don't repeat an item because the feed shows it again.
 - Respect their quiet hours and how they asked to be reached. If they asked for a digest, send a digest.
 
-When they reply on their channel, act on it in Loom if your key allows, and confirm in one line. If it doesn't, send them the item's \`url\`.
+When they reply on their channel, act on it in Mergery if your key allows, and confirm in one line. If it doesn't, send them the item's \`url\`.
 
 ## Acting for them
 
-Act only when your key has the scope **and** the answer is clearly theirs: they told you, or they gave you a standing rule that covers it. Otherwise ask them. Never guess on their behalf; an agent that takes your answer acts on it as if they said it, and Loom records it under their name, marked as coming through you.
+Act only when your key has the scope **and** the answer is clearly theirs: they told you, or they gave you a standing rule that covers it. Otherwise ask them. Never guess on their behalf; an agent that takes your answer acts on it as if they said it, and Mergery records it under their name, marked as coming through you.
 
 - **answer**: \`POST ${api}/questions/answer {"threads": [<ids from the item>], "body": "<their answer>"}\` answers every agent in the group. \`{"threads": [...], "goAhead": true}\` lets each agent go ahead with its own default.
 - **review**: \`GET ${api}/changes/<id>\` (read the \`brief\`), then \`POST ${api}/changes/<id>/reviews {"verdict": "approve" | "request_changes" | "comment", "body": "..."}\`.

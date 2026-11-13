@@ -1,7 +1,7 @@
 // Where a project's data lives, and where its coordinator runs.
 //
 // Residency is chosen once, when the project is created, because none of the
-// three places Loom keeps a project's data can move it later:
+// three places Mergery keeps a project's data can move it later:
 //   - its repositories live in an Artifacts namespace created in that jurisdiction,
 //   - its coordinator is a Durable Object in that jurisdiction,
 //   - its change context and patches are in an R2 bucket created there.

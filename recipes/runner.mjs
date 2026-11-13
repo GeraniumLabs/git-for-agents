@@ -1,6 +1,6 @@
 #!/usr/bin/env node
-// A runner for a Loom project: waits for work an agent could pick up, and
-// starts an agent for it. Loom doesn't run agents; this does, on any machine
+// A runner for a Mergery project: waits for work an agent could pick up, and
+// starts an agent for it. Mergery doesn't run agents; this does, on any machine
 // with Node 20 and the agent CLI you use.
 //
 //   LOOM_URL=https://loom.example.dev LOOM_PROJECT=my-app LOOM_KEY=... node recipes/runner.mjs

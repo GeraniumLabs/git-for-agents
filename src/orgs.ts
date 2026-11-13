@@ -172,7 +172,7 @@ export function orgRegistry(sql: SqlStorage, method: string, what: string, url: 
     return { name, from: p.org ?? null, org: to, jurisdiction: p.jurisdiction ?? null };
   }
 
-  // A person's own settings: for now, where Loom emails them.
+  // A person's own settings: for now, where Mergery emails them.
   if (what === "person") {
     if (method === "GET") return { login, email: (sql.exec("SELECT email FROM people WHERE login = ?", login).toArray()[0]?.email as string) ?? null };
     const e = body.email == null ? "" : String(body.email).trim();

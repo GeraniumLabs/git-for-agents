@@ -5,7 +5,7 @@
 //
 // 1. Track records. Two reviewers build different records: rex's objections
 //    hold up and his approvals land; ivy approves a change that jo, the human
-//    lead, then sends back. Loom weighs each agent's approvals and votes by
+//    lead, then sends back. Mergery weighs each agent's approvals and votes by
 //    how its earlier ones turned out.
 // 2. A contest. One task, three independent attempts (kai, lou, mo). The
 //    other agents compare them side by side and vote. ivy votes for the
@@ -17,7 +17,7 @@
 //
 // Set PACE=0 to run as fast as possible.
 
-import { Loom, sleep } from "./client.mjs";
+import { Mergery, sleep } from "./client.mjs";
 import { SEED } from "./seed.mjs";
 
 const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
@@ -27,7 +27,7 @@ const PROJECT = process.argv[2] ?? `contest-${Date.now().toString(36).slice(-5)}
 const pause = (s) => sleep(s * 1000 * PACE);
 const log = (who, msg) => console.log(`${new Date().toISOString().slice(11, 19)}  ${who.padEnd(5)} ${msg}`);
 
-const admin = new Loom(BASE, PROJECT, ADMIN);
+const admin = new Mergery(BASE, PROJECT, ADMIN);
 
 async function waitFor(what, check, seconds = 60) {
   for (let i = 0; i < seconds * 4; i++) {
@@ -133,11 +133,11 @@ export function search(text) {
   log("sam", `votes for #${a2.id} (lou): simple and case-insensitive`);
   await pause(1);
   let standings = (await jo.req("GET", `/contests/${c.id}`)).standings;
-  log("loom", `standings: ${standings.map((s) => `#${s.candidate} ${s.weight}`).join(", ")}; no attempt has the quorum of ${(await jo.req("GET", `/contests/${c.id}`)).contest.quorum} yet`);
+  log("mergery", `standings: ${standings.map((s) => `#${s.candidate} ${s.weight}`).join(", ")}; no attempt has the quorum of ${(await jo.req("GET", `/contests/${c.id}`)).contest.quorum} yet`);
   const r = await rex.req("POST", `/contests/${c.id}/votes`, { changeId: a1.id, reason: "Case-insensitive like the task asks, and keeps data access in db.js as the description says; #" + a3.id + " is case-sensitive." });
   log("rex", `votes for #${a1.id} (kai): follows the task and the db.js convention`);
   standings = r.standings;
-  log("loom", `standings: ${standings.map((s) => `#${s.candidate} ${s.weight}`).join(", ")}`);
+  log("mergery", `standings: ${standings.map((s) => `#${s.candidate} ${s.weight}`).join(", ")}`);
   if (r.contest.status !== "decided") {
     await nia.req("POST", `/contests/${c.id}/votes`, { changeId: a1.id, reason: "Same reasons as rex: db.search is reusable." });
     log("nia", `votes for #${a1.id} (kai) too`);
@@ -146,7 +146,7 @@ export function search(text) {
     const v = await jo.req("GET", `/contests/${c.id}`);
     return v.contest.status === "decided" && v;
   });
-  log("loom", `contest decided: #${decided.contest.winner} wins; the other attempts are closed with their context kept`);
+  log("mergery", `contest decided: #${decided.contest.winner} wins; the other attempts are closed with their context kept`);
   await merged(kai, decided.contest.winner);
   log("kai", `#${decided.contest.winner} landed`);
 

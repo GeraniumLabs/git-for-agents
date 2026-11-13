@@ -16,7 +16,7 @@ const claudeCode = [
   '{"type":"assistant","message":{"cut off',
 ].join("\n");
 
-test("Claude Code transcripts become steps, with Loom calls and files picked out", () => {
+test("Claude Code transcripts become steps, with Mergery calls and files picked out", () => {
   assert.equal(detectSource(claudeCode), "claude-code");
   const t = parseTrace(claudeCode);
   assert.equal(t.sessionId, "s-1");
@@ -28,7 +28,7 @@ test("Claude Code transcripts become steps, with Loom calls and files picked out
   assert.equal(intent.loomCall, "declare_intent");
   assert.deepEqual(intent.files, ["src/todo.ts"]);
   assert.equal(t.steps[3].loomCall, "declare_intent", "the result is tied to its call");
-  assert.equal(t.steps[4].loomCall, undefined, "Edit isn't a Loom call");
+  assert.equal(t.steps[4].loomCall, undefined, "Edit isn't a Mergery call");
   assert.equal(t.steps[5].error, true);
   assert.equal(t.startedAt, Date.parse("2026-11-11T10:00:00Z"));
   assert.equal(t.endedAt, Date.parse("2026-11-11T10:01:01Z"));
@@ -110,7 +110,7 @@ test("owner patterns must compile and can't match empty text", () => {
   assert.match(checkPattern("x*")!, /empty/);
 });
 
-test("Loom calls are recognized by the server name, including through loom_tool", () => {
+test("Mergery calls are recognized by the server name, including through loom_tool", () => {
   assert.equal(loomCallOf("mcp__loom__vote", {}), "vote");
   assert.equal(loomCallOf("mcp__my-loom__loom_tool", { tool: "open_dispute" }), "open_dispute");
   assert.equal(loomCallOf("mcp__github__create_issue", {}), undefined);
@@ -207,7 +207,7 @@ const opencode = JSON.stringify({
   ],
 }, null, 2);
 
-test("OpenCode sessions (as opencode export prints them) become steps, with Loom calls and thoughts", () => {
+test("OpenCode sessions (as opencode export prints them) become steps, with Mergery calls and thoughts", () => {
   assert.equal(detectSource(opencode), "opencode");
   const t = parseTrace(opencode);
   assert.equal(t.source, "opencode");

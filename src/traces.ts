@@ -2,9 +2,9 @@
 // produced a change, kept with the change so people can review its decisions
 // after the fact.
 //
-// An agent (or the hook or runner around it) uploads its session log. Loom
+// An agent (or the hook or runner around it) uploads its session log. Mergery
 // removes secrets first, so the unredacted text is never stored, then reads
-// the log into a list of steps it can index and link to Loom's own events.
+// the log into a list of steps it can index and link to Mergery's own events.
 // The redacted log itself goes to R2, so nothing in it is lost.
 //
 // Formats read: Claude Code transcripts and Codex session logs (one JSON
@@ -27,7 +27,7 @@ export interface Step {
   kind: StepKind;
   /** The tool called, as the agent named it. */
   tool?: string;
-  /** Set when the call was to Loom: the Loom tool's own name, e.g. declare_intent. */
+  /** Set when the call was to Mergery: the Mergery tool's own name, e.g. declare_intent. */
   loomCall?: string;
   /** The text, the call's arguments or its result, cut to PREVIEW characters. */
   preview: string;
@@ -192,17 +192,17 @@ export function detectSource(text: string): TraceSource {
   return "text";
 }
 
-/** A call to Loom: the server's name has "loom" in it, e.g. mcp__loom__declare_intent or loom.declare_intent. */
+/** A call to Mergery: the server's name has "mergery" or "loom" in it, e.g. mcp__mergery__declare_intent, mcp__loom__declare_intent or loom.declare_intent. */
 export function loomCallOf(tool: string, args: any): string | undefined {
   const parts = tool.split(/__|\./);
   if (parts.length < 2) return undefined;
   const name = parts[parts.length - 1];
-  if (!/loom/i.test(parts.slice(0, -1).join("_"))) return undefined;
+  if (!/loom|mergery/i.test(parts.slice(0, -1).join("_"))) return undefined;
   if (name === "loom_tool") return typeof args?.tool === "string" ? args.tool : typeof args?.name === "string" ? args.name : name;
   return name;
 }
 
-/** Paths a tool call names: file_path, path, paths, Loom's write_files list or map, and apply_patch headers. */
+/** Paths a tool call names: file_path, path, paths, Mergery's write_files list or map, and apply_patch headers. */
 export function filesOf(args: any): string[] {
   const out = new Set<string>();
   const add = (p: unknown) => { if (typeof p === "string" && p && p.length < 400 && !p.includes("\n")) out.add(p); };
@@ -366,15 +366,15 @@ function parseCodex(text: string, keepThoughts: boolean): ParsedTrace {
 }
 
 /**
- * OpenCode: a session as `opencode export` prints it, or as Loom's plugin sends
+ * OpenCode: a session as `opencode export` prints it, or as Mergery's plugin sends
  * it: {info: Session, messages: [{info: Message, parts: Part[]}]}. Its MCP tools
- * are named <server>_<tool>, so Loom's are loom_<tool>.
+ * are named <server>_<tool>, so Mergery's are loom_<tool>.
  */
 function parseOpenCode(text: string, keepThoughts: boolean): ParsedTrace {
   const b = new Builder(keepThoughts);
   let doc: any;
   try { doc = JSON.parse(text); } catch {
-    // Only the start of a log (Loom reads one to find its session): no steps, just the id.
+    // Only the start of a log (Mergery reads one to find its session): no steps, just the id.
     b.sessionId = (text.match(/^\s*\{\s*"info"\s*:\s*\{\s*"id"\s*:\s*"([^"]+)"/) ?? text.match(/"sessionID"\s*:\s*"([^"]+)"/))?.[1] ?? null;
     return b.done("opencode");
   }
@@ -584,7 +584,7 @@ const oneLine = (t: string, n = 200) => { const s = t.replace(/\s+/g, " ").trim(
 
 /**
  * From a trace's steps, what bears on one change: the agent's consequential
- * acts (edits to the change's files, Loom calls about its task or change,
+ * acts (edits to the change's files, Mergery calls about its task or change,
  * commands with lasting effects, refusals and failures), each with the
  * reason the agent gave just before and the person's prompt it answered.
  */

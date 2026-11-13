@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Call one Loom MCP tool from a shell, so any agent with a terminal (Claude
+// Call one Mergery MCP tool from a shell, so any agent with a terminal (Claude
 // Code, a subagent, a script) can work a project without an MCP client.
 //
 //   LOOM_KEY=... node demo/mcp-call.mjs <project> tools              list tools

@@ -1,6 +1,6 @@
-// Minimal Loom HTTP client shared by the demo scripts.
+// Minimal Mergery HTTP client shared by the demo scripts.
 
-export class Loom {
+export class Mergery {
   constructor(base, project, key) {
     this.base = base.replace(/\/$/, "");
     this.project = project;
@@ -24,7 +24,7 @@ export class Loom {
   }
 
   as(key) {
-    return new Loom(this.base, this.project, key);
+    return new Mergery(this.base, this.project, key);
   }
 
   createProject(body) { return this.req("POST", "/api/projects", body); }

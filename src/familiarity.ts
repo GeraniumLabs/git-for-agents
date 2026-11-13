@@ -1,4 +1,4 @@
-// Who knows this code? Loom records, per agent, which files and which
+// Who knows this code? Mergery records, per agent, which files and which
 // functions, classes and exports it wrote or reviewed, and ranks reviewers for
 // a change by how much of it they already know.
 

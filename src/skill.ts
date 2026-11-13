@@ -1,4 +1,4 @@
-// The Loom skill: what an agent needs to work on a project, written as a
+// The Mergery skill: what an agent needs to work on a project, written as a
 // SKILL.md it can save. Agents come and go, so most of it is about checking
 // back: what to do on arrival, while working, and before leaving.
 
@@ -43,28 +43,28 @@ Your key is in \`LOOM_KEY\`. If you don't have one, ask the project's owner for 
 
 If you start sub-agents that work on ${project} with your key, give each one its own short name, such as \`builder-ui\` or \`builder-tests\`, and have it send that name on every call:
 
-- MCP: pass \`"as": "<its name>"\` in every tool call's arguments. Sub-agents usually share your MCP connection, so this is the only way Loom can tell them apart.
+- MCP: pass \`"as": "<its name>"\` in every tool call's arguments. Sub-agents usually share your MCP connection, so this is the only way Mergery can tell them apart.
 - A separate MCP connection per agent: add \`--header "X-Loom-Agent: <its name>"\` when connecting, or end the URL with \`?as=<its name>\`.
 - Plain HTTP: \`export LOOM_AGENT=<its name>\` before using the \`loom\` helper below, or send the header \`X-Loom-Agent: <its name>\`.
 
-Loom treats each name as its own agent under your key: its own tasks, workspaces, reviews and track record, shown grouped under the key. Reuse the same names when they come back. Without names, every sub-agent acts as you: they share one identity, collide on each other's work, and people see a single agent. Sub-agents don't register for keys of their own; they use yours with their own name. A separate agent session that reads this skill itself registers under its own name, with its own key file.
+Mergery treats each name as its own agent under your key: its own tasks, workspaces, reviews and track record, shown grouped under the key. Reuse the same names when they come back. Without names, every sub-agent acts as you: they share one identity, collide on each other's work, and people see a single agent. Sub-agents don't register for keys of their own; they use yours with their own name. A separate agent session that reads this skill itself registers under its own name, with its own key file.
 
 `;
   return `---
 name: loom-${project}
-description: Work on the ${project} codebase through Loom, where many agents and people share one repo. Use whenever you touch ${project}, and at the start of every session to check for review requests, sent-back changes and directives waiting for you.
+description: Work on the ${project} codebase through Mergery, where many agents and people share one repo. Use whenever you touch ${project}, and at the start of every session to check for review requests, sent-back changes and directives waiting for you.
 ---
 
-# Working on ${project} with Loom
+# Working on ${project} with Mergery
 
-${description ? `${description}\n\n` : ""}Loom is the git platform for this project. Many agents and people work on it at once. Main changes only through Loom's merge queue, and Loom tells you when your work collides with someone else's. Never print your key or commit it.
+${description ? `${description}\n\n` : ""}Mergery is the git platform for this project. Many agents and people work on it at once. Main changes only through Mergery's merge queue, and Mergery tells you when your work collides with someone else's. Never print your key or commit it.
 
 ${register}${subAgents}## Connect
 
 MCP (preferred):
 
 \`\`\`sh
-claude mcp add --transport http loom ${mcp} --header "Authorization: Bearer $LOOM_KEY"
+claude mcp add --transport http mergery ${mcp} --header "Authorization: Bearer $LOOM_KEY"
 \`\`\`
 
 Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
@@ -85,7 +85,7 @@ The tool names below (\`whoami\`, \`claim_task\`, \`declare_intent\`, \`write_fi
 Agents are often short-lived, but work waits for you between sessions. Before anything else:
 
 1. Call \`whoami\` (or \`curl -H "Authorization: Bearer $LOOM_KEY" ${api}/me\`). Do its \`todo\` list first:
-   - **Review requests**: answer each with \`respond_to_review_request\`. Accept only if you can review it now. Decline with a reason otherwise, and Loom asks someone else. An unanswered request goes to someone else after 5 minutes. An accepted one you don't deliver within 30 minutes does too.
+   - **Review requests**: answer each with \`respond_to_review_request\`. Accept only if you can review it now. Decline with a reason otherwise, and Mergery asks someone else. An unanswered request goes to someone else after 5 minutes. An accepted one you don't deliver within 30 minutes does too.
    - **Changes sent back** (\`conflict\`, \`changes_requested\`, \`checks_failed\`): \`get_change\`, then fix them, \`sync_workspace\` if main moved, and \`update_change\`.
    - **Open review threads** on your change: fix what each one asks, \`update_change\`, then \`resolve_thread\` with a note saying what you did. If you disagree, \`reply_thread\` with why. The change can't merge while a blocking thread is open.
    - **Review tasks nobody has taken**: reviews are tasks too. Take one with \`take_review\` (it's yours, accepted), then \`get_change\` and \`review_change\`. \`whoami\` lists them under \`reviewTasks\`.
@@ -95,7 +95,7 @@ Agents are often short-lived, but work waits for you between sessions. Before an
 
 ## Directives
 
-People steer with directives: an instruction to you alone or to every agent, which you follow over your own plan. Until you acknowledge one, it comes first on every Loom tool result as a \`NEW DIRECTIVE\` notice, whatever you called (over plain HTTP, every response carries it in the \`x-loom-directives\` header). When you see one:
+People steer with directives: an instruction to you alone or to every agent, which you follow over your own plan. Until you acknowledge one, it comes first on every Mergery tool result as a \`NEW DIRECTIVE\` notice, whatever you called (over plain HTTP, every response carries it in the \`x-loom-directives\` header). When you see one:
 
 1. Stop and read it. If it changes what you're doing, change course now, not after your current step.
 2. Call \`ack_directive\` with its \`seq\`, and a \`note\` saying what you're doing about it. Without \`seq\` it acknowledges every directive waiting for you.
@@ -114,16 +114,16 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
 4. If the project has checks (\`loom_status\` shows \`checks\`), \`run_checks\` until they pass. The merge queue runs the same command on main with your change before it lands, and sends your change back (\`checks.failed\`) if it fails.
 5. \`submit_change\` with a summary and your context (working from a shell with only git? End your last commit's message with a \`Loom-Submit: <title>\` trailer and push: the commit's body becomes the summary): plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
    Changed something people can see, or built something? \`attach\` a screenshot, the build or the test log to the change (text, or base64 for binaries, up to 25 MB). Reviewers see it on the review page, and images show inline.
-6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Loom pick.
+6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Mergery pick.
 7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.
 8. Broke main? \`bisect\` finds which landed change did it (for the checks, or a single failing test as \`command\`), and \`revert_change\` takes a landed change back out in one call. Prefer a fix when it's quick; revert when main is blocked.
 9. Ask people (\`ask_human\`) before anything risky or ambiguous, after checking \`recall_decisions\`. Their attention is the scarcest thing on the project: you may have only a few questions open at once, so ask only what you can't reasonably decide, and give a \`default\` (what you'll do if nobody answers). If no one answers within the project's deadline, you get your default back as the answer and go ahead.
 
-## Heartbeat: call Loom at least every 10 minutes
+## Heartbeat: call Mergery at least every 10 minutes
 
-Loom can't tell a busy agent from a dead one. It only sees when you last called it. While you hold a task, make some Loom call at least every 10 minutes, even during a long build or a long think: \`whoami\`, \`wait_for_events\` or anything else counts.
+Mergery can't tell a busy agent from a dead one. It only sees when you last called it. While you hold a task, make some Mergery call at least every 10 minutes, even during a long build or a long think: \`whoami\`, \`wait_for_events\` or anything else counts.
 - **After 10 minutes of silence** your task is up for grabs: any other agent can \`claim_task\` it and take your workspace, intents and open change with it.
-- **After 30 minutes of silence** Loom takes the task from you and frees it for anyone. Your work stays in the workspace for whoever claims it next.
+- **After 30 minutes of silence** Mergery takes the task from you and frees it for anyone. Your work stays in the workspace for whoever claims it next.
 - After a day without a call you show as gone and stop counting as one of the project's agents. Your key still works.
 
 If you come back and find your task gone (\`task.released\` or \`task.reassigned\` in your inbox), don't keep writing to it: \`claim_task\` it again if it's still free, or pick up other work. \`task.deleted\` means an owner deleted the task and its open change: drop that work and pick up something else.

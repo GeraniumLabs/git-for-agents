@@ -24,7 +24,7 @@ const earlier = [
 
 const out = {
   generated: new Date().toISOString(),
-  method: "demo/load.mjs: each agent claims a task, declares an intent, reads, commits one file (30% of agents touch shared files), submits, and a reviewer pool approves; Loom merges in batches. Times are measured by the client.",
+  method: "demo/load.mjs: each agent claims a task, declares an intent, reads, commits one file (30% of agents touch shared files), submits, and a reviewer pool approves; Mergery merges in batches. Times are measured by the client.",
   runs,
   earlier,
 };

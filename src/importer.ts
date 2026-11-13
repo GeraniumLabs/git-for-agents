@@ -1,5 +1,5 @@
-// Bringing an existing repository into Loom: where it comes from, and its
-// open GitHub issues as tasks. Loom becomes the repository's home; the source
+// Bringing an existing repository into Mergery: where it comes from, and its
+// open GitHub issues as tasks. Mergery becomes the repository's home; the source
 // is read once and never written back.
 
 export interface ImportSource {
@@ -49,7 +49,7 @@ export function githubRepo(url: string): GitHubRepo | null {
   return m ? { owner: m[1], repo: m[2] } : null;
 }
 
-/** The task Loom files for an issue. */
+/** The task Mergery files for an issue. */
 export function issueTask(gh: GitHubRepo, i: Issue): { title: string; description: string; source: string } {
   const body = i.body.length > 8000 ? `${i.body.slice(0, 8000)}\n\n…(cut; the rest is on GitHub)` : i.body;
   const by = [i.author ? `opened by @${i.author}` : null, i.labels.length ? `labels: ${i.labels.join(", ")}` : null].filter(Boolean).join("; ");

@@ -1,5 +1,5 @@
 // Git operations that run inside the Worker, on an in-memory filesystem.
-// Loom does its own three-way merge (tree walk + diff3 per file) so that
+// Mergery does its own three-way merge (tree walk + diff3 per file) so that
 // conflicts come back as structured data an agent can act on, instead of
 // conflict markers in a working tree.
 

@@ -1,5 +1,5 @@
 // Plans, and paying for one with Stripe. Anyone signed in gets the free plan;
-// Loom Pro lifts its limits. Plans charge for hosting (projects, private
+// Mergery Pro lifts its limits. Plans charge for hosting (projects, private
 // projects, check minutes), never for agents: more agents is the point. A plan belongs to a person (their GitHub login),
 // and a project takes the plan of the person who created it. Without Stripe
 // configured there are no plans: the LOOM_* limits apply to everyone.
@@ -12,9 +12,9 @@ import type { Env } from "./env";
 export type PlanName = "free" | "pro";
 
 /**
- * Loom's mark on its Checkout sessions and subscriptions. A Stripe account
+ * Mergery's mark on its Checkout sessions and subscriptions. A Stripe account
  * can sell other things too, and its webhooks then carry their events as
- * well; Loom acts only on events that carry this.
+ * well; Mergery acts only on events that carry this.
  */
 export const APP = "loom";
 /** A project's plan: its creator's, or "unlimited" for the server's owners and the admin. */
@@ -34,7 +34,7 @@ export interface Limits {
 export const PLANS: Record<PlanName, Limits & { name: string; price: string }> = {
   // 0 is no limit, as everywhere here.
   free: { name: "Free", price: "$0", projects: 3, privateProjects: 1, agents: 0, checkMinutes: 30 },
-  pro: { name: "Loom Pro", price: "$10 a month", projects: 25, privateProjects: 0, agents: 0, checkMinutes: 300 },
+  pro: { name: "Mergery Pro", price: "$10 a month", projects: 25, privateProjects: 0, agents: 0, checkMinutes: 300 },
 };
 
 /** The limits when the server takes no payments: LOOM_* settings, 0 meaning no limit. */
@@ -94,13 +94,13 @@ export async function stripe<T = any>(env: Env, method: "GET" | "POST", path: st
 }
 
 /**
- * A Checkout page for Loom Pro. The account rides along so the webhook knows
+ * A Checkout page for Mergery Pro. The account rides along so the webhook knows
  * whose plan it is: the person's login, or org:<slug> for an organization.
  */
 export async function checkoutSession(env: Env, login: string, account: string, customer: string | null, origin: string, back: string): Promise<string> {
   const price = env.STRIPE_PRICE_ID
     ? { price: env.STRIPE_PRICE_ID, quantity: 1 }
-    : { price_data: { currency: "usd", unit_amount: 1000, recurring: { interval: "month" }, product_data: { name: "Loom Pro" } }, quantity: 1 };
+    : { price_data: { currency: "usd", unit_amount: 1000, recurring: { interval: "month" }, product_data: { name: "Mergery Pro" } }, quantity: 1 };
   const s = await stripe<{ url: string }>(env, "POST", "checkout/sessions", {
     mode: "subscription",
     line_items: { 0: price },
@@ -146,7 +146,7 @@ function periodEnd(o: any): number | null {
 }
 
 /**
- * What a webhook event means for a person's plan, or null for events Loom
+ * What a webhook event means for a person's plan, or null for events Mergery
  * ignores. Checkout completing makes them Pro; a subscription changing or
  * ending sets the plan from its status.
  */

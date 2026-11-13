@@ -83,7 +83,7 @@ function setCookie(req: Request, name: string, value: string, maxAge: number): s
 
 /**
  * The GitHub token a signed-in person granted for reading their repositories,
- * if it is still fresh and theirs. Loom asks for it only when an import needs
+ * if it is still fresh and theirs. Mergery asks for it only when an import needs
  * it, keeps it sealed in a short-lived cookie in their own browser, and never
  * stores it.
  */
@@ -112,19 +112,19 @@ export async function sessionUser(env: Env, req: Request): Promise<User | null> 
   return s ? { id: s.id, login: s.login, name: s.name, avatar: s.avatar } : null;
 }
 
-/** Loom's own registry, where the GitHub app it created for itself is kept. */
+/** Mergery's own registry, where the GitHub app it created for itself is kept. */
 export type Registry = (path: string, init?: RequestInit) => Promise<Response>;
 
 interface GitHubApp { client_id: string; client_secret: string; slug?: string; html_url?: string }
 
-/** Where a person installs Loom's GitHub app on their repositories, when Loom knows its name. */
+/** Where a person installs Mergery's GitHub app on their repositories, when Mergery knows its name. */
 function installUrl(env: Env, app: GitHubApp | null): string | null {
   const slug = env.GITHUB_APP_SLUG ?? app?.slug;
   return slug ? `https://github.com/apps/${slug}/installations/new` : null;
 }
 let cachedApp: GitHubApp | null = null;
 
-/** GitHub sign-in credentials: from Worker secrets, or from the app Loom created for itself. */
+/** GitHub sign-in credentials: from Worker secrets, or from the app Mergery created for itself. */
 async function githubApp(env: Env, registry: Registry): Promise<GitHubApp | null> {
   if (env.GITHUB_CLIENT_ID && env.GITHUB_CLIENT_SECRET) return { client_id: env.GITHUB_CLIENT_ID, client_secret: env.GITHUB_CLIENT_SECRET };
   if (cachedApp) return cachedApp;
@@ -178,17 +178,17 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     return startSession(env, req, { id: `github:${login}`, login, name: login, avatar: "" }, safeReturn(url.searchParams.get("return")));
   }
 
-  // One-click setup: Loom asks GitHub to create a GitHub app for it (the
+  // One-click setup: Mergery asks GitHub to create a GitHub app for it (the
   // manifest flow), then keeps the app's client ID and secret itself. Needs
   // the admin token once, so nobody else can claim sign-in for this server.
   if (path === "/auth/setup") {
     const existing = await githubApp(env, registry);
-    if (existing) return page("GitHub sign-in is set up", `<p>Loom signs people in with ${existing.html_url ? `<a href="${escHtml(existing.html_url)}">its GitHub app</a>` : "GitHub"}.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
+    if (existing) return page("GitHub sign-in is set up", `<p>Mergery signs people in with ${existing.html_url ? `<a href="${escHtml(existing.html_url)}">its GitHub app</a>` : "GitHub"}.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
     if (req.method !== "POST") {
-      return page("Set up GitHub sign-in", `<p>Loom will ask GitHub to create a small GitHub app for this server. It lets people sign in, and, on the repositories someone chooses to install it on, read code and issues so they can import them. You'll approve it on GitHub, and that's it.</p>
+      return page("Set up GitHub sign-in", `<p>Mergery will ask GitHub to create a small GitHub app for this server. It lets people sign in, and, on the repositories someone chooses to install it on, read code and issues so they can import them. You'll approve it on GitHub, and that's it.</p>
 <form method="post"><label>Admin token (one last time) <input name="token" type="password" autocomplete="off" required></label>
 <label>Create it under a GitHub organization (optional) <input name="org" placeholder="e.g. GeraniumLabs"></label>
-<p><button>Create Loom's GitHub app</button></p></form>`);
+<p><button>Create Mergery's GitHub app</button></p></form>`);
     }
     const form = await req.formData();
     if (!(await sameSecret(form.get("token") as string | null, env.LOOM_ADMIN_TOKEN))) return page("That isn't the admin token", `<p><a href="/auth/setup">Try again</a></p>`);
@@ -196,7 +196,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     const state = await signed(env, { setup: true, exp: Date.now() + 30 * 60_000 });
     const host = url.hostname.split(".");
     const manifest = {
-      name: `Loom ${host.length > 2 ? host[1] : host[0]}`.slice(0, 34),
+      name: `Mergery ${host.length > 2 ? host[1] : host[0]}`.slice(0, 34),
       url: url.origin,
       redirect_url: `${url.origin}/auth/github/setup-done`,
       callback_urls: [`${url.origin}/auth/github/callback`],
@@ -221,11 +221,11 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     if (!res.ok || !app.client_id || !app.client_secret) return page("GitHub didn't finish creating the app", `<p>${escHtml(app.message ?? `HTTP ${res.status}`)}</p><p><a href="/auth/setup">Try again</a></p>`);
     await registry("/registry/github", { method: "PUT", body: JSON.stringify({ client_id: app.client_id, client_secret: app.client_secret, slug: app.slug, html_url: app.html_url }) });
     cachedApp = null;
-    return page("GitHub sign-in is ready", `<p>Loom created <b>${escHtml(app.name ?? "its GitHub app")}</b>. People can now sign in with GitHub.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
+    return page("GitHub sign-in is ready", `<p>Mergery created <b>${escHtml(app.name ?? "its GitHub app")}</b>. People can now sign in with GitHub.</p><p><a class="button" href="/auth/github">Sign in with GitHub</a></p>`);
   }
 
   // After someone installs the app on their repositories, GitHub sends them here.
-  // Before an import: can Loom read this GitHub repository, and if not, what would let it?
+  // Before an import: can Mergery read this GitHub repository, and if not, what would let it?
   if (path === "/auth/github/access") {
     const me = await sessionUser(env, req);
     if (!me) return Response.json({ error: "sign in first" }, { status: 401 });
@@ -246,7 +246,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     // Installs started from the import form carry where to go back to, and the form picks up from there.
     const back = url.searchParams.get("state");
     if (back) return new Response(null, { status: 302, headers: { location: safeReturn(back) } });
-    return page("Loom can read those repositories now", `<p>Go back to Loom and create the project again. The import uses your GitHub access, so you don't need a token.</p><p><a class="button" href="/">Back to Loom</a></p>`);
+    return page("Mergery can read those repositories now", `<p>Go back to Mergery and create the project again. The import uses your GitHub access, so you don't need a token.</p><p><a class="button" href="/">Back to Mergery</a></p>`);
   }
 
   // Sign in (or, with ?grant=repo, let an import read the person's repositories as them).
@@ -287,7 +287,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     if (state.grant) {
       // Keep the token only for the person who is signed in, and only for a few minutes.
       const me = await sessionUser(env, req);
-      if (!me || me.id !== `github:${login}`) return Response.json({ error: `you're signed in to Loom as ${me?.login ?? "nobody"} but to GitHub as ${profile.login}` }, { status: 400 });
+      if (!me || me.id !== `github:${login}`) return Response.json({ error: `you're signed in to Mergery as ${me?.login ?? "nobody"} but to GitHub as ${profile.login}` }, { status: 400 });
       const headers = new Headers({ location: state.to });
       headers.append("set-cookie", await grantCookie(env, req, me, tok.access_token));
       headers.append("set-cookie", setCookie(req, STATE, "", 0));

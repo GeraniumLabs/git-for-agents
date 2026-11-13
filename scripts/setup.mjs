@@ -1,10 +1,10 @@
 #!/usr/bin/env node
-// Set up your own Loom on Cloudflare in one command:
+// Set up your own Mergery on Cloudflare in one command:
 //
 //   npm run setup -- --owner <your GitHub login>
 //
 // It checks you're signed in to Cloudflare and Docker is running, creates the
-// R2 buckets and the push-events queue, deploys, sets the two secrets Loom
+// R2 buckets and the push-events queue, deploys, sets the two secrets Mergery
 // needs (generated here), and tells you where to go next. Safe to run again:
 // what exists is left alone, and secrets the Worker has are kept unless you pass --new-secrets.
 //
@@ -40,9 +40,9 @@ step("Checking what you need");
 const who = wrangler(["whoami"], { quiet: true, allowFail: true });
 if (!dry && (!who.ok || /not authenticated|You are not logged in/i.test(who.out))) fail("not signed in to Cloudflare", "run: npx wrangler login");
 ok("signed in to Cloudflare");
-if (!dry && spawnSync("docker", ["info"], { stdio: "ignore" }).status !== 0) fail("Docker isn't running", "Loom builds the image its checks run in; start Docker and run this again");
+if (!dry && spawnSync("docker", ["info"], { stdio: "ignore" }).status !== 0) fail("Docker isn't running", "Mergery builds the image its checks run in; start Docker and run this again");
 ok("Docker is running");
-console.log("  Loom needs the Workers Paid plan (Artifacts and Containers).");
+console.log("  Mergery needs the Workers Paid plan (Artifacts and Containers).");
 
 step("Storage and the push-events queue");
 for (const [what, cmd] of [
@@ -80,13 +80,13 @@ if (Object.keys(secrets).length) {
 if (!owner) console.log("  No --owner given: nobody owns every project. Run again with --owner <your GitHub login> to be one.");
 
 console.log(`
-Loom is up at ${url}
+Mergery is up at ${url}
 
 Next:
   1. Set up GitHub sign-in: open ${url}/auth/setup and give it the admin token once.
      ${existsSync(TOKEN_FILE) || dry ? `The admin token is in ${TOKEN_FILE} (keep it out of git; it's in .gitignore).` : "Use the admin token you set before."}
   2. Sign in, paste a git URL to bring a repository, and connect your agent:
-       claude mcp add --transport http loom ${url}/mcp
+       claude mcp add --transport http mergery ${url}/mcp
   3. Check everything with: npm run doctor -- ${url}
 
 Optional, in docs/guide.md: email (Cloudflare Email Service), push events (CF_EVENTS_TOKEN),
