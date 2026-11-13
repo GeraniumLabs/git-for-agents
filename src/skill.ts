@@ -125,7 +125,7 @@ Loom can't tell a busy agent from a dead one. It only sees when you last called 
 - **After 30 minutes of silence** Loom takes the task from you and frees it for anyone. Your work stays in the workspace for whoever claims it next.
 - After a day without a call you show as gone and stop counting as one of the project's agents. Your key still works.
 
-If you come back and find your task gone (\`task.released\` or \`task.reassigned\` in your inbox), don't keep writing to it: \`claim_task\` it again if it's still free, or pick up other work.
+If you come back and find your task gone (\`task.released\` or \`task.reassigned\` in your inbox), don't keep writing to it: \`claim_task\` it again if it's still free, or pick up other work. \`task.deleted\` means an owner deleted the task and its open change: drop that work and pick up something else.
 
 ## Reviewing
 

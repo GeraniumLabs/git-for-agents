@@ -673,6 +673,45 @@ test("an owner deletes a project: its repositories, attachments and listing go, 
   assert.equal((await repos()).length, 1);
 });
 
+test("an owner deletes a task: its open change, workspace and attachments go, its holder is told, landed tasks stay", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
+  const name = project("e2e-taskdel");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "task delete", files: SEED, requiredApprovals: 0 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Restyle", "");
+  const after = await ada.req("POST", "/tasks", { title: "After restyle", dependsOn: [t.id] });
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "restyle");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// v1\n" }, "v1");
+  await admin.req("POST", "/freeze", { reason: "hold the queue" });
+  const ch = await ada.submit(t.id, t.title, "Restyle", {});
+  const shot = await ada.req("POST", "/attachments", { name: "test.log", text: "ok\n", change: ch.id });
+  const repos = async () => (await (await fetch(`${shim}/repos`)).json()).repos.map((r: any) => r.name).filter((r: string) => r === ws);
+
+  await assert.rejects(ada.req("DELETE", `/tasks/${t.id}`), /403/, "an agent can't delete a task");
+  const gone = await admin.req("DELETE", `/tasks/${t.id}`);
+  assert.deepEqual([gone.deleted, gone.changes, gone.attachments], [t.id, [ch.id], 1]);
+  await assert.rejects(admin.req("GET", `/tasks/${t.id}`), /404/);
+  await assert.rejects(admin.req("GET", `/changes/${ch.id}`), /404/);
+  assert.equal((await fetch(`${url}/api/projects/${name}/attachments/${shot.id}/raw`)).status, 404);
+  assert.deepEqual((await admin.req("GET", `/tasks/${after.id}`)).task.depends_on, [], "the task that waited on it stops waiting");
+  const inbox = await ada.req("GET", "/events?mine=1");
+  assert.ok((inbox.events ?? inbox).some((e: any) => e.type === "task.deleted" && e.task_id === t.id && e.to_agent), "ada hears it was deleted");
+  for (let i = 0; i < 20 && (await repos()).length; i++) await new Promise((r) => setTimeout(r, 500));
+  assert.deepEqual(await repos(), [], "the workspace is swept");
+
+  // A task that landed is part of main's history.
+  await admin.req("POST", "/unfreeze", {});
+  const ws2 = (await ada.claim(after.id)).workspace.name;
+  await ada.write(ws2, { "src/db.js": (await ada.read("src/db.js", ws2)) + "\n// v2\n" }, "v2");
+  await ada.submit(after.id, after.title, "v2", {});
+  for (let i = 0; i < 40 && (await admin.req("GET", `/tasks/${after.id}`)).task.status !== "merged"; i++) await new Promise((r) => setTimeout(r, 500));
+  await assert.rejects(admin.req("DELETE", `/tasks/${after.id}`), /409.*landed/);
+});
+
 test("a write with no message is committed under the task's title, not a generic one", { skip: !url, timeout: 60_000 }, async () => {
   const { Loom } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");

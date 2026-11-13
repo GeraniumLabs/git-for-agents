@@ -65,7 +65,7 @@ const MERGE_IDENTITY = { name: "Loom merge queue", email: "merge-queue@loom.dev"
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
 const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made", "task.assigned"]);
@@ -839,6 +839,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (!need) throw new HttpError(403, `a stand-in key can't ${m} /${parts.join("/")}; ask ${actor.name} to do it in Loom`);
       if (need !== "watch" && !actor.standin.scopes.includes(need)) throw new HttpError(403, `this stand-in key doesn't have the "${need}" right (${SCOPES[need].toLowerCase()}); ${actor.name} can grant it in Settings`);
       if (need !== "watch") this.standinActs.set(req, { id: actor.standin.id, name: actor.standin.name, person: actor.id, action: `${m} /${parts.join("/")}` });
+    }
+    if (a === "tasks" && b && !c && m === "DELETE") {
+      ownerOnly("delete tasks");
+      return json(await this.deleteTask(actor, Number(b)));
     }
     if (a === "project" && m === "DELETE") {
       ownerOnly("delete the project");
@@ -2520,6 +2524,79 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.tokens.delete(`${name}:read`);
       this.tokens.delete(`${name}:write`);
     }
+  }
+
+  /**
+   * Delete a task that hasn't landed, with the work done for it: its open
+   * changes and their reviews, its threads, intents and attachments. Its
+   * workspace is closed and swept like any finished one. A task whose change
+   * landed is part of main's history and stays. A contest goes with all of its
+   * attempts; one attempt alone can't be deleted. Whoever held the task hears
+   * about it; tasks that waited on it stop waiting. Notes, decisions and traces
+   * outlive it, unlinked.
+   */
+  private async deleteTask(actor: Agent, taskId: number) {
+    const task = this.task(taskId);
+    if (task.attempt) throw new HttpError(409, `task ${taskId} is one attempt in contest #${task.parent}; delete the contest instead`);
+    const tasks = [task, ...(task.attempts ? this.contestAttempts(taskId) : [])];
+    const ids = tasks.map((t) => t.id as number);
+    const inIds = (col: string) => `${col} IN (${ids.map(() => "?").join(",")})`;
+    const changes = this.sql.exec(`SELECT id, status FROM changes WHERE ${inIds("task_id")}`, ...ids).toArray();
+    if (tasks.some((t) => t.status === "merged") || changes.some((c) => c.status === "merged"))
+      throw new HttpError(409, `task ${taskId} already landed; its change is part of main's history, so it stays`);
+    if (changes.some((c) => c.status === "merging")) throw new HttpError(409, `task ${taskId}'s change is merging right now; try again once it lands or fails`);
+    const changeIds = changes.map((c) => c.id as number);
+    const inChanges = (col: string) => changeIds.length ? `${col} IN (${changeIds.map(() => "?").join(",")})` : "0";
+
+    // Stored context and attachments first: if storage fails, nothing is gone yet.
+    const files = this.sql.exec(`SELECT id FROM attachments WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds).toArray().map((r) => r.id as number);
+    const keys = files.map((id) => `${this.project}/attachments/${id}`);
+    for (const id of changeIds) {
+      for (let cursor: string | undefined, more = true; more; ) {
+        const page = await this.context.list({ prefix: `${this.project}/changes/${id}/`, cursor });
+        keys.push(...page.objects.map((o) => o.key));
+        more = page.truncated;
+        cursor = page.truncated ? page.cursor : undefined;
+      }
+    }
+    for (let i = 0; i < keys.length; i += 1000) await this.context.delete(keys.slice(i, i + 1000));
+
+    const now = Date.now();
+    const threads = this.sql.exec(`SELECT id FROM threads WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds).toArray().map((r) => r.id as number);
+    if (threads.length) {
+      const q = threads.map(() => "?").join(",");
+      this.sql.exec(`DELETE FROM posts WHERE thread_id IN (${q})`, ...threads);
+      this.sql.exec(`DELETE FROM threads WHERE id IN (${q})`, ...threads);
+      this.sql.exec(`UPDATE decisions SET thread_id = NULL WHERE thread_id IN (${q})`, ...threads);
+    }
+    if (changeIds.length) {
+      this.sql.exec(`DELETE FROM reviews WHERE ${inChanges("change_id")}`, ...changeIds);
+      this.sql.exec(`DELETE FROM review_requests WHERE ${inChanges("change_id")}`, ...changeIds);
+      this.sql.exec(`DELETE FROM changes WHERE ${inChanges("id")}`, ...changeIds);
+    }
+    this.sql.exec(`DELETE FROM attachments WHERE ${inIds("task_id")} OR ${inChanges("change_id")}`, ...ids, ...changeIds);
+    this.sql.exec(`DELETE FROM intents WHERE ${inIds("task_id")}`, ...ids);
+    this.sql.exec("DELETE FROM contest_votes WHERE contest = ?", taskId);
+    for (const table of ["decisions", "notes", "traces"]) {
+      this.sql.exec(`UPDATE ${table} SET task_id = NULL WHERE ${inIds("task_id")}`, ...ids);
+      if (changeIds.length) this.sql.exec(`UPDATE ${table} SET change_id = NULL WHERE ${inChanges("change_id")}`, ...changeIds);
+    }
+    // Close the workspaces; the sweep deletes their repos on its next pass.
+    this.sql.exec(`UPDATE workspaces SET status = 'closed', done_at = 0 WHERE ${inIds("task_id")} AND status = 'active'`, ...ids);
+    // Tasks that waited on this one no longer do.
+    for (const r of this.sql.exec("SELECT id, depends_on FROM tasks WHERE depends_on != '[]'").toArray()) {
+      const deps = JSON.parse(r.depends_on as string) as number[];
+      if (deps.some((d) => ids.includes(d))) this.sql.exec("UPDATE tasks SET depends_on = ? WHERE id = ?", JSON.stringify(deps.filter((d) => !ids.includes(d))), r.id);
+    }
+    this.sql.exec(`UPDATE tasks SET waits_for = NULL WHERE ${inIds("waits_for")}`, ...ids);
+    this.sql.exec(`UPDATE tasks SET parent = NULL WHERE ${inIds("parent")} AND COALESCE(attempt, 0) = 0`, ...ids);
+    this.sql.exec(`DELETE FROM tasks WHERE ${inIds("id")}`, ...ids);
+
+    const holders = [...new Set(tasks.map((t) => t.assignee as string | null).filter((a): a is string => !!a && a !== actor.id))];
+    for (const to of holders) this.emit("task.deleted", { actor: actor.id, task: taskId, to, data: { title: task.title, changes: changeIds } });
+    if (!holders.length) this.emit("task.deleted", { actor: actor.id, task: taskId, data: { title: task.title, changes: changeIds } });
+    void this.armAlarm(now + 1000);
+    return { deleted: taskId, tasks: ids, changes: changeIds, threads: threads.length, attachments: files.length };
   }
 
   /**
