@@ -58,6 +58,26 @@ class Stats {
 
 export class MemoryFS {
   private nodes = new Map<string, Node>([["/", { kind: "dir", mtime: Date.now() }]]);
+
+  /**
+   * Take another filesystem's entries under `prefix` (and the folders above
+   * them). File contents are shared, not copied: git objects never change, so
+   * a new workspace can start from what an earlier one already fetched.
+   */
+  adopt(other: MemoryFS, prefix: string) {
+    for (const [path, node] of other.nodes) {
+      if (path !== prefix && !path.startsWith(`${prefix}/`)) continue;
+      for (let p = parent(path); p !== "/" && !this.nodes.has(p); p = parent(p)) this.nodes.set(p, { kind: "dir", mtime: Date.now() });
+      this.nodes.set(path, node);
+    }
+  }
+
+  /** How many files sit under a folder. */
+  count(prefix: string): number {
+    let n = 0;
+    for (const [path, node] of this.nodes) if (node.kind === "file" && path.startsWith(`${prefix}/`)) n++;
+    return n;
+  }
   promises = {
     readFile: this.readFile.bind(this),
     writeFile: this.writeFile.bind(this),

@@ -3,6 +3,8 @@
 
 const $ = (s) => document.querySelector(s);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+/** Durable Object location hints (src/residency.ts PLACEMENTS). */
+const PLACEMENTS = { wnam: "Western North America", enam: "Eastern North America", sam: "South America", weur: "Western Europe", eeur: "Eastern Europe", apac: "Asia-Pacific", oc: "Oceania", afr: "Africa", me: "the Middle East" };
 const PALETTE = ["#f38020", "#2b6cb0", "#2f8f5b", "#9f50c8", "#c53030", "#0f8b8d", "#b7791f", "#d53f8c"];
 
 let project = new URLSearchParams(location.search).get("project");
@@ -729,12 +731,32 @@ async function showDirectory(st) {
   if (!$("#detail").open) $("#detail").showModal();
 }
 
+// ── per-agent limits: paths, changes a day, check minutes a day ──
+function limitsText(l) {
+  if (!l) return "no limits";
+  const parts = [l.paths?.length ? `only ${l.paths.join(", ")}` : "", l.changesPerDay === 0 ? "any number of changes" : l.changesPerDay !== undefined ? `${l.changesPerDay} change${l.changesPerDay === 1 ? "" : "s"} a day` : "", l.checkMinutesPerDay === 0 ? "any check minutes" : l.checkMinutesPerDay !== undefined ? `${l.checkMinutesPerDay} check minute${l.checkMinutesPerDay === 1 ? "" : "s"} a day` : ""].filter(Boolean);
+  return parts.length ? parts.join(" · ") : "no limits";
+}
+function limitsForm(p, l) {
+  return `<div class="row"><input id="${p}-paths" class="mono grow" placeholder="Paths it may change, e.g. src/ui/, docs/** (blank: all)" value="${esc((l?.paths ?? []).join(", "))}">
+    <label class="check">Changes a day <input id="${p}-changes" type="number" min="0" style="width:5em" value="${l?.changesPerDay ?? ""}" placeholder="any" title="0 is no limit, even where the project has a default"></label>
+    <label class="check">Check minutes a day <input id="${p}-minutes" type="number" min="0" step="0.5" style="width:5em" value="${l?.checkMinutesPerDay ?? ""}" placeholder="any" title="0 is no limit, even where the project has a default"></label>
+    <button class="ghost" id="${p}-save">Save</button></div>`;
+}
+function readLimitsForm(p) {
+  const num = (id) => { const v = $(`#${p}-${id}`).value.trim(); return v === "" ? undefined : Number(v); };
+  const l = { paths: $(`#${p}-paths`).value.split(",").map((x) => x.trim()).filter(Boolean), changesPerDay: num("changes"), checkMinutesPerDay: num("minutes") };
+  return l.paths.length || l.changesPerDay !== undefined || l.checkMinutesPerDay !== undefined ? l : null;
+}
+
 async function showAgent(id) {
   const p = await api(`/agents/${encodeURIComponent(id)}`);
   if (p.error) return toast(p.error);
   const a = p.agent;
   names[a.id] = a.name;
   if (a.under) names[a.under.id] = a.under.name;
+  const sc = isHuman() && a.role !== "human" ? await act("GET", `/scorecards?days=30&agent=${encodeURIComponent(a.id)}`).then((r) => r.agents[0] ?? null).catch(() => null) : null;
+  const lim = a.role !== "human" && (isOwner() || me?.id === a.id) ? await api(`/agents/${encodeURIComponent(a.id)}/limits`).then((r) => (r.error ? null : r)).catch(() => null) : null;
   const ctl = isHuman() && a.role !== "human" ? `<div class="row">
       <button data-op="${a.state === "paused" ? "resume" : "pause"}" class="${a.state === "paused" ? "" : "ghost"}">${a.state === "paused" ? "Resume" : "Pause"}</button>
       <input id="dm-body" placeholder="Directive to ${esc(a.name)} only"><button id="dm-send" class="ghost">Send</button></div>` : "";
@@ -744,6 +766,9 @@ async function showAgent(id) {
     ${p.underKey?.length ? `<h2>Agents under this key <small>${p.underKey.length}</small></h2>${p.underKey.map((u) => { names[u.id] = u.name; return `<div class="qrow"><span class="dot ${u.state}"></span>${who(u.id)} <span class="grow meta ellipsis">${u.state}${u.task ? ` · #${u.task.id} ${esc(u.task.title)}` : ""}</span></div>`; }).join("")}` : ""}
     ${p.trust ? `<div class="card"><div class="qrow"><b class="grow">Track record</b><span class="pill" title="what this agent's approvals and contest votes count for">${p.trust.weight}× vote</span></div><div class="meta">${esc(p.trust.summary)}</div></div>` : ""}
     ${ctl}
+    ${lim ? `<div class="card"><div class="qrow"><b class="grow">Limits</b><span class="meta">${lim.usage.changesToday} change${lim.usage.changesToday === 1 ? "" : "s"} in 24 h · ${lim.usage.checkMinutesToday} check min today${lim.sharedWith ? ` · shared with ${esc(lim.sharedWith)}'s key` : ""}</span></div>
+      <div class="meta">${esc(limitsText(lim.effective))}${lim.own ? "" : lim.defaults ? " (the project's defaults)" : ""}</div>${isOwner() ? limitsForm("al", lim.own) + `<p class="meta">Blank fields fall back to its key's, its join code's, then the project's defaults.</p>` : ""}</div>` : ""}
+    ${sc ? `<div class="card"><div class="qrow"><b class="grow">Scorecard, last 30 days</b><a class="meta" href="#scorecards">Compare all</a></div><div class="meta">${scoreLine(sc)}</div></div>` : ""}
     <div id="agent-grid" class="card contrib-card"></div>
     ${p.knows.length ? `<h2>Knows</h2><div class="knows">${p.knows.map((k) => `<div><span class="mono">${esc(k.path)}</span> <span class="meta">${[k.wrote && `wrote ×${k.wrote}`, k.reviewed && `reviewed ×${k.reviewed}`].filter(Boolean).join(", ")}${k.symbols.length ? ` · ${k.symbols.slice(0, 6).map(esc).join(", ")}${k.symbols.length > 6 ? "…" : ""}` : ""}</span></div>`).join("")}</div>` : ""}
     ${p.reviewQueue.length || p.reviewStats.approved + p.reviewStats.changesRequested ? `<h2>Reviews <small>${p.reviewStats.approved} approved · ${p.reviewStats.changesRequested} sent back${p.reviewStats.medianResponseMs != null ? ` · answers requests in ${dur(p.reviewStats.medianResponseMs)} (median)` : ""}</small></h2>
@@ -756,6 +781,11 @@ async function showAgent(id) {
     <h2>Recent activity</h2><ol class="feed">${p.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("")}</ol>`;
   wire($("#detail-body"));
   renderGrid($("#agent-grid"), a.id);
+  if ($("#al-save")) $("#al-save").onclick = async () => {
+    try { await act("POST", `/agents/${encodeURIComponent(a.id)}/limits`, { limits: readLimitsForm("al") }); } catch { return; }
+    toast(`Limits saved for ${a.name}`);
+    showAgent(a.id);
+  };
   for (const b of $("#detail-body").querySelectorAll("[data-op]")) b.onclick = async () => {
     const reason = b.dataset.op === "pause" ? await ask({ title: `Pause ${a.name}?`, body: "It stops taking work until you resume it. It will see your reason.", ok: "Pause", input: { label: "Reason", placeholder: "e.g. Waiting on the schema decision" } }) : undefined;
     if (b.dataset.op === "pause" && reason === null) return;
@@ -1324,7 +1354,9 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
     <label class="check"><input id="np-review" type="checkbox" checked> Changes need one approval before they merge</label>
     <label class="check"><input type="radio" name="np-vis" value="public" checked> Public: anyone can see the work; only members act</label>
     <label class="check"><input type="radio" name="np-vis" value="private"> Private: only members and the project's agents can see it</label>
-    ${(auth.regions ?? []).includes("eu") ? `<label class="check"><input id="np-eu" type="checkbox"> Keep its data in the EU: repositories, coordinator and change context. This can't be changed later.</label>` : ""}
+    ${(auth.regions ?? []).length ? `<label>Where its data lives <select id="np-where"><option value="">Anywhere: Cloudflare keeps it where it serves it best</option>${(auth.regions ?? []).map((j) => `<option value="${j}">${j === "eu" ? "In the EU" : j === "fedramp" ? "In the US, FedRAMP data centers" : esc(j)}</option>`).join("")}<option disabled>In India: coming when Cloudflare can keep data there</option><option disabled>In Australia: coming when Cloudflare can keep data there</option></select></label>` : ""}
+    <label>Where its agents run <select id="np-place"><option value="">Wherever you are now</option>${Object.entries(PLACEMENTS).map(([k, v]) => `<option value="${k}">${v}</option>`).join("")}</select></label>
+    <p class="meta">The project's coordinator does its git work, so it should sit near the agents. Both choices are made once: a project can't move later.</p>
     <div id="np-access" class="warn" hidden></div>
     <div class="row"><button id="np-create">Create project</button></div>`;
   wireBilling($("#detail-body"));
@@ -1396,7 +1428,7 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
       if (a.access === "missing") return stuck(`Loom can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-eu")?.checked ? { jurisdiction: "eu" } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-where")?.value ? { jurisdiction: $("#np-where").value } : {}), ...($("#np-place")?.value ? { placement: $("#np-place").value } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
     const data = await res.json().catch(() => ({}));
     if (!res.ok) {
       $("#np-create").disabled = false;
@@ -1561,8 +1593,8 @@ async function showInvite(code) {
 async function showSettings() {
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
-  let mail = null, account = null, hooks = [];
-  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : []]); } catch { return; }
+  let mail = null, account = null, hooks = [], cs = null, ev = null;
+  try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : [], isOwner() ? act("GET", "/check-secrets").catch(() => null) : null, act("GET", "/evals").catch(() => null)]).then((r) => { ev = r.pop(); cs = r.pop(); return r; }); } catch { return; }
   const org = state?.project?.org ?? null;
   const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
@@ -1576,7 +1608,7 @@ async function showSettings() {
     <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Loom is its home: nothing is written back.</p>
     ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
     <h2>Where the data lives</h2>
-    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union. Chosen when the project was made; it can't move." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best. Keeping it in the EU is chosen when a project is made."}</p>
+    <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
@@ -1585,6 +1617,18 @@ async function showSettings() {
     <h2>Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
+    ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Loom checks main itself and, if main fails, finds the change that broke it and opens its revert for a person to approve."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>, <a href="#incident/bisect/${state.project.lastBisect.id}">incident view</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
+    ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
+    ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
+    ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
+    <h2>Previews</h2>
+    <p class="meta">${state?.project?.preview ? `Every change gets a link to ${state.project.preview.command ? `what <span class="mono">${esc(state.project.preview.command)}</span> builds into <span class="mono">${esc(state.project.preview.dir || ".")}/</span>` : `the files in <span class="mono">${esc(state.project.preview.dir || "/")}</span>`}, rebuilt on each version. Anyone with the link can open it, even in a private project; the page runs sandboxed, so it can't act as whoever opens it.` : "<b>Off.</b> Give each change a link to see what it builds before it lands: a static folder, or a build command's output (run in the check container, using the author's check minutes)."}</p>
+    ${isOwner() ? `<div class="row"><input id="pv-cmd" class="mono grow" placeholder="Build command (optional), e.g. npm ci && npm run build" value="${esc(state?.project?.preview?.command ?? "")}"><input id="pv-dir" class="mono" style="width:9em" placeholder="Folder, e.g. dist" value="${esc(state?.project?.preview?.dir ?? "")}"><button class="ghost" id="pv-save">${state?.project?.preview ? "Save" : "Turn on"}</button>${state?.project?.preview ? `<button class="ghost" id="pv-off">Turn off</button>` : ""}</div>` : ""}
+    <h2>Evals</h2>
+    <p class="meta">Scores from 0 to 1 on every version of every change. A <b>command</b> eval runs in the check container (a last line like <span class="mono">score: 0.8</span> sets the score; otherwise passing is 1) and uses check minutes. A <b>review</b> eval is a job for an agent other than the author: runners see it on /work and agents in their todo; Loom doesn't run that agent. A blocking eval under its threshold sends the change back.</p>
+    ${(ev?.evals ?? []).map((e) => `<div class="qrow"><span class="grow"><b>${esc(e.name)}</b> <span class="meta">${e.kind}${e.blocking ? ` · blocks under ${e.threshold}` : ""} · ${e.scored ? `average ${e.average} over ${e.scored}${e.trend.length > 1 ? `, by week: ${e.trend.slice().reverse().map((w) => w.average).join(" → ")}` : ""}` : "nothing scored yet"}${e.waiting ? ` · ${e.waiting} waiting` : ""}</span><br><span class="meta mono">${esc(e.command ?? e.rubric ?? "")}</span></span>${isOwner() ? `<button class="ghost mini" data-eval-remove="${esc(e.name)}">Remove</button>` : ""}</div>`).join("")}
+    ${isOwner() ? `<div class="card key-card"><div class="row"><input id="ev-name" placeholder="Name, e.g. Security" style="width:12em"><select id="ev-kind"><option value="review">Review by an agent</option><option value="command">Command</option></select><label class="check"><input type="checkbox" id="ev-block"> Blocking under <input id="ev-th" type="number" min="0" max="1" step="0.05" value="0.5" style="width:4.5em"></label></div>
+      <textarea id="ev-text" rows="2" class="grow" style="width:100%" placeholder="Review: the rubric, what a 1 and a 0 look like. Command: e.g. npm run lint"></textarea><div class="row"><button class="ghost" id="ev-save">Add eval</button></div></div>` : ""}
     <h2>Questions for people</h2>
     <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
     ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
@@ -1593,13 +1637,16 @@ async function showSettings() {
     ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
       return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
         + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
+    <h2>Agent limits</h2>
+    <p class="meta">What each agent may do unless its own limits say otherwise: which paths it may change, how many changes it may open a day, and how many check minutes it may use a day. Sub-agents share their key's limits. ${state?.project?.agentLimits ? `Now: <b>${esc(limitsText(state.project.agentLimits))}</b>.` : "<b>No limits</b> beyond the project's."} Set one agent's limits from its profile.</p>
+    ${isOwner() ? limitsForm("dl", state?.project?.agentLimits) : ""}
     <h2>Review agent</h2>
     ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Loom reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Loom review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
     <h2>Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
-      return `<p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
+      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Loom removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
       + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
       <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
@@ -1721,6 +1768,43 @@ async function showSettings() {
   };
   if ($("#threads-toggle")) $("#threads-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { resolveThreads: state.project.resolveThreads === false }); state.project.resolveThreads = r.resolveThreads; } catch { return; }
+    showSettings();
+  };
+  if ($("#pv-save")) $("#pv-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { preview: { command: $("#pv-cmd").value.trim() || null, dir: $("#pv-dir").value.trim() } }); state.project.preview = r.preview; } catch { return; }
+    toast("Previews on"); showSettings();
+  };
+  if ($("#pv-off")) $("#pv-off").onclick = async () => {
+    try { const r = await act("POST", "/settings", { preview: null }); state.project.preview = r.preview; } catch { return; }
+    showSettings();
+  };
+  if ($("#ev-save")) $("#ev-save").onclick = async () => {
+    const kind = $("#ev-kind").value, text = $("#ev-text").value.trim();
+    try { await act("POST", "/evals", { name: $("#ev-name").value.trim(), kind, ...(kind === "command" ? { command: text } : { rubric: text }), blocking: $("#ev-block").checked, threshold: Number($("#ev-th").value) }); } catch { return; }
+    toast("Eval added"); showSettings();
+  };
+  for (const b of document.querySelectorAll("[data-eval-remove]")) b.onclick = async () => {
+    try { await act("DELETE", `/evals/${encodeURIComponent(b.dataset.evalRemove)}`); } catch { return; }
+    showSettings();
+  };
+  if ($("#cs-save")) $("#cs-save").onclick = async () => {
+    try { await act("POST", "/check-secrets", { name: $("#cs-name").value.trim(), value: $("#cs-value").value, onDemand: $("#cs-demand").checked }); } catch { return; }
+    toast("Secret saved"); showSettings();
+  };
+  for (const b of document.querySelectorAll("[data-secret-remove]")) b.onclick = async () => {
+    try { await act("DELETE", `/check-secrets/${encodeURIComponent(b.dataset.secretRemove)}`); } catch { return; }
+    showSettings();
+  };
+  for (const b of document.querySelectorAll("[data-secret-demand]")) b.onclick = async () => {
+    try { await act("POST", "/check-secrets", { name: b.dataset.secretDemand, onDemand: !!b.dataset.on }); } catch { return; }
+    showSettings();
+  };
+  if ($("#dl-save")) $("#dl-save").onclick = async () => {
+    try { const r = await act("POST", "/agent-limits", { limits: readLimitsForm("dl") }); state.project.agentLimits = r.defaults; } catch { return; }
+    toast("Default agent limits saved");
+  };
+  if ($("#bisect-toggle")) $("#bisect-toggle").onclick = async () => {
+    try { const r = await act("POST", "/settings", { autoBisect: state.project.autoBisect === false }); state.project.autoBisect = r.autoBisect; } catch { return; }
     showSettings();
   };
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
@@ -2029,7 +2113,7 @@ function describe(e) {
     case "task.unassigned": return null;
     case "task.unblocked": return ["", `Task #${e.task_id} may now land (after #${d.after})`];
     case "paths.protected": return ["directive", `${who} protected <span class="mono">${d.paths.map(esc).join(", ") || "nothing"}</span>: changes there need a human approval`];
-    case "approval.needs_human": return ["question", `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval`];
+    case "approval.needs_human": return ["question", d.paths?.length ? `#${e.change_id} touches protected <span class="mono">${d.paths.map(esc).join(", ")}</span> and needs a human approval` : `#${e.change_id} needs a person's approval: ${esc(d.reason ?? "")}`];
     case "project.visibility": return ["directive", `${who} made the project ${esc(d.visibility)}`];
     case "member.added": return ["directive", `${who} added ${esc(d.login)} to the project${d.owner ? " as an owner" : ""}`];
     case "member.removed": return ["directive", `${who} removed ${esc(d.login)} from the project`];
@@ -2130,9 +2214,104 @@ function showTask(id) {
 }
 
 /** The dashboard, or a change, contest, task or the code on its own page, from the URL. */
+// ── asking Loom, the incident view and the factory report ──
+
+/** A question box: asks Loom about `about` ({change}, {bisect} or {trace}) and shows the answer with what it cites. */
+function askBox(about, placeholder) {
+  const id = `ask-${Math.random().toString(36).slice(2, 8)}`;
+  setTimeout(() => {
+    const box = document.getElementById(id);
+    if (!box) return;
+    const input = box.querySelector("input"), out = box.querySelector(".ask-out"), btn = box.querySelector("button");
+    const go = async () => {
+      const question = input.value.trim();
+      if (!question) return;
+      btn.disabled = true; out.innerHTML = `<p class="meta">Reading the traces and events…</p>`;
+      try {
+        const r = await act("POST", "/ask", { question, ...about });
+        const cite = (t) => esc(t).replace(/\[([A-Z]\d+(?:\.\d+)?)\]/g, (_, ref) => `<a href="#" class="cite mono" data-ref="${ref}">${ref}</a>`);
+        out.innerHTML = `<p>${cite(r.answer)}</p>${r.citations.length ? `<details><summary class="meta">${plural(r.citations.length, ["source", "sources"])} · ${esc(r.model)}${r.truncated ? " · some sources didn't fit" : ""}</summary>${r.citations.map((c) => `<p class="meta" data-src="${esc(c.ref)}"><span class="mono">${esc(c.ref)}</span> ${esc(c.text)}</p>`).join("")}</details>` : `<p class="meta">${esc(r.model)}, citing nothing: the sources may not cover this.</p>`}`;
+        for (const a of out.querySelectorAll(".cite")) a.onclick = (e) => { e.preventDefault(); const d = out.querySelector("details"); if (d) d.open = true; out.querySelector(`[data-src="${a.dataset.ref}"]`)?.scrollIntoView({ block: "nearest" }); };
+      } catch { out.innerHTML = ""; }
+      btn.disabled = false;
+    };
+    btn.onclick = go;
+    input.onkeydown = (e) => { if (e.key === "Enter") go(); };
+  });
+  return `<div class="ask-box" id="${id}"><div class="row"><input class="grow" maxlength="1000" placeholder="${esc(placeholder)}"><button class="ghost mini">Ask</button></div><div class="ask-out"></div></div>`;
+}
+
+const pct = (n) => (n == null ? "–" : `${n}%`);
+const kNum = (n) => (n == null ? "–" : n >= 10_000 ? `${Math.round(n / 1000)}k` : String(n));
+function scoreLine(c) {
+  return [`${c.landed} of ${c.changes} landed`, c.firstPassRate != null && `${pct(c.firstPassRate)} first pass`, c.revertRate ? `${pct(c.revertRate)} reverted` : null, c.checksFailed && `${c.checksFailed} failed checks`,
+    c.medianHoursToLand != null && `lands in ${c.medianHoursToLand} h (median)`, c.tokensPerLanded && `${kNum(c.tokensPerLanded)} tokens per landed change`, c.costPerLanded != null && `$${c.costPerLanded} per landed change`,
+    c.reviews?.accuracy != null && `reviews hold up ${pct(c.reviews.accuracy)}`].filter(Boolean).map(esc).join(" · ");
+}
+
+async function showScorecards(days) {
+  if (!isHuman()) return showSignIn("Scorecards use agents' session traces, so only the project's people can see them.");
+  let r; try { r = await act("GET", `/scorecards?days=${days}`); } catch { return; }
+  const cols = [["Landed", (c) => `${c.landed}/${c.changes}`], ["First pass", (c) => pct(c.firstPassRate)], ["Rework per change", (c) => c.reworkPerChange ?? "–"], ["Failed checks", (c) => c.checksFailed], ["Reverted", (c) => pct(c.revertRate)], ["Conflicts", (c) => c.conflicts], ["Hours to land", (c) => c.medianHoursToLand ?? "–"], ["Tokens per landed", (c) => kNum(c.tokensPerLanded)], ["$ per landed", (c) => (c.costPerLanded == null ? "–" : `$${c.costPerLanded}`)]];
+  const table = (rows, label, extra = []) => `<table class="report"><tr><th>${label}</th>${[...cols, ...extra].map(([h]) => `<th>${h}</th>`).join("")}</tr>${rows.map((c) => `<tr><td>${label === "Agent" ? who(c.key) : esc(c.name)}</td>${[...cols, ...extra].map(([, f]) => `<td>${esc(String(f(c)))}</td>`).join("")}</tr>`).join("")}</table>`;
+  $("#detail-body").innerHTML = `
+    <h3>Scorecards · last ${r.days} days</h3>
+    <p class="meta">${[7, 30, 90].map((d) => (d === r.days ? `<b>${d} days</b>` : `<a href="#scorecards/${d}">${d} days</a>`)).join(" · ")}. First pass: landed without being sent back. A change's model is the one in the session traces linked to it. Tokens and cost come from traces, so agents that don't upload them show none.</p>
+    <h2>By model</h2>${r.models.length ? table(r.models, "Model") : `<p class="empty">No changes in this window.</p>`}
+    <h2>By agent</h2>${r.agents.length ? table(r.agents, "Agent", [["Reviews hold up", (c) => pct(c.reviews?.accuracy)], ["Vote weight", (c) => (c.weight == null ? "–" : `${c.weight}×`)]]) : ""}
+    <p class="meta"><a href="#report">Factory report</a>: what the traces say to change.</p>`;
+  wire($("#detail-body"));
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
+async function showIncident(kind, id) {
+  if (!isHuman()) return showSignIn("The incident view reads agents' session traces, so only the project's people can see it.");
+  let inc; try { inc = await act("GET", `/incident?${kind}=${id}`); } catch { return; }
+  const s = inc.suspect;
+  $("#detail-body").innerHTML = `
+    <h3>Incident · ${inc.bisect ? `bisect #${inc.bisect}` : `change #${id}`}</h3>
+    <p class="meta">${inc.command ? `<span class="mono">${esc(inc.command)}</span> · ` : ""}${inc.verdict ? `${esc(inc.verdict.replace(/^./, (c) => c.toUpperCase()))}.` : "Changes landed from the suspect on."} ${inc.from ? `Last passing at v${inc.from}.` : ""}</p>
+    ${s ? `<h2>Most likely: <a href="#change/${s.id}">#${s.id} ${esc(s.title)}</a></h2>
+      <p class="meta">By ${esc(s.authorName ?? s.author)}. ${s.ranChecks === true ? "They ran the checks and they passed then." : s.ranChecks === false ? "They ran the checks, and they failed." : "They didn't run the checks themselves."} ${s.approvedBy.length ? `Approved by ${s.approvedBy.map(esc).join(", ")}.` : "Nobody approved it; it landed without review."}${s.filesNamed.length ? ` The failure names ${s.filesNamed.map((f) => `<span class="mono">${esc(f)}</span>`).join(", ")}.` : ""}</p>
+      ${s.failing ? `<pre class="mono out">${esc(s.failing)}</pre>` : ""}
+      ${s.knew.length ? `<p class="meta"><b>What the author did to those files</b>, from their session:</p>${s.knew.map((k) => `<p class="meta"><span class="mono">${esc(k.ref)}</span> ${esc(k.text)}</p>`).join("")}` : `<p class="meta">No session trace from the author covers these files.</p>`}
+      <div class="row">${s.revertedBy ? `<a class="button ghost" href="#change/${s.revertedBy}">Reverted by #${s.revertedBy}</a>` : `<button class="ghost" id="inc-revert">Revert #${s.id}</button>`}</div>` : ""}
+    <h2>What landed${inc.from ? ` since v${inc.from}` : ""}</h2>
+    ${inc.changes.map((c) => `<div class="qrow"><span class="grow"><a href="#change/${c.id}">#${c.id} ${esc(c.title)}</a> <span class="meta">v${c.version} · ${esc(c.authorName ?? c.author)} · ${plural(c.files.length, ["file", "files"])} · ${c.reviews.length ? c.reviews.map((r) => `${esc(r.reviewerName ?? r.reviewer)} ${r.verdict === "approve" ? "approved" : "asked for changes"}`).join(", ") : "no review"} · ${c.traces.length ? plural(c.traces.length, ["trace", "traces"]) : "no trace"}${c.revertedBy ? ` · reverted by #${c.revertedBy}` : ""}</span></span>${c.suspect ? `<span class="pill checks_failed">suspect</span>` : ""}</div>`).join("") || `<p class="empty">Nothing landed in between.</p>`}
+    ${inc.runs.length ? `<h2>Check runs</h2>${[...inc.runs].sort((a, b) => a.version - b.version).map((r) => `<p class="meta">${r.ok ? "✓" : "✗"} ${r.change ? `#${r.change} ${esc(r.title)}` : esc(r.title)} · v${r.version} · ${Math.round(r.ms / 1000)}s</p>`).join("")}` : ""}
+    <h2>Ask about it</h2>
+    ${inc.bisect ? askBox({ bisect: inc.bisect }, "What did the author know when they changed this?") : s ? askBox({ change: s.id }, "Why did this change land without tests?") : ""}`;
+  if ($("#inc-revert")) $("#inc-revert").onclick = async () => {
+    $("#inc-revert").disabled = true;
+    let r; try { r = await act("POST", `/changes/${s.id}/revert`, { reason: inc.bisect ? `Bisect #${inc.bisect}: ${inc.verdict}` : "" }); } catch { $("#inc-revert").disabled = false; return; }
+    toast(`Revert #${r.id} is in the merge queue`); location.hash = `#change/${r.id}`;
+  };
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
+async function showReport(days, summarize = false) {
+  if (!isHuman()) return showSignIn("The factory report reads agents' session traces, so only the project's people can see it.");
+  let r; try { r = await act("GET", `/report?days=${days}${summarize ? "&summary=1" : ""}`); } catch { return; }
+  const num = (n) => (n == null ? "–" : n >= 10_000 ? `${Math.round(n / 1000)}k` : String(n));
+  const table = (rows, label) => rows.length ? `<table class="report"><tr><th>${label}</th><th>Sessions</th><th>Tokens</th><th>Changes</th><th>Landed</th><th>Rework rounds</th><th>Failed checks</th><th>Reverted</th><th>Tokens per landed change</th></tr>${rows.map((m) => `<tr><td>${esc(m.model)}</td><td>${m.sessions}</td><td>${num(m.tokens)}</td><td>${m.changes}</td><td>${m.landed}</td><td>${m.reworkRounds}</td><td>${m.checksFailed}</td><td>${m.reverted}</td><td>${num(m.tokensPerLanded)}</td></tr>`).join("")}</table>` : "";
+  $("#detail-body").innerHTML = `
+    <h3>Factory report · last ${r.days} days</h3>
+    <p class="meta">${plural(r.sessions, ["session", "sessions"])}, ${plural(r.changes, ["change", "changes"])}, ${r.landed} landed. <a href="#report/${r.days === 7 ? 30 : 7}">Last ${r.days === 7 ? 30 : 7} days</a> · <a href="#scorecards">Scorecards</a></p>
+    ${r.summary ? `<div class="card ask-answer"><p>${esc(r.summary.text)}</p><p class="meta">Written by ${esc(r.summary.model)} from this report's findings and rows.</p></div>` : r.sessions || r.changes ? `<div class="row"><button class="ghost" id="rp-sum">Summarize it</button><span class="meta">One model call, counted with the day's questions.</span></div>` : ""}
+    <h2>What to change</h2>
+    ${r.findings.map((f) => `<div class="card"><b>${esc(f.title)}</b><p class="meta">${esc(f.detail)}</p><p>${esc(f.suggest)}</p><p class="meta">${f.refs.map((x) => x.startsWith("#") ? `<a href="#change/${x.slice(1)}">${esc(x)}</a>` : `<span class="mono">${esc(x)}</span>`).join(" ")}</p></div>`).join("") || `<p class="empty">Nothing stood out. Findings need session traces: turn on uploads in Connect an agent.</p>`}
+    <h2>By model</h2>${table(r.models, "Model") || `<p class="empty">No sessions yet.</p>`}
+    <h2>By agent</h2>${table(r.agents, "Agent")}
+    <h2>Ask about the project</h2>${askBox({}, "Which agent's changes get sent back most, and why?")}`;
+  if ($("#rp-sum")) $("#rp-sum").onclick = () => showReport(days, true);
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
 function route() {
   const page = /^#(?:account|org\/([a-z0-9-]+))$/.exec(location.hash);
   if (page) { page[1] ? showOrg(page[1]) : showAccount(); return; }
+  const ana = /^#(?:incident\/(bisect|change)\/(\d+)|(report|scorecards)(?:\/(\d+))?)$/.exec(location.hash);
+  if (ana) { ana[1] ? showIncident(ana[1], Number(ana[2])) : ana[3] === "report" ? showReport(Number(ana[4] ?? 7)) : showScorecards(Number(ana[4] ?? 30)); return; }
   const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
   const cm = /^#code(?:\/change\/(\d+)|\/workspace\/([^/]+))?(?:\/(history)|\/(tree|file)\/(.+?))?\/?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!(m || cm));
@@ -2152,7 +2331,7 @@ function route() {
 }
 window.addEventListener("hashchange", route);
 // Closing the account or an org page leaves its link, so the same link opens it again.
-$("#detail").addEventListener("close", () => { if (/^#(account|org\/)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
+$("#detail").addEventListener("close", () => { if (/^#(account|org\/|incident\/|report|scorecards)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
 async function loadReview(id) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
@@ -2220,9 +2399,11 @@ function drawReview() {
       <h1>${esc(c.title)} <span class="meta">#${c.id}</span> <span class="pill ${c.status}">${c.status.replace("_", " ")}</span></h1>
       <div class="meta">${who(c.agent_id)} wants to land this for <a href="#task/${c.task.id}">task #${c.task.id} “${esc(c.task.title)}”</a> · updated ${ago(c.updated_at)} ago · <span class="add">+${added}</span> <span class="del">−${removed}</span> in ${plural(c.brief.files.length, ["file", "files"])}</div>
       ${c.summary ? `<p class="rv-summary">${esc(c.summary)}</p>` : ""}
+      ${c.evals?.length ? `<div class="evals">${c.evals.map((e) => `<span class="pill ${e.passed === false ? "checks_failed" : e.passed ? "merged" : ""}" title="${esc(`${e.kind === "command" ? "Run by Loom" : e.byName ? `Scored by ${e.byName}` : "Waiting for an agent to score it"}${e.notes ? `: ${e.notes.slice(-300)}` : ""}${e.rubric ? `\nRubric: ${e.rubric}` : ""}`)}">${esc(e.eval)} ${e.score != null ? e.score.toFixed(2) : e.status === "failed" ? "didn't run" : "…"}${e.previous != null && e.score != null && e.previous !== e.score ? ` <small>${e.score > e.previous ? "↑" : "↓"} from ${e.previous.toFixed(2)}</small>` : ""}${e.blocking ? " ·" : ""}</span>`).join(" ")}</div>` : ""}
       ${attachmentsHtml(c.attachments, { where: false })}
+      ${isHuman() && c.traceCount ? askBox({ change: c.id }, "Ask about this change: why did the author skip the tests?") : ""}
       ${c.traceCount ? `<div class="rv-traces"><button class="ghost mini" data-traces title="The session logs of the agents behind this change: what they read, thought and did">Session traces (${c.traceCount})</button><div id="traces-box"></div></div>` : ""}
-      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}</div>
+      <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}${c.preview?.url ? `<a class="button mini" href="${esc(c.preview.url)}" target="_blank" rel="noopener noreferrer nofollow" title="${c.preview.current ? "What this change builds" : "Built from an earlier version; the current one is building"}">Preview${c.preview.current ? "" : " (older version)"}</a>` : c.preview?.status === "building" ? `<span class="pill">preview building…</span>` : c.preview?.status === "failed" ? `<span class="pill checks_failed" title="${esc(c.preview.error ?? "")}">preview failed</span>` : ""}${c.reverts ? `<a class="button ghost mini" href="#change/${c.reverts}">Reverts #${c.reverts}</a>` : ""}${c.revertedBy ? `<a class="button ghost mini" href="#change/${c.revertedBy}">Reverted by #${c.revertedBy}</a><a class="button ghost mini" href="#incident/change/${c.id}">Incident view</a>` : c.status === "merged" && isHuman() ? `<button class="ghost mini" data-revert title="Take this change back out of main: a revert goes through the merge queue, so the checks still run">Revert</button>` : ""}</div>
       <div id="clone-box"></div>
     </div>
     <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
@@ -2442,6 +2623,13 @@ function wireReview(canReview) {
       review.pending.push({ path: row.dataset.path, line: Number(row.dataset.line), body, ...(box.querySelector("input").checked ? { blocking: true } : {}) });
       redraw();
     };
+  };
+  const rvBtn = $("#review [data-revert]");
+  if (rvBtn) rvBtn.onclick = async () => {
+    rvBtn.disabled = true;
+    let r; try { r = await act("POST", `/changes/${c.id}/revert`, {}); } catch { rvBtn.disabled = false; return; }
+    toast(`Revert #${r.id} is in the merge queue`);
+    location.hash = `#change/${r.id}`;
   };
   for (const b of root.querySelectorAll("[data-verdict]")) b.onclick = async () => {
     const r = await act("POST", `/changes/${c.id}/reviews`, { verdict: b.dataset.verdict, body: $("#rv-body").value, comments: review.pending });

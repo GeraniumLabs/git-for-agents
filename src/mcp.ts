@@ -101,6 +101,24 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("GET", `/files${a.workspace ? `?workspace=${encodeURIComponent(a.workspace)}` : ""}`),
   },
   {
+    name: "code_map",
+    description: "Find your way around main without reading files: each folder's size, and each file's language, line count, what it exports (with line numbers), what it imports and which files import it, plus notes agents left on those paths. Start at the root, then pass a folder as path to go deeper; detail=true lists every file under it with all its declarations. Much cheaper than reading files to find where something lives.",
+    inputSchema: obj({ path: str("A folder or file; omit for the root"), detail: { type: "boolean", description: "Every file under path, with all its declarations" } }),
+    run: (a, call) => call("GET", `/codemap?${new URLSearchParams({ ...(a.path ? { path: a.path } : {}), ...(a.detail ? { detail: "1" } : {}) })}`),
+  },
+  {
+    name: "search_code",
+    description: "Search main for where something is: files ranked by declarations whose names match (camelCase and snake_case split), then paths, then identifiers used. Each result says why it matched, with line numbers. Use it before read_file.",
+    inputSchema: obj({ query: str("Words or a name, e.g. 'trim title' or trimTitle"), limit: num("At most this many results (default 15)") }, ["query"]),
+    run: (a, call) => call("GET", `/codemap/search?q=${encodeURIComponent(a.query)}${a.limit ? `&limit=${a.limit}` : ""}`),
+  },
+  {
+    name: "find_symbol",
+    description: "Where a function, class or type is declared (file, line, whether it's exported), and every file that uses it, the files importing its definition first. Use it to see what a change to a symbol would affect.",
+    inputSchema: obj({ name: str("The exact name, e.g. trimTitle") }, ["name"]),
+    run: (a, call) => call("GET", `/codemap/symbol?name=${encodeURIComponent(a.name)}`),
+  },
+  {
     name: "read_file",
     description: "Read a file from main or from a workspace.",
     inputSchema: obj({ path: str("Repository path"), workspace: str("Workspace name; omit for main"), ref: str("Branch, tag or commit; default main") }, ["path"]),
@@ -182,6 +200,42 @@ const TOOLS: Tool[] = [
     description: "Run the project's checks (its test command, e.g. `npm test`) on what your task would land: main with your workspace merged in. The same checks run in the merge queue before anything lands, and a change that fails them is sent back to its author. Returns pass or fail, the exit code and the end of the output. Takes a while: the project's dependencies are installed each time.",
     inputSchema: obj({ taskId: num("Your task") }, ["taskId"]),
     run: (a, call) => call("POST", `/tasks/${a.taskId}/checks`),
+  },
+  {
+    name: "revert_change",
+    description: "Take a landed change back out of main in one call. Opens a task and a change that undo it, through the merge queue like anything else (the checks still run). A person's revert goes straight to the queue; yours needs review, so request_review after. Refused, with the later changes in the way, when it can't be undone cleanly.",
+    inputSchema: obj({ changeId: num("The landed change to revert"), reason: str("Why it has to come out, for the record") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/revert`, { reason: a.reason }),
+  },
+  {
+    name: "bisect",
+    description: "Find which landed change made the project's checks (or another command) start failing. Loom checks main, steps back until they pass, then halves the range, one check run per step; it runs in the background and bisect.done names the change. Call with bisectId to follow one. Costs check minutes.",
+    inputSchema: obj({ bisectId: num("Follow a bisect already started"), command: str("A command to bisect instead of the project's checks, e.g. one failing test"), good: num("A landed change known to pass, to start from"), reason: str("What's broken") }),
+    run: (a, call) => (a.bisectId ? call("GET", `/bisects/${a.bisectId}`) : call("POST", "/bisects", { command: a.command, good: a.good, reason: a.reason })),
+  },
+  {
+    name: "scorecards",
+    description: "How each agent and model does on this project over a window: changes landed, landed on first pass, rework, failed checks, reverts, conflicts, time to land, tokens and cost per landed change, and how well each agent's reviews hold up. Use it to pick which model or agent to give a task. Readable by agents only if the project's owner lets agents read traces.",
+    inputSchema: obj({ days: num("Window in days (default 30)"), agent: str("Only this agent (name or id)") }),
+    run: (a, call) => call("GET", `/scorecards?days=${a.days ?? 30}${a.agent ? `&agent=${encodeURIComponent(a.agent)}` : ""}`),
+  },
+  {
+    name: "take_eval",
+    description: "Take an eval job: score a change you didn't write against one of the project's eval rubrics (e.g. Security, Slop, Needs a person). whoami lists eval jobs under todo, and runners see them on /work. Returns the rubric. Then get_change, read it against the rubric, and score_eval. A job you take and don't score within 30 minutes goes back to the pool.",
+    inputSchema: obj({ changeId: num("The change"), eval: str("The eval's name") }, ["changeId", "eval"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/evals/${encodeURIComponent(a.eval)}/take`),
+  },
+  {
+    name: "score_eval",
+    description: "Score a change on an eval you took: a score from 0 to 1 (or pass / fail) and notes saying what in the change earned it. Scores are kept for every version of every change, so the project sees its trend. A blocking eval under its threshold sends the change back to its author.",
+    inputSchema: obj({ changeId: num("The change"), eval: str("The eval's name"), score: { description: "0 to 1, or pass / fail" }, notes: str("Why: what in the change earned the score") }, ["changeId", "eval", "score", "notes"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/evals/${encodeURIComponent(a.eval)}`, { score: a.score, notes: a.notes }),
+  },
+  {
+    name: "preview_change",
+    description: "Build (again) the preview of a change: a link where people and agents can open what it builds, before it lands. Previews build by themselves on every version when the project has them on; get_change shows the link under preview.url, and preview.ready announces it.",
+    inputSchema: obj({ changeId: num("The change") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/preview`),
   },
   {
     name: "get_change",
@@ -381,7 +435,7 @@ const AS = {
 const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
 
 /** The tools most work needs. The rest stay one call away (loom_tool), so a small model isn't handed 45 at once. */
-const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
+const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "code_map", "search_code", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
 
 const PROJECT = { type: "string", description: "The project to act in (list_projects shows yours)." };
 

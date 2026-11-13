@@ -66,12 +66,26 @@ export class Workspace {
   private fetched: { remote: string; ref: string; token: string }[] = [];
   private constructor() {}
 
-  /** Clone the default branch of `origin` without a checkout. */
-  static async open(origin: Remote, branch = "main"): Promise<Workspace> {
+  /**
+   * Clone the default branch of `origin` without a checkout. With `seed`, an
+   * earlier workspace of the same repository, start from the objects it
+   * already has and fetch only what's new: on a big repository that's the
+   * difference between moving megabytes and moving a few objects.
+   */
+  static async open(origin: Remote, branch = "main", seed?: Workspace | null): Promise<Workspace> {
     const w = new Workspace();
     await w.fs.mkdir(DIR);
     await git.init({ fs: w.fs, dir: DIR, defaultBranch: branch });
     await git.addRemote({ fs: w.fs, dir: DIR, remote: "origin", url: origin.url });
+    const known = seed ? await seed.head(branch) : null;
+    if (seed && known) {
+      w.fs.adopt(seed.fs, `${DIR}/.git/objects`);
+      const shallow = await seed.fs.readFile(`${DIR}/.git/shallow`, "utf8").catch(() => null);
+      if (shallow) await w.fs.writeFile(`${DIR}/.git/shallow`, shallow);
+      // What we already have, so the fetch asks only for what's newer.
+      await git.writeRef({ fs: w.fs, dir: DIR, ref: `refs/remotes/origin/${branch}`, value: known, force: true });
+      await git.writeRef({ fs: w.fs, dir: DIR, ref: `refs/heads/${branch}`, value: known, force: true });
+    }
     try {
       await git.fetch({ fs: w.fs, http, dir: DIR, remote: "origin", ref: branch, singleBranch: true, tags: false, depth: HISTORY, onAuth: auth(origin.token) });
       w.fetched.push({ remote: "origin", ref: branch, token: origin.token });
@@ -82,6 +96,11 @@ export class Workspace {
       if (!/Could not find|NotFoundError|empty/i.test(String(e?.message ?? e))) throw e;
     }
     return w;
+  }
+
+  /** How many pack and loose object files this workspace holds: a cache past a few hundred starts fresh. */
+  objectFiles(): number {
+    return this.fs.count(`${DIR}/.git/objects`);
   }
 
   async head(branch = "main"): Promise<string | null> {
@@ -261,7 +280,32 @@ export class Workspace {
    * conflicts when the two sides touched the same lines.
    */
   async merge(ours: string, theirs: string, resolutions: Record<string, string | null> = {}) {
-    const base = await this.mergeBase(ours, theirs);
+    return this.threeWay(await this.mergeBase(ours, theirs), ours, theirs, resolutions);
+  }
+
+  /**
+   * Undo `commit` on top of `ours`: a three-way merge whose base is the
+   * commit and whose other side is `before`, what main was without it.
+   */
+  async revert(commit: string, before: string | null, ours: string) {
+    await this.ensure(commit);
+    if (before) await this.ensure(before);
+    return this.threeWay(commit, ours, before);
+  }
+
+  /** Make sure a commit older than what was fetched is here, deepening if it isn't. */
+  async ensure(oid: string): Promise<void> {
+    try { await git.readCommit({ fs: this.fs, dir: DIR, oid }); return; } catch { /* not fetched */ }
+    await this.deepen();
+    await git.readCommit({ fs: this.fs, dir: DIR, oid });
+  }
+
+  async parents(oid: string): Promise<string[]> {
+    await this.ensure(oid);
+    return (await git.readCommit({ fs: this.fs, dir: DIR, oid })).commit.parent;
+  }
+
+  private async threeWay(base: string | null, ours: string, theirs: string | null, resolutions: Record<string, string | null> = {}) {
     const [B, O, T] = await Promise.all([this.flatten(base), this.flatten(ours), this.flatten(theirs)]);
     const merged: FlatTree = new Map();
     const conflicts: FileConflict[] = [];

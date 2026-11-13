@@ -6,6 +6,8 @@
 // approves whatever reaches review. Prints where time goes.
 //
 //   LOOM_URL=http://127.0.0.1:8787 node demo/load.mjs --agents 200 [--share 0.3] [--reviewers 5] [--private]
+//     [--repo-files 5000 --repo-mb 50]   a bigger codebase: filler files besides the ones agents edit
+//     [--json bench/results/run.json --label "local, 200 agents"]   save the numbers for the benchmark page
 //
 // Numbers from `wrangler dev` are only indicative; production Durable Objects
 // and Artifacts behave differently.
@@ -26,6 +28,10 @@ const AREAS = ["api", "auth", "billing", "db", "jobs", "search", "ui", "util"];
 const FILES_PER_AREA = 5;
 const SLOTS = 60;
 const PROJECT = arg("project", `load-${N}-${Date.now().toString(36).slice(-4)}`);
+const REPO_FILES = Number(arg("repo-files", 0));
+const REPO_MB = Number(arg("repo-mb", 0));
+const JSON_OUT = arg("json", null);
+const LABEL = arg("label", null);
 
 // A codebase with a few shared files per area, each with many independent slots.
 function seed() {
@@ -35,6 +41,15 @@ function seed() {
       let s = `// ${a}/mod${f}.js\n`;
       for (let i = 0; i < SLOTS; i++) s += `\n// slot ${i}\nexport const s${i} = 0;\n`;
       files[`src/${a}/mod${f}.js`] = s;
+    }
+  }
+  // Filler, so the repository is as big as asked: many files, about REPO_MB in all.
+  if (REPO_FILES) {
+    const each = Math.max(64, Math.floor((REPO_MB * 1024 * 1024) / REPO_FILES));
+    for (let i = 0; i < REPO_FILES; i++) {
+      const lines = [`// lib/pkg${i % 50}/f${i}.js`];
+      while (lines.join("\n").length < each) lines.push(`export function f${i}_${lines.length}(x) { return x + ${lines.length}; }`);
+      files[`lib/pkg${i % 50}/f${i}.js`] = lines.join("\n") + "\n";
     }
   }
   return files;
@@ -150,7 +165,25 @@ async function reviewer(admin, key, stop, index) {
 async function main() {
   const admin = new Loom(BASE, PROJECT, ADMIN);
   console.log(`project ${PROJECT}: ${N} agents, ${REVIEWERS} reviewers, ${Math.round(SHARE * 100)}% on shared files. Watch: ${BASE}/?project=${PROJECT}`);
-  await admin.createProject({ name: PROJECT, description: `Load test with ${N} agents`, files: seed(), requiredApprovals: 1, visibility: process.argv.includes("--private") ? "private" : "public" });
+  const files = seed();
+  const created = performance.now();
+  if (REPO_FILES > 2000) {
+    // A big seed goes in as a first commit through a workspace, in batches, like an import would.
+    const base = Object.fromEntries(Object.entries(files).filter(([p]) => !p.startsWith("lib/")));
+    await admin.createProject({ name: PROJECT, description: `Load test with ${N} agents`, files: base, requiredApprovals: 0, visibility: process.argv.includes("--private") ? "private" : "public" });
+    const t = await admin.createTask("Seed the codebase", "");
+    const ws = (await admin.claim(t.id)).workspace.name;
+    const lib = Object.entries(files).filter(([p]) => p.startsWith("lib/"));
+    for (let i = 0; i < lib.length; i += 1000) await admin.write(ws, Object.fromEntries(lib.slice(i, i + 1000)), `seed ${i}`);
+    const ch = await admin.submit(t.id, t.title, "seed", {});
+    for (let i = 0; i < 600 && (await admin.change(ch.id)).status !== "merged"; i++) await sleep(500);
+    await admin.req("POST", "/settings", { requiredApprovals: 1 });
+  } else {
+    await admin.createProject({ name: PROJECT, description: `Load test with ${N} agents`, files, requiredApprovals: 1, visibility: process.argv.includes("--private") ? "private" : "public" });
+  }
+  const seeded = performance.now() - created;
+  const repoBytes = Object.values(files).reduce((n, f) => n + f.length, 0);
+  console.log(`repository: ${Object.keys(files).length} files, ${(repoBytes / 1024 / 1024).toFixed(1)} MB, seeded in ${fmt(seeded)}`);
 
   const keys = [];
   for (let i = 0; i < N; i += 25) {
@@ -189,6 +222,21 @@ async function main() {
   }
   if (Object.keys(errors).length) console.log("errors:", errors);
   if (failed.length) console.log(`${failed.length} agents failed, e.g.`, failed.slice(0, 3));
+  if (JSON_OUT) {
+    const { writeFileSync, mkdirSync } = await import("node:fs");
+    const { dirname } = await import("node:path");
+    const summary = (xs) => ({ p50: Math.round(pct(xs, 50)), p95: Math.round(pct(xs, 95)), max: Math.round(Math.max(0, ...xs)), n: xs.length });
+    const result = {
+      label: LABEL ?? `${N} agents`, at: new Date().toISOString(), target: /127\.0\.0\.1|localhost/.test(BASE) ? "local wrangler dev" : "production",
+      agents: N, reviewers: REVIEWERS, shared: SHARE, repo: { files: Object.keys(files).length, mb: Math.round((repoBytes / 1024 / 1024) * 10) / 10, seededMs: Math.round(seeded) },
+      merged: done.length, failed: failed.length, wallSeconds: Math.round(wall * 10) / 10, mergesPerHour: Math.round((done.length / wall) * 3600),
+      submitToMerged: summary(done.map((d) => d.toMerge)), requests: Object.fromEntries(Object.entries(lat).map(([k, xs]) => [k, summary(xs)])),
+      conflicts: counts.conflicts, syncs: counts.syncs, retries: counts.retries, errors,
+    };
+    mkdirSync(dirname(JSON_OUT), { recursive: true });
+    writeFileSync(JSON_OUT, JSON.stringify(result, null, 2));
+    console.log(`saved ${JSON_OUT}`);
+  }
   process.exit(failed.length ? 1 : 0);
 }
 

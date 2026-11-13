@@ -2,7 +2,7 @@ import { handleMcp, type Account } from "./mcp";
 import { agentNameOf, handleOAuth, mcpGrant, signInFirst } from "./oauth";
 import { USER_HEADER, githubGrant, handleAuth, isAdmin, sessionUser, type User } from "./auth";
 import type { Env } from "./env";
-import { parseJurisdiction, projectNamespace, type Jurisdiction } from "./residency";
+import { parseJurisdiction, parsePlacement, projectNamespace, type Jurisdiction } from "./residency";
 import { eventsEnabled, projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
@@ -53,6 +53,20 @@ async function orgCall(env: Env, method: string, what: string, body: Record<stri
 
 function registry(env: Env) {
   return env.PROJECT.get(env.PROJECT.idFromName("__registry"));
+}
+
+/**
+ * A preview is unlisted: whoever has the link can open it, but search engines
+ * shouldn't keep it, and its link (which carries the token) shouldn't leak to
+ * the sites it links to. robots.txt doesn't block /preview/: a crawler that
+ * isn't allowed to fetch a page never sees its noindex, and can still list the
+ * bare link.
+ */
+function unlisted(res: Response): Response {
+  const r = new Response(res.body, res);
+  r.headers.set("x-robots-tag", "noindex, nofollow, noarchive, nosnippet");
+  r.headers.set("referrer-policy", "no-referrer");
+  return r;
 }
 
 /** Where each project's coordinator lives. A project never moves, so this isolate keeps what it learns. */
@@ -149,10 +163,13 @@ async function createProject(env: Env, user: User | null, body: any): Promise<Re
   if (!PROJECT_NAME.test(body.name ?? "")) return Response.json({ error: "name must be lowercase letters, digits and dashes" }, { status: 400 });
   const jurisdiction = parseJurisdiction(env, body.jurisdiction);
   if (jurisdiction && typeof jurisdiction === "object") return Response.json({ error: jurisdiction.error }, { status: jurisdiction.status });
+  const placement = parsePlacement(body.placement);
+  if (placement && typeof placement === "object") return Response.json({ error: placement.error }, { status: placement.status });
   // Names are unique across jurisdictions: a project in the EU and one elsewhere can't share one.
   if ((await locate(env, body.name)).exists) return Response.json({ error: "project already exists" }, { status: 409 });
   const ns = projectNamespace(env, jurisdiction);
-  const res = await ns.get(ns.idFromName(body.name)).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, owner: user ?? undefined, plan }) });
+  // A location hint counts only on the coordinator's first request, which is this one.
+  const res = await ns.get(ns.idFromName(body.name), placement ? { locationHint: placement } : undefined).fetch("https://do/init", { method: "POST", body: JSON.stringify({ ...body, jurisdiction, placement, owner: user ?? undefined, plan }) });
   if (res.ok) {
     await registry(env).fetch("https://do/registry", { method: "POST", body: JSON.stringify({ name: body.name, description: body.description, private: body.visibility === "private", jurisdiction, owner: user?.login ?? null, org: user ? org : null }) });
     located.set(body.name, jurisdiction);
@@ -213,6 +230,7 @@ export default {
         pushEvents: eventsEnabled(env),
         payments: billingOn(env),
         eu: !!(env.ARTIFACTS_EU && env.CONTEXT_EU),
+        fedramp: !!(env.ARTIFACTS_FEDRAMP && env.CONTEXT_FEDRAMP),
         owners: logins(env.LOOM_OWNERS).length,
         creators: logins(env.LOOM_CREATORS ?? "*").includes("*") ? "anyone signed in" : `${logins(env.LOOM_CREATORS).length} listed`,
       }, { headers: { "cache-control": "no-store" } });
@@ -448,6 +466,13 @@ export default {
     }
 
     // Local development: the Artifacts shim posts push events here, shaped like the queue's messages.
+    // A change's preview: /preview/<project>/<change>/<token>/<path>. The token is the access; no sign-in.
+    const pv = /^\/preview\/([a-z0-9][a-z0-9-]{1,40})\/(\d+)\/([0-9a-f]{20})(\/.*)?$/.exec(path);
+    if (pv && req.method === "GET") {
+      if (!pv[4]) return unlisted(Response.redirect(`${url.origin}${path}/`, 301));
+      if (!(await locate(env, pv[1])).exists) return unlisted(new Response("no such preview", { status: 404 }));
+      return unlisted(await (await coordinator(env, pv[1])).fetch(`https://do/preview-serve/${pv[2]}/${pv[3]}${pv[4]}`));
+    }
     if (path === "/api/dev/artifacts-events" && req.method === "POST" && env.LOOM_DEV_LOGIN === "1") {
       for (const msg of await req.json<unknown[]>()) await deliverEvent(env, msg);
       return Response.json({ ok: true });

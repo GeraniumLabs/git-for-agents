@@ -776,3 +776,14 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
 .step.thought pre { font-style: italic; }
 .step.error .k { color: var(--del, #c0392b); }
 .step.loom .k code { font-weight: 700; }
+
+/* Asking Loom, the incident view and the factory report */
+.ask-box { margin: 8px 0; }
+.ask-box .ask-out p { margin: 6px 0; }
+.ask-box .cite { font-size: var(--fs-11_5); padding: 0 3px; border-radius: 3px; background: var(--line); text-decoration: none; }
+table.report { width: 100%; border-collapse: collapse; font-size: var(--fs-12_5); display: block; overflow-x: auto; }
+table.report th { text-align: right; font-weight: 500; color: var(--muted); font-size: var(--fs-11_5); padding: 0 6px 4px 0; }
+table.report td { text-align: right; padding: 4px 6px 4px 0; border-top: 1px solid var(--line); font-variant-numeric: tabular-nums; }
+table.report th:first-child, table.report td:first-child { text-align: left; }
+pre.out { max-height: 220px; overflow: auto; font-size: var(--fs-11_5); white-space: pre-wrap; }
+.evals { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }

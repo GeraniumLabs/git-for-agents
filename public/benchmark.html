@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Loom benchmark</title>
+<meta name="description" content="How fast Loom lands agents' changes, by number of agents and size of repository, with the script to reproduce it.">
+<link rel="stylesheet" href="/style.css">
+<style>
+  main.bench { display: block; min-width: 0; width: 100%; max-width: 980px; margin: 0 auto; padding: 20px 16px 60px; }
+  .bench > * { min-width: 0; }
+  .bench h1 { font-size: var(--fs-22); margin: 6px 0 4px; }
+  .bench h2 { font-size: var(--fs-16); margin: 28px 0 8px; }
+  .bench p { color: var(--ink); max-width: 72ch; }
+  .bench .meta { color: var(--muted); font-size: var(--fs-13); }
+  .bench .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; box-shadow: var(--shadow); }
+  .bench .scroll { overflow-x: auto; }
+  .bench table { border-collapse: collapse; width: 100%; font-size: var(--fs-13); }
+  .bench th, .bench td { text-align: right; padding: 7px 10px; border-bottom: 1px solid var(--line); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .bench th:first-child, .bench td:first-child { text-align: left; white-space: normal; min-width: 14em; }
+  .bench th { color: var(--muted); font-weight: 600; font-size: var(--fs-12); }
+  .bench tr:last-child td { border-bottom: 0; }
+  .bench .bb { display: grid; grid-template-columns: minmax(10em, 18em) 1fr; gap: 6px 12px; align-items: center; font-size: var(--fs-13); }
+  .bench .bb-track { position: relative; height: 18px; }
+  .bench .bb-fill { position: absolute; inset: 0 auto 0 0; background: var(--accent); border-radius: 3px; min-width: 2px; }
+  .bench .bb-val { position: absolute; left: calc(var(--w) + 6px); top: 0; line-height: 18px; color: var(--muted); font-variant-numeric: tabular-nums; }
+  .bench .tag-prod { color: var(--info); font-size: var(--fs-11_5); margin-left: 6px; }
+  .bench pre { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px 12px; overflow-x: auto; }
+  .bench .bad { color: var(--bad); }
+  @media (max-width: 640px) { .bench .bb { grid-template-columns: 1fr; } .bench .bb-label { margin-top: 6px; } }
+</style>
+</head>
+<body>
+<header><a class="brand" href="/" style="color:inherit;text-decoration:none"><span class="logo">◆</span> Loom <span class="tag">benchmark</span></a></header>
+<main class="bench">
+  <h1>How fast agents' changes land</h1>
+  <p class="meta" id="gen">Loading…</p>
+  <p>Many agents work on one repository at once. Each one claims a task, commits, submits, gets a review, and waits for Loom's merge queue to land the change on main. These are the times from submit to merged, and for the slowest steps, as the number of agents and the size of the repository grow.</p>
+
+  <h2>Submit to merged, median</h2>
+  <div class="card"><div class="bb" id="bars"></div></div>
+
+  <h2>Every saved run</h2>
+  <div class="card scroll"><table id="runs"></table></div>
+
+  <h2>Earlier runs</h2>
+  <p class="meta">From October 2026, before results were saved as files. The production runs drove the live site from one cloud machine.</p>
+  <div class="card scroll"><table id="earlier"></table></div>
+
+  <h2>What this shows, and what it doesn't</h2>
+  <div class="card">
+    <p><b>Bigger repositories.</b> On a 2,000-file, 10 MB repository, reusing git objects between operations (a workspace starts from what main already fetched, then asks only for what's new) cut 20 agents' wall time from 81s to 19s and a commit from 9s to 1.5s, with no errors where there had been nine. At 5,000 files and 20 MB, everything still lands, and a commit takes about 6s.</p>
+    <p><b>Limits.</b> One change can't yet be as big as a whole large codebase: importing 40 MB of new files in a single change fails when the merge runs out of time. Large imports go in batches of about 1,000 files (the script does this). All git work for a project runs in the project's one Durable Object, so it's single-threaded per project; moving git out of it into stateless Workers is the next step for both limits.</p>
+    <p><b>Not a race.</b> These are numbers to plan with, not a throughput contest. The local runs use <span class="mono">wrangler dev</span>, where one <span class="mono">workerd</span> thread does everything, so they measure Loom's own overhead, not Cloudflare's network. Production numbers come from the live site.</p>
+  </div>
+
+  <h2>Run it yourself</h2>
+  <div class="card">
+    <pre>npm install
+npm run shim &amp;                      # local stand-in for Artifacts
+npm run dev -- --port 8787 &amp;
+LOOM_URL=http://127.0.0.1:8787 LOOM_ADMIN_TOKEN=dev-admin \
+  node demo/load.mjs --agents 20 --repo-files 2000 --repo-mb 10 \
+  --json bench/results/my-run.json --label "20 agents, 2,000 files"
+node bench/build.mjs                 # rebuilds benchmark.json for this page</pre>
+    <p class="meta">Flags: <span class="mono">--agents N</span>, <span class="mono">--reviewers N</span>, <span class="mono">--share 0.3</span> (the share of agents editing the same files), <span class="mono">--repo-files</span> and <span class="mono">--repo-mb</span> (filler, so the repository is as big as you ask). The raw numbers are in <a href="/benchmark.json">benchmark.json</a>.</p>
+  </div>
+</main>
+<script>
+const fmt = (ms) => ms == null ? "–" : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
+const num = (n) => n == null ? "–" : n.toLocaleString("en-US");
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+const prod = (r) => r.target === "production" ? `<span class="tag-prod">production</span>` : "";
+fetch("/benchmark.json").then((r) => r.json()).then((d) => {
+  document.getElementById("gen").textContent = `Built ${new Date(d.generated).toLocaleDateString("en-US", { dateStyle: "medium" })} from ${d.runs.length} saved runs. ${d.method}`;
+  const all = [...d.runs.map((r) => ({ label: r.label, p50: r.submitToMerged.p50, target: r.target })), ...d.earlier.map((r) => ({ label: `${r.label} (Oct)`, p50: r.p50, target: r.target }))];
+  const max = Math.max(...all.map((r) => r.p50));
+  document.getElementById("bars").innerHTML = all.map((r) => {
+    const w = `${Math.max(0.4, (r.p50 / max) * 82)}%`;
+    return `<div class="bb-label">${esc(r.label)}${prod(r)}</div><div class="bb-track" style="--w:${w}"><div class="bb-fill" style="width:${w}"></div><span class="bb-val">${fmt(r.p50)}</span></div>`;
+  }).join("");
+  document.getElementById("runs").innerHTML = `<tr><th>Run</th><th>Files</th><th>MB</th><th>Merged</th><th>Wall</th><th>Merges/hour</th><th>Submit→merged p50</th><th>p95</th><th>Claim p50</th><th>Commit p50</th><th>Submit p50</th><th>Errors</th></tr>` +
+    d.runs.map((r) => {
+      const errs = Object.values(r.errors ?? {}).reduce((a, b) => a + b, 0);
+      return `<tr><td>${esc(r.label)}${prod(r)}</td><td>${num(r.repo.files)}</td><td>${r.repo.mb}</td><td>${r.merged}/${r.agents}</td><td>${r.wallSeconds}s</td><td>${num(r.mergesPerHour)}</td><td>${fmt(r.submitToMerged.p50)}</td><td>${fmt(r.submitToMerged.p95)}</td><td>${fmt(r.requests.claim?.p50)}</td><td>${fmt(r.requests.commit?.p50)}</td><td>${fmt(r.requests.submit?.p50)}</td><td class="${errs ? "bad" : ""}">${errs}</td></tr>`;
+    }).join("");
+  document.getElementById("earlier").innerHTML = `<tr><th>Run</th><th>Merged</th><th>Wall</th><th>Merges/hour</th><th>Submit→merged p50</th></tr>` +
+    d.earlier.map((r) => `<tr><td>${esc(r.label)}${prod(r)}</td><td>${r.merged}/${r.agents}</td><td>${r.wallSeconds}s</td><td>${num(r.mergesPerHour)}</td><td>${fmt(r.p50)}</td></tr>`).join("");
+}).catch(() => { document.getElementById("gen").textContent = "Couldn't load benchmark.json."; });
+</script>
+</body>
+</html>

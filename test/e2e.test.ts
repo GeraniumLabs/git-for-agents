@@ -412,6 +412,19 @@ test("a plain git push to a workspace updates its change, through Artifacts push
   assert.equal(events.filter((e: any) => e.type === "workspace.pushed").length, 1);
 });
 
+test("a project can ask for its coordinator near its agents, and FedRAMP only where the server has it", { skip: !url, timeout: 60_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const name = project("e2e-place");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await assert.rejects(admin.createProject({ name, placement: "moon" }), /400/);
+  // This server has no FedRAMP namespace and bucket, so it says it can't.
+  await assert.rejects(admin.createProject({ name, jurisdiction: "fedramp" }), /503/);
+  await admin.createProject({ name, description: "near agents in Asia", placement: "apac", requiredApprovals: 0 });
+  const p = (await admin.state()).project;
+  assert.equal(p.placement, "apac");
+  assert.equal(p.jurisdiction, null);
+});
+
 test("a project created in the EU says so, and its name can't be reused elsewhere", { skip: !url, timeout: 120_000 }, async () => {
   const { Loom } = await import("../demo/client.mjs");
   const name = project("e2e-eu");
@@ -1415,4 +1428,446 @@ test("session traces are opt-in: a person's trace key installs the hook, uploads
   assert.ok(!readFileSync(join(home, ".codex/config.toml"), "utf8").includes("trace-hook"), "Codex's notify is taken out");
   assert.ok(!existsSync(plugin), "the OpenCode plugin is removed");
   assert.ok(!existsSync(join(home, ".loom/traces", `${name}.json`)));
+});
+
+test("per-agent limits: paths, changes a day and check minutes, from the agent, its key, its join code or the project", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-limits");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "limits", files: SEED, requiredApprovals: 1 });
+  const adaKey = await admin.addAgent("ada", "builder");
+  const ada = admin.as(adaKey.key);
+
+  // Paths: writes, intents and changes outside them are refused, with what's allowed.
+  await assert.rejects(ada.req("POST", `/agents/${adaKey.id}/limits`, { limits: { paths: ["src/"] } }), /owners/);
+  const set = await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: { paths: ["src/db.js"], changesPerDay: 1 } });
+  assert.deepEqual(set.effective, { paths: ["src/db.js"], changesPerDay: 1 });
+  assert.deepEqual((await ada.req("GET", "/me")).limits.effective, { paths: ["src/db.js"], changesPerDay: 1 }, "whoami says what the agent may do");
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await assert.rejects(ada.req("POST", "/intents", { taskId: t.id, paths: ["README.md"] }), /may only declare an intent on src\/db\.js/);
+  await ada.intent(t.id, ["src/"], "trim"); // reaches into its scope
+  await assert.rejects(ada.write(ws, { "src/server.js": "x" }, "nope"), /may only write src\/db\.js; not src\/server\.js/);
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", {});
+  assert.ok(ch.id);
+
+  // Changes a day count across every agent under the key.
+  const t2 = await ada.createTask("Second", "");
+  const ws2 = (await ada.claim(t2.id)).workspace.name;
+  await ada.write(ws2, { "src/db.js": (await ada.read("src/db.js", ws2)) + "\n// two\n" }, "two");
+  await assert.rejects(ada.submit(t2.id, t2.title, "Two", {}), /may open 1 change a day/);
+
+  // Project defaults apply to agents without their own; a join code's limits beat the defaults.
+  await admin.req("POST", "/agent-limits", { limits: { changesPerDay: 5, checkMinutesPerDay: 3 } });
+  const bob = await admin.addAgent("bob", "builder");
+  assert.deepEqual((await admin.req("GET", `/agents/${bob.id}/limits`)).effective, { changesPerDay: 5, checkMinutesPerDay: 3 });
+  const jc = await admin.req("POST", "/join-codes", { role: "builder", maxUses: 1, expiresInHours: 1, limits: { paths: ["docs/"] } });
+  const joined = await (await fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code: jc.code, name: "outsider" }) })).json();
+  assert.deepEqual((await admin.req("GET", `/agents/${joined.id}/limits`)).effective, { paths: ["docs/"], changesPerDay: 5, checkMinutesPerDay: 3 });
+  // Clearing an agent's own limits falls back to the defaults.
+  assert.deepEqual((await admin.req("POST", `/agents/${adaKey.id}/limits`, { limits: null })).effective, { changesPerDay: 5, checkMinutesPerDay: 3 });
+  // 0 is no limit, and beats the default instead of falling back to it.
+  assert.deepEqual((await admin.req("POST", `/agents/${bob.id}/limits`, { limits: { checkMinutesPerDay: 0 } })).effective, { changesPerDay: 5 });
+  await assert.rejects(admin.req("POST", "/agent-limits", { limits: { paths: "src" } }), /list of path patterns/);
+  await assert.rejects(admin.req("POST", "/agent-limits", { limits: { speed: 3 } }), /unknown limit/);
+});
+
+test("submit on push: a commit with a Loom-Submit trailer opens the change, no MCP needed", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-pushsubmit");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "submit on push", requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Say hello", "");
+  const claim = await ada.claim(t.id);
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const dir = await mkdtemp(`${tmpdir()}/loom-pushsubmit-`);
+  const git = (...a: string[]) => run("git", ["-c", `http.extraHeader=Authorization: Bearer ${claim.workspace.token}`, "-c", "user.name=ada", "-c", "user.email=ada@example.com", ...a], { cwd: dir });
+  await git("clone", claim.workspace.remote, ".");
+  // A push without the trailer only shows in the activity.
+  await writeFile(`${dir}/hello.txt`, "hello\n");
+  await git("add", "hello.txt");
+  await git("commit", "-m", "wip");
+  await git("push", "origin", "HEAD:main");
+  await sleep(1500);
+  assert.ok(!(await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "change.submitted"), "no trailer, no change");
+  await writeFile(`${dir}/hello.txt`, "hello, world\n");
+  await git("commit", "-am", "Say hello to the world\n\nAdds hello.txt for new visitors.\n\nLoom-Submit: Say hello");
+  await git("push", "origin", "HEAD:main");
+  let ch: any;
+  for (let i = 0; i < 40 && !ch; i++) {
+    await sleep(250);
+    const events = (await admin.req("GET", "/events?after=0")).events;
+    const opened = events.find((e: any) => e.type === "change.submitted");
+    const id = opened?.change ?? opened?.changeId ?? opened?.change_id;
+    if (id) ch = await ada.change(id);
+  }
+  assert.ok(ch, "the push opened a change");
+  assert.equal(ch.title, "Say hello");
+  assert.equal(ch.summary, "Adds hello.txt for new visitors.");
+  assert.equal(ch.task_id, t.id);
+});
+
+test("check secrets: the merge queue's checks get them, agents' run_checks only when allowed, and output never shows them", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-secrets");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "check secrets", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { checks: { command: `echo "token is $NPM_TOKEN"; [ -n "$NPM_TOKEN" ]` } });
+  const adaKey = await admin.addAgent("ada", "builder");
+  const ada = admin.as(adaKey.key);
+  const value = "s3cr3t-npm-token-value";
+  await assert.rejects(ada.req("POST", "/check-secrets", { name: "NPM_TOKEN", value }), /owners/);
+  await assert.rejects(admin.req("POST", "/check-secrets", { name: "npm-token", value }), /env var name/);
+  const saved = await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", value });
+  assert.deepEqual(saved.secrets.map((s: any) => [s.name, s.onDemand]), [["NPM_TOKEN", false]]);
+  assert.ok(!JSON.stringify(saved).includes(value), "the value is never sent back");
+
+  const t = await ada.createTask("Add a file", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "a.txt": "a\n" }, "a");
+  // An agent's own run doesn't get a merge-queue-only secret.
+  const without = await ada.req("POST", `/tasks/${t.id}/checks`);
+  assert.equal(without.ok, false);
+  assert.match(without.output, /token is\s*$/m);
+  // Allowed in run_checks: it gets it, and the output shows its name, not its value.
+  await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", onDemand: true });
+  const withIt = await ada.req("POST", `/tasks/${t.id}/checks`);
+  assert.equal(withIt.ok, true, withIt.output);
+  assert.match(withIt.output, /token is \[secret NPM_TOKEN\]/);
+  assert.ok(!withIt.output.includes(value));
+
+  // Back to merge queue only: the change still lands, because the queue's checks get every secret.
+  await admin.req("POST", "/check-secrets", { name: "NPM_TOKEN", onDemand: false });
+  const ch = await ada.submit(t.id, t.title, "a", {});
+  await admin.review(ch.id, "approve", "ok");
+  for (let i = 0; i < 60 && (await admin.change(ch.id)).status !== "merged"; i++) await sleep(500);
+  const done = await admin.change(ch.id);
+  assert.equal(done.status, "merged", JSON.stringify(done.checks ?? done.status));
+  assert.ok(!JSON.stringify(done).includes(value), "nothing about the change shows the value");
+  assert.deepEqual((await admin.req("DELETE", "/check-secrets/NPM_TOKEN")).secrets, []);
+});
+
+test("bisect finds the change that broke a command, and one call reverts it through the merge queue", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-bisect");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "bisect", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const land = async (file: string) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await ada.submit(t.id, t.title, file, {});
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+    assert.equal((await ada.change(ch.id)).status, "merged");
+    return ch.id as number;
+  };
+  const a = await land("a.txt"), b = await land("b.txt"), c = await land("c.txt");
+
+  const started = await ada.req("POST", "/bisects", { command: "test ! -f b.txt", reason: "b.txt must not exist" });
+  assert.equal(started.status, "running");
+  await assert.rejects(ada.req("POST", "/bisects", {}), /already running/);
+  let done: any;
+  for (let i = 0; i < 120 && (!done || done.status === "running"); i++) { await sleep(500); done = await ada.req("GET", `/bisects/${started.id}`); }
+  assert.equal(done.status, "done", JSON.stringify(done));
+  assert.equal(done.culprit?.id, b, done.verdict);
+  assert.ok(done.steps.length <= 4, `found in ${done.steps.length} runs`);
+  assert.ok(done.steps.some((s: any) => s.change === a && s.ok), "stepped back to a change that passes");
+  assert.ok(!done.steps.some((s: any) => s.change === c && s.ok));
+  assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "bisect.done"));
+
+  // A person's revert goes straight to the queue and takes b.txt back out.
+  await assert.rejects(admin.req("POST", `/changes/${a + 1000}/revert`, {}), /no change|not found|404/i);
+  const rev = await admin.req("POST", `/changes/${b}/revert`, { reason: "bisect blamed it" });
+  assert.equal(rev.reverts, b);
+  assert.match(rev.title, new RegExp(`^Revert #${b}`));
+  for (let i = 0; i < 60 && (await admin.change(rev.id)).status !== "merged"; i++) await sleep(250);
+  assert.equal((await admin.change(rev.id)).status, "merged");
+  await assert.rejects(admin.read("b.txt"), /not found|no file|404/i);
+  assert.equal(await admin.read("a.txt"), "a.txt\n");
+  assert.equal((await admin.change(b)).revertedBy, rev.id);
+  await assert.rejects(admin.req("POST", `/changes/${b}/revert`, {}), /already reverts/);
+
+  // An agent's revert needs review like any change.
+  await admin.req("POST", "/settings", { requiredApprovals: 1 });
+  const agentRev = await ada.req("POST", `/changes/${c}/revert`, {});
+  assert.equal(agentRev.status, "review");
+});
+
+test("when changes by different agents keep failing the checks, Loom bisects main by itself", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-autobisect");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "auto bisect", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const bob = admin.as((await admin.addAgent("bob", "builder")).key);
+  const submit = async (who: any, file: string) => {
+    const t = await who.createTask(`Add ${file}`, "");
+    const ws = (await who.claim(t.id)).workspace.name;
+    await who.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await who.submit(t.id, t.title, file, {});
+    for (let i = 0; i < 60 && ["queued", "merging"].includes((await who.change(ch.id)).status); i++) await sleep(250);
+    return ch.id as number;
+  };
+  await submit(ada, "ok.txt");
+  const bad = await submit(ada, "bad.txt");
+  assert.equal((await ada.change(bad)).status, "merged");
+  // A stricter check that main (because of bad.txt) now fails: every change after this fails too.
+  await admin.req("POST", "/settings", { checks: { command: "test ! -f bad.txt" } });
+  for (const [who, f] of [[ada, "x1.txt"], [bob, "x2.txt"], [bob, "x3.txt"]] as const) {
+    const id = await submit(who, f);
+    assert.equal((await who.change(id)).status, "checks_failed");
+  }
+  let b: any;
+  for (let i = 0; i < 120 && b?.status !== "done"; i++) { await sleep(500); b = (await admin.req("GET", "/bisects")).bisects[0]; }
+  assert.ok(b, "a bisect started");
+  assert.equal(b.auto, true);
+  assert.equal(b.culprit?.id, bad, JSON.stringify(b));
+  // It also opened the revert, which waits for a person even though the project needs no approvals.
+  let rid: number | undefined;
+  for (let i = 0; i < 40 && !rid; i++) { rid = (await admin.req("GET", "/bisects")).bisects[0].culprit?.revertedBy ?? undefined; if (!rid) await sleep(250); }
+  assert.ok(rid, "an automatic bisect opens the revert");
+  await sleep(1000);
+  assert.equal((await admin.change(rid!)).status, "review", "Loom's own revert doesn't land without a person");
+  await bob.review(rid!, "approve", "looks right");
+  assert.equal((await admin.change(rid!)).status, "review", "an agent's approval isn't enough");
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const jo = admin.as((await admin.req("POST", "/agents", { name: "jo", role: "human" })).key);
+  await jo.review(rid!, "approve", "yes, take it out");
+  let st = "";
+  for (let i = 0; i < 60 && st !== "merged"; i++) { await sleep(250); st = (await admin.change(rid!)).status; }
+  assert.equal(st, "merged", "a person's approval lands it");
+});
+
+test("ask Loom about a change or an incident, cited to trace steps; the incident view and the factory report", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-ask");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "ask", requiredApprovals: 0 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const base = `${url}/api/projects/${name}`;
+  const land = async (file: string, edits = 1) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: `${file}\n` }, file);
+    const ch = await ada.submit(t.id, t.title, file, {});
+    const now = new Date().toISOString();
+    const lines = [
+      { type: "user", sessionId: `s-${file}`, timestamp: now, message: { role: "user", content: `Add ${file}` } },
+      { type: "assistant", sessionId: `s-${file}`, timestamp: now, message: { id: "m1", role: "assistant", model: "claude-test", usage: { input_tokens: 100, output_tokens: 10 }, content: [
+        { type: "text", text: `I'll write ${file} without running the tests.` },
+        ...Array.from({ length: edits }, (_, i) => ({ type: "tool_use", id: `w${i}`, name: "Write", input: { file_path: file, content: "x" } })),
+      ] } },
+    ];
+    const tr = await (await fetch(`${base}/traces?source=claude-code&change=${ch.id}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/x-ndjson" }, body: lines.map((l) => JSON.stringify(l)).join("\n") })).json();
+    assert.equal(tr.change, ch.id);
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+    return { id: ch.id as number, trace: tr.id as number };
+  };
+  await land("a.txt");
+  const b = await land("b.txt", 7);
+  await land("c.txt");
+
+  // Ask about a change: the answer cites a step of its trace.
+  await assert.rejects(ada.req("POST", "/ask", { question: "why?", change: b.id }), /people/);
+  const ans = await admin.req("POST", "/ask", { question: "Did ada run the tests before writing b.txt?", change: b.id });
+  assert.equal(ans.ok, true);
+  assert.ok(ans.citations.length >= 1, JSON.stringify(ans));
+  assert.match(ans.citations[0].ref, new RegExp(`^T${b.trace}\\.`));
+  assert.match(ans.answer, /\[T\d+\.\d+\]/);
+
+  // The incident view from a bisect: what landed since green, the suspect and what its author did.
+  const bis = await admin.req("POST", "/bisects", { command: "test ! -f b.txt" });
+  let done: any;
+  for (let i = 0; i < 120 && (!done || done.status === "running"); i++) { await sleep(500); done = await admin.req("GET", `/bisects/${bis.id}`); }
+  assert.equal(done.culprit?.id, b.id);
+  const inc = await admin.req("GET", `/incident?bisect=${bis.id}`);
+  assert.deepEqual(inc.changes.map((c: any) => c.id).includes(b.id), true);
+  assert.equal(inc.suspect.id, b.id);
+  assert.ok(inc.suspect.knew.length >= 1 && inc.suspect.knew.every((k: any) => k.ref.startsWith(`T${b.trace}.`)), "the steps where ada wrote b.txt");
+  assert.equal((await admin.req("GET", `/incident?change=${b.id}`)).suspect.id, b.id);
+  const incAns = await admin.req("POST", "/ask", { question: "What broke main?", bisect: bis.id });
+  assert.ok(incAns.citations.length >= 1);
+
+  // The factory report: thrash on b.txt, and each model's numbers.
+  const rep = await admin.req("GET", "/report?days=7");
+  assert.equal(rep.sessions, 3);
+  assert.equal(rep.landed, 3);
+  assert.ok(rep.findings.some((f: any) => f.kind === "thrash" && /b\.txt 7 times/.test(f.title)), JSON.stringify(rep.findings));
+  assert.equal(rep.models.find((m: any) => m.model === "claude-test")?.landed, 3);
+  assert.equal((await fetch(`${base}/report`, { headers: { authorization: `Bearer ${ada.key}` } })).status, 403);
+  // A person can ask for a short summary at the top, cited to the report's own findings and rows.
+  assert.equal(rep.summary, undefined, "no model call unless asked");
+  const summed = await admin.req("GET", "/report?days=7&summary=1");
+  assert.ok(summed.summary?.text, JSON.stringify(summed.summary));
+  assert.ok(summed.summary.citations.every((c: any) => /^[SFMA]\d+$/.test(c.ref)), JSON.stringify(summed.summary.citations));
+
+  // Scorecards: per model and agent, with the revert counted once the revert lands.
+  const rev = await admin.req("POST", `/changes/${b.id}/revert`, {});
+  for (let i = 0; i < 60 && (await admin.change(rev.id)).status !== "merged"; i++) await sleep(250);
+  const sc = await admin.req("GET", "/scorecards?days=30");
+  const m = sc.models.find((x: any) => x.name === "claude-test");
+  assert.deepEqual([m.changes, m.landed, m.firstPassRate, m.reverted, m.revertRate, m.sessions], [3, 3, 100, 1, 33, 3]);
+  assert.equal(m.tokensPerLanded, 110);
+  assert.ok(sc.models.some((x: any) => x.name === "no trace" && x.changes === 1), "the revert has no trace");
+  const adaCard = sc.agents.find((x: any) => x.name === "ada");
+  assert.equal(adaCard.landed, 3);
+  assert.equal((await admin.req("GET", "/scorecards?agent=ada")).agents.length, 1);
+});
+
+test("with no agent around to score a review eval, Loom's review agent scores it", { skip: !url, timeout: 90_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-agenteval");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "evals without runners", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { reviewAgent: { afterMinutes: 0 } });
+  await admin.req("POST", "/evals", { name: "Done", rubric: "1 if the work is finished; 0 if it leaves TODOs.", blocking: true, threshold: 0.5 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const submit = async (file: string, text: string) => {
+    const t = await ada.createTask(`Add ${file}`, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [file]: text }, file);
+    return (await ada.submit(t.id, t.title, file, {})).id as number;
+  };
+  const scored = async (id: number) => {
+    let e: any;
+    for (let i = 0; i < 60 && e?.status !== "done"; i++) { await sleep(250); e = (await admin.change(id)).evals.find((x: any) => x.eval === "Done"); }
+    return e;
+  };
+  const good = await scored(await submit("ok.txt", "finished\n"));
+  assert.equal(good.score, 0.9, JSON.stringify(good));
+  assert.match(good.notes, /Loom's review agent/);
+  const id = await submit("todo.txt", "TODO: finish\n");
+  const bad = await scored(id);
+  assert.equal(bad.score, 0.2);
+  assert.equal((await admin.change(id)).status, "changes_requested", "a blocking eval under its threshold sends it back, whoever scored it");
+});
+
+test("evals score every version of a change: command evals in the check container, review evals by an agent off the work list", { skip: !url, timeout: 180_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-evals");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "evals", requiredApprovals: 1 });
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const rex = admin.as((await admin.addAgent("rex", "reviewer")).key);
+  await assert.rejects(ada.req("POST", "/evals", { name: "Size", command: "true" }), /owners/);
+  await assert.rejects(admin.req("POST", "/evals", { name: "Security", rubric: "x" }), /rubric/);
+  await admin.req("POST", "/evals", { name: "Size", command: `n=$(cat *.txt | wc -c); echo "score: $(( n < 20 ? 100 : 30 ))%"` });
+  await admin.req("POST", "/evals", { name: "Security", rubric: "1 if the change handles input safely and leaks nothing; 0 if it adds a hole.", blocking: true, threshold: 0.5 });
+
+  const t = await ada.createTask("Add a note", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "note.txt": "short\n" }, "note");
+  const ch = await ada.submit(t.id, t.title, "note", {});
+  let evals: any[] = [];
+  for (let i = 0; i < 60; i++) { evals = (await admin.change(ch.id)).evals; if (evals.find((e) => e.eval === "Size")?.status === "done") break; await sleep(250); }
+  const size = evals.find((e) => e.eval === "Size");
+  assert.equal(size.score, 1, JSON.stringify(size));
+  assert.equal(evals.find((e) => e.eval === "Security").status, "pending");
+
+  // The review eval is a job on the work list and in other agents' todo, not the author's.
+  const work = await (await fetch(`${url}/api/projects/${name}/work`, { headers: { authorization: `Bearer ${rex.key}` } })).json();
+  assert.ok(work.items.some((i: any) => i.kind === "eval" && i.change === ch.id));
+  assert.ok((await rex.me()).todo.some((x: string) => /eval/.test(x)));
+  assert.ok(!(await ada.me()).todo.some((x: string) => /eval to score/.test(x)));
+  await assert.rejects(ada.req("POST", `/changes/${ch.id}/evals/Security/take`), /another agent/);
+  const took = await rex.req("POST", `/changes/${ch.id}/evals/Security/take`);
+  assert.match(took.rubric, /input safely/);
+  // A blocking eval under its threshold sends the change back.
+  const scored = await rex.req("POST", `/changes/${ch.id}/evals/Security`, { score: 0.2, notes: "Echoes user input into a shell command." });
+  assert.equal(scored.passed, false);
+  assert.equal((await ada.change(ch.id)).status, "changes_requested");
+
+  // A new version gets new runs; the old score shows as previous.
+  await ada.write(ws, { "note.txt": "a much longer note than before, over twenty bytes\n" }, "longer");
+  await ada.update(ch.id, "longer");
+  for (let i = 0; i < 60; i++) { evals = (await admin.change(ch.id)).evals; if (evals.find((e) => e.eval === "Size")?.status === "done") break; await sleep(250); }
+  assert.equal(evals.find((e) => e.eval === "Size").score, 0.3);
+  assert.equal(evals.find((e) => e.eval === "Size").previous, 1);
+  assert.equal(evals.find((e) => e.eval === "Security").previous, 0.2);
+  await rex.req("POST", `/changes/${ch.id}/evals/Security`, { score: "pass", notes: "Input is quoted now." });
+  const list = (await admin.req("GET", "/evals")).evals;
+  assert.equal(list.find((e: any) => e.name === "Size").scored, 2);
+  assert.equal(list.find((e: any) => e.name === "Size").average, 0.65);
+  assert.equal(list.find((e: any) => e.name === "Security").trend[0].runs, 2);
+});
+
+test("the code map: a project's files, exports and imports over HTTP and MCP, rebuilt when main moves", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-codemap");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "code map", files: SEED, requiredApprovals: 0 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const root = await ada.req("GET", "/codemap");
+  assert.ok(root.folders.some((f: any) => f.path === "src"), JSON.stringify(root));
+  const src = await ada.req("GET", "/codemap?path=src");
+  assert.ok(src.files.length >= 2);
+  assert.ok(src.files.every((f: any) => Array.isArray(f.exports) && Array.isArray(f.importedBy)));
+  // MCP, as an agent would.
+  const mcp = async (tool: string, args: any) => {
+    const r = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${ada.key}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: tool, arguments: args } }) })).json();
+    return JSON.parse(r.result.content[0].text.replace(/^[\s\S]*?(\{)/, "$1"));
+  };
+  // Land a new function; the map moves with main.
+  const t = await ada.createTask("Add slugify", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/slug.js": "export function slugifyTitle(t) {\n  return t.toLowerCase();\n}\n", "src/use.js": "import { slugifyTitle } from \"./slug.js\";\nexport const go = () => slugifyTitle(\"A\");\n" }, "slug");
+  const ch = await ada.submit(t.id, t.title, "slug", {});
+  for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await sleep(250);
+  const found = await mcp("search_code", { query: "slugify title" });
+  assert.equal(found.results[0].path, "src/slug.js", JSON.stringify(found));
+  const sym = await mcp("find_symbol", { name: "slugifyTitle" });
+  assert.deepEqual(sym.defs.map((d: any) => [d.path, d.line, d.exported]), [["src/slug.js", 1, true]]);
+  assert.deepEqual(sym.usedIn.map((u: any) => [u.path, u.imports]), [["src/use.js", ["src/slug.js"]]]);
+  const file = await mcp("code_map", { path: "src/slug.js" });
+  assert.deepEqual(file.files[0].importedBy, ["src/use.js"]);
+});
+
+test("a preview link per change: static files or a build's output, sandboxed, behind an unguessable link", { skip: !url, timeout: 120_000 }, async () => {
+  const { Loom, sleep } = await import("../demo/client.mjs");
+  const name = project("e2e-preview");
+  const admin = new Loom(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "preview", requiredApprovals: 1, private: true });
+  await admin.req("POST", "/settings", { checks: { command: "true" }, preview: { dir: "site" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Landing page", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "site/index.html": "<h1>Hello v1</h1>", "site/app.js": "console.log(1)", "README.md": "not served" }, "page");
+  const ch = await ada.submit(t.id, t.title, "page", {});
+  let pv: any;
+  for (let i = 0; i < 60 && pv?.status !== "ready"; i++) { await sleep(250); pv = (await ada.change(ch.id)).preview; }
+  assert.equal(pv.status, "ready", JSON.stringify(pv));
+  assert.equal(pv.files, 2);
+  const page = await fetch(pv.url);
+  assert.equal(page.status, 200, "a private project's preview opens with the link alone");
+  assert.match(await page.text(), /Hello v1/);
+  assert.match(page.headers.get("content-security-policy") ?? "", /^sandbox/);
+  // Unlisted: search engines don't keep it, and its tokened link doesn't leak as a referrer.
+  assert.match(page.headers.get("x-robots-tag") ?? "", /noindex.*nofollow/);
+  assert.equal(page.headers.get("referrer-policy"), "no-referrer");
+  assert.match((await fetch(pv.url.replace(/\/[0-9a-f]{20}\//, "/00000000000000000000/"))).headers.get("x-robots-tag") ?? "", /noindex/, "a wrong link is unlisted too");
+  assert.match((await fetch(`${pv.url}app.js`)).headers.get("content-type") ?? "", /javascript/);
+  assert.equal((await fetch(`${pv.url}README.md`)).status, 404, "only the preview folder is served");
+  assert.match(await (await fetch(`${pv.url}some/route`)).text(), /Hello v1/, "unknown routes get the app's index.html");
+  assert.equal((await fetch(pv.url.replace(/\/[0-9a-f]{20}\//, "/00000000000000000000/"))).status, 404);
+
+  // With a build command, the preview is the build's output folder; a new version replaces it.
+  await admin.req("POST", "/settings", { preview: { command: "mkdir -p out && sed 's/v1/v2/' site/index.html > out/index.html && echo ok > out/built.txt", dir: "out" } });
+  await ada.write(ws, { "site/index.html": "<h1>Hello v1 again</h1>" }, "again");
+  await ada.update(ch.id, "again");
+  const before = pv.head;
+  for (let i = 0; i < 60; i++) { await sleep(250); pv = (await ada.change(ch.id)).preview; if (pv.status === "ready" && pv.head !== before) break; }
+  assert.equal(pv.status, "ready", JSON.stringify(pv));
+  assert.match(await (await fetch(pv.url)).text(), /Hello v2 again/);
+  assert.equal(await (await fetch(`${pv.url}built.txt`)).text(), "ok\n");
+  assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "preview.ready"));
 });

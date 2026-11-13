@@ -217,13 +217,26 @@ async function runCheck(req, res) {
       t.stdin.end(Buffer.concat(chunks));
     });
     const result = await new Promise((ok) => {
-      const child = spawn("sh", ["-c", command], { cwd: dir, env: { ...process.env, CI: "1" } });
+      const extra = req.headers["x-env"] ? JSON.parse(Buffer.from(req.headers["x-env"], "base64").toString("utf8")) : {};
+      const child = spawn("sh", ["-c", command], { cwd: dir, env: { ...process.env, ...extra, CI: "1" } });
       let output = "";
       child.stdout.on("data", (d) => (output += d));
       child.stderr.on("data", (d) => (output += d));
       const timer = setTimeout(() => { output += `\ntimed out after ${timeout / 1000}s`; child.kill("SIGKILL"); }, timeout);
       child.on("close", (code) => { clearTimeout(timer); ok({ exitCode: code ?? 124, output }); });
     });
+    const collect = req.headers["x-collect"] ? decodeURIComponent(req.headers["x-collect"]).replace(/^\/+/, "").replace(/\.\.(\/|$)/g, "") : null;
+    if (collect && result.exitCode === 0) {
+      // A preview build's output folder, sent back as a tar.
+      const tarred = await new Promise((ok) => {
+        const t = spawn("tar", ["-c", "-C", join(dir, collect), "."]);
+        const out = [];
+        t.stdout.on("data", (d) => out.push(d));
+        t.on("close", (code) => ok(code === 0 ? Buffer.concat(out) : null));
+      });
+      if (tarred) result.archive = tarred.toString("base64");
+      else { result.exitCode = 1; result.output += `\nno ${collect}/ folder after the build`; }
+    }
     send(res, 200, result);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -255,6 +268,21 @@ async function reviewStandIn(req, res) {
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const prompt = String(body.messages?.[0]?.content ?? "");
+  if (body.output_config?.format?.schema?.properties?.score) {
+    // Scoring a review eval: a diff that adds a TODO scores low, anything else high.
+    const low = /^\+.*TODO/m.test(prompt);
+    const result = { score: low ? 0.2 : 0.9, notes: low ? "The diff adds a TODO, so the work isn't finished." : "The diff does what the rubric asks." };
+    return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "text", text: JSON.stringify(result) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
+  }
+  if (body.output_config?.format?.schema?.properties?.answer) {
+    // A question about what Loom holds: answer from the first trace step, else the first source.
+    const refs = [...prompt.matchAll(/^\[([A-Z]\d+(?:\.\d+)?)\] (.*)$/gm)];
+    const pick = refs.find((r) => r[1].startsWith("T")) ?? refs[0];
+    const answer = pick ? `From the sources: ${pick[2].slice(0, 120)} [${pick[1]}]` : "The sources don't say.";
+    return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "text", text: JSON.stringify({ answer, citations: pick ? [pick[1]] : [] }) }], usage: { input_tokens: prompt.length, output_tokens: 20 } });
+  }
   // Loom numbers each diff line by its line in the new file.
   let file = null, bug = null;
   for (const l of prompt.split("\n")) {

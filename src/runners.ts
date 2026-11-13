@@ -35,6 +35,7 @@ export function runnerPrompt(origin: string, project: string): string {
 1. Call whoami and do anything on its todo first (directives, review requests, changes sent back to you).
 2. Call list_work. Take the first item you can finish in this session:
    - review: take_review, get_change (read its brief first), then review_change with a verdict.
+   - eval: take_eval (it returns the rubric), get_change, then score_eval with a score from 0 to 1 and notes saying why. Never score a change you wrote.
    - contest: compare_attempts, then vote for the attempt that should land, with a reason.
    - fix: the author is away. task_context the task, claim_task it, fix what the change was sent back for, and update_change.
    - task: claim_task, declare_intent for the paths you'll touch, do the work (run_checks if the project has checks), then submit_change with your context.
