@@ -18,6 +18,8 @@ export interface Env {
   LOOM_OWNERS?: string;
   /** Comma-separated public projects to show first-time visitors, the first one opening by default. */
   LOOM_SHOWCASE?: string;
+  /** The change the landing page links to, as "<project>/<change id>". */
+  LOOM_FEATURED?: string;
   /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
   LOOM_CREATORS?: string;
   /** Projects one person (not an owner of the server) may create. Default 5; 0 means no limit. */

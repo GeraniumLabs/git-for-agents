@@ -929,6 +929,17 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "attachments" && !b) return json(this.listAttachments(url.searchParams));
       if (a === "attachments" && b && c === "raw") return await this.serveAttachment(Number(b), url.searchParams.get("download") === "1");
       if (a === "attachments" && b && !c) return json(this.attachmentView(this.attachmentRow(Number(b))));
+      // An owner can publish a public project's traces, so anyone can review a change's intent without signing in.
+      if (this.tracesPublic) {
+        if (a === "changes" && b && c === "intent") return json(await this.changeIntent(Number(b)));
+        if (a === "traces" && !b) return json(await this.listTraces(url.searchParams));
+        if (a === "traces" && b && b !== "settings") {
+          if (c === "raw") return await this.serveTrace(Number(b));
+          if (c === "verify") return json(await this.verifyTrace(Number(b)));
+          if (c === "versions") return json(this.traceVersions(Number(b)));
+          if (!c) return json(await this.traceDetail(Number(b), url.searchParams));
+        }
+      }
     }
 
     // Agents register themselves with a join code an owner shared.
@@ -1066,7 +1077,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
     if (a === "me") return json(this.me(actor));
-    // Traces are for the project's people (and its agents, if an owner allows), even on a public project.
+    // Traces are for the project's people (and its agents, if an owner allows), even on a public project,
+    // unless an owner published them (the open reads above). Asking, reports and scorecards stay people only.
     if (a === "changes" && b && c === "intent" && m === "GET") {
       this.assertCanReadTraces(actor);
       return json(await this.changeIntent(Number(b)));
@@ -4971,7 +4983,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
@@ -6326,12 +6338,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── session traces: what an agent saw, thought and did, kept with its change ─
 
-  private get traceSettings(): { thoughts: boolean; agentsCanRead: boolean; redact: string[]; askAll: boolean } {
-    return { thoughts: true, agentsCanRead: false, redact: [], askAll: false, ...JSON.parse(this.meta("trace_settings") ?? "{}") };
+  private get traceSettings(): { thoughts: boolean; agentsCanRead: boolean; redact: string[]; askAll: boolean; public: boolean } {
+    return { thoughts: true, agentsCanRead: false, redact: [], askAll: false, public: false, ...JSON.parse(this.meta("trace_settings") ?? "{}") };
   }
 
-  private setTraceSettings(body: { thoughts?: boolean; agentsCanRead?: boolean; redact?: string[]; askAll?: boolean }) {
+  /** Anyone may read this project's traces: an owner published them, and the project itself is public. */
+  private get tracesPublic(): boolean {
+    return !this.isPrivate && this.traceSettings.public;
+  }
+
+  private setTraceSettings(body: { thoughts?: boolean; agentsCanRead?: boolean; redact?: string[]; askAll?: boolean; public?: boolean }) {
     const cfg = this.traceSettings;
+    if (body.public !== undefined) cfg.public = !!body.public;
     if (body.thoughts !== undefined) cfg.thoughts = !!body.thoughts;
     if (body.askAll !== undefined) cfg.askAll = !!body.askAll;
     if (body.agentsCanRead !== undefined) cfg.agentsCanRead = !!body.agentsCanRead;
