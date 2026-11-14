@@ -26,7 +26,9 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: var(--fs-14)/1
 code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-code); }
 header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
 .brand { font-weight: 700; font-size: var(--fs-18); letter-spacing: .2px; }
-.logo { color: var(--accent); }
+.logo { color: var(--accent); display: inline-flex; vertical-align: -0.25em; }
+.logo svg { width: 1.4em; height: 1.4em; }
+.logo .i { stroke: var(--ink); } .logo .a { fill: var(--accent); } .logo .s { stroke: var(--accent); }
 .tag { font-weight: 400; color: var(--muted); font-size: var(--fs-13); margin-left: 8px; }
 .proj { display: flex; gap: 10px; align-items: center; }
 select { background: var(--chip); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; }

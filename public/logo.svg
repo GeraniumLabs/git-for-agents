@@ -1,0 +1,8 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round">
+<style>.i{stroke:#1d1d1b}@media (prefers-color-scheme:dark){.i{stroke:#ecebe6}}</style>
+<path class="i" d="M32 12 V6" stroke-width="4"/><circle cx="32" cy="5" r="3.4" fill="#f38020"/>
+<rect class="i" x="9" y="13" width="46" height="40" rx="12" stroke-width="5"/>
+<path class="i" d="M4 30 V38 M60 30 V38" stroke-width="4.5"/>
+<circle cx="23" cy="28" r="4.2" fill="#f38020"/><circle cx="41" cy="28" r="4.2" fill="#f38020"/>
+<path d="M23 32 C23 38 32 37 32 43 M41 32 C41 38 32 37 32 43" stroke="#f38020" stroke-width="3.4"/>
+</svg>
