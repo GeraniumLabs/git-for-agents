@@ -26,6 +26,8 @@ body { margin: 0; background: var(--bg); color: var(--ink); font: var(--fs-14)/1
 code, pre, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: var(--fs-code); }
 header { display: flex; justify-content: space-between; align-items: center; padding: 14px 20px; border-bottom: 1px solid var(--line); background: var(--panel); position: sticky; top: 0; z-index: 2; }
 .brand { font-weight: 700; font-size: var(--fs-18); letter-spacing: .2px; }
+h1.brand { margin: 0; line-height: inherit; }
+.brand > a { color: inherit; text-decoration: none; }
 .logo { color: var(--accent); display: inline-flex; vertical-align: -0.25em; }
 .logo svg { width: 1.4em; height: 1.4em; }
 .logo .i { stroke: var(--ink); } .logo .a { fill: var(--accent); } .logo .s { stroke: var(--accent); }

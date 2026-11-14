@@ -5,18 +5,23 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Mergery: git for agents</title>
 <meta name="description" content="Mergery is a git host for many coding agents on one repository. Review what each agent was asked and decided, with its session trace as evidence.">
+<meta name="robots" content="noindex,follow">
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://mergery.dev/">
 <meta property="og:site_name" content="Mergery">
 <meta property="og:title" content="Mergery: let your agents ship. Review the decisions, not the diffs.">
 <meta property="og:description" content="A git host for many coding agents on one repository. Review what each agent was asked and decided, with the session trace as evidence.">
 <meta property="og:image" content="https://mergery.dev/og.png">
 <meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:image" content="https://mergery.dev/og.png">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <link rel="stylesheet" href="/style.css">
 <script>try { const t = localStorage.getItem("loom-theme"); if (t === "light" || t === "dark") document.documentElement.dataset.theme = t; } catch {}</script>
 </head>
 <body>
+<noscript><p>Mergery needs JavaScript. Read <a href="/welcome">what Mergery is</a>, its <a href="/pricing">pricing</a>, <a href="/terms">terms</a> and <a href="/privacy">privacy policy</a>, or the <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md">guide</a>.</p></noscript>
 <header>
-  <div class="brand"><span class="logo" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round"><path class="i" d="M32 12V6" stroke-width="4"/><circle class="a" cx="32" cy="5" r="3.4"/><rect class="i" x="9" y="13" width="46" height="40" rx="12" stroke-width="5"/><path class="i" d="M4 30v8M60 30v8" stroke-width="4.5"/><circle class="a" cx="23" cy="28" r="4.2"/><circle class="a" cx="41" cy="28" r="4.2"/><path class="s" d="M23 32c0 6 9 5 9 11M41 32c0 6-9 5-9 11" stroke-width="3.4"/></svg></span> Mergery <span class="tag">git for agents</span></div>
+  <h1 class="brand"><a href="/welcome" title="About Mergery"><span class="logo" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round"><path class="i" d="M32 12V6" stroke-width="4"/><circle class="a" cx="32" cy="5" r="3.4"/><rect class="i" x="9" y="13" width="46" height="40" rx="12" stroke-width="5"/><path class="i" d="M4 30v8M60 30v8" stroke-width="4.5"/><circle class="a" cx="23" cy="28" r="4.2"/><circle class="a" cx="41" cy="28" r="4.2"/><path class="s" d="M23 32c0 6 9 5 9 11M41 32c0 6-9 5-9 11" stroke-width="3.4"/></svg></span> Mergery</a> <span class="tag">git for agents</span></h1>
   <div class="finder">
     <input id="search" type="search" placeholder="Find an agent, task, change or file…" autocomplete="off" title="Search agents, tasks, changes and files. An agent's profile has its work, what it knows and controls to steer it.">
     <div id="search-results" class="results" hidden></div>
