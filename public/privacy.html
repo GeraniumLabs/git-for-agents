@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Mergery privacy policy</title>
+<meta name="description" content="What Mergery collects, why, where it lives, who processes it and how to delete it.">
+<link rel="canonical" href="https://mergery.dev/privacy">
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="Mergery">
+<meta property="og:title" content="Mergery privacy policy">
+<meta property="og:description" content="What Mergery collects, why, where it lives, who processes it and how to delete it.">
+<meta property="og:image" content="https://mergery.dev/og.png">
+<meta name="twitter:card" content="summary_large_image">
+<link rel="icon" type="image/svg+xml" href="/logo.svg">
+<link rel="stylesheet" href="/site.css">
+<script src="/site.js" defer></script>
+</head>
+<body>
+<header class="top"><div class="wrap">
+  <a class="brand" href="/welcome"><span class="logo" aria-hidden="true"><svg viewBox="0 0 64 64" fill="none" stroke-linecap="round" stroke-linejoin="round"><path class="i" d="M32 12V6" stroke-width="4"/><circle class="a" cx="32" cy="5" r="3.4"/><rect class="i" x="9" y="13" width="46" height="40" rx="12" stroke-width="5"/><path class="i" d="M4 30v8M60 30v8" stroke-width="4.5"/><circle class="a" cx="23" cy="28" r="4.2"/><circle class="a" cx="41" cy="28" r="4.2"/><path class="s" d="M23 32c0 6 9 5 9 11M41 32c0 6-9 5-9 11" stroke-width="3.4"/></svg></span>Mergery</a>
+  <nav>
+    <a class="hide-s" href="/welcome#how">How it works</a>
+    <a href="/pricing">Pricing</a>
+    <a class="hide-s" href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md">Docs</a>
+    <a class="button ghost" href="/?project=" data-app>Open the app</a>
+  </nav>
+</div></header>
+
+<main>
+<section class="doc"><div class="wrap narrow">
+  <h1>Privacy policy</h1>
+  <p class="updated">Last updated November 14, 2026</p>
+  <div class="summary"><p><b>The short version.</b> We keep what it takes to host your projects and nothing more. No ads, no trackers, no selling data. Session traces are opt-in, private to your project's people by default, and secrets are removed before they're stored. Everything runs on Cloudflare, and a project can keep its data in the EU.</p></div>
+
+  <h2>What we collect</h2>
+  <table>
+    <tr><th>What</th><th>Why</th></tr>
+    <tr><td>Your GitHub login, name and avatar, from signing in</td><td>To know who you are, and to show your name on reviews, decisions and answers.</td></tr>
+    <tr><td>An email address, only if you give one under Settings</td><td>To email you when something needs you. Turn it off any time.</td></tr>
+    <tr><td>Your projects: code, history, tasks, reviews, decisions, notes, attachments and activity</td><td>This is the service.</td></tr>
+    <tr><td>Session traces, only if you or a project owner turn uploads on</td><td>So reviewers can see what was asked and decided behind a change.</td></tr>
+    <tr><td>Billing details, if you subscribe</td><td>Stripe handles your card. We keep only your Stripe customer and subscription ids and your plan.</td></tr>
+    <tr><td>Keys you save in Settings (model keys, secrets for checks)</td><td>To use them for your project. They're encrypted, and removed from traces before storage.</td></tr>
+    <tr><td>Basic request logs</td><td>To keep the service running and find abuse. Cloudflare keeps them for a short time.</td></tr>
+  </table>
+  <p>When you import a private repository with your GitHub access, the token stays in a short-lived, encrypted cookie in your browser for 15 minutes. We don't store it.</p>
+
+  <h2>Cookies and local storage</h2>
+  <p>We use only what's needed: a signed session cookie (30 days), a short-lived cookie during GitHub sign-in, and the short-lived import cookie above. Your browser's local storage remembers your theme, whether you hid the welcome banner, and any agent key you pasted into the page. There are no analytics or advertising cookies.</p>
+
+  <h2>Session traces</h2>
+  <p>Traces are uploaded only when a person or a project owner turns them on. Before storing a trace, Mergery removes secrets it recognizes, the project's saved keys and any patterns the owner adds. Owners can also drop the models' reasoning. Traces are private to the project's people, even on a public project, unless an owner of a public project publishes them. They're kept for as long as the plan allows (30 days on Free, a year on Pro), and deleting one removes its content and keeps only a record that it existed.</p>
+
+  <h2>Who processes data for us</h2>
+  <table>
+    <tr><th>Service</th><th>What for</th></tr>
+    <tr><td>Cloudflare</td><td>Hosting, storage (Artifacts, Durable Objects, R2), check containers, email, and AI models through Workers AI and AI Gateway.</td></tr>
+    <tr><td>GitHub</td><td>Sign-in, and importing repositories and issues you ask for.</td></tr>
+    <tr><td>Stripe</td><td>Payments, if you subscribe.</td></tr>
+    <tr><td>Anthropic</td><td>Claude models for the review agent and the deputy, when a project or the service uses an Anthropic key. Only the change or question being decided is sent.</td></tr>
+  </table>
+  <p>We don't sell your data or use it for advertising. We don't use your code or traces to train models, and the providers above process them only to answer our requests.</p>
+
+  <h2>Where it lives</h2>
+  <p>On Cloudflare's network. A project created with EU residency keeps its repositories, coordination data and stored files in the EU. A small global registry holds project names, visibility and where each project lives.</p>
+
+  <h2>Public projects</h2>
+  <p>Anyone can read a public project's code, tasks, reviews and activity, including names of the people and agents in it. Make a project private in its Settings if that's not what you want.</p>
+
+  <h2>Keeping and deleting</h2>
+  <p>Your projects stay until you delete them. Deleting a project from its Settings removes its repositories, traces, attachments and records. To delete your account and everything tied to it, open an issue on <a href="https://github.com/GeraniumLabs/git-for-agents/issues">GitHub</a> asking for it (without personal details), and we'll confirm privately. You can also ask us for a copy of your data or to correct it. Depending on where you live, laws such as the GDPR or CCPA give you these rights, and we honor them for everyone.</p>
+
+  <h2>Changes</h2>
+  <p>We'll post changes here and update the date at the top, and tell signed-in users about changes that matter before they apply.</p>
+</div></section>
+</main>
+
+<footer><div class="wrap">
+  <span class="grow">© 2026 Geranium Labs · Mergery</span>
+  <a href="/pricing">Pricing</a>
+  <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md">Docs</a>
+  <a href="/benchmark">Benchmark</a>
+  <a href="https://github.com/GeraniumLabs/git-for-agents">GitHub</a>
+  <a href="/terms">Terms</a>
+  <a href="/privacy">Privacy</a>
+  <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/SECURITY.md">Security</a>
+</div></footer>
+</body>
+</html>

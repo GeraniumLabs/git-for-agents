@@ -7,6 +7,7 @@
 //     node demo/claude-swarm.mjs [--project name] [--builders 3] [--reviewers 2]
 //       [--contest] [--model claude-opus-5-5] [--effort medium] [--budget 5]
 //       [--max-turns 60] [--check]
+//       [--repo <git url> --tasks tasks.json [--issues]] [--public] [--no-traces]
 //
 // Without --project it creates a fresh project seeded from the todo service
 // and a backlog of overlapping tasks. --contest makes the search task a
@@ -14,6 +15,14 @@
 // --budget stops every agent once the run has spent that many dollars.
 // --check connects each agent over MCP and lists its tools without calling
 // Claude, to test the setup for free.
+//
+// Each agent uploads its session as a trace (Claude Code's transcript format)
+// after every submit_change and when it stops, so its changes carry the
+// evidence the Intent view is drawn from. --no-traces turns that off.
+// --repo imports a real repository instead of the todo service, with the
+// backlog from --tasks (a JSON list of [title, description]) or its open
+// GitHub issues (--issues). --public publishes the project's traces, so anyone
+// can open the Intent view signed out: the showcase setup.
 
 import Anthropic from "@anthropic-ai/sdk";
 import { Mergery } from "./client.mjs";
@@ -30,6 +39,9 @@ const MAX_TURNS = Number(arg("max-turns", 60));
 const BUDGET = Number(arg("budget", 10));
 const CONTEST = flag("contest");
 const CHECK = flag("check");
+const TRACES = !flag("no-traces");
+const REPO = arg("repo");
+const TASKS = arg("tasks");
 /** Tool results longer than this are cut, so one big read can't bloat every later turn. */
 const MAX_RESULT = 20_000;
 
@@ -98,47 +110,69 @@ How to work here:
 - If a tool reports a collision forecast, message the other agent and agree who does what.
 - When main moves under you (workspace.stale) or your change conflicts, sync and resolve by keeping both agents' intent.
 - When you submit, put what you planned, tested and decided in the context. If you learned something the next agent on these files should know (a convention, a trap), add it to context.notes; it becomes the project's when your change lands.
-- In a contest, also give an `approach` when you submit: two or three plain sentences for a person who won't read the code: what your attempt does differently and what it gives up. No file lists or tool names. Submitting an attempt without one is refused.
+- In a contest, also give an \`approach\` when you submit: two or three plain sentences for a person who won't read the code: what your attempt does differently and what it gives up. No file lists or tool names. Submitting an attempt without one is refused.
 - Your approvals and votes are weighed by how your earlier ones turned out (my_track_record shows yours). Approve only what you have read closely.
 - When you have nothing left to do, reply with a one-line summary and stop.`;
 
   const messages = [{ role: "user", content: "Begin." }];
-  const toolDefs = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema }));
-  for (let turn = 0; turn < MAX_TURNS; turn++) {
-    if (spent() >= BUDGET) { log(agent.name, `stopping: the run has spent $${spent().toFixed(2)} of its $${BUDGET} budget`); return; }
-    const response = await client.beta.messages.create({
-      model: MODEL,
-      max_tokens: 16000,
-      output_config: { effort: EFFORT },
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      // Every turn resends the system prompt, the ~40 tool definitions and the
-      // conversation so far; caching reprices all of that at the cache-read rate.
-      cache_control: { type: "ephemeral" },
-      system,
-      tools: toolDefs,
-      messages,
-    });
-    count(response.usage ?? {});
-    messages.push({ role: "assistant", content: response.content });
+  // The session as Claude Code would write it: one JSON line per message, so Mergery parses it like any transcript.
+  const session = `${project}-${agent.name}-${Date.now().toString(36)}`;
+  const transcript = [];
+  const note = (type, message) => transcript.push(JSON.stringify({ type, sessionId: session, timestamp: new Date().toISOString(), message }));
+  note("user", { role: "user", content: `${goal}\n\nBegin.` });
+  const upload = async (why) => {
+    if (!TRACES || !transcript.length) return;
+    const res = await fetch(`${BASE}/api/projects/${project}/traces`, {
+      method: "POST",
+      headers: { authorization: `Bearer ${agent.key}`, "content-type": "application/json" },
+      body: JSON.stringify({ text: transcript.join("\n"), source: "claude-code", session }),
+    }).then((r) => r.json()).catch((e) => ({ error: e.message }));
+    if (res.error) log(agent.name, `trace upload failed (${why}): ${res.error}`);
+    else log(agent.name, `uploaded its session trace (${why})`);
+  };
+  try {
+    const toolDefs = tools.map((t) => ({ name: t.name, description: t.description, input_schema: t.inputSchema }));
+    for (let turn = 0; turn < MAX_TURNS; turn++) {
+      if (spent() >= BUDGET) { log(agent.name, `stopping: the run has spent $${spent().toFixed(2)} of its $${BUDGET} budget`); return; }
+      const response = await client.beta.messages.create({
+        model: MODEL,
+        max_tokens: 16000,
+        output_config: { effort: EFFORT },
+        betas: ["server-side-fallback-2026-07-01"],
+        fallbacks: "default",
+        // Every turn resends the system prompt, the ~40 tool definitions and the
+        // conversation so far; caching reprices all of that at the cache-read rate.
+        cache_control: { type: "ephemeral" },
+        system,
+        tools: toolDefs,
+        messages,
+      });
+      count(response.usage ?? {});
+      messages.push({ role: "assistant", content: response.content });
+      note("assistant", { role: "assistant", id: response.id, model: response.model, content: response.content, usage: response.usage });
 
-    if (response.stop_reason === "refusal") { log(agent.name, "declined to continue"); return; }
-    for (const b of response.content) if (b.type === "text" && b.text.trim()) log(agent.name, b.text.trim().split("\n")[0].slice(0, 160));
-    if (response.stop_reason !== "tool_use") return;
+      if (response.stop_reason === "refusal") { log(agent.name, "declined to continue"); return; }
+      for (const b of response.content) if (b.type === "text" && b.text.trim()) log(agent.name, b.text.trim().split("\n")[0].slice(0, 160));
+      if (response.stop_reason !== "tool_use") return;
 
-    const calls = response.content.filter((b) => b.type === "tool_use");
-    const results = await Promise.all(calls.map(async (call) => {
-      log(agent.name, `→ ${call.name} ${JSON.stringify(call.input).slice(0, 100)}`);
-      try {
-        const r = await mcp.rpc("tools/call", { name: call.name, arguments: call.input });
-        return { type: "tool_result", tool_use_id: call.id, content: cap(r.content.map((c) => c.text).join("\n")), is_error: !!r.isError };
-      } catch (e) {
-        return { type: "tool_result", tool_use_id: call.id, content: String(e.message ?? e), is_error: true };
-      }
-    }));
-    messages.push({ role: "user", content: results });
+      const calls = response.content.filter((b) => b.type === "tool_use");
+      const results = await Promise.all(calls.map(async (call) => {
+        log(agent.name, `→ ${call.name} ${JSON.stringify(call.input).slice(0, 100)}`);
+        try {
+          const r = await mcp.rpc("tools/call", { name: call.name, arguments: call.input });
+          return { type: "tool_result", tool_use_id: call.id, content: cap(r.content.map((c) => c.text).join("\n")), is_error: !!r.isError };
+        } catch (e) {
+          return { type: "tool_result", tool_use_id: call.id, content: String(e.message ?? e), is_error: true };
+        }
+      }));
+      messages.push({ role: "user", content: results });
+      note("user", { role: "user", content: results });
+      if (calls.some((c) => c.name === "submit_change" || c.name === "update_change")) await upload("after submitting");
+    }
+    log(agent.name, `stopped after ${MAX_TURNS} turns`);
+  } finally {
+    await upload("at the end");
   }
-  log(agent.name, `stopped after ${MAX_TURNS} turns`);
 }
 
 const cap = (text) => text.length <= MAX_RESULT ? text : `${text.slice(0, MAX_RESULT)}\n[cut at ${MAX_RESULT} characters; read a narrower range or a single file]`;
@@ -148,6 +182,14 @@ async function main() {
   const log = (who, msg) => console.log(`${new Date().toISOString().slice(11, 19)}  ${who.padEnd(6)} ${msg}`);
   let project = arg("project");
   const admin = new Mergery(BASE, project ?? "", ADMIN);
+  if (!project && REPO) {
+    project = `${REPO.replace(/\.git$/, "").split("/").pop().toLowerCase().replace(/[^a-z0-9-]/g, "-").slice(0, 30)}-${Date.now().toString(36).slice(-4)}`;
+    admin.project = project;
+    await admin.createProject({ name: project, description: `${REPO.replace(/^https:\/\//, "")}, built on by Claude agents`, import: { url: REPO, issues: flag("issues") }, requiredApprovals: REVIEWERS ? 1 : 0 });
+    await admin.req("POST", "/settings", { approvalMode: "weighted" }).catch(() => {});
+    const { readFile } = await import("node:fs/promises");
+    for (const [title, desc] of TASKS ? JSON.parse(await readFile(TASKS, "utf8")) : []) await admin.createTask(title, desc);
+  }
   if (!project) {
     const { SEED } = await import("./seed.mjs");
     project = `claude-${Date.now().toString(36).slice(-5)}`;
@@ -159,6 +201,10 @@ async function main() {
       const t = await admin.req("POST", "/tasks", { title: "Search todos by title", description: "GET ?q=text returns the todos whose title contains text, ignoring case.", attempts: 3 });
       console.log(`contest: task #${t.id}, 3 attempts; the agents vote on which lands`);
     }
+  }
+  if (flag("public")) {
+    const s = await admin.req("POST", "/settings", { traces: { public: true } });
+    console.log(s.traces?.public ? "traces are published: anyone can open a change's Intent view" : "couldn't publish traces (is the project private?)");
   }
   console.log(`project ${project}: watch at ${BASE}/?project=${project}`);
 

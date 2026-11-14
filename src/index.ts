@@ -478,6 +478,11 @@ export default {
       return Response.json({ ok: true });
     }
 
+    // The storefront: a signed-out visitor at the bare root gets the landing page, with the app a click away.
+    // Anything with a query (?project=, ?import=, ?invite=) is a link into the app, so it opens the app.
+    if (path === "/" && (req.method === "GET" || req.method === "HEAD") && !url.search && !(await sessionUser(env, req))) {
+      return env.ASSETS.fetch(new Request(new URL("/welcome", url), req));
+    }
     return env.ASSETS.fetch(req);
   },
 

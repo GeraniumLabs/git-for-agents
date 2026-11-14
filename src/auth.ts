@@ -148,6 +148,15 @@ async function startSession(env: Env, req: Request, user: User, to: string): Pro
   return new Response(null, { status: 302, headers });
 }
 
+/**
+ * The change the landing page shows off: LOOM_FEATURED is "<project>/<change id>",
+ * a change whose Intent view a visitor can open (a public project with published traces).
+ */
+export function featuredLink(env: Env): string | null {
+  const m = /^([a-z0-9][a-z0-9-]{1,40})\/(\d+)$/.exec((env.LOOM_FEATURED ?? "").trim());
+  return m ? `/?project=${m[1]}#change/${m[2]}/intent` : null;
+}
+
 /** /auth/* routes, or null when the path isn't one. */
 export async function handleAuth(env: Env, req: Request, registry: Registry): Promise<Response | null> {
   const url = new URL(req.url);
@@ -157,7 +166,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (path === "/auth/me") {
     const app = await githubApp(env, registry);
     const me = await sessionUser(env, req);
-    return Response.json({ user: me, github: !!app, githubInstall: installUrl(env, app), repoAccess: !!(me && (await githubGrant(env, req, me))), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), regions: regions(env) }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ user: me, github: !!app, githubInstall: installUrl(env, app), repoAccess: !!(me && (await githubGrant(env, req, me))), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), featured: featuredLink(env), regions: regions(env) }, { headers: { "cache-control": "no-store" } });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {

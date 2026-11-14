@@ -66,6 +66,33 @@ test("a project that asks every agent for its session trace asks agents with the
   assert.ok(((await ada.me()).todo as string[]).some((t) => t.includes("attach_trace") && t.includes(`change ${asked.id}`)), "whoami asks for it too");
 });
 
+test("an owner can publish a public project's traces, so anyone reads them signed out", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-trace-public");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "traces anyone can read", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Trim titles", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trimmed\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim"] });
+  const line = (type: string, content: unknown) => JSON.stringify({ type, sessionId: "s-public", timestamp: new Date().toISOString(), message: { role: type, content } });
+  const log = [line("user", "Trim titles in src/db.js"), line("assistant", [{ type: "tool_use", id: "t1", name: "Edit", input: { file_path: "src/db.js" } }])].join("\n");
+  await ada.req("POST", "/traces", { text: log, change: ch.id });
+  const anon = (p: string) => fetch(`${url}/api/projects/${name}${p}`);
+  assert.equal((await anon(`/traces?change=${ch.id}`)).status, 401, "private to the project's people by default");
+  const s = await admin.req("POST", "/settings", { traces: { public: true } });
+  assert.equal(s.traces.public, true);
+  const list = await (await anon(`/traces?change=${ch.id}`)).json();
+  assert.equal(list.traces.length, 1);
+  assert.equal((await anon(`/changes/${ch.id}/intent`)).status, 200);
+  assert.equal((await anon(`/traces/settings`)).status, 401, "settings stay with the owners");
+  assert.equal((await fetch(`${url}/api/projects/${name}/ask`, { method: "POST", body: "{}" })).status, 401, "asking stays with the project's people");
+  await admin.req("POST", "/settings", { visibility: "private" });
+  assert.equal((await anon(`/traces?change=${ch.id}`)).status, 404, "a private project's traces are never public");
+});
+
 test("the merge queue runs the project's tests: two clean merges that break main together are caught", { skip: !url, timeout: 300_000 }, async () => {
   const { stdout } = await run("node", ["demo/checks.mjs", project("e2e-checks")], { env, maxBuffer: 1 << 24 });
   assert.match(stdout, /fails the tests on main/);

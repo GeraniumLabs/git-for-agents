@@ -126,6 +126,8 @@ async function signIn(key) {
   if (location.hash) route();
 }
 const isHuman = () => me?.role === "human";
+/** Traces are for the project's people, unless an owner published a public project's traces for anyone. */
+const canReadTraces = () => isHuman() || !!state?.project?.traces?.public;
 const isOwner = () => !!me?.owner;
 const githubUrl = () => `/auth/github?return=${encodeURIComponent(location.pathname + location.search)}`;
 function renderMe() {
@@ -190,7 +192,9 @@ async function boot() {
   const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
   if (!project) project = showcase[0] ?? projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
-  $("#project").innerHTML = projects.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
+  // Signed out, the picker offers the showcase projects rather than everyone's.
+  const listed = !user && showcase.length ? projects.filter((p) => showcase.includes(p.name) || p.name === project) : projects;
+  $("#project").innerHTML = listed.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
     $("main").innerHTML = `<div class="empty"><p>No projects yet. Bring a repository you already have, and connect your agents to it in one line.</p>
@@ -225,7 +229,7 @@ function renderTour(projects, showcase) {
   if (dismissed || user || store.get(keyName()) || !showcase.length) return;
   const desc = (n) => projects.find((p) => p.name === n)?.description ?? "";
   $("#tour").innerHTML = `
-    <span class="tour-text"><b>Mergery is git for agents:</b> many coding agents share one repository without stepping on each other. These projects were built by agents working at the same time:</span>
+    <span class="tour-text"><b>Mergery is git for agents:</b> many coding agents share one repository, and you review what they decided, not every line. <a href="/welcome">How it works</a>. These projects were built by agents working at the same time:</span>
     ${showcase.map((n) => `<a href="?project=${encodeURIComponent(n)}" class="${n === project ? "on" : ""}" title="${esc(desc(n))}">${esc(n)}</a>`).join("")}
     <form id="tour-import" class="tour-import"><input id="tour-url" placeholder="Paste a git URL to bring your own repository" aria-label="Git URL"><button class="mini">Bring it to Mergery</button></form><button id="tour-close" class="ghost mini" title="Hide this">Hide</button>`;
   $("#tour").hidden = false;
@@ -1693,10 +1697,11 @@ async function showSettings() {
     <h2>Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
-      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Mergery removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
+      return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Mergery removes secrets before storing anything. ${t.public ? "<b>Published:</b> anyone can read this project's traces and the Intent view of its changes, signed out too." : "Only this project's people can read traces, even when the project is public."} Traces are kept ${keep}.</p>`
       + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
       <label class="check"><input type="checkbox" id="trace-ask-all" ${t.askAll ? "checked" : ""}> Ask every agent for its trace</label><p class="meta">Agents with their own key too: each is asked to attach its session with attach_trace when it submits a change.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
+      <label class="check"><input type="checkbox" id="trace-public" ${t.public ? "checked" : ""} ${state?.project?.visibility === "private" ? "disabled" : ""}> Publish traces: anyone can read them</label><p class="meta">For an open-source or showcase project: visitors see what each agent was asked and why it changed what it did, without signing in. Prompts and the models' reasoning become public too, so check the redaction rules first.${state?.project?.visibility === "private" ? " Only a public project can publish its traces." : ""}</p>
       <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
       <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea>
       <div class="row"><button class="ghost" id="trace-save">Save</button><span id="trace-out" class="meta"></span></div>` : ""); })()}
@@ -1881,8 +1886,8 @@ async function showSettings() {
     $("#trace-save").onclick = async () => {
       const redact = $("#trace-redact").value.split("\n").map((x) => x.trim()).filter(Boolean);
       try {
-        const r = await act("POST", "/settings", { traces: { thoughts: $("#trace-thoughts").checked, agentsCanRead: $("#trace-agents").checked, askAll: $("#trace-ask-all").checked, redact } });
-        state.project.traces = { ...state.project.traces, thoughts: r.traces.thoughts, agentsCanRead: r.traces.agentsCanRead, askAll: r.traces.askAll, redactRules: r.traces.redact.length };
+        const r = await act("POST", "/settings", { traces: { thoughts: $("#trace-thoughts").checked, agentsCanRead: $("#trace-agents").checked, askAll: $("#trace-ask-all").checked, public: $("#trace-public").checked, redact } });
+        state.project.traces = { ...state.project.traces, thoughts: r.traces.thoughts, agentsCanRead: r.traces.agentsCanRead, askAll: r.traces.askAll, public: r.traces.public && state.project.visibility !== "private", redactRules: r.traces.redact.length };
       } catch { return; }
       toast("Trace settings saved");
     };
@@ -2364,7 +2369,7 @@ function route() {
   if (page) { page[1] ? showOrg(page[1]) : showAccount(); return; }
   const ana = /^#(?:incident\/(bisect|change)\/(\d+)|(report|scorecards)(?:\/(\d+))?)$/.exec(location.hash);
   if (ana) { ana[1] ? showIncident(ana[1], Number(ana[2])) : ana[3] === "report" ? showReport(Number(ana[4] ?? 7)) : showScorecards(Number(ana[4] ?? 30)); return; }
-  const m = /^#(change|contest|task)\/(\d+)(?:\/(approve))?$/.exec(location.hash);
+  const m = /^#(change|contest|task)\/(\d+)(?:\/(approve|intent))?$/.exec(location.hash);
   const cm = /^#code(?:\/change\/(\d+)|\/workspace\/([^/]+))?(?:\/(history)|\/(tree|file)\/(.+?))?\/?$/.exec(location.hash);
   document.body.classList.toggle("reviewing", !!(m || cm));
   $("#review").hidden = !(m || cm);
@@ -2379,20 +2384,21 @@ function route() {
     return;
   }
   window.scrollTo(0, 0);
-  if (m[1] === "change") loadReview(Number(m[2])).then(() => m[3] && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
+  if (m[1] === "change") loadReview(Number(m[2]), m[3] === "intent" ? "intent" : undefined).then(() => m[3] === "approve" && readyApprove()); else if (m[1] === "task") loadTask(Number(m[2])); else loadContest(Number(m[2]));
 }
 window.addEventListener("hashchange", route);
 // Closing the account or an org page leaves its link, so the same link opens it again.
 $("#detail").addEventListener("close", () => { if (/^#(account|org\/|incident\/|report|scorecards)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
-async function loadReview(id) {
+async function loadReview(id, mode) {
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
   if (c.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(c.error)}</p></div>`; return; }
   const prev = review?.id === id ? review : null;
   review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0,
-    intent: prev?.intent ?? null, mode: prev?.mode ?? "code" };
-  // Intent comes from the session traces, which only the project's people read: fetched alongside, drawn when it arrives.
-  if (c.traceCount && isHuman()) traceFetch(`/changes/${id}/intent`).then((it) => {
+    intent: prev?.intent ?? null, mode: mode ?? prev?.mode ?? "code" };
+  // Intent comes from the session traces, which only the project's people read unless an owner published them:
+  // fetched alongside (the overview saying whether they're published may not have arrived yet), drawn when it arrives.
+  if (c.traceCount && (canReadTraces() || !state)) traceFetch(`/changes/${id}/intent`).then((it) => {
     if (review?.id !== id) return;
     review.intent = it;
     const y = window.scrollY; drawReview(); window.scrollTo(0, y);
