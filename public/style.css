@@ -105,6 +105,7 @@ button.mini, select.mini { padding: 2px 8px; font-size: var(--fs-11_5); margin-t
 input, textarea { background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 6px; padding: 5px 8px; font: inherit; font-size: var(--fs-13); min-width: 0; }
 textarea { width: 100%; }
 .row { display: flex; gap: 6px; margin-top: 6px; align-items: center; }
+.row > button, .row > a.button { margin-top: 0; } /* the row aligns them; a top margin pushed buttons below the inputs and text beside them */
 .row input { flex: 1; }
 .grow { flex: 1; min-width: 0; }
 .role.bad { color: var(--bad); }
@@ -235,6 +236,19 @@ svg.contrib rect:hover { stroke: var(--ink); stroke-width: 1; }
 /* code browser */
 a.button { display: inline-block; text-decoration: none; cursor: pointer; border-radius: 6px; padding: 2px 8px; font-size: var(--fs-11_5); margin-top: 4px; background: var(--chip); color: var(--ink); border: 1px solid var(--line); }
 .code-row { gap: 6px; margin: 6px 0; }
+/* Connect an agent: the two ways in, side by side, one shown at a time. */
+.connect-paths { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 10px 0 4px; }
+.connect-paths .path-card { margin: 0; text-align: left; display: flex; flex-direction: column; gap: 4px; padding: 12px 14px; background: var(--panel); color: var(--ink); border: 1px solid var(--line); border-radius: 10px; font-size: var(--fs-13); }
+.connect-paths .path-card span { color: var(--muted); line-height: 1.4; }
+.connect-paths .path-card em { font-style: normal; color: var(--ok); font-weight: 600; white-space: nowrap; }
+.connect-paths .path-card:hover { border-color: var(--edge); }
+.connect-paths .path-card[aria-selected="true"] { border-color: var(--accent); box-shadow: inset 0 0 0 1px var(--accent); background: color-mix(in srgb, var(--accent) 6%, var(--panel)); }
+.connect-body button:disabled { opacity: .45; cursor: not-allowed; }
+.standin-note { margin: 10px 0 0; padding: 10px 14px; border: 1px dashed var(--edge); border-radius: 10px; }
+.connect-app { margin: 12px 0 0; }
+.connect-body { margin-top: 12px; }
+.connect-foot { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 10px; }
+@media (max-width: 600px) { .connect-paths { grid-template-columns: 1fr; } }
 /* highlight.js token colors, on the app's existing palette (both themes).
    hljs-* spans only appear in the file viewer, diffs and the full-file view. */
 .hljs-comment, .hljs-quote { color: var(--muted); font-style: italic; }
@@ -393,6 +407,10 @@ dialog .feed { border: 1px solid var(--line); border-radius: 10px; overflow: aut
 
 /* dialogs: sections separated by rules, headed in the same voice as panels */
 dialog { padding: 22px 24px; border-color: var(--edge); box-shadow: 0 20px 60px rgb(0 0 0 / .25); }
+/* A close button that stays in the corner while a long dialog (Settings) scrolls. */
+.corner-close { position: sticky; top: 0; float: right; height: 0; margin: 0 -8px 0 8px; z-index: 3; }
+dialog .corner-close button { margin: 0; width: 40px; height: 40px; padding: 0; font-size: 22px; line-height: 1; border-radius: 99px; background: var(--panel); color: var(--muted); border: 1px solid var(--line); box-shadow: 0 1px 4px rgb(0 0 0 / .08); }
+dialog .corner-close button:hover { color: var(--ink); border-color: var(--edge); }
 #detail-body > h3:first-child { margin-top: 0; font-size: var(--fs-18); }
 #detail-body h2 { margin: 22px 0 10px; padding-top: 16px; border-top: 1px solid var(--line); font-size: var(--fs-13_5); font-weight: 650; text-transform: none; letter-spacing: 0; color: var(--ink); }
 #detail-body h2 small { color: var(--muted); font-size: var(--fs-12); font-weight: 400; }
@@ -724,6 +742,7 @@ main > .empty form { max-width: 560px; margin: 10px auto; }
   dialog#detail > form { order: -1; position: sticky; top: 0; z-index: 3; margin: 0 -16px 8px; padding: 6px 12px; background: var(--panel); border-bottom: 1px solid var(--line); display: flex; justify-content: flex-end; }
   dialog#detail > form button { margin: 0; }
   dialog#detail > form button::before { content: "✕ "; }
+  dialog#detail > form.corner-close { display: none; } /* phones already have Close pinned at the top */
   #jev .jev-form > .row:last-child { position: sticky; bottom: -24px; margin: 0 -16px -24px; padding: 8px 16px 12px; background: var(--panel); border-top: 1px solid var(--line); }
   #jev .jev-form > h3 { padding-top: 16px; }
   dialog.ask { width: calc(100% - 24px); max-width: none; }

@@ -1139,6 +1139,8 @@ function showNewJoinCode() {
 }
 // Whether a skill without a join code was copied, so a code made afterwards says to copy again.
 let copiedPlainSkill = false;
+// Which way in the Connect dialog shows: "me" (signed in as you, through a browser) or "own" (headless, a join code and its own key).
+let connectPath = null;
 async function showSkill(joinCode, fresh = false) {
   const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   // A pasted code is checked by the server, which only puts a live join code into the skill.
@@ -1152,43 +1154,68 @@ async function showSkill(joinCode, fresh = false) {
     ? `<h2>1. Join code ready</h2><div class="card fresh"><b>Join code #${joinCode.id} is in the skill below</b> <span class="role">${esc(joinCode.role)}</span>
         ${copiedPlainSkill ? `<p><b>Copy the skill again.</b> The one you copied earlier has no join code, so agents given it can't register.</p>` : ""}
         <p class="meta">Any agent you give this skill registers itself once and saves its own key, up to ${joinCode.maxUses} agents until ${new Date(joinCode.expiresAt).toLocaleString()}. Sub-agents use that key with their own names. The code is shown only now; revoke it below to stop new agents joining.</p></div>`
-    : `<h2>1. Let agents register themselves</h2>
-      <p class="meta">Create a join code first: the skill in step 2 then carries it. One code lets many agents register: each trades it for its own key once and reuses that key, so it keeps its history and track record. Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
+    : `<h2>1. Make a join code</h2>
+      <p class="meta">Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   const mcpUrl = `${location.origin}/mcp/${project}`;
-  const firstAsk = `Use the mergery MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Mergery's merge queue.`;
-  const oneLine = [`claude mcp add --transport http mergery ${mcpUrl}`, `codex mcp add mergery --url ${mcpUrl}`];
+  const firstAsk = `Use the loom MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Mergery's merge queue.`;
+  // OpenCode has no one-line add for a remote server: it reads opencode.json, and signs in with OAuth on its own.
+  const openCode = JSON.stringify({ mcp: { mergery: { type: "remote", url: mcpUrl } } });
+  const oneLine = [
+    ["Claude Code", `claude mcp add --transport http mergery ${mcpUrl}`],
+    ["Codex", `codex mcp add mergery --url ${mcpUrl}`],
+    ["OpenCode", openCode, `Put this in <span class="mono">opencode.json</span> in your repository (or merge its <span class="mono">mcp</span> entry into one you have), then run <span class="mono">opencode mcp auth mergery</span> once to sign in.`],
+  ];
   const p = state?.project ?? (fresh ? (await api("/overview").catch(() => ({}))).project ?? {} : {});
   const ready = fresh ? `<div class="card fresh"><b>${esc(project)} is ready${p.importedFrom ? `, with the history of <span class="mono">${esc(p.importedFrom.url)}</span>` : ""}.</b>
     <p class="meta">Three steps to the first change landing: connect your agent below; ${p.checks ? `checks are on (<span class="mono">${esc(p.checks.command)}</span>);` : p.suggestedCheck ? `turn on checks so main is tested before it moves <button class="ghost mini" id="fresh-check">Use <span class="mono">${esc(p.suggestedCheck)}</span></button>;` : `set a check command in Settings so main is tested before it moves;`} then ask your agent:</p>
     <pre class="diff copy">${esc(firstAsk)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(firstAsk)}">Copy</button></div></div>` : "";
+  // Two ways in, and a newcomer needs only one: say which before showing either.
+  const shown = joinCode && !fresh ? "own" : connectPath ?? "me";
+  const ownStep1 = owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
+    : `<h2>1. Get a join code</h2>
+      <p class="meta">Only a project's owners can make one.</p>
+      <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (loomjoin_…)"><button id="jc-use">Use code</button></div>
+      <p class="meta">${user ? `${me ? `You aren't an owner of ${esc(project)}: ask one for a join code.` : `Ask an owner of ${esc(project)} for a join code.`} Or <a href="#" id="jc-new-project">create your own project</a>: it comes with a join code.`
+        : `Own ${esc(project)}? <a href="#" id="jc-signin">Sign in</a> to make one. Want your own? Sign in and create a project: it comes with a join code.`}</p>`;
   $("#detail-body").innerHTML = `
     <h3>Connect an agent</h3>
     ${ready}
-    <h2>Your own agent, in one line</h2>
-    <p class="meta">Run one of these where your agent runs. It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Sub-agents pass their own name as <span class="mono">as</span>. Any other MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once.</p>
-    ${oneLine.map((c) => `<div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
-    ${traceSection(me && isHuman() && me.id !== "admin" && !me.standin ? await api("/trace-keys").catch(() => []) : null)}
-    <p class="meta">For agents you won't sign in for, such as a swarm or a runner on a server, use a join code:</p>
-    ${owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
-      : `<h2>1. Get a join code</h2>
-      <p class="meta">A swarm needs a join code: each agent trades it for its own key, so Mergery shows every agent separately. Only a project's owners can make one, so it never appears here on its own.</p>
-      <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (loomjoin_…)"><button id="jc-use">Use code</button></div>
-      <p class="meta">${user ? `${me ? `You aren't an owner of ${esc(project)}: ask one for a join code.` : `Ask an owner of ${esc(project)} for a join code.`} Or <a href="#" id="jc-new-project">create your own project</a>: it comes with a join code.`
-        : `Own ${esc(project)}? <a href="#" id="jc-signin">Sign in</a> to make one. Want your own? Sign in and create a project: it comes with a join code.`}</p>`}
-    ${owner ? "" : `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "Without a join code it covers how to work here, but each agent needs a key from an owner."}</p>`}
-    ${owner ? `<h2>2. Copy the skill</h2><p class="meta">${joinCode ? "With the join code in it." : "It has no join code yet: agents given it need a key you create for each one (below)."}</p>` : ""}
-    <div class="row code-row"><button id="skill-copy" class="${joinCode || !owner ? "" : "ghost"}">${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd">Copy install command</button></div>
-    <pre class="diff copy">${esc(save)}</pre>
-    ${owner && codes.length ? `<h2>Join codes</h2>${codeRows}${joinCode ? `<div class="row"><button class="ghost mini" id="jc-another">Create another join code</button></div>` : ""}` : ""}
-    <section class="key-section">
-    <h2>Single-agent keys <small>separate from join codes</small></h2>
-    ${isOwner() ? `<p class="meta">Not a join code: a key you make for one agent you set up yourself. Prefer a join code for anything that starts sub-agents or a swarm. The key is shown once: give it to the agent as <span class="mono">LOOM_KEY</span>. One key per agent, kept for its life; an agent can replace a leaked key without losing who it is.</p>
-    <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create</button></div>
-    <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."} People don't need keys: they sign in with GitHub and are added in Settings.</p>`}
+    <p class="meta">There are two ways to connect agents, and a project can use both at once: say, you working in Claude Code at your computer while a swarm on a server takes tasks from the same board. Both give an agent the same tools. What differs is whose account the agent works under, and whether someone can sign in for it in a browser. Use one, the other, or both.</p>
+    <div class="connect-paths" role="tablist">
+      <button role="tab" class="path-card" data-path="me" aria-selected="${shown === "me"}"><b>Through your account</b><span>A coding agent you run at your computer: Claude Code, Codex, OpenCode. You sign in once in the browser, and it works on the project under your account. No skill, no key.</span></button>
+      <button role="tab" class="path-card" data-path="own" aria-selected="${shown === "own"}"><b>With its own key</b><span>Headless agents that run without you: a swarm, a CI job, a server. No browser: each registers with a join code and gets its own name, key and track record, not tied to you.${joinCode ? " <em>Join code ready</em>" : ""}</span></button>
+    </div>
+    <p class="meta standin-note"><b>Not a worker: your stand-in.</b> Both of these connect agents that do the work. A stand-in is a different kind of agent: it does no work on the project, but acts as you, making only the calls you set it up to handle (answering questions, approving, steering), and reaches you when something needs a person. Set one up in <a href="#" id="connect-settings">Settings › Stand-in for you</a>.</p>
+    <section class="connect-body" data-path-body="me" ${shown === "me" ? "" : "hidden"}>
+      <h2>Run this where your agent runs</h2>
+      <p class="meta">It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Mergery's MCP server tells the agent how to work here, so it doesn't need the skill.</p>
+      ${oneLine.map(([app, c, how]) => `<p class="meta connect-app"><b>${app}</b>${how ? `: ${how}` : ""}</p><div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
+      <p class="meta">Another MCP client: add <span class="mono">${esc(mcpUrl)}</span> as a server, or <span class="mono">${esc(location.origin)}/mcp</span> for all your projects at once. If your agent starts sub-agents, each sends its own name in the <span class="mono">as</span> argument, so Mergery shows them separately.</p>
     </section>
-    <h2>The skill</h2>
-    <pre class="diff copy skill">${esc(text)}</pre>`;
+    <section class="connect-body" data-path-body="own" ${shown === "own" ? "" : "hidden"}>
+      <p class="meta">A <b>join code</b> lets many agents register: each trades it for its own key once and reuses that key, so Mergery shows every agent separately with its own history and track record. The <b>skill</b> is a SKILL.md file for the agent: it registers with the code, saves the key, connects over MCP with it and explains how to work here.</p>
+      ${ownStep1}
+      <h2>2. Give your agents the skill</h2>
+      <p class="meta" id="skill-why">${joinCode ? "It carries the join code." : `Needs a join code from step 1 first: without one, agents given the skill can't register.${owner ? " (Or make a key for a single agent below.)" : " If an owner gave you a key for one agent instead, open the skill below and give it that key as LOOM_KEY."}`}</p>
+      <div class="row code-row"><button id="skill-copy" ${joinCode ? "" : "disabled"}>${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd" ${joinCode ? "" : "disabled"}>Copy install command</button></div>
+      <pre class="diff copy" id="skill-cmd" ${joinCode ? "" : "hidden"}>${esc(save)}</pre>
+      ${owner && codes.length ? `<h2>Join codes</h2>${codeRows}${joinCode ? `<div class="row"><button class="ghost mini" id="jc-another">Create another join code</button></div>` : ""}` : ""}
+      <details class="alt key-section"><summary>Only one agent, set up by hand? Make a key just for it</summary>
+      ${isOwner() ? `<p class="meta">Instead of a join code, a key for one agent. It's shown once: give it to the agent as <span class="mono">LOOM_KEY</span>, with the skill. Keep one key per agent for its life; an agent can replace a leaked key without losing who it is. Anything that starts sub-agents or a swarm is better off with a join code.</p>
+      <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create key</button></div>
+      <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."}</p>`}
+      </details>
+      <details class="alt"><summary>Read the skill</summary><pre class="diff copy skill">${esc(text)}</pre></details>
+    </section>
+    ${traceSection(me && isHuman() && me.id !== "admin" && !me.standin ? await api("/trace-keys").catch(() => []) : null, p)}
+    <p class="meta connect-foot">People don't need any of this: they sign in with GitHub and are added under People in Settings. Model keys (Anthropic and others) for Mergery's own reviewer and deputy are in Settings too.</p>`;
+  for (const t of $("#detail-body").querySelectorAll("[data-path]")) t.onclick = () => {
+    connectPath = t.dataset.path;
+    for (const x of $("#detail-body").querySelectorAll("[data-path]")) x.setAttribute("aria-selected", String(x === t));
+    for (const s of $("#detail-body").querySelectorAll("[data-path-body]")) s.hidden = s.dataset.pathBody !== connectPath;
+  };
+  if ($("#connect-settings")) $("#connect-settings").onclick = (e) => { e.preventDefault(); showSettings(); };
   wireTraceSection(() => showSkill(joinCode, fresh));
   if ($("#mk-go")) $("#mk-go").onclick = async () => {
     const n = $("#mk-name").value.trim();
@@ -1196,6 +1223,10 @@ async function showSkill(joinCode, fresh = false) {
     try {
       const k = await act("POST", "/agents", { name: n, role: $("#mk-role").value });
       $("#mk-out").innerHTML = keyBox(k, project);
+      // A key for one agent is the other way past step 1: the skill without a code is now useful.
+      for (const id of ["#skill-copy", "#skill-copy-cmd"]) $(id).disabled = false;
+      $("#skill-cmd").hidden = false;
+      $("#skill-why").textContent = "Give this agent the skill and its key. The skill has no join code, so it uses LOOM_KEY.";
       wireCopy($("#mk-out"));
     } catch {}
   };
@@ -1241,18 +1272,34 @@ const TRACE_AGENTS = { "claude-code": "Claude Code", codex: "Codex", opencode: "
 function traceInstall(key, kind) {
   return `mkdir -p ~/.loom && curl -fsS ${location.origin}/trace-hook.mjs -o ~/.loom/trace-hook.mjs && node ~/.loom/trace-hook.mjs --install ${location.origin} ${project} ${key.key} --for ${kind}`;
 }
-/** keys: this person's trace keys, or null when the viewer can't make one. */
-function traceSection(keys) {
-  const why = `Off unless you turn it on. When it's on, your agent's sessions in a repository upload to ${esc(project)} (Claude Code when a session ends; Codex and OpenCode once a session has been idle for 5 minutes), so a reviewer can switch a change to <b>Intent</b> and see what you asked and why the agent did what it did. Secrets are removed before anything is stored, and only the project's people can read traces.`;
-  if (!keys) return `<h2>Session traces <small>optional</small></h2><p class="meta">${why} ${me ? "Sign in as a person to turn it on." : `<a href="#" id="tr-signin">Sign in</a> to turn it on.`} Agents with their own key can use the same hook: see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>.</p>`;
+/** Session traces, for every agent that makes decisions however it connects. keys: this person's trace keys, or null when the
+ *  viewer can't make one; p: the project, for whether it asks every agent for its trace. */
+function traceSection(keys, p = state?.project ?? {}) {
+  const askAll = !!p.traces?.askAll;
+  const intro = `<h2>Session traces <small>from every agent that makes decisions</small></h2>
+    <p class="meta">Every agent makes decisions, whichever way it connects, so every agent can leave a trace: a reviewer switches a change to <b>Intent</b> and sees what was asked and why the agent did what it did. Nothing is collected until it's turned on. Secrets are removed before anything is stored, and only the project's people can read traces.</p>`;
+  const all = `<p class="meta connect-app"><b>Every agent, including those with their own key</b></p>
+    <p class="meta">${askAll ? "<b>On.</b> Every agent is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change, until the change has its trace. Agents whose person runs a hook below aren't asked twice." : "<b>Off.</b> Turn it on and every agent, headless ones included, is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change."} A headless agent can also upload with the hook script, given <span class="mono">LOOM_URL</span>, <span class="mono">LOOM_PROJECT</span> and its <span class="mono">LOOM_KEY</span> (see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>).</p>
+    ${isOwner() ? `<div class="row"><button class="ghost" id="tr-ask-all">${askAll ? "Stop asking every agent" : "Ask every agent for its trace"}</button></div>` : askAll ? "" : `<p class="meta">The project's owners turn this on.</p>`}`;
+  const hookWhy = `A hook uploads your own agent's sessions in a repository (Claude Code when a session ends; Codex and OpenCode once a session has been idle for 5 minutes), with no work for the agent.`;
+  const mine = `<p class="meta connect-app"><b>Your agents, through your account</b></p>`;
+  if (!keys) return `${intro}${all}${mine}<p class="meta">${hookWhy} ${me ? "Sign in as a person to set one up." : `<a href="#" id="tr-signin">Sign in</a> to set one up.`}</p>`;
   const rows = keys.map((k) => `<div class="qrow"><span class="grow">${k.kind === "other" ? "<b>Your agents are asked to attach their traces</b>" : `On for <b>${esc(k.agent)}</b>`} <span class="meta">${k.person !== me.id ? `${esc(k.personName)} · ` : ""}since ${new Date(k.createdAt).toLocaleDateString()} · ${k.kind === "other" ? "they call attach_trace when they submit" : k.lastUsed ? `last upload ${ago(k.lastUsed)}` : "nothing uploaded yet"}</span></span><button class="ghost mini" data-tk-revoke="${esc(k.id)}">Turn off</button></div>`).join("");
-  return `<h2>Session traces <small>optional</small></h2><p class="meta">${why}</p>
+  return `${intro}${all}${mine}<p class="meta">${hookWhy}</p>
     ${rows}
     <div class="row"><select id="tk-kind" title="The agent you run in this repository">${Object.entries(TRACE_AGENTS).map(([k, n]) => `<option value="${k}">${n}</option>`).join("")}${keys.some((k) => k.kind === "other") ? "" : `<option value="other">Another agent</option>`}</select><button class="ghost" id="tk-go">${keys.length ? "Turn on in another repository" : "Turn on"}</button></div>
-    <p class="meta">For another agent, Mergery asks your agents to upload their own session with the <span class="mono">attach_trace</span> tool when they submit a change. Mergery reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
+    <p class="meta">For another agent, Mergery asks your agents to upload their own session with <span class="mono">attach_trace</span> when they submit a change. Mergery reads Claude Code, Codex and OpenCode logs and OpenTelemetry spans, and keeps anything else as plain text.</p>
     <div id="tk-out"></div>`;
 }
 function wireTraceSection(redraw) {
+  if ($("#tr-ask-all")) $("#tr-ask-all").onclick = async () => {
+    const on = !state?.project?.traces?.askAll;
+    let r;
+    try { r = await act("POST", "/settings", { traces: { askAll: on } }); } catch { return; }
+    if (state?.project) state.project.traces = { ...state.project.traces, askAll: r.traces.askAll };
+    toast(on ? "Every agent is now asked for its session trace when it submits" : "Agents are no longer all asked for their traces");
+    redraw();
+  };
   if ($("#tr-signin")) $("#tr-signin").onclick = (e) => { e.preventDefault(); showSignIn(`Sign in to turn on session traces for ${project}.`); };
   if ($("#tk-go")) $("#tk-go").onclick = async () => {
     let k;
@@ -1641,13 +1688,14 @@ async function showSettings() {
     <p class="meta">What each agent may do unless its own limits say otherwise: which paths it may change, how many changes it may open a day, and how many check minutes it may use a day. Sub-agents share their key's limits. ${state?.project?.agentLimits ? `Now: <b>${esc(limitsText(state.project.agentLimits))}</b>.` : "<b>No limits</b> beyond the project's."} Set one agent's limits from its profile.</p>
     ${isOwner() ? limitsForm("dl", state?.project?.agentLimits) : ""}
     <h2>Review agent</h2>
-    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Mergery reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key above." : ""}</p>`
+    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Mergery reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key under Model keys below." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Mergery review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
     <h2>Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
       return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Mergery removes secrets before storing anything, and only this project's people can read traces, even when the project is public. Traces are kept ${keep}.</p>`
       + (isOwner() ? `<label class="check"><input type="checkbox" id="trace-thoughts" ${t.thoughts ? "checked" : ""}> Keep the models' own reasoning</label><p class="meta">The most useful part for reviewing a decision, and the most likely to quote something sensitive.</p>
+      <label class="check"><input type="checkbox" id="trace-ask-all" ${t.askAll ? "checked" : ""}> Ask every agent for its trace</label><p class="meta">Agents with their own key too: each is asked to attach its session with attach_trace when it submits a change.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
       <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
       <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea>
@@ -1660,6 +1708,9 @@ async function showSettings() {
       <div class="row"><select id="hook-events"><option value="work">New work for agents</option><option value="work,change.merged">New work, and merges</option><option value="*">Every event</option></select><input id="hook-auth" type="password" autocomplete="off" class="grow" placeholder="Authorization header (optional), e.g. Bearer <token>"><button id="hook-add">Add webhook</button></div>
       <div id="hook-out"></div>
     </div>` : ""}
+    <h2>Agents</h2>
+    <p class="meta">Agents connect from <b>Connect an agent</b>, in two ways that work side by side, so a project can have both: <b>through your account</b> (Claude Code, Codex, OpenCode or any MCP client you work with, after one browser sign-in), or <b>with its own key</b> (headless: a swarm, CI, a server), where each agent registers with a join code and the skill. Join codes and single-agent keys are made and revoked there. Your stand-in is something else: it does no work, it makes the calls you set it up for (below).</p>
+    <div class="row"><button class="ghost" id="settings-connect">Connect an agent…</button></div>
     <h2>People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
@@ -1671,8 +1722,8 @@ async function showSettings() {
     ${mail ? `<h2>Email me</h2>
     <p class="meta">${mail.email ? `Mergery emails you at <b>${esc(account?.email ?? mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : account?.email ? `Get an email at <b>${esc(account.email)}</b> when something on ${esc(project)} needs you, with a link straight to it.` : `Get an email when something on ${esc(project)} needs you. First set your address on <a href="#account">your account page</a>.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
     ${mail.email || account?.email ? `<div class="row">${mail.email ? `<button class="ghost" id="mail-off">Stop emailing me about ${esc(project)}</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : `<button class="ghost" id="mail-on" data-to="${esc(account.email)}">Email me about ${esc(project)}</button>`}</div>` : ""}` : ""}
-    <h2>Your agent</h2>
-    <p class="meta">Let your own agent watch this project for you and reach you where you are (Slack, email, a text) when agents need a person. Give it a stand-in key: it signs in as you, but only with the rights you tick, and never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
+    <h2>Stand-in for you</h2>
+    <p class="meta">Not for connecting agents to do the work (that's <a href="#" id="settings-connect2">Connect an agent</a>). A stand-in is your own assistant watching this project for you: it reaches you where you are (Slack, email, a text) when agents need a person, and can act for you with the rights you tick. Its stand-in key signs in as you, but never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
       <div class="row"><input id="si-name" placeholder="Your agent's name, e.g. my-assistant"></div>
       ${Object.entries(si.scopes).map(([k, d]) => `<label class="check si-scope"><input type="checkbox" data-si-scope="${k}" ${k === "answer" ? "checked" : ""}> <b>${esc(k)}</b> <span class="meta">${esc(d)}</span></label>`).join("")}
@@ -1680,8 +1731,8 @@ async function showSettings() {
       <div id="si-out"></div>
     </div>
     ${si.standins.map((x) => `<div class="qrow"><span class="grow"><b>${esc(x.name)}</b>${x.for !== me?.id ? ` <span class="meta">for ${esc(x.forName)}</span>` : ""} <span class="meta">${x.scopes.length ? esc(x.scopes.join(", ")) : "watch only"}${x.webhook ? " · webhook" : ""}${x.lastDelivery ? ` (last ${x.lastDelivery.status && x.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(x.lastDelivery.error || String(x.lastDelivery.status))}`})` : ""} · ${x.revoked ? "revoked" : x.lastUsed ? `used ${ago(x.lastUsed)}` : "not used yet"}</span></span>${!x.revoked && x.webhook ? `<button class="ghost mini" data-si-test="${x.id}">Test</button>` : ""}${x.revoked ? "" : `<button class="ghost mini" data-si-revoke="${x.id}">Revoke</button>`}</div>`).join("")}
-    <h2>Keys</h2>
-    <p class="meta">Bring your own keys for this project. Mergery encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
+    <h2>Model keys</h2>
+    <p class="meta">API keys for the AI models Mergery itself uses on this project, such as the review agent and the deputy. Agents' own keys and join codes are in <b>Connect an agent</b>, not here. Mergery encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
     ${s.keys.map((k) => `<div class="card key-card">
       <div class="row"><b class="grow">${esc(k.label)}</b>${k.saved ? `<span class="pill mono">…${esc(k.saved.last4)}</span>` : k.serverKey ? `<span class="pill">server key</span>` : `<span class="pill">not set</span>`}</div>
@@ -1692,6 +1743,7 @@ async function showSettings() {
     ${isOwner() ? `<h2>Delete project</h2>
     <p class="meta">Removes the repository with all its history, every workspace, and the project's tasks, reviews, attachments, people and keys. Agents' keys stop working. This can't be undone.</p>
     <div class="row"><button class="bad" id="proj-delete">Delete this project…</button></div>` : ""}`;
+  for (const id of ["#settings-connect", "#settings-connect2"]) if ($(id)) $(id).onclick = (e) => { e.preventDefault(); showSkill(); };
   if ($("#proj-delete")) $("#proj-delete").onclick = async () => {
     const typed = await ask({ title: `Delete ${project}?`, body: "Everything in it goes, for good. Type the project's name to confirm.", ok: "Delete forever", danger: true, input: { label: "Project name", placeholder: project, required: true } });
     if (typed === null) return;
@@ -1829,8 +1881,8 @@ async function showSettings() {
     $("#trace-save").onclick = async () => {
       const redact = $("#trace-redact").value.split("\n").map((x) => x.trim()).filter(Boolean);
       try {
-        const r = await act("POST", "/settings", { traces: { thoughts: $("#trace-thoughts").checked, agentsCanRead: $("#trace-agents").checked, redact } });
-        state.project.traces = { ...state.project.traces, thoughts: r.traces.thoughts, agentsCanRead: r.traces.agentsCanRead, redactRules: r.traces.redact.length };
+        const r = await act("POST", "/settings", { traces: { thoughts: $("#trace-thoughts").checked, agentsCanRead: $("#trace-agents").checked, askAll: $("#trace-ask-all").checked, redact } });
+        state.project.traces = { ...state.project.traces, thoughts: r.traces.thoughts, agentsCanRead: r.traces.agentsCanRead, askAll: r.traces.askAll, redactRules: r.traces.redact.length };
       } catch { return; }
       toast("Trace settings saved");
     };

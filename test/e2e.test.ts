@@ -44,6 +44,28 @@ test("updating a change without new context keeps the context it was submitted w
   assert.deepEqual(detail.context.context, { plan: ["trim in db.js"], tested: ["v2 by hand"] });
 });
 
+test("a project that asks every agent for its session trace asks agents with their own key too", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-trace-all");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "every agent leaves its trace", files: SEED, requiredApprovals: 1 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const work = async (title: string) => {
+    const t = await ada.createTask(title, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.write(ws, { [`notes/${t.id}.md`]: `${title}\n` }, title);
+    return ada.submit(t.id, title, title, { plan: [title] });
+  };
+  const quiet = await work("Before asking");
+  assert.equal(quiet.traceAsk, undefined, "nothing asked until the project asks");
+  const s = await admin.req("POST", "/settings", { traces: { askAll: true } });
+  assert.equal(s.traces.askAll, true);
+  const asked = await work("After asking");
+  assert.match(asked.traceAsk ?? "", /every agent.*attach_trace/);
+  assert.ok(((await ada.me()).todo as string[]).some((t) => t.includes("attach_trace") && t.includes(`change ${asked.id}`)), "whoami asks for it too");
+});
+
 test("the merge queue runs the project's tests: two clean merges that break main together are caught", { skip: !url, timeout: 300_000 }, async () => {
   const { stdout } = await run("node", ["demo/checks.mjs", project("e2e-checks")], { env, maxBuffer: 1 << 24 });
   assert.match(stdout, /fails the tests on main/);
