@@ -75,6 +75,14 @@ node bench/build.mjs                 # rebuilds benchmark.json for this page</pr
     <p class="meta">Flags: <span class="mono">--agents N</span>, <span class="mono">--reviewers N</span>, <span class="mono">--share 0.3</span> (the share of agents editing the same files), <span class="mono">--repo-files</span> and <span class="mono">--repo-mb</span> (filler, so the repository is as big as you ask). The raw numbers are in <a href="/benchmark.json">benchmark.json</a>.</p>
   </div>
 </main>
+<footer style="max-width:980px;margin:0 auto;padding:16px 16px 40px;display:flex;flex-wrap:wrap;gap:8px 20px;font-size:var(--fs-13);color:var(--muted)">
+  <a href="/">Mergery</a>
+  <a href="/pricing">Pricing</a>
+  <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md">Docs</a>
+  <a href="https://github.com/GeraniumLabs/git-for-agents">GitHub</a>
+  <a href="/terms">Terms</a>
+  <a href="/privacy">Privacy</a>
+</footer>
 <script>
 const fmt = (ms) => ms == null ? "–" : ms < 1000 ? `${ms}ms` : `${(ms / 1000).toFixed(1)}s`;
 const num = (n) => n == null ? "–" : n.toLocaleString("en-US");
