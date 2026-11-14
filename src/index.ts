@@ -213,6 +213,11 @@ export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
     const path = url.pathname;
+    // Search engines found the site over plain HTTP. The public hosts only answer on HTTPS.
+    if (url.protocol === "http:" && /(^|\.)mergery\.(dev|link)$/.test(url.hostname)) {
+      url.protocol = "https:";
+      return Response.redirect(url.toString(), 301);
+    }
 
     const oauth = await handleOAuth(env, req);
     if (oauth) return oauth;
