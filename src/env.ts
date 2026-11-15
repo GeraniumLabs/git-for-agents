@@ -51,7 +51,7 @@ export interface Env {
   LOOM_AI_GATEWAY?: string;
   /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
   LOOM_REVIEW_MODEL_URL?: string;
-  /** Ask Mergery (src/helpdesk.ts): the Workers AI model it uses when the server has no Anthropic key. Default Llama 4 Scout. */
+  /** Ask Mergery (src/helpdesk.ts): the model it runs through the AI binding when the server has no Anthropic key: a Workers AI model (@cf/…) or an AI Gateway catalog model on Unified Billing (anthropic/claude-haiku-5.5). Default Llama 4 Scout, which is also the fallback. */
   LOOM_ASK_MODEL?: string;
   /** An Anthropic key for Ask Mergery alone (Claude Haiku), so it can use Claude without switching the review agent and deputy to the server's key. */
   LOOM_ASK_ANTHROPIC_KEY?: string;

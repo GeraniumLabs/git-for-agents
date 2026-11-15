@@ -61,3 +61,26 @@ test("Workers AI: history and the question go in order, and an empty reply is a 
   const empty = { run: async () => ({ response: "" }) } as unknown as Ai;
   assert.equal((await askHelp({ kind: "workers-ai", ai: empty, model: "m" }, { question: "q", history: [], project: null, view: null, digest: null })).ok, false);
 });
+
+test("made-up links become the guide; Mergery's own links stay", async () => {
+  const { keepKnownLinks } = await import("../src/helpdesk");
+  const guide = "https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md";
+  assert.equal(keepKnownLinks("See https://docs.mergery.dev/."), `See ${guide}.`);
+  assert.equal(keepKnownLinks("[Docs](https://mergery.dev/docs)"), `[Docs](${guide})`);
+  assert.equal(keepKnownLinks("Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm"), "Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm");
+  assert.equal(keepKnownLinks(`Read ${guide}, or https://mergery.dev/pricing`), `Read ${guide}, or https://mergery.dev/pricing`);
+});
+
+test("a Claude catalog model gets Anthropic's shape through the AI binding, and any reply shape is read", async () => {
+  const { replyText, modelLabel } = await import("../src/helpdesk");
+  let sent: any;
+  const ai = { run: async (_m: string, input: any) => { sent = input; return { content: [{ type: "text", text: "From Haiku." }] }; } } as unknown as Ai;
+  const r = await askHelp({ kind: "workers-ai", ai, model: "anthropic/claude-haiku-5.5", gateway: "default" }, { question: "q", history: [], project: null, view: null, digest: null });
+  assert.deepEqual(r, { ok: true, answer: "From Haiku.", model: "Claude Haiku 5.5" });
+  assert.equal(sent.system, HELP_SYSTEM);
+  assert.equal(sent.temperature, undefined);
+  assert.deepEqual(sent.messages.map((m: any) => m.role), ["user"]);
+  assert.equal(replyText({ choices: [{ message: { content: " hi " } }] }), "hi");
+  assert.equal(replyText({ result: { response: "x" } }), "x");
+  assert.equal(modelLabel("@cf/meta/llama-4-scout-17b-16e-instruct"), "Llama 4 Scout");
+});

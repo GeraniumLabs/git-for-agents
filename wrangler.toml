@@ -98,6 +98,10 @@ LOOM_FEATURED = ""
 # A list of logins makes it invite-only: anyone else joins a waitlist, and the
 # admin lets them in (POST /api/admin/creators).
 LOOM_CREATORS = "*"
+# Ask Mergery's model. A catalog model like this one runs through AI Gateway on
+# Unified Billing credits (no Anthropic key); without credits it falls back to
+# Llama 4 Scout on Workers AI. Unset means Llama 4 Scout.
+LOOM_ASK_MODEL = "anthropic/claude-haiku-5.5"
 
 # Local development: no Artifacts binding. The Worker talks to the
 # Artifacts shim (shim/artifacts-shim.mjs), which serves real git over HTTP.
