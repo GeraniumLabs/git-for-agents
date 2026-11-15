@@ -448,10 +448,20 @@ function personAskHtml(c) {
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   $("#stuck").innerHTML = items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
-    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}</div>`).join("")
+    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`;
   wire($("#stuck"));
+  for (const b of $("#stuck").querySelectorAll("[data-reconcile]")) b.onclick = async () => {
+    let r; try { r = await act("POST", `/changes/${b.dataset.reconcile}/reconcile`, {}); } catch { return; }
+    const o = r?.outcome;
+    toast(o === "merged" ? "It was already on main; marked merged" : o ? `Not on main yet: ${o}` : "Checked");
+  };
+  for (const b of $("#stuck").querySelectorAll("[data-withdraw]")) b.onclick = async () => {
+    if (!confirm(`Withdraw change #${b.dataset.withdraw}?`)) return;
+    try { await act("POST", `/changes/${b.dataset.withdraw}/withdraw`, { reason: "withdrawn by a project owner from the Stuck list" }); } catch { return; }
+    toast("Withdrawn");
+  };
 }
 
 /**
@@ -741,7 +751,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -2237,7 +2247,10 @@ function describe(e) {
     case "merge.started": return ["", `Merging #${e.change_id}…`];
     case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})`];
     case "workspace.conflict": return ["conflict", `Syncing ${to}'s workspace hit a conflict in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Hunks sent back for resolution.`];
-    case "merge.retry": return ["stale", `Merge of #${e.change_id} will retry: ${esc(d.error)}`];
+    case "merge.retry": return ["stale", d.reconciled ? `Merge of #${e.change_id} was cut off before main moved; it's back in the queue` : `Merge of #${e.change_id} will retry${d.attempt ? ` (attempt ${d.attempt} of ${d.of})` : ""}: ${esc(d.error)}`];
+    case "merge.failed": return ["conflict", `Merging #${e.change_id} failed ${d.attempts} times (${esc(d.error)}). Sent back to ${to}.`];
+    case "merge.reconciled": return ["merged", `#${e.change_id} was already on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span>; its unfinished merge was completed${who && e.actor ? ` by ${who}` : ""} (v${d.version})`];
+    case "change.withdrawn": return ["", `#${e.change_id} was withdrawn by ${esc(d.by ?? "Mergery")}${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "checks.started": return ["", `Running the checks on main with ${d.changes.map((x) => `#${x}`).join(", ")}: <span class="mono">${esc(d.command)}</span>`];
     case "checks.passed": return ["merged", `Checks passed with #${e.change_id} (${Math.round(d.ms / 100) / 10}s)`];
     case "checks.failed": return ["conflict", `#${e.change_id} fails the checks on main${d.alongside ? ` after ${esc(d.alongside.join(", "))}` : ""} (exit ${d.exitCode}). Sent back to ${to}.`];

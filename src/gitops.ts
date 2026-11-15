@@ -145,9 +145,14 @@ export class Workspace {
     return { branch, head: await git.resolveRef({ fs: this.fs, dir: DIR, ref: `refs/remotes/source/${branch}` }) };
   }
 
-  async isAncestor(ancestor: string, descendant: string): Promise<boolean> {
+  async isAncestor(ancestor: string, descendant: string, deep = false): Promise<boolean> {
     if (ancestor === descendant) return true;
-    return git.isDescendent({ fs: this.fs, dir: DIR, oid: descendant, ancestor, depth: -1 });
+    const check = () => git.isDescendent({ fs: this.fs, dir: DIR, oid: descendant, ancestor, depth: -1 });
+    if (!deep) return check();
+    // A shallow fetch can hide the answer: on a miss, fetch the rest of history once and ask again.
+    const first = await check().catch(() => false);
+    if (first || !(await this.deepen())) return first;
+    return check().catch(() => false);
   }
 
   async mergeBase(a: string, b: string): Promise<string | null> {

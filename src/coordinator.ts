@@ -107,10 +107,10 @@ const MERGE_IDENTITY = { name: "Mergery merge queue", email: "merge-queue@merger
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
-const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "proposal.made", "task.assigned"]);
+const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "merge.failed", "proposal.made", "task.assigned"]);
 /** Most queued changes merged together in one pass of the queue. */
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const CHATTER_LIMIT = 20;
@@ -118,6 +118,10 @@ const since = (ms: number) => (ms < 3600_000 ? `${Math.max(1, Math.round(ms / 60
 const ACCEPT_MS = 5 * 60_000; // to accept or decline a review request
 const REVIEW_MS = 30 * 60_000; // to deliver an accepted review
 const MERGE_BATCH = 8;
+/** Failed merge attempts before a change goes back to its author with merge.failed, instead of retrying forever. */
+const MERGE_ATTEMPTS = 5;
+/** A merge still "merging" this long after it started was cut off (the object restarted mid-merge): check main and finish it. */
+const MERGE_STALL_MS = 5 * 60_000;
 /** How long a workspace outlives the change that landed (or closed) it, before its Artifacts repo is deleted. */
 const WORKSPACE_GRACE_MS = 10 * 60_000;
 
@@ -459,8 +463,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const row = this.sql.exec("SELECT value FROM meta WHERE key = ?", key).toArray()[0];
     return row ? (row.value as string) : null;
   }
-  private setMeta(key: string, value: string) {
-    this.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", key, value);
+  private setMeta(key: string, value: string | null) {
+    if (value === null) this.sql.exec("DELETE FROM meta WHERE key = ?", key);
+    else this.sql.exec("INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)", key, value);
   }
   private get project(): string {
     const p = this.meta("project");
@@ -1170,6 +1175,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "changes" && b && c === "reviewers" && m === "POST") return json(await this.requestReviewers(actor, Number(b), body));
     if (a === "changes" && b && c === "reviews") return json(await this.review(actor, Number(b), body));
     if (a === "changes" && b && c === "update") return json(await this.updateChange(actor, Number(b), body));
+    if (a === "changes" && b && c === "withdraw" && m === "POST") return json(this.withdrawChange(actor, Number(b), body.reason));
+    if (a === "changes" && b && c === "reconcile" && m === "POST") {
+      ownerOnly("check main and finish a merge");
+      const [r] = await this.reconcileMerging([Number(b)], actor);
+      return json({ ...(r ?? { id: Number(b), outcome: "nothing to do" }), change: this.change(Number(b)).status });
+    }
     if (a === "changes" && b && c === "preview" && m === "POST") return json(await this.requestPreview(actor, Number(b)));
     if (a === "evals" && !b && m === "GET") return json(this.evalsView());
     if (a === "evals" && m === "POST" && !b) { ownerOnly("define evals"); return json(this.saveEval(actor, body)); }
@@ -1505,7 +1516,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.emit("task.reassigned", { actor: actor.id, task: taskId, to: task.assignee, data: { from: task.assignee, fromName: this.agentName(task.assignee), reason: `${this.agentName(task.assignee)} went quiet (last seen ${since(Date.now() - ((holder?.last_seen as number) ?? 0))} ago); ${actor.name} took it over` } });
     }
     for (const dep of task.depends_on as number[]) {
-      if (this.task(dep).status !== "merged") throw new HttpError(409, `task ${taskId} waits on task ${dep}`);
+      const d = this.task(dep);
+      if (d.status !== "merged") {
+        const open = this.sql.exec("SELECT id, status FROM changes WHERE task_id = ? AND status NOT IN ('merged','closed','abandoned') ORDER BY id DESC LIMIT 1", dep).toArray()[0];
+        throw new HttpError(409, `task ${taskId} waits on task ${dep} (${d.status}${open ? `, change #${open.id} ${open.status}` : ""}); it opens once task ${dep} lands`);
+      }
     }
 
     // Hold the task before the first await, so two agents claiming at once can't both get it.
@@ -1882,6 +1897,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (inContest && approach.length < MIN_APPROACH && !this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned')", body.taskId).toArray().length)
       throw new HttpError(400, `task ${body.taskId} is an attempt in contest #${inContest.id}: explain your approach (approach: two or three plain sentences for a person who won't read the code: what your attempt does differently from the obvious way, and what it gives up), so people and voters can compare the attempts without reading every diff`);
     const wsRow = this.sql.exec("SELECT * FROM workspaces WHERE name = ?", task.workspace).toArray()[0] as any;
+    // Fail now rather than queue something the merge can never fetch.
+    if (!wsRow || wsRow.status === "deleted")
+      throw new HttpError(409, `task ${body.taskId}'s workspace ${task.workspace ?? "(none)"} was deleted after its last change landed; create_task for the follow-up work and submit it from the new task's workspace`);
     const analysis = await this.analyze(task.workspace);
     if (!analysis.files.length) throw new HttpError(400, "the workspace has no changes against main");
     this.assertInScope(actor, analysis.files.map((f) => f.path), "change");
@@ -2567,6 +2585,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   // ── merge queue ──────────────────────────────────────────────────────────
 
   private async enqueue(id: number) {
+    this.setMeta(`merge_attempts:${id}`, null);
     this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now(), id);
     const position = this.sql.exec("SELECT COUNT(*) AS n FROM changes WHERE status IN ('queued','merging') AND id <= ?", id).one().n;
     this.emit("change.queued", { change: id, task: this.change(id).task_id, data: { position } });
@@ -2581,6 +2600,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Work that stopped moving needs no event to need a person, or a runner.
     this.notifySoon();
     this.hooksSoon();
+    // Nothing is merging in this object right now, so a change still "merging" was cut off: finish it from main.
+    if (!this.merging) await this.reconcileMerging().catch((e) => console.error("reconcile", e));
     if (this.merging || this.meta("frozen")) return;
     this.merging = true;
     try {
@@ -2625,6 +2646,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.sql.exec("UPDATE changes SET status = 'merging', updated_at = ? WHERE id = ?", now(), id);
       this.emit("merge.started", { change: id, task: this.change(id).task_id, data: { batch: ids.length } });
     }
+    // If this object is cut off mid-merge (after main moved, say), nothing would ever finish these:
+    // come back and reconcile them with main.
+    await this.armAlarm(now() + MERGE_STALL_MS + 10_000);
     let landed: { ch: any; before: string; commit: string }[] = [];
     let w: Workspace, mainW: Remote, main: string;
     try {
@@ -2675,27 +2699,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     } catch (e: any) {
       return this.retryMerge(landed.map((l) => l.ch.id), e);
     }
+    // Main has moved: record every landed change before anything else can go wrong. Files and the
+    // rest come after, so a cut-off here leaves records that say merged, not "merging" forever.
     let version = this.mainVersion;
-    for (const { ch, before, commit } of landed) {
+    const versions = landed.map(({ before, commit }) => (commit !== before ? ++version : version));
+    for (const [n, { ch, before, commit }] of landed.entries()) this.markMerged(ch, before, commit, versions[n], true);
+    for (const [n, { ch, before, commit }] of landed.entries()) {
       const files = await w.changes(before, commit);
-      if (commit !== before) version++;
-      const t = now();
-      this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, merged_before = ?, updated_at = ? WHERE id = ?", commit, version, before, t, ch.id);
-      this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?", t, ch.task_id);
-      this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE winner = ?", t, ch.id);
-      this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", t, ch.task_id);
-      this.sql.exec("UPDATE workspaces SET status = 'merged', done_at = ? WHERE name = ?", t, ch.workspace);
-      this.setMeta("main_version", String(version));
-      this.setMeta("main_head", commit);
-      this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, batch: landed.length } });
-      if (files.some((f) => isTest(f.path))) this.mainTestsStale = true;
-      this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
-      await this.notesFromContext(ch).catch((e) => console.error("notes", e));
-      this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", Date.now(), ch.id);
-      this.adviseStale(ch.id, files.map((f) => f.path));
-      for (const r of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ?", ch.task_id).toArray()) {
-        this.emit("task.unblocked", { task: r.id as number, data: { after: ch.task_id } });
-      }
+      await this.afterMerged(ch, commit, versions[n], files, { batch: landed.length });
     }
     // Why each change landed travels with the repository, as git notes on main.
     const notes = landed.filter((l) => l.commit !== l.before).map(({ ch, commit }) => ({ id: ch.id as number, oid: commit }));
@@ -2704,6 +2715,132 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private notesChain: Promise<void> = Promise.resolve();
+
+  /**
+   * The records that say a change landed, in one synchronous step (a Durable
+   * Object can't be cut off between these): the change, its task, its
+   * intents, its workspace, and main's version. Tasks that depend on it can
+   * be claimed from here on.
+   */
+  private markMerged(ch: any, before: string, commit: string, version: number, advanceMain: boolean) {
+    const t = Date.now();
+    this.sql.exec("UPDATE changes SET status = 'merged', merged_commit = ?, merged_version = ?, merged_before = ?, updated_at = ? WHERE id = ?", commit, version, before, t, ch.id);
+    this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE id = ?", t, ch.task_id);
+    this.sql.exec("UPDATE tasks SET status = 'merged', updated_at = ? WHERE winner = ?", t, ch.id);
+    this.sql.exec("UPDATE intents SET released_at = ? WHERE task_id = ? AND released_at IS NULL", t, ch.task_id);
+    this.sql.exec("UPDATE workspaces SET status = 'merged', done_at = ? WHERE name = ?", t, ch.workspace);
+    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", t, ch.id);
+    this.setMeta(`merge_attempts:${ch.id}`, null);
+    if (advanceMain && version >= this.mainVersion) {
+      this.setMeta("main_version", String(version));
+      this.setMeta("main_head", commit);
+    }
+  }
+
+  /** What follows a landing: the event, memory, stale-workspace advice, unblocked tasks. */
+  private async afterMerged(ch: any, commit: string, version: number, files: FileChange[], data: Record<string, unknown>) {
+    this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, ...data } });
+    if (files.some((f) => isTest(f.path))) this.mainTestsStale = true;
+    this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
+    await this.notesFromContext(ch).catch((e) => console.error("notes", e));
+    this.adviseStale(ch.id, files.map((f) => f.path));
+    const unblocked = new Set<number>();
+    for (const r of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ? AND status NOT IN ('merged','closed')", ch.task_id).toArray()) unblocked.add(r.id as number);
+    for (const r of this.sql.exec("SELECT t.id FROM tasks t, json_each(t.depends_on) d WHERE d.value = ? AND t.status = 'open'", ch.task_id).toArray()) unblocked.add(r.id as number);
+    for (const id of unblocked) this.emit("task.unblocked", { task: id, data: { after: ch.task_id } });
+  }
+
+  /**
+   * Finish merges that were cut off: a change still "merging" with no merge
+   * running. Main is the truth. If main already contains the change's head,
+   * the change landed: record it, at the commit that brought it in. If not,
+   * it goes back in the queue. Runs from the alarm, and for an owner's
+   * "Check main and finish".
+   */
+  private async reconcileMerging(only?: number[], by?: Agent): Promise<{ id: number; outcome: string; commit?: string }[]> {
+    const stale = Date.now() - MERGE_STALL_MS;
+    // Open changes whose workspace is gone can never land: withdraw them rather than retry forever.
+    for (const r of this.sql.exec("SELECT c.id, c.workspace FROM changes c JOIN workspaces w ON w.name = c.workspace WHERE c.status NOT IN ('merged','closed','abandoned','merging') AND w.status = 'deleted'").toArray()) {
+      this.withdraw(r.id as number, null, `its workspace ${r.workspace} was deleted, so it can't land; push the work to a new task if it's still needed`);
+    }
+    const rows = only?.length
+      ? this.sql.exec("SELECT id FROM changes WHERE id IN (SELECT value FROM json_each(?)) AND status NOT IN ('merged','closed','abandoned')", JSON.stringify(only)).toArray()
+      : this.sql.exec("SELECT id FROM changes WHERE status = 'merging' AND updated_at < ?", stale).toArray();
+    if (!rows.length) return [];
+    const out: { id: number; outcome: string; commit?: string }[] = [];
+    let w: Workspace;
+    try {
+      w = await this.openMain("read");
+    } catch (e) {
+      console.error("reconcile: can't read main", e);
+      return [];
+    }
+    const tip = (await w.head())!;
+    for (const r of rows) {
+      const ch = this.change(r.id as number);
+      if (ch.status === "merging" && this.merging) { out.push({ id: ch.id, outcome: "a merge is running right now; check again in a minute" }); continue; }
+      let onMain = false;
+      try { onMain = !!ch.head && (await w.isAncestor(ch.head, tip, true)); } catch { onMain = false; /* main never received the commit */ }
+      if (!onMain) {
+        if (ch.status === "merging") {
+          this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now(), ch.id);
+          this.emit("merge.retry", { change: ch.id, task: ch.task_id, data: { error: "the merge was cut off before main moved; trying again", reconciled: true } });
+          await this.armAlarm(Date.now() + 1000);
+        }
+        out.push({ id: ch.id, outcome: ch.status === "merging" ? "requeued" : "not on main" });
+        continue;
+      }
+      // The commit on main's first-parent line that brought the change in, and what main was before it.
+      let landing = tip, before: string | null = null;
+      for (let steps = 0; steps < 400; steps++) {
+        const parent = (await w.parents(landing))[0] ?? null;
+        before = parent;
+        if (!parent || !(await w.isAncestor(ch.head, parent))) break;
+        landing = parent;
+        before = null;
+      }
+      const same = this.sql.exec("SELECT merged_version FROM changes WHERE merged_commit = ? AND status = 'merged' LIMIT 1", landing).toArray()[0];
+      const prior = this.sql.exec("SELECT MAX(merged_version) AS v FROM changes WHERE status = 'merged' AND updated_at <= ?", ch.updated_at).one().v as number | null;
+      // Versions count main's moves; one cut off mid-merge never got its number, so it shares its neighbour's.
+      const version = (same?.merged_version as number | undefined) ?? (prior ?? 0) + 1;
+      this.markMerged(ch, before ?? landing, landing, version, false);
+      const files = await w.changes(before, landing).catch(() => ch.files as FileChange[]);
+      await this.afterMerged(ch, landing, version, files, { reconciled: true, by: by?.name ?? "Mergery" });
+      this.emit("merge.reconciled", { actor: by?.id ?? null, change: ch.id, task: ch.task_id, data: { commit: landing, version, why: `main already contained the change's head ${String(ch.head).slice(0, 7)}; its merge had been cut off` } });
+      out.push({ id: ch.id, outcome: "merged", commit: landing });
+    }
+    return out;
+  }
+
+  /**
+   * Take a change out of review and the queue for good: its author (or an
+   * owner) withdrew it, or it can't land (its workspace is gone). Its task
+   * goes back to whoever holds it, or to the open list.
+   */
+  private withdraw(id: number, actor: Agent | null, reason: string) {
+    const ch = this.change(id);
+    if (["merged", "closed", "abandoned"].includes(ch.status)) return { id, status: ch.status, unchanged: true };
+    if (ch.status === "merging") throw new HttpError(409, `change ${id} is landing right now; if it stays merging, an owner can check main and finish it`);
+    const t = Date.now();
+    this.sql.exec("UPDATE changes SET status = 'closed', updated_at = ? WHERE id = ?", t, id);
+    this.sql.exec("UPDATE review_requests SET status = 'done', done_at = ? WHERE change_id = ? AND status IN ('open','accepted')", t, id);
+    this.setMeta(`merge_attempts:${id}`, null);
+    const task = this.task(ch.task_id);
+    const landed = this.sql.exec("SELECT 1 FROM changes WHERE task_id = ? AND status = 'merged' LIMIT 1", ch.task_id).toArray().length > 0;
+    const ws = this.sql.exec("SELECT status FROM workspaces WHERE name = ?", ch.workspace).toArray()[0];
+    const status = landed ? "merged" : ws && ws.status === "active" && task.assignee ? "claimed" : "open";
+    if (task.status === "in_review" || task.status === "conflict") {
+      this.sql.exec(`UPDATE tasks SET status = ?, ${status === "open" ? "assignee = NULL, " : ""}updated_at = ? WHERE id = ?`, status, t, ch.task_id);
+    }
+    this.emit("change.withdrawn", { actor: actor?.id ?? null, change: id, task: ch.task_id, to: ch.agent_id, data: { reason, by: actor?.name ?? "Mergery", taskStatus: status } });
+    return { id, status: "closed", reason, task: { id: ch.task_id, status } };
+  }
+
+  private withdrawChange(actor: Agent, id: number, reason?: string) {
+    const ch = this.change(id);
+    if (ch.agent_id !== actor.id && !actor.owner && actor.id !== "admin") throw new HttpError(403, `change ${id} is ${this.agentName(ch.agent_id)}'s; only its author or an owner can withdraw it`);
+    return this.withdraw(id, actor, reason?.trim() || `${actor.name} withdrew it`);
+  }
 
   private mergeMessage(ch: any) {
     return `Merge change #${ch.id}: ${ch.title}\n\nTask #${ch.task_id}, by ${this.agentName(ch.agent_id)}.\n\n${ch.summary ?? ""}`.trim();
@@ -3730,7 +3867,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * then the agent can still read its workspace.
    */
   private async sweepWorkspaces() {
-    const due = this.sql.exec("SELECT name, subscription FROM workspaces WHERE status IN ('merged','closed') AND done_at < ? LIMIT 10", Date.now() - WORKSPACE_GRACE_MS).toArray();
+    // Not while a change from it is still open (a follow-up submitted after its first change landed).
+    const due = this.sql.exec(`SELECT name, subscription FROM workspaces w WHERE status IN ('merged','closed') AND done_at < ?
+      AND NOT EXISTS (SELECT 1 FROM changes c WHERE c.workspace = w.name AND c.status NOT IN ('merged','closed','abandoned')) LIMIT 10`, Date.now() - WORKSPACE_GRACE_MS).toArray();
     for (const r of due) {
       const name = r.name as string;
       try {
@@ -3873,9 +4012,28 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return;
     }
     console.error("merge failed", e);
+    const error = String(e?.message ?? e);
     for (const id of ids) {
-      this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + 5000, id);
-      this.emit("merge.retry", { change: id, task: this.change(id).task_id, data: { error: String(e?.message ?? e) } });
+      const ch = this.change(id);
+      // The workspace is gone: no retry can bring it back.
+      const ws = this.sql.exec("SELECT status FROM workspaces WHERE name = ?", ch.workspace).toArray()[0];
+      if (ws?.status === "deleted" || (/repository not found/i.test(error) && error.includes(ch.workspace))) {
+        this.withdraw(id, null, `its workspace ${ch.workspace} no longer exists, so it can't land (${error})`);
+        continue;
+      }
+      const attempts = Number(this.meta(`merge_attempts:${id}`) ?? 0) + 1;
+      if (attempts >= MERGE_ATTEMPTS) {
+        // Stop instead of looping: the author hears why, and can fix and update_change, or withdraw_change.
+        this.setMeta(`merge_attempts:${id}`, null);
+        this.sql.exec("UPDATE changes SET status = 'changes_requested', updated_at = ? WHERE id = ?", Date.now(), id);
+        this.emit("merge.failed", { change: id, task: ch.task_id, to: ch.agent_id, data: { error, attempts,
+          advice: `Merging failed ${attempts} times (${error}). Fix what's wrong and update_change to queue it again, or withdraw_change if it's no longer needed.` } });
+        continue;
+      }
+      this.setMeta(`merge_attempts:${id}`, String(attempts));
+      // Back off: 5 s, 10 s, 20 s, … up to 5 minutes.
+      this.sql.exec("UPDATE changes SET status = 'queued', updated_at = ? WHERE id = ?", Date.now() + Math.min(5000 * 2 ** (attempts - 1), 300_000), id);
+      this.emit("merge.retry", { change: id, task: ch.task_id, data: { error, attempt: attempts, of: MERGE_ATTEMPTS } });
     }
   }
 
@@ -5256,7 +5414,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       items.push({ kind: "stuck", reason: a.state === "paused" ? "paused while holding a task" : "agent went quiet holding a task", detail: `#${a.task!.id} ${a.task!.title}${freeIn > 0 ? ` (Mergery frees it in ${since(freeIn)} unless the agent comes back)` : ""}`, agent: a.id, task: a.task!.id, since: a.lastSeen });
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
-      items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t });
+      items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t, action: "merge" });
+    }
+    // The queue normally finishes these itself (reconcileMerging); listed so an owner can see and nudge it.
+    for (const r of this.sql.exec("SELECT id, updated_at FROM changes WHERE status = 'merging' AND updated_at < ?", now - MERGE_STALL_MS).toArray()) {
+      items.push({ kind: "stuck", reason: "merge cut off partway", detail: `#${r.id}`, change: r.id, since: r.updated_at, action: "merge" });
     }
     const rank: Record<string, number> = { dispute: 0, question: 1, approval: 2, brief: 2, review: 2, task: 2, stuck: 3 };
     // Stable sort: questions keep their own order (most blocked first).

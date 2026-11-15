@@ -334,6 +334,12 @@ const TOOLS: Tool[] = [
     run: (a, call) => call("POST", `/changes/${a.changeId}/update`, a),
   },
   {
+    name: "withdraw_change",
+    description: "Withdraw your change from review or the merge queue (status becomes closed). Use it for a change you no longer want, or one stuck retrying a merge (for example because its workspace is gone). The task goes back to you if your workspace is still active, otherwise back to open. Project owners can withdraw anyone's change. A change that is merging right now can't be withdrawn; wait for merge.failed or change.merged.",
+    inputSchema: obj({ changeId: num("Change id"), reason: str("Why, shown to reviewers and in the timeline") }, ["changeId"]),
+    run: (a, call) => call("POST", `/changes/${a.changeId}/withdraw`, { reason: a.reason }),
+  },
+  {
     name: "sync_workspace",
     description: "Merge the latest main into your task's workspace. Clean merges are committed for you. On conflict you get each conflicting hunk (base, yours, theirs) and which change caused it; call again with resolutions to finish. If the task has a change in flight it goes back to review.",
     inputSchema: obj({ taskId: num("Your task id"), resolutions: { type: "object", description: "path -> full merged file content (null deletes)", additionalProperties: { type: ["string", "null"] } } }, ["taskId"]),
