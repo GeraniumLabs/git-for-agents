@@ -328,7 +328,9 @@ function paint(el, html) {
     fields.push({ k, value: x.value, focused, sel, scroll: x.scrollTop });
   }
   const opened = new Set([...el.querySelectorAll(".q.open")].map((q) => q.textContent));
+  const top = el.scrollTop;
   el.innerHTML = html;
+  if (top) el.scrollTop = top; // panels with their own scrollbar keep their place on live redraws
   if (!fields.length && !opened.size) return;
   // A question that gained an asker gets a longer thread list ("12,13" → "12,13,14"): still the same box.
   const find = ([attr, value]) => {

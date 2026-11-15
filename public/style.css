@@ -386,6 +386,8 @@ main { gap: 20px; padding-top: 20px; }
 .panel-body > .card.inbox.q, .panel-body > .card.stuck { border-left: 3px solid var(--warn); padding-left: 11px; }
 .panel-body > .card.stuck { border-left-color: var(--bad); }
 .panel .decisions { max-height: 460px; margin-top: 0; }
+/* Discussions & contracts: up to six threads with three posts each grew taller than the screen; scroll inside the panel instead. */
+#discussions { max-height: min(480px, 60vh); overflow-y: auto; overscroll-behavior: contain; }
 .panel-body > .card > .empty:first-child { padding-top: 0; }
 .card.q { font-weight: inherit; }
 .panel .kicker { margin-bottom: 6px; }
