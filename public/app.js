@@ -2758,6 +2758,31 @@ function threadHtml(t, located = false) {
 
 const pendingHtml = (p) => `<div class="thr pending"><div class="thr-head"><span class="pill">pending</span>${p.blocking ? `<span class="pill changes_requested">blocks merge</span>` : ""}</div><div class="tp"><b>${esc(me.name)}</b><div>${esc(p.body)}</div></div><div class="row"><button class="ghost mini" data-unpend="${review.pending.indexOf(p)}">Discard</button></div></div>`;
 
+/**
+ * What the agent said about its change. Agents send context as an object of
+ * named parts (plan, tested, ...) or, some of them, as one markdown string.
+ * A string must render as markdown, not be walked key by key (that printed
+ * one row per character).
+ */
+function agentContextHtml(ctx) {
+  if (ctx == null || ctx === "") return "";
+  // Records saved before the server fix spread a string into "0", "1", ... keys.
+  if (ctx && typeof ctx === "object" && !Array.isArray(ctx) && "0" in ctx) {
+    const spread = [];
+    for (let i = 0; String(i) in ctx; i++) spread.push(ctx[i]);
+    if (spread.every((ch) => typeof ch === "string" && ch.length === 1)) {
+      const rest = Object.fromEntries(Object.entries(ctx).filter(([k]) => !/^\d+$/.test(k)));
+      ctx = "notes" in rest ? rest : { ...rest, notes: spread.join("") };
+    }
+  }
+  const text = (v) => typeof v === "string" ? v : v?.text ?? JSON.stringify(v, null, 2);
+  const val = (v) => Array.isArray(v) ? `<ul>${v.map((x) => `<li>${md(text(x))}</li>`).join("")}</ul>`
+    : v && typeof v === "object" ? `<pre class="mono">${esc(JSON.stringify(v, null, 2))}</pre>`
+    : `<div class="md">${md(String(v))}</div>`;
+  if (typeof ctx !== "object" || Array.isArray(ctx)) return `<div class="actx">${val(ctx)}</div>`;
+  return Object.entries(ctx).filter(([, v]) => v != null && v !== "" && !(Array.isArray(v) && !v.length)).map(([k, v]) => `<div class="actx"><b>${esc(k)}</b>${val(v)}</div>`).join("");
+}
+
 /** The context a reviewer needs beside the diff: approval, checks, intent, what the agent said. */
 function whyPanel(c, rv) {
   const a = c.approval;
@@ -2765,9 +2790,7 @@ function whyPanel(c, rv) {
     <div class="meta">${a.weight} of ${a.needed} approval weight${a.approvers.length ? `: ${a.approvers.map((x) => `${esc(x.name)} ${x.weight}×`).join(", ")}` : ""}</div>
     ${a.humanNeeded ? `<div class="warn">Touches protected paths, so a person must approve.</div>` : ""}
     ${a.openThreads ? `<div class="warn">${plural(a.openThreads, ["blocking thread", "blocking threads"])} still open.</div>` : ""}` : "";
-  const ctx = c.context?.context ?? {};
-  const list = (v) => Array.isArray(v) ? `<ul>${v.map((x) => `<li>${esc(typeof x === "string" ? x : x?.text ?? JSON.stringify(x))}</li>`).join("")}</ul>` : `<p>${esc(typeof v === "string" ? v : JSON.stringify(v, null, 2))}</p>`;
-  const ctxHtml = Object.entries(ctx).map(([k, v]) => `<div class="actx"><b>${esc(k)}</b>${list(v)}</div>`).join("");
+  const ctxHtml = agentContextHtml(c.context?.context);
   const declared = c.intents.flatMap((i) => i.paths);
   const outside = new Set(c.undeclared);
   const reviews = c.reviews.filter((r) => !r.vote).map((r) => {
@@ -2783,7 +2806,7 @@ function whyPanel(c, rv) {
       ${c.intents.length ? c.intents.map((i) => `<div>${esc(i.description)}</div><div class="mono meta">${i.paths.map(esc).join(", ")}</div>`).join("") : `<p class="meta">No intent was declared.</p>`}
       <ul class="touched">${c.brief.files.map((f) => `<li class="${outside.has(f.path) ? "out" : "in"}" title="${outside.has(f.path) ? "outside the declared intent" : "inside the declared intent"}"><span class="mono">${esc(f.path)}</span></li>`).join("")}</ul>
       ${declared.length && !outside.size ? `<p class="meta">Everything it touched was declared.</p>` : ""}</div></section>
-    ${ctxHtml ? `<section class="panel"><div class="panel-head"><h2>What the agent says</h2><small>its plan and testing</small></div><div class="panel-body">${ctxHtml}</div></section>` : ""}
+    ${ctxHtml ? `<section class="panel"><div class="panel-head"><h2>What the agent says</h2><small>its plan and testing</small></div><div class="panel-body agent-says">${ctxHtml}</div></section>` : ""}
     <section class="panel"><div class="panel-head"><h2>Reviews</h2><small>${c.reviews.length ? "" : "none yet"}</small></div><div class="panel-body">${reviews || `<p class="meta">Nobody has reviewed it yet.</p>`}
       ${rv.requested.length ? `<h3>Asked to review</h3>${rv.requested.map((r) => `<div class="qrow"><a class="who" data-agent="${r.reviewer}">${esc(r.reviewerName)}</a> <span class="grow"></span>${requestState(r)}</div>`).join("")}` : ""}
       ${inReview && rv.candidates.length ? `<h3>Who knows this code</h3>${rv.candidates.map((k) => `<div class="qrow"><span class="dot ${k.present ? "working" : "away"}"></span><a class="who" data-agent="${k.agent}">${esc(k.name)}</a> <span class="grow meta ellipsis" title="${esc(k.reasons.join(" · "))}">${k.reasons.map(esc).join(" · ")}</span>${isHuman() && !asked.has(k.agent) ? `<button class="ghost mini" data-ask="${k.agent}" title="Send this agent a review request. If it doesn't answer in 5 minutes, Mergery asks the next best agent">Ask</button>` : ""}</div>`).join("")}` : ""}
