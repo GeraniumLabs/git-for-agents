@@ -2786,7 +2786,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.withdraw(r.id as number, null, `its workspace ${r.workspace} was deleted, so it can't land; push the work to a new task if it's still needed`);
     }
     const rows = only?.length
-      ? this.sql.exec("SELECT id FROM changes WHERE id IN (SELECT value FROM json_each(?)) AND status NOT IN ('merged','closed','abandoned')", JSON.stringify(only)).toArray()
+      ? this.sql.exec("SELECT id FROM changes WHERE id IN (SELECT value FROM json_each(?)) AND status NOT IN ('closed','abandoned')", JSON.stringify(only)).toArray()
       : this.sql.exec("SELECT id FROM changes WHERE status = 'merging' AND updated_at < ?", stale).toArray();
     if (!rows.length) return [];
     const out: { id: number; outcome: string; commit?: string }[] = [];
@@ -2812,16 +2812,21 @@ export class ProjectCoordinator extends DurableObject<Env> {
         out.push({ id: ch.id, outcome: ch.status === "merging" ? "requeued" : "not on main" });
         continue;
       }
-      // The commit on main's first-parent line that brought the change in, and what main was before it.
-      let landing = tip, before: string | null = null;
-      for (let steps = 0; steps < 400; steps++) {
-        const parent = (await w.parents(landing))[0] ?? null;
-        before = parent;
-        if (!parent || !(await w.isAncestor(ch.head, parent))) break;
-        landing = parent;
-        before = null;
+      // The commit that brought the change in: the queue's merge commit with the head as a later
+      // parent, or the head itself when main fast-forwarded to it. Main's first-parent line can't
+      // say: a later workspace merge may have fast-forwarded main past the queue's merge commit.
+      const history = await w.log(tip, 1000);
+      const merge = history.find((c) => c.message.startsWith(`Merge change #${ch.id}:`) && c.parents.slice(1).includes(ch.head))
+        ?? history.find((c) => c.parents.slice(1).includes(ch.head));
+      const landing: string = merge?.oid ?? ch.head;
+      const before: string | null = merge ? merge.parents[0] : ((await w.parents(ch.head))[0] ?? null);
+      // Already merged (an owner asked again): only correct where it says it landed.
+      if (ch.status === "merged") {
+        if (ch.merged_commit !== landing) this.sql.exec("UPDATE changes SET merged_commit = ?, merged_before = ? WHERE id = ?", landing, before, ch.id);
+        out.push({ id: ch.id, outcome: ch.merged_commit !== landing ? "corrected" : "already merged", commit: landing });
+        continue;
       }
-      const same = this.sql.exec("SELECT merged_version FROM changes WHERE merged_commit = ? AND status = 'merged' LIMIT 1", landing).toArray()[0];
+      const same = this.sql.exec("SELECT merged_version FROM changes WHERE merged_commit = ? AND status = 'merged' AND id != ? LIMIT 1", landing, ch.id).toArray()[0];
       const prior = this.sql.exec("SELECT MAX(merged_version) AS v FROM changes WHERE status = 'merged' AND updated_at <= ?", ch.updated_at).one().v as number | null;
       // Versions count main's moves; one cut off mid-merge never got its number, so it shares its neighbour's.
       const version = (same?.merged_version as number | undefined) ?? (prior ?? 0) + 1;

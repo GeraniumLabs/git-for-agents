@@ -2086,6 +2086,7 @@ test("a merge cut off after main moved finishes from main; a change whose worksp
   assert.equal(fixed.outcome, "merged");
   assert.equal(fixed.commit, landed.mergedCommit ?? landed.merged_commit);
   assert.equal(fixed.change, "merged");
+  assert.equal((await admin.req("POST", `/changes/${chA.id}/reconcile`)).outcome, "already merged");
   await bex.claim(b.id);
 
   // Withdrawing: only the author or an owner, and the task goes back to its agent.
