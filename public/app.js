@@ -282,6 +282,52 @@ function onEvent(e, ws) {
   if (!refreshTimer) refreshTimer = setTimeout(() => { refreshTimer = null; ws.send("overview"); }, 1000);
 }
 
+/**
+ * Live panels redraw up to once a second while agents work. Redrawing with
+ * innerHTML would throw away whatever a person is typing, and their focus,
+ * so paint() skips a redraw that changes nothing and otherwise carries over
+ * every field's text, the focused field with its cursor, and long questions
+ * someone opened.
+ */
+const fieldKey = (x) => {
+  const a = [...x.attributes].find((at) => at.name.startsWith("data-")) ?? (x.id && { name: "id", value: x.id }) ?? (x.name && { name: "name", value: x.name });
+  return a ? [a.name, a.value] : null;
+};
+function paint(el, html) {
+  if (el._painted === html) return;
+  el._painted = html;
+  const fields = [];
+  for (const x of el.querySelectorAll("input, textarea, select")) {
+    const k = fieldKey(x);
+    if (!k || x.type === "checkbox" || x.type === "radio" || x.type === "file") continue;
+    const focused = document.activeElement === x;
+    if (!focused && x.value === x.defaultValue) continue;
+    let sel = null;
+    try { sel = [x.selectionStart, x.selectionEnd, x.selectionDirection]; } catch {}
+    fields.push({ k, value: x.value, focused, sel, scroll: x.scrollTop });
+  }
+  const opened = new Set([...el.querySelectorAll(".q.open")].map((q) => q.textContent));
+  el.innerHTML = html;
+  if (!fields.length && !opened.size) return;
+  // A question that gained an asker gets a longer thread list ("12,13" → "12,13,14"): still the same box.
+  const find = ([attr, value]) => {
+    const all = [...el.querySelectorAll(`[${attr}]`)];
+    return all.find((x) => x.getAttribute(attr) === value)
+      ?? (value.includes(",") || /^\d+$/.test(value) ? all.find((x) => x.getAttribute(attr).split(",").some((v) => value.split(",").includes(v))) : null);
+  };
+  for (const f of fields) {
+    const x = find(f.k);
+    if (!x) continue;
+    x.value = f.value;
+    x.scrollTop = f.scroll;
+    if (f.focused) {
+      x.focus({ preventScroll: true });
+      if (f.sel) try { x.setSelectionRange(...f.sel); } catch {}
+    }
+  }
+  for (const q of el.querySelectorAll(".q")) if (opened.has(q.textContent)) q.classList.add("open");
+}
+
 // The project's grid changes slowly: redraw it every half minute, not on every event.
 let gridAt = 0;
 function render() {
@@ -357,7 +403,7 @@ function renderHealth() {
     h.conflictRate > 0.2 ? `<span class="warning bad" title="Share of merge attempts in the last hour that hit a conflict. Look at Where the work is, under Work">${Math.round(h.conflictRate * 100)}% of merges conflicted this hour</span>` : "",
     state.project.checks ? "" : `<span class="warning" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing">No checks: main isn't tested before it moves${state.project.mainTests === 0 ? ", and has no tests" : ""}${state.project.suggestedCheck && isOwner() ? ` <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : isOwner() ? " · set one in Settings" : ""}</span>`,
   ].filter(Boolean).join("");
-  $("#health").innerHTML = `
+  paint($("#health"), `
     <div class="tile" title="Agents in this project, one per name, by what they're doing now. Click a state to list those agents">
       <b>${h.agents.total}</b><span>agent${h.agents.total === 1 ? "" : "s"}${h.agents.records > h.agents.total ? ` <small class="meta" title="Some names joined more than once, with a new key or another connection. Each name counts once">· ${h.agents.records} connections</small>` : ""}</span>
       <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}" title="${STATE_HELP[k] ?? ""}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
@@ -369,7 +415,7 @@ function renderHealth() {
     </div>
     <div class="tile" title="Changes waiting for review (each is a task any agent can take), and approved changes waiting to land on main. ${h.mergedLastHour} landed in the last hour"><b>${inReview} <small>in review</small></b><span>${h.queue.depth ? `${h.queue.depth} approved, waiting to land` : "nothing waiting to land"}${h.reviewTasks?.open ? ` · ${h.reviewTasks.open} nobody has taken` : ""} · ${h.mergedLastHour} landed in the last hour</span></div>
     <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}</span></div>
-    ${warnings ? `<div class="warnings">${warnings}</div>` : ""}`;
+    ${warnings ? `<div class="warnings">${warnings}</div>` : ""}`);
   const useCheck = $("#health [data-use-check]");
   if (useCheck) useCheck.onclick = async () => {
     try { const r = await act("POST", "/settings", { checks: { command: state.project.suggestedCheck } }); state.project.checks = r.checks; } catch { return; }
@@ -388,7 +434,7 @@ function renderAttention() {
   $("#attention-count").textContent = items.length ? `${items.length} waiting` : "nothing waiting";
   $("#attention-panel").classList.toggle("hot", items.length > 0);
   const box = (inner, cls = "") => `<div class="card inbox ${cls}">${inner}</div>`;
-  $("#attention").innerHTML = items.map((it) => {
+  paint($("#attention"), items.map((it) => {
     if (it.kind === "question") {
       const many = it.threads.length > 1;
       const askers = it.askers.slice(0, 3).map(who).join(", ") + (it.askers.length > 3 ? ` and ${it.askers.length - 3} more` : "");
@@ -420,11 +466,12 @@ function renderAttention() {
       return box(`<div class="kicker">Task for ${yours ? "you" : esc(name(it.person))}${it.by ? ` · from ${esc(name(it.by))}` : ""} · ${ago(it.since)}</div><div><a data-task="${it.task}">#${it.task} ${esc(it.title)}</a></div>${yours ? `<div class="row"><button data-task="${it.task}">Open</button><button class="ghost" data-take-task="${it.task}">Take it</button></div>` : ""}`, "q");
     }
     return box(`<div class="kicker">Approval · touches protected paths · ${ago(it.since)}</div><div><a data-change="${it.change}">#${it.change} ${esc(it.title)}</a> · ${who(it.agent)}</div><div class="files mono">${it.files.map(esc).join("  ")}</div>${escalation(it.escalated)}${me ? `<div class="row"><button data-change="${it.change}">Review</button></div>` : signInToAct("approve")}`, "q");
-  }).join("") || `<p class="empty">Nothing needs a person right now.</p>`;
+  }).join("") || `<p class="empty">Nothing needs a person right now.</p>`);
   wire($("#attention"));
   // Long questions show two lines; a click shows the rest.
   for (const q of $("#attention").querySelectorAll(".q")) {
-    if (q.scrollHeight > q.clientHeight + 2) { q.classList.add("more"); q.title = "Show all of it"; q.onclick = (e) => { if (e.target.closest("a, button")) return; q.classList.toggle("open"); }; }
+    const open = q.classList.contains("open"); q.classList.remove("open");
+    if (q.scrollHeight > q.clientHeight + 2) { q.classList.add("more"); q.classList.toggle("open", open); q.title = "Show all of it"; q.onclick = (e) => { if (e.target.closest("a, button")) return; q.classList.toggle("open"); }; }
   }
   for (const b of $("#attention").querySelectorAll("[data-take-task]")) b.onclick = async () => {
     const r = await act("POST", `/tasks/${b.dataset.takeTask}/claim`);
@@ -447,10 +494,10 @@ function personAskHtml(c) {
 
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
-  $("#stuck").innerHTML = items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
+  paint($("#stuck"), items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
     <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
-    || `<p class="empty">Nothing is stuck.</p>`;
+    || `<p class="empty">Nothing is stuck.</p>`);
   wire($("#stuck"));
   for (const b of $("#stuck").querySelectorAll("[data-reconcile]")) b.onclick = async () => {
     let r; try { r = await act("POST", `/changes/${b.dataset.reconcile}/reconcile`, {}); } catch { return; }
@@ -511,9 +558,9 @@ function md(text) {
 
 function renderDiscussions() {
   const posts = (t) => t.posts.slice(-3).map((p) => `<div class="post md">${who(p.author)} ${md(p.body)}</div>`).join("");
-  $("#discussions").innerHTML = state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · <a data-task="${t.task_id}">task #${t.task_id}</a>` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
+  paint($("#discussions"), state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · <a data-task="${t.task_id}">task #${t.task_id}</a>` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
     ${me ? `<div class="row"><input data-reply="${t.id}" placeholder="Reply…"><button data-send="${t.id}">Send</button></div>` : signInToAct("reply")}</div>`).join("")
-    || `<p class="empty">No open discussions.</p>`;
+    || `<p class="empty">No open discussions.</p>`);
   wire($("#discussions"));
 }
 
@@ -537,6 +584,12 @@ function wire(root) {
     const input = root.querySelector(`[data-answer-text="${b.dataset.answerSend}"]`);
     if (input.value.trim()) await answer(b.dataset.answerSend, input.value.trim());
   };
+  // Enter sends an answer or a reply, like the Send button beside it.
+  for (const x of root.querySelectorAll("[data-answer-text], [data-reply]")) x.onkeydown = (e) => {
+    if (e.key !== "Enter" || e.isComposing) return;
+    e.preventDefault();
+    root.querySelector(x.dataset.reply ? `[data-send="${x.dataset.reply}"]` : `[data-answer-send="${x.dataset.answerText}"]`)?.click();
+  };
   for (const b of root.querySelectorAll("[data-rule]")) b.onclick = async () => {
     const note = await ask({ title: `Rule for ${name(b.dataset.for)}?`, body: "This settles the dispute. The agents will see your reason.", ok: "Rule", input: { label: "Reason (optional)", placeholder: "Why this side wins" } });
     if (note === null) return;
@@ -559,25 +612,25 @@ function renderFlow() {
       ${hc ? `<rect x="${i * bw + bw / 2 + 0.5}" y="${H - hc}" width="${Math.max(1, bw / 2 - 1.5)}" height="${hc}" rx="1.5" class="m-bad"/>` : ""}</g>`;
   }).join("");
   const sum = (a) => a.reduce((x, y) => x + y, 0);
-  $("#flow").innerHTML = `<div class="legend"><span><i class="m-ok"></i>merged ${sum(merged)}</span><span><i class="m-bad"></i>conflicts ${sum(conflict)}</span><span class="meta">peak ${Math.max(...merged)}/min</span></div>
+  paint($("#flow"), `<div class="legend"><span><i class="m-ok"></i>merged ${sum(merged)}</span><span><i class="m-bad"></i>conflicts ${sum(conflict)}</span><span class="meta">peak ${Math.max(...merged)}/min</span></div>
     <svg viewBox="0 0 ${W} ${H + 1}" preserveAspectRatio="none" class="chart" role="img" aria-label="Merges and conflicts per minute over the last 30 minutes">${bars}<line x1="0" x2="${W}" y1="${H + 0.5}" y2="${H + 0.5}" class="axis"/></svg>
-    <div class="axis-labels"><span>30m ago</span><span>now</span></div>`;
+    <div class="axis-labels"><span>30m ago</span><span>now</span></div>`);
 }
 
 function renderQueue() {
   $("#queue-count").textContent = state.health.queue.depth ? `${state.health.queue.depth} waiting` : "empty";
   const row = (c, right) => `<div class="qrow"><a data-change="${c.id}">#${c.id}</a> <span class="grow ellipsis">${esc(c.title)}</span> ${who(c.agent)} <span class="meta">${right}</span></div>`;
-  $("#queue").innerHTML = `<div class="card">${state.queue.map((c) => row(c, c.status === "merging" ? "merging…" : `waiting ${dur(c.waitingMs)}`)).join("") || `<p class="empty">Nothing queued.</p>`}
-    ${state.recentlyMerged.length ? `<div class="kicker" style="margin-top:8px">Recently landed</div>${state.recentlyMerged.map((c) => row(c, `v${c.version} · ${ago(c.at)}`)).join("")}` : ""}</div>`;
+  paint($("#queue"), `<div class="card">${state.queue.map((c) => row(c, c.status === "merging" ? "merging…" : `waiting ${dur(c.waitingMs)}`)).join("") || `<p class="empty">Nothing queued.</p>`}
+    ${state.recentlyMerged.length ? `<div class="kicker" style="margin-top:8px">Recently landed</div>${state.recentlyMerged.map((c) => row(c, `v${c.version} · ${ago(c.at)}`)).join("")}` : ""}</div>`);
   wire($("#queue"));
 }
 
 function renderAreas() {
   const areas = state.areas;
   const max = Math.max(1, ...areas.map((a) => a.agents + a.inFlight));
-  $("#areas").innerHTML = areas.length ? `<table class="areas"><thead><tr><th>Folder</th><th title="agents with live intents or changes here">Agents</th><th title="changes in review, queued or in conflict">In flight</th><th title="merged in the last hour">Landed</th><th title="conflicts in the last hour">Conflicts</th></tr></thead><tbody>
+  paint($("#areas"), areas.length ? `<table class="areas"><thead><tr><th>Folder</th><th title="agents with live intents or changes here">Agents</th><th title="changes in review, queued or in conflict">In flight</th><th title="merged in the last hour">Landed</th><th title="conflicts in the last hour">Conflicts</th></tr></thead><tbody>
     ${areas.map((a) => `<tr><td><a class="mono" href="#" data-find="${esc(a.path)}" title="Who is working here, the changes in flight and what landed">${esc(a.path)}</a><div class="heat"><span style="width:${((a.agents + a.inFlight) / max) * 100}%"></span></div></td><td>${a.agents || ""}</td><td>${a.inFlight || ""}</td><td>${a.mergedLastHour || ""}</td><td class="${a.conflictsLastHour ? "bad" : ""}">${a.conflictsLastHour || ""}</td></tr>`).join("")}
-    </tbody></table>` : `<p class="empty">No work in progress.</p>`;
+    </tbody></table>` : `<p class="empty">No work in progress.</p>`);
   for (const a of $("#areas").querySelectorAll("[data-find]")) a.onclick = (e) => { e.preventDefault(); showArea(a.dataset.find); };
 }
 
@@ -585,11 +638,11 @@ function renderAreas() {
 function renderContests() {
   const list = state.contests ?? [];
   $("#contests-wrap").hidden = !list.length;
-  $("#contests").innerHTML = list.map((c) => `<div class="card contest">
+  paint($("#contests"), list.map((c) => `<div class="card contest">
     <div class="qrow"><b class="grow ellipsis">#${c.id} ${esc(c.title)}</b><span class="pill ${c.status === "open" ? "review" : "merged"}">${c.status === "open" ? plural(c.votes, ["vote", "votes"]) : "decided"}</span></div>
     ${c.attempts.map((a) => `<div class="qrow">${a.agent ? who(a.agent) : `<span class="meta">unclaimed</span>`} <span class="grow">${a.change ? `<a data-change="${a.change}">#${a.change}</a> <span class="meta">${esc(a.status)}</span>` : `<span class="meta">${a.agent ? "working…" : ""}</span>`}</span>
       ${a.change ? `<span class="votebar" title="${a.weight} of ${c.quorum} vote weight needed"><span style="width:${Math.min(100, (a.weight / c.quorum) * 100)}%"></span></span><span class="meta">${a.weight}</span>` : ""}${c.winner && a.change === c.winner ? ` <span class="pill merged">won</span>` : ""}</div>`).join("")}
-    <div class="row"><button class="ghost mini" data-contest="${c.id}">Compare attempts</button></div></div>`).join("");
+    <div class="row"><button class="ghost mini" data-contest="${c.id}">Compare attempts</button></div></div>`).join(""));
   wire($("#contests"));
 }
 
@@ -597,11 +650,11 @@ function renderContests() {
 function renderNotes() {
   const list = state.notes ?? [];
   $("#notes-count").textContent = list.length ? `${list.length} recent` : "";
-  $("#notes").innerHTML = list.map((n) => `<li class="card decision"><div class="kicker">${esc(n.kind)} #${n.id} · ${who(n.by)}${n.paths.length ? ` · <span class="mono">${n.paths.map(esc).join(", ")}</span>` : " · whole project"}${n.change ? ` · from <a data-change="${n.change}">#${n.change}</a>` : ""}</div>
+  paint($("#notes"), list.map((n) => `<li class="card decision"><div class="kicker">${esc(n.kind)} #${n.id} · ${who(n.by)}${n.paths.length ? ` · <span class="mono">${n.paths.map(esc).join(", ")}</span>` : " · whole project"}${n.change ? ` · from <a data-change="${n.change}">#${n.change}</a>` : ""}</div>
     <div>${esc(n.text)}</div>
     <div class="meta">${n.confirmed ? `confirmed by ${n.confirmed}` : "not confirmed yet"}${n.disputed ? ` · disputed by ${n.disputed}${n.disputes.length ? `: ${n.disputes.map((d) => `${esc(d.by)}: “${esc(d.comment)}”`).join("; ")}` : ""}` : ""}</div>
     ${isHuman() ? `<button class="ghost mini" data-note-retire="${n.id}">Retire</button>` : ""}</li>`).join("")
-    || `<li class="empty">Agents leave notes (remember, or notes in a change's context) about what they learned. The next agent on those files gets them.</li>`;
+    || `<li class="empty">Agents leave notes (remember, or notes in a change's context) about what they learned. The next agent on those files gets them.</li>`);
   wire($("#notes"));
   for (const b of document.querySelectorAll("[data-note-retire]")) b.onclick = () => act("POST", `/notes/${b.dataset.noteRetire}/retire`, {});
 }
@@ -726,7 +779,7 @@ function wireAttachments(root, after) {
 function renderAttachments() {
   const list = state.attachments ?? [];
   $("#attachments-count").textContent = state.attachmentCount ? `${state.attachmentCount} posted` : "";
-  $("#attachments").innerHTML = attachmentsHtml(list) || `<p class="empty">Agents post screenshots, builds, logs and documents with the attach tool, on a change, a task or the project.</p>`;
+  paint($("#attachments"), attachmentsHtml(list) || `<p class="empty">Agents post screenshots, builds, logs and documents with the attach tool, on a change, a task or the project.</p>`);
   wire($("#attachments"));
   wireAttachments($("#attachments"));
 }
@@ -737,8 +790,8 @@ function renderDecisions() {
   const list = state.decisions ?? [];
   $("#decisions-count").textContent = list.length ? `${list.length} on record` : "";
   $("#decision-add").hidden = !isHuman();
-  $("#decisions").innerHTML = list.map((d) => `<li class="card decision"><div class="kicker">${KIND[d.kind] ?? d.kind} #${d.id} · ${esc(d.byName ?? d.by)}${d.paths.length ? ` · <span class="mono">${d.paths.map(esc).join(", ")}</span>` : " · whole project"}</div>${d.question ? `<div class="meta">${esc(d.question)}</div>` : ""}<div>${esc(d.decision)}</div>${isHuman() ? `<button class="ghost mini" data-retire="${d.id}">Retire</button>` : ""}</li>`).join("")
-    || `<li class="empty">Nothing decided yet. Answers, directives, objections and rulings land here, and agents get them when they work on the same files.</li>`;
+  paint($("#decisions"), list.map((d) => `<li class="card decision"><div class="kicker">${KIND[d.kind] ?? d.kind} #${d.id} · ${esc(d.byName ?? d.by)}${d.paths.length ? ` · <span class="mono">${d.paths.map(esc).join(", ")}</span>` : " · whole project"}</div>${d.question ? `<div class="meta">${esc(d.question)}</div>` : ""}<div>${esc(d.decision)}</div>${isHuman() ? `<button class="ghost mini" data-retire="${d.id}">Retire</button>` : ""}</li>`).join("")
+    || `<li class="empty">Nothing decided yet. Answers, directives, objections and rulings land here, and agents get them when they work on the same files.</li>`);
   for (const b of document.querySelectorAll("[data-retire]")) b.onclick = () => act("POST", `/decisions/${b.dataset.retire}/retire`, {});
 }
 $("#decision-save").onclick = async () => {
