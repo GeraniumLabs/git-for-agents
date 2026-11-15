@@ -34,6 +34,7 @@ import { ORG_TABLES, OrgError, orgRegistry, type OrgRole } from "./orgs";
 import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 import { hookBody, isGitHubDispatch, runnerPrompt, validHookEvents } from "./runners";
+import { contextOf } from "./changecontext";
 
 const TOKEN_TTL = 6 * 3600;
 /** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
@@ -1930,6 +1931,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const task = this.task(body.taskId);
     if (task.assignee !== actor.id) throw new HttpError(403, `task ${body.taskId} is assigned to ${task.assignee ? this.agentName(task.assignee as string) : "nobody"}, not to you (${actor.name}); claim it first`);
     // A person comparing several attempts can't read five versions of the same code: each attempt says how it works.
+    if (body.context != null) body = { ...body, context: contextOf(body.context) };
     const approach = String(body.approach ?? body.context?.approach ?? "").trim();
     if (approach) body = { ...body, context: { ...(body.context ?? {}), approach } };
     const inContest = this.openContest(body.taskId);
@@ -2000,8 +2002,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), JSON.stringify(explained), status, body.summary ?? null, Date.now(), id);
     // An update (or a sync) without new context keeps what the author said
     // at submit; new context is merged over it, key by key.
-    const prev = (await (await this.context.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
-    const context = body.context && typeof body.context === "object" ? { ...prev, ...body.context } : prev;
+    const prev = contextOf((await (await this.context.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: unknown }>())?.context);
+    const context = { ...prev, ...contextOf(body.context) };
     await this.saveContext(id, actor, { ...body, context, summary: body.summary ?? ch.summary }, analysis.patch, analysis.head, analysis.snapshot);
     await this.checkChangeIntent(id, analysis.patch);
     const outdated = this.markOutdated(id, analysis.snapshot);

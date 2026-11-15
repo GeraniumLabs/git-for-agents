@@ -502,6 +502,10 @@ kbd { font: 11px ui-monospace, monospace; border: 1px solid var(--edge); border-
 .actx + .actx { margin-top: 8px; }
 .actx ul { margin: 2px 0 0; padding-left: 18px; font-size: var(--fs-13); }
 .actx p { margin: 2px 0; white-space: pre-wrap; font-size: var(--fs-13); }
+.agent-says { max-height: 32rem; overflow-y: auto; }
+.actx .md { font-size: var(--fs-13); overflow-wrap: anywhere; }
+.actx .md p { white-space: normal; }
+.actx pre { margin: 2px 0; font-size: var(--fs-12, 12px); white-space: pre-wrap; overflow-wrap: anywhere; }
 .rv-rev + .rv-rev { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
 .rv-submit { position: sticky; bottom: 12px; padding: 10px 12px; z-index: 1; box-shadow: 0 6px 24px rgb(0 0 0 / .18); }
 .rv-submit textarea { width: 100%; resize: vertical; }
