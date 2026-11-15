@@ -136,6 +136,24 @@ export function keepKnownLinks(answer: string): string {
   });
 }
 
+/** The answer's text, whichever shape the model's reply came in: Workers AI, Anthropic Messages or OpenAI chat. */
+export function replyText(out: any): string {
+  if (typeof out === "string") return out.trim();
+  if (typeof out?.response === "string") return out.response.trim();
+  if (Array.isArray(out?.content)) return out.content.filter((b: any) => b?.type === "text").map((b: any) => b.text).join("").trim();
+  const choice = out?.choices?.[0]?.message?.content;
+  if (typeof choice === "string") return choice.trim();
+  if (out?.result) return replyText(out.result);
+  return "";
+}
+
+export function modelLabel(model: string): string {
+  if (model === HELP_WORKERS_AI_MODEL) return "Llama 4 Scout";
+  const claude = model.match(/^anthropic\/claude-([a-z]+)-([\d.]+)/);
+  if (claude) return `Claude ${claude[1][0].toUpperCase()}${claude[1].slice(1)} ${claude[2]}`;
+  return model.split("/").pop()!;
+}
+
 export async function askHelp(m: HelpModel, i: HelpInput): Promise<HelpResult> {
   const history = i.history.map((t) => ({ role: t.role, content: t.text }));
   const last = { role: "user" as const, content: helpMessage(i) };
@@ -159,16 +177,20 @@ export async function askHelp(m: HelpModel, i: HelpInput): Promise<HelpResult> {
       throw e;
     }
   }
+  // A Workers AI model (@cf/…), or a catalog model such as anthropic/claude-haiku-5.5 that AI Gateway
+  // runs for the account and bills through Unified Billing (no provider key).
+  const catalog = !m.model.startsWith("@cf/");
+  const anthropic = m.model.startsWith("anthropic/");
   try {
-    const out = await m.ai.run(m.model as any, {
-      messages: [{ role: "system", content: HELP_SYSTEM }, ...history, last],
-      max_tokens: HELP_LIMITS.maxOutputTokens,
-      temperature: 0.2,
-    } as any, m.gateway ? { gateway: { id: m.gateway, metadata: { loom: "help" } } } : undefined) as { response?: unknown };
-    const text = typeof out?.response === "string" ? out.response.trim() : "";
+    const input = anthropic
+      // Anthropic's shape: the system prompt on its own; current Claude models reject a temperature.
+      ? { system: HELP_SYSTEM, messages: [...history, last], max_tokens: 2000 }
+      : { messages: [{ role: "system", content: HELP_SYSTEM }, ...history, last], max_tokens: HELP_LIMITS.maxOutputTokens, ...(catalog ? {} : { temperature: 0.2 }) };
+    const out = await m.ai.run(m.model as any, input as any, m.gateway ? { gateway: { id: m.gateway, metadata: { loom: "help" } } } : undefined);
+    const text = replyText(out);
     if (!text) return { ok: false, reason: "the model returned no answer" };
-    return { ok: true, answer: keepKnownLinks(text), model: m.model === HELP_WORKERS_AI_MODEL ? "Llama 4 Scout" : m.model.split("/").pop()! };
+    return { ok: true, answer: keepKnownLinks(text), model: modelLabel(m.model) };
   } catch (e: any) {
-    return { ok: false, reason: `the model is unavailable (${String(e?.message ?? e).slice(0, 80)})` };
+    return { ok: false, reason: `the model is unavailable (${String(e?.message ?? e).slice(0, 120)})` };
   }
 }

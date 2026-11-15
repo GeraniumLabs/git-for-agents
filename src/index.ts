@@ -279,7 +279,12 @@ async function helpAsk(env: Env, req: Request): Promise<Response> {
       parsed.digest = projectDigest(overview, state, parsed.view, role);
     }
   }
-  const r = await askHelp(model, parsed);
+  let r = await askHelp(model, parsed);
+  // A catalog model (Claude through AI Gateway) needs Unified Billing credits; without them, answer with Workers AI.
+  if (!r.ok && model.kind === "workers-ai" && model.model !== HELP_WORKERS_AI_MODEL) {
+    console.warn("ask: falling back to Workers AI", r.reason);
+    r = await askHelp({ ...model, model: HELP_WORKERS_AI_MODEL }, parsed);
+  }
   if (!r.ok) return Response.json({ error: `Ask Mergery couldn't answer: ${r.reason}` }, { status: 502 });
   return Response.json({ answer: r.answer, model: r.model, grounded: !!parsed.digest, left: quota.left });
 }
