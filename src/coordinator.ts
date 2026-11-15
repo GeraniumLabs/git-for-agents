@@ -6,7 +6,8 @@
 import { DurableObject } from "cloudflare:workers";
 import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
 import { anyOverlap, matches, normalizePattern, overlaps as patternsOverlap } from "./paths";
-import { makeStore, type RepoStore } from "./store";
+import { makeStore, tokenSecret, type RepoStore } from "./store";
+import { loginCommands } from "./gitlogin";
 import { contextBucket, artifactsNamespace, isJurisdiction, PLACEMENTS, type Jurisdiction, type Placement } from "./residency";
 import { subscribePushes, unsubscribe, type Push } from "./events";
 import type { Env } from "./env";
@@ -1108,6 +1109,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return json(await this.importIssues(actor, body));
     }
     if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body, url.origin));
+    if (a === "git-credential" && m === "POST") return json(await this.gitCredential(actor, String(body.repo ?? "")));
     if (a === "me") return json(this.me(actor));
     // Traces are for the project's people (and its agents, if an owner allows), even on a public project,
     // unless an owner published them (the open reads above). Asking, reports and scorecards stay people only.
@@ -1723,8 +1725,28 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...(at ? {} : { pull: `git -C ${dir} -c http.extraHeader="Authorization: Bearer ${token}" pull ${remote} main` }),
       // For keys and scripts: a fresh pull command whenever you need one, no browser.
       ...(at || !origin ? {} : { pullWithKey: `curl -fsS -X POST -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" -d '${JSON.stringify(body.workspace ? { workspace: body.workspace } : body.change ? { change: body.change } : {})}' ${origin}/api/projects/${this.project}/checkout | jq -r .pull | sh` }),
+      // Set up once, then plain git works on every repository here: the helper fetches a fresh token per command.
+      ...(origin && remote ? { login: loginCommands(origin, remote), plainClone: `git clone ${remote} ${dir}${at ? ` && git -C ${dir} checkout --detach ${at}` : ""}` } : {}),
       note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
     };
+  }
+
+  /**
+   * A git credential for one repository, for the "git login" helper. Main is
+   * read-only; a workspace is writable by the agent holding it (unless paused),
+   * the same rule as pushing over the API; other workspaces are readable.
+   */
+  private async gitCredential(actor: Agent, repo: string) {
+    let scope: "read" | "write" = "read";
+    if (repo !== this.mainRepo) {
+      const ws = this.sql.exec("SELECT agent_id, status FROM workspaces WHERE name = ?", repo).toArray()[0];
+      if (!ws) throw new HttpError(404, `no repository ${repo} in ${this.project}`);
+      if (ws.status === "deleted") throw new HttpError(410, `workspace ${repo} was deleted after its work landed or was closed`);
+      if ((ws.agent_id === actor.id || actor.id === "admin") && !actor.paused) scope = "write";
+    }
+    const ttl = 3600;
+    const token = await this.store.token(repo, scope, ttl);
+    return { repo, scope, username: "x", password: tokenSecret(token), expiresAt: new Date(Date.now() + ttl * 1000).toISOString() };
   }
 
   /**
