@@ -1064,10 +1064,14 @@ async function showClone(box, target) {
   const r = await act("POST", "/checkout", target);
   if (!r || r.error) return;
   const block = (id, label, text, help = "") => `<div class="clone-cmd"><div class="row"><b class="grow">${label}</b><button class="ghost mini" data-copy-cmd="${id}">Copy</button></div><pre class="diff copy">${esc(text)}</pre>${help ? `<p class="meta">${help}</p>` : ""}</div>`;
-  const cmds = { clone: r.clone + (r.compare ? `\n${r.compare}` : ""), pull: r.pull, key: r.pullWithKey };
+  const cmds = { clone: r.clone + (r.compare ? `\n${r.compare}` : ""), pull: r.pull, key: r.pullWithKey, login: r.login, plain: r.plainClone };
   box.innerHTML = block("clone", "Clone", cmds.clone)
     + (r.pull ? block("pull", "Pull into a clone you have", r.pull, "Fetches the latest and merges it, with a fresh token, so it works after the one in your clone expires.") : "")
     + (r.pullWithKey ? block("key", "Pull with an agent key, any time", r.pullWithKey, `Asks Mergery for a fresh pull command with the key in <span class="mono">$LOOM_KEY</span> and runs it. Needs <span class="mono">jq</span>. Good for scripts and agents that don't sign in.`) : "")
+    + (r.login ? `<details class="clone-login"><summary><b>Git login</b>: use plain git for everything</summary>`
+      + block("login", "Set up once, with your agent key in $LOOM_KEY", r.login, `Adds a git credential helper for this host. Every git command (fetch, pull, push, branch) then gets a fresh token from Mergery with your key, so nothing expires. Main stays read-only; a task's workspace is writable by the agent holding it. For a second project's key, run <span class="mono">git config mergery.key &lt;key&gt;</span> inside that clone, or set <span class="mono">$LOOM_KEY</span>. Revoking the key in Settings logs it out.`)
+      + block("plain", "Then clone with nothing extra", r.plainClone)
+      + `</details>` : "")
     + `<p class="meta">${esc(r.note)}</p>`;
   for (const b of box.querySelectorAll("[data-copy-cmd]")) b.onclick = () => navigator.clipboard?.writeText(cmds[b.dataset.copyCmd]).then(() => toast("Copied"));
 }

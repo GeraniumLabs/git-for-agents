@@ -2005,3 +2005,43 @@ test("agents say why: a widened intent, explanations on submit, a busy heartbeat
   await tool("ada", "heartbeat", { status: "idle" });
   assert.equal((await tool("bex", "mergery_status")).structuredContent.agents.find((a: any) => a.name === "ada").busy, null);
 });
+
+test("git login: plain git reads main and pushes to your own workspace, and nothing else", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { mkdtemp, writeFile } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const name = project("e2e-login");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "git login", files: SEED, requiredApprovals: 1 });
+  const adaKey = (await admin.addAgent("ada", "builder")).key;
+  const bobKey = (await admin.addAgent("bob", "builder")).key;
+  const ada = admin.as(adaKey);
+  const t = await ada.createTask("Say hello", "");
+  const claim = await ada.claim(t.id);
+  const co = await ada.req("POST", "/checkout", {});
+  assert.ok(co.login && co.plainClone);
+
+  // A home of its own, so the helper is set up as a person would.
+  const home = await mkdtemp(`${tmpdir()}/loom-login-home-`);
+  const dir = await mkdtemp(`${tmpdir()}/loom-login-`);
+  const base = { ...process.env, HOME: home, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
+  await run("sh", ["-c", co.login], { env: { ...base, LOOM_KEY: adaKey } });
+  const git = (key: string, cwd: string, ...a: string[]) => run("git", ["-c", "user.name=ada", "-c", "user.email=ada@example.com", ...a], { cwd, env: { ...base, LOOM_KEY: key } });
+
+  await git(adaKey, dir, "clone", co.remote, "main");
+  await git(adaKey, `${dir}/main`, "fetch");
+  await git(adaKey, `${dir}/main`, "commit", "--allow-empty", "-m", "not allowed");
+  await assert.rejects(git(adaKey, `${dir}/main`, "push", "origin", "HEAD:main"), /merge queue/);
+
+  await git(adaKey, dir, "clone", claim.workspace.remote, "ws");
+  await writeFile(`${dir}/ws/hello.txt`, "hello\n");
+  await git(adaKey, `${dir}/ws`, "add", ".");
+  await git(adaKey, `${dir}/ws`, "commit", "-m", "hello");
+  await git(adaKey, `${dir}/ws`, "push", "origin", "HEAD:main");
+  // Another agent's key reads the workspace but can't push to it.
+  await git(bobKey, `${dir}/ws`, "fetch");
+  await git(adaKey, `${dir}/ws`, "commit", "--allow-empty", "-m", "bob's");
+  await assert.rejects(git(bobKey, `${dir}/ws`, "push", "origin", "HEAD:main"));
+  await assert.rejects(git("", `${dir}/ws`, "-c", "mergery.key=", "fetch"), /no agent key/);
+});

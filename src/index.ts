@@ -7,6 +7,7 @@ import { eventsEnabled, projectOfWorkspace, pushOf } from "./events";
 import { MAX_ATTACHMENT_BYTES, tooBig } from "./attachments";
 
 import { AGENT_HEADER, DIRECTIVES_HEADER, PERSON_AGENT_HEADER } from "./coordinator";
+import { formatCredential, parseCredentialRequest, projectCandidates, repoOf } from "./gitlogin";
 import { PLANS, billingOn, testMode, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
 import { ORG_SLUG, orgAccount, type OrgPeople, type OrgRole } from "./orgs";
 export { ProjectCoordinator } from "./coordinator";
@@ -98,6 +99,32 @@ async function deliverEvent(env: Env, msg: unknown) {
  * project name. The signed-in person, if any, rides along in x-loom-user; a
  * client can never set that header itself.
  */
+/**
+ * Answer git's credential helper. The body is git's own request (key=value
+ * lines); the repository's name says which project, and the coordinator
+ * decides read or write. Errors are plain text: the helper prints them.
+ */
+async function gitCredential(env: Env, req: Request): Promise<Response> {
+  const text = (msg: string, status: number) => new Response(msg + "\n", { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+  const auth = req.headers.get("authorization") ?? "";
+  if (!/^Bearer \S+/.test(auth)) return text("no agent key: set LOOM_KEY, or run git config --global mergery.key <key>", 401);
+  const repo = repoOf(parseCredentialRequest(await req.text()));
+  if (!repo) return text("git didn't send a repository path; run git config --global credential.useHttpPath true for this host", 400);
+  let last: Response | null = null;
+  for (const project of projectCandidates(repo)) {
+    if (!PROJECT_NAME.test(project) || !(await locate(env, project)).exists) continue;
+    const headers: Record<string, string> = { authorization: auth, "content-type": "application/json" };
+    const agent = req.headers.get(AGENT_HEADER);
+    if (agent) headers[AGENT_HEADER] = agent;
+    const res = await (await coordinator(env, project)).fetch("https://do/git-credential", { method: "POST", headers, body: JSON.stringify({ repo }) });
+    const data = await res.json<any>().catch(() => ({}));
+    if (res.ok) return new Response(formatCredential(data), { headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
+    last = text(data?.error ?? `HTTP ${res.status}`, res.status);
+    if (res.status !== 404) break;
+  }
+  return last ?? text(`no repository ${repo} on this Mergery`, 404);
+}
+
 async function forward(env: Env, req: Request, project: string, rest: string): Promise<Response> {
   const url = new URL(req.url);
   url.pathname = "/" + rest;
@@ -418,6 +445,9 @@ export default {
       if (res.ok) located.delete(del[1]);
       return res;
     }
+
+    // "git login": git's credential helper asks for a token for one repository; the agent key says who.
+    if (path === "/api/git/credential" && req.method === "POST") return gitCredential(env, req);
 
     let m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(.*)$/);
     if (m && /^(init|registry|visible|artifacts-event|project)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
