@@ -253,7 +253,9 @@ const limit = (v: string | undefined, d: number) => (v !== undefined && v !== ""
 
 /** POST /api/ask: a person's question about how Mergery works, answered with what they're looking at. */
 async function helpAsk(env: Env, req: Request): Promise<Response> {
-  const user = await sessionUser(env, req);
+  // The admin token asks too, so a deploy can be smoke-tested from a script; it reads projects as the admin.
+  const admin = await isAdmin(env, req);
+  const user = admin ? ({ login: "admin" } as User) : await sessionUser(env, req);
   if (!user) return Response.json({ error: "sign in with GitHub to ask Mergery" }, { status: 401 });
   const parsed = parseHelpInput(await req.json<any>().catch(() => ({})));
   if ("error" in parsed) return Response.json({ error: parsed.error }, { status: 400 });
@@ -268,7 +270,7 @@ async function helpAsk(env: Env, req: Request): Promise<Response> {
   if (!quota.ok) return Response.json({ error: quota.reason }, { status: 429 });
   // What the person is looking at, read as them: a private project they can't see tells the model nothing.
   if (parsed.project && (await locate(env, parsed.project)).exists) {
-    const headers = { [USER_HEADER]: JSON.stringify(user) };
+    const headers: Record<string, string> = admin ? { authorization: req.headers.get("authorization") ?? "" } : { [USER_HEADER]: JSON.stringify(user) };
     const stub = await coordinator(env, parsed.project);
     const get = (p: string) => stub.fetch(`https://do/${p}`, { headers }).then((r) => (r.ok ? r.json<any>() : null)).catch(() => null);
     const [overview, state, me] = await Promise.all([get("overview"), get("state"), get("me")]);
