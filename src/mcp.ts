@@ -21,7 +21,7 @@ export interface McpOptions {
   /** Set on /mcp: the person's account, and the project to use when a call names none. */
   account?: Account;
   defaultProject?: string | null;
-  /** "core": the tools most work needs, with the rest one call away through loom_tool. */
+  /** "core": the tools most work needs, with the rest one call away through mergery_tool. */
   tools?: "all" | "core";
 }
 
@@ -38,7 +38,7 @@ const num = (description: string) => ({ type: "number", description });
 
 const TOOLS: Tool[] = [
   {
-    name: "loom_status",
+    name: "mergery_status",
     description: "See the whole project at a glance: agents, tasks, active intents (who is editing what), changes in review or the merge queue, and recent events. Start here.",
     inputSchema: obj({}),
     run: async (_a, call) => {
@@ -179,7 +179,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "take_review",
-    description: "Take a review task nobody has taken yet (whoami's reviewTasks with status open, or loom_status reviewTasks). It becomes yours, already accepted, with 30 minutes to deliver: get_change, then review_change.",
+    description: "Take a review task nobody has taken yet (whoami's reviewTasks with status open, or mergery_status reviewTasks). It becomes yours, already accepted, with 30 minutes to deliver: get_change, then review_change.",
     inputSchema: obj({ changeId: num("Change id") }, ["changeId"]),
     run: (a, call) => call("POST", `/changes/${a.changeId}/reviewers/take`),
   },
@@ -434,8 +434,8 @@ const AS = {
 };
 const withAs = (schema: Record<string, any>) => ({ ...schema, properties: { ...schema.properties, as: AS } });
 
-/** The tools most work needs. The rest stay one call away (loom_tool), so a small model isn't handed 45 at once. */
-const CORE = new Set(["loom_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "code_map", "search_code", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
+/** The tools most work needs. The rest stay one call away (mergery_tool), so a small model isn't handed 45 at once. */
+const CORE = new Set(["mergery_status", "whoami", "ack_directive", "create_task", "claim_task", "declare_intent", "list_files", "code_map", "search_code", "read_file", "write_files", "submit_change", "sync_workspace", "get_change", "review_change", "take_review", "ask_human", "wait_for_events", "list_work"]);
 
 const PROJECT = { type: "string", description: "The project to act in (list_projects shows yours)." };
 
@@ -464,7 +464,7 @@ const ACCOUNT_TOOLS: (Omit<Tool, "run"> & { run: (args: any, account: Account) =
 ];
 
 const LOOM_TOOL = {
-  name: "loom_tool",
+  name: "mergery_tool",
   inputSchema: obj({ name: str("The tool's name"), arguments: { type: "object", description: "Its arguments, as that tool takes them" } }, ["name"]),
 };
 
@@ -478,7 +478,7 @@ export async function handleMcp(req: Request, call: CallAs, opts: McpOptions = {
   return Response.json(Array.isArray(msg) ? out : out[0]);
 }
 
-const INSTRUCTIONS = "Mergery coordinates many agents and humans on one codebase. If you start sub-agents that also use Mergery, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Mergery sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Heartbeat: while you hold a task, call Mergery at least every 10 minutes (whoami or wait_for_events will do), even during long builds. After 10 minutes of silence any agent may take your task over, and after 30 Mergery frees it for anyone. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: loom_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.";
+const INSTRUCTIONS = "Mergery coordinates many agents and humans on one codebase. If you start sub-agents that also use Mergery, give each its own name and have it pass that name as `as` on every tool call (you pass yours too, or none): otherwise they all act as you and Mergery sees one agent. Whenever you arrive, call whoami first and work through its todo (review requests to accept or decline, open review tasks to take_review, changes sent back) before new work; before you leave, decline reviews you won't do and release_task what you won't finish. Humans steer: a directive from a person comes first on every tool result until you acknowledge it; follow it over your own plan and call ack_directive (with a note if it changes what you're doing). Check whoami regularly for pause notices, reassignments and answers too. Heartbeat: while you hold a task, call Mergery at least every 10 minutes (whoami or wait_for_events will do), even during long builds. After 10 minutes of silence any agent may take your task over, and after 30 Mergery frees it for anyone. Ask a human (ask_human) before risky or ambiguous decisions, but first check whether it was already decided (declare_intent returns decisions for your paths; recall_decisions searches them). People's attention is the scarcest resource: each agent may have only a few open questions, so ask with a default (what you'll do if nobody answers) and you'll go ahead on it after the project's deadline. When memory shows an earlier agent who is still around, consult_agent them rather than guessing their reasons. If you and another agent disagree and can't settle it, open_dispute rather than arguing; rulings are binding. When an overlap is forecast, settle it with propose/answer_proposal rather than racing. Workflow: mergery_status -> claim_task -> declare_intent (paths you will touch) -> edit via write_files or git push to your workspace -> submit_change with your context (attach screenshots of UI changes, builds and logs to the change so reviewers can see them) -> watch whoami/wait_for_events for reviews, conflicts and stale-workspace notices -> sync_workspace when told main moved under you. Reviews: after submit_change, ask agents who know the code with request_review (suggest_reviewers shows who and why). When you get a review.assigned event, get_change (read its brief first) then review_change; line comments become threads the author must resolve_thread or reply_thread to before the change merges; reviewer agents also pick up any review.requested. Checks: when the project has a check command, run_checks before you submit; the merge queue runs the same checks on main with your change and sends it back (checks.failed) if they fail. Contests: a task with several attempts gives each claimer its own attempt; when contest.ready arrives (or whoami lists it), compare_attempts and vote for the one that should land, with a reason. Your approvals and votes count by your track record (my_track_record), so approve only what you have read. Memory: declare_intent and recall return notes other agents left; follow them and rate_note the ones you relied on. When you learn something the next agent on these files should know, remember it, or put it in your submit context as notes.";
 
 const ACCOUNT_INSTRUCTIONS = "You're signed in to Mergery as the person you work for, and you act as their agent. Call list_projects first, and pass `project` on every other tool call. To bring a repository the person already has, create_project with importUrl. ";
 
@@ -501,7 +501,7 @@ async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
         protocolVersion: m.params?.protocolVersion ?? "2025-06-18",
         capabilities: { tools: {} },
         serverInfo: { name: "mergery", version: "0.1.0" },
-        instructions: (account ? ACCOUNT_INSTRUCTIONS : "") + INSTRUCTIONS + (core ? " Only the core tools are listed; call any other Mergery tool named here through loom_tool." : ""),
+        instructions: (account ? ACCOUNT_INSTRUCTIONS : "") + INSTRUCTIONS + (core ? " Only the core tools are listed; call any other Mergery tool named here through mergery_tool." : ""),
       });
     case "ping":
       return reply({});
@@ -520,7 +520,9 @@ async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
     case "tools/call": {
       let name = m.params?.name;
       let args = m.params?.arguments ?? {};
-      if (name === LOOM_TOOL.name) {
+      // Agents set up before the rename still call loom_status and loom_tool.
+      if (name === "loom_status") name = "mergery_status";
+      if (name === LOOM_TOOL.name || name === "loom_tool") {
         name = args.name;
         args = args.arguments ?? {};
       }

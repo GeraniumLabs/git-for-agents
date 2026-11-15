@@ -96,7 +96,7 @@ export function standinSkill(origin: string, project: string, who: string | null
   const keyFile = `~/.config/loom/${project}.standin.key`;
   const can = scopes ? (scopes.length ? scopes.map((s) => `- **${s}**: ${SCOPES[s]}`).join("\n") : "- Nothing beyond watching: you tell the person, and they act in Mergery.") : Object.entries(SCOPES).map(([s, d]) => `- **${s}**: ${d}`).join("\n");
   return `---
-name: loom-${project}-standin
+name: mergery-${project}-standin
 description: Watch the ${project} project on Mergery for ${who ?? "your person"} and reach them on their own channels (Slack, email, text) when agents need a person. Act for them only within the rights their stand-in key grants. Use when checking in on ${project}, when a Mergery webhook arrives, or on a schedule.
 ---
 

@@ -129,7 +129,8 @@ const isHuman = () => me?.role === "human";
 /** Traces are for the project's people, unless an owner published a public project's traces for anyone. */
 const canReadTraces = () => isHuman() || !!state?.project?.traces?.public;
 const isOwner = () => !!me?.owner;
-const githubUrl = () => `/auth/github?return=${encodeURIComponent(location.pathname + location.search)}`;
+// Back to the same page after GitHub, including the change or task that was open.
+const githubUrl = () => `/auth/github?return=${encodeURIComponent(location.pathname + location.search + location.hash)}`;
 function renderMe() {
   const face = user?.avatar ? `<img class="avatar" src="${esc(user.avatar)}" alt="">` : "";
   $("#me").innerHTML = me
@@ -161,6 +162,20 @@ async function showSignIn(why = "") {
       : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}`;
   if ($("#si-dev-go")) $("#si-dev-go").onclick = () => { const l = $("#si-dev").value.trim(); if (l) location.href = `/auth/dev?login=${encodeURIComponent(l)}&return=${encodeURIComponent(location.pathname + location.search)}`; };
   if (!$("#detail").open) $("#detail").showModal();
+}
+
+/**
+ * A "Sign in to …" button: straight to GitHub when signed out. Signed in to
+ * GitHub but not yet known on this page (the project check hadn't finished),
+ * check again rather than asking to sign in. Only a non-member gets the
+ * dialog, which says who can add them.
+ */
+async function signInNow() {
+  if (!user) await loadUser();
+  if (!user && auth.github) { location.href = githubUrl(); return; }
+  if (user && !me) await signIn();
+  if (me) return toast(`Signed in as ${me.name}`);
+  showSignIn("Answering, reviewing and replying are signed with your name.");
 }
 
 /**
@@ -343,8 +358,8 @@ function renderHealth() {
     state.project.checks ? "" : `<span class="warning" title="Set a check command and the merge queue runs it on main with each change before main moves, so a change that breaks the build goes back to its author instead of landing">No checks: main isn't tested before it moves${state.project.mainTests === 0 ? ", and has no tests" : ""}${state.project.suggestedCheck && isOwner() ? ` <button class="ghost mini" data-use-check title="${esc(state.project.suggestedCheck)}">Use <span class="mono">${esc(state.project.suggestedCheck)}</span></button>` : isOwner() ? " · set one in Settings" : ""}</span>`,
   ].filter(Boolean).join("");
   $("#health").innerHTML = `
-    <div class="tile" title="Agents in this project, by what they're doing now. Click a state to list those agents">
-      <b>${h.agents.total}</b><span>agents</span>
+    <div class="tile" title="Agents in this project, one per name, by what they're doing now. Click a state to list those agents">
+      <b>${h.agents.total}</b><span>agent${h.agents.total === 1 ? "" : "s"}${h.agents.records > h.agents.total ? ` <small class="meta" title="Some names joined more than once, with a new key or another connection. Each name counts once">· ${h.agents.records} connections</small>` : ""}</span>
       <div class="states">${STATES.filter(([k]) => h.agents.byState[k]).map(([k, label, cls]) => `<button class="state ${cls}" data-state="${k}" title="${STATE_HELP[k] ?? ""}">${h.agents.byState[k]} ${label}</button>`).join("") || `<span class="meta">none yet</span>`}</div>
     </div>
     <div class="tile" title="Tasks whose change has landed on main, out of all tasks. The bar shows the rest by stage. Click to list the tasks">
@@ -352,7 +367,7 @@ function renderHealth() {
       <div class="bar">${seg(merged, "ok", "landed")}${seg(review, "info", "in review or queued")}${seg(active, "warn", "in progress")}${seg(open, "muted", "open")}</div>
       <div class="meta"><a data-tasks="open" href="#tasks">${open} open</a> · <a data-tasks="active" href="#tasks">${active} in progress</a></div>
     </div>
-    <div class="tile" title="Changes waiting for review (each is a task any agent can take), and approved changes waiting to land on main. ${h.mergedLastHour} landed in the last hour"><b>${inReview} <small>in review</small> · ${h.queue.depth} <small>queued</small></b><span>${h.reviewTasks?.open ? `${h.reviewTasks.open} nobody has taken · ` : ""}${h.mergedLastHour} landed in the last hour</span></div>
+    <div class="tile" title="Changes waiting for review (each is a task any agent can take), and approved changes waiting to land on main. ${h.mergedLastHour} landed in the last hour"><b>${inReview} <small>in review</small></b><span>${h.queue.depth ? `${h.queue.depth} approved, waiting to land` : "nothing waiting to land"}${h.reviewTasks?.open ? ` · ${h.reviewTasks.open} nobody has taken` : ""} · ${h.mergedLastHour} landed in the last hour</span></div>
     <div class="tile" title="The commit main points at now. The version goes up by one with each landing"><b class="mono">${(state.project.mainHead ?? "").slice(0, 7)}</b><span>main · v${state.project.mainVersion}</span></div>
     ${warnings ? `<div class="warnings">${warnings}</div>` : ""}`;
   const useCheck = $("#health [data-use-check]");
@@ -417,6 +432,19 @@ function renderAttention() {
   };
 }
 
+/**
+ * Why a change sits in Needs a person and what to do about it, from the same
+ * list the dashboard shows. The brief below it only scores the diff.
+ */
+function personAskHtml(c) {
+  const asks = c.personAsk ?? [];
+  if (!asks.length || ["merged", "closed", "abandoned"].includes(c.status)) return "";
+  const handBack = asks.some((a) => a.kind === "review") && isHuman();
+  return `<div class="rv-brief person rv-ask"><div class="rv-verdict"><span class="badge">Waiting on a person</span> ${asks.map((a) => esc(a.why)).join(" ")}</div>
+    <p><b>What to do:</b> ${asks.map((a) => esc(a.todo)).join(" ")}</p>
+    ${me ? `<div class="row">${asks.some((a) => a.kind === "contest") ? `<a class="button mini" href="#contest/${c.contest}">Compare attempts</a>` : `<button class="mini" data-jump-verdict>Go to Approve / Request changes</button>`}${handBack ? `<button class="ghost mini" data-hand-back title="Decline the request; Mergery asks an agent instead">Hand it back to the agents</button>` : ""}</div>` : signInToAct("review")}</div>`;
+}
+
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   $("#stuck").innerHTML = items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
@@ -426,8 +454,53 @@ function renderStuck() {
   wire($("#stuck"));
 }
 
+/**
+ * Markdown for what agents and people write in discussions: fenced and inline
+ * code, headings, bold, italics, links, lists, quotes and paragraphs. The text
+ * is escaped first and only these tags are added back, so no HTML gets through.
+ */
+function md(text) {
+  const blocks = [];
+  let src = String(text ?? "").replace(/\r/g, "");
+  // Fenced code first, so nothing inside it is touched.
+  src = src.replace(/```[^\n]*\n([\s\S]*?)(?:```|$)/g, (_, code) => { blocks.push(`<pre class="md-code">${esc(code.replace(/\n$/, ""))}</pre>`); return `\u0000${blocks.length - 1}\u0000`; });
+  const inline = (t) => {
+    const codes = [];
+    t = esc(t).replace(/`([^`\n]+)`/g, (_, c) => { codes.push(`<code>${c}</code>`); return `\u0001${codes.length - 1}\u0001`; });
+    t = t.replace(/\[([^\]\n]+)\]\((https?:\/\/[^\s)]+)\)/g, (_, label, url) => `<a href="${url}" target="_blank" rel="noopener noreferrer nofollow">${label}</a>`)
+      .replace(/(^|[\s(])(https?:\/\/[^\s<)]+)/g, (_, pre, url) => { const tail = /[.,;:!?]+$/.exec(url)?.[0] ?? ""; url = url.slice(0, url.length - tail.length); return `${pre}<a href="${url}" target="_blank" rel="noopener noreferrer nofollow">${url}</a>${tail}`; })
+      .replace(/\*\*([^*\n]+)\*\*/g, "<b>$1</b>").replace(/__([^_\n]+)__/g, "<b>$1</b>")
+      .replace(/(^|[^*\w])\*([^*\n]+)\*(?!\w)/g, "$1<i>$2</i>").replace(/(^|[^_\w])_([^_\n]+)_(?!\w)/g, "$1<i>$2</i>")
+      .replace(/~~([^~\n]+)~~/g, "<s>$1</s>");
+    return t.replace(/\u0001(\d+)\u0001/g, (_, i) => codes[i]);
+  };
+  const out = [];
+  let list = null, para = [];
+  const flushPara = () => { if (para.length) out.push(`<p>${para.map(inline).join("<br>")}</p>`); para = []; };
+  const flushList = () => { if (list) out.push(`<${list.tag}>${list.items.map((x) => `<li>${inline(x)}</li>`).join("")}</${list.tag}>`); list = null; };
+  for (const line of src.split("\n")) {
+    const block = /^\u0000(\d+)\u0000$/.exec(line.trim());
+    const h = /^(#{1,6})\s+(.*)$/.exec(line);
+    const li = /^\s*(?:([-*+])|(\d+)[.)])\s+(.*)$/.exec(line);
+    const quote = /^>\s?(.*)$/.exec(line);
+    if (block) { flushPara(); flushList(); out.push(blocks[block[1]]); }
+    else if (!line.trim()) { flushPara(); flushList(); }
+    else if (h) { flushPara(); flushList(); out.push(`<p class="md-h"><b>${inline(h[2])}</b></p>`); }
+    else if (li) {
+      flushPara();
+      const tag = li[1] ? "ul" : "ol";
+      if (list && list.tag !== tag) flushList();
+      (list ??= { tag, items: [] }).items.push(li[3]);
+    }
+    else if (quote) { flushPara(); flushList(); out.push(`<blockquote>${inline(quote[1])}</blockquote>`); }
+    else { flushList(); para.push(line); }
+  }
+  flushPara(); flushList();
+  return out.join("").replace(/\u0000(\d+)\u0000/g, (_, i) => blocks[i]);
+}
+
 function renderDiscussions() {
-  const posts = (t) => t.posts.slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("");
+  const posts = (t) => t.posts.slice(-3).map((p) => `<div class="post md">${who(p.author)} ${md(p.body)}</div>`).join("");
   $("#discussions").innerHTML = state.discussions.map((t) => `<div class="card inbox"><div class="kicker">${t.kind === "contract" ? "Contract" : t.title?.startsWith("Consult:") ? `Consult · ${esc(name(t.created_by))} asks ${esc(name(t.to_agent))}` : "Discussion"}${t.path ? ` · <span class="mono">${esc(t.path)}${t.line ? ":" + t.line : ""}</span>` : ""}${t.task_id ? ` · <a data-task="${t.task_id}">task #${t.task_id}</a>` : ""}</div>${t.kind === "contract" ? `<div class="mono"><b>${esc(t.title)}</b></div>` : ""}${posts(t)}
     ${me ? `<div class="row"><input data-reply="${t.id}" placeholder="Reply…"><button data-send="${t.id}">Send</button></div>` : signInToAct("reply")}</div>`).join("")
     || `<p class="empty">No open discussions.</p>`;
@@ -436,7 +509,7 @@ function renderDiscussions() {
 
 // One place to hook up links and buttons inside rendered HTML.
 function wire(root) {
-  for (const b of root.querySelectorAll("[data-signin]")) b.onclick = () => showSignIn("Answering, reviewing and replying are signed with your name, so sign in first.");
+  for (const b of root.querySelectorAll("[data-signin]")) b.onclick = signInNow;
   for (const a of root.querySelectorAll("[data-agent]")) a.onclick = (e) => { e.preventDefault(); showAgent(a.dataset.agent); };
   for (const a of root.querySelectorAll("[data-change]")) a.onclick = (e) => { e.preventDefault(); showChange(Number(a.dataset.change)); };
   for (const a of root.querySelectorAll("[data-contest]")) a.onclick = (e) => { e.preventDefault(); showContest(Number(a.dataset.contest)); };
@@ -493,9 +566,9 @@ function renderAreas() {
   const areas = state.areas;
   const max = Math.max(1, ...areas.map((a) => a.agents + a.inFlight));
   $("#areas").innerHTML = areas.length ? `<table class="areas"><thead><tr><th>Folder</th><th title="agents with live intents or changes here">Agents</th><th title="changes in review, queued or in conflict">In flight</th><th title="merged in the last hour">Landed</th><th title="conflicts in the last hour">Conflicts</th></tr></thead><tbody>
-    ${areas.map((a) => `<tr><td><a class="mono" data-find="${esc(a.path)}">${esc(a.path)}</a><div class="heat"><span style="width:${((a.agents + a.inFlight) / max) * 100}%"></span></div></td><td>${a.agents || ""}</td><td>${a.inFlight || ""}</td><td>${a.mergedLastHour || ""}</td><td class="${a.conflictsLastHour ? "bad" : ""}">${a.conflictsLastHour || ""}</td></tr>`).join("")}
+    ${areas.map((a) => `<tr><td><a class="mono" href="#" data-find="${esc(a.path)}" title="Who is working here, the changes in flight and what landed">${esc(a.path)}</a><div class="heat"><span style="width:${((a.agents + a.inFlight) / max) * 100}%"></span></div></td><td>${a.agents || ""}</td><td>${a.inFlight || ""}</td><td>${a.mergedLastHour || ""}</td><td class="${a.conflictsLastHour ? "bad" : ""}">${a.conflictsLastHour || ""}</td></tr>`).join("")}
     </tbody></table>` : `<p class="empty">No work in progress.</p>`;
-  for (const a of $("#areas").querySelectorAll("[data-find]")) a.onclick = () => { $("#search").value = a.dataset.find; runSearch(); $("#search").focus(); };
+  for (const a of $("#areas").querySelectorAll("[data-find]")) a.onclick = (e) => { e.preventDefault(); showArea(a.dataset.find); };
 }
 
 // ── contests: several attempts at one task, weighted votes pick one ─────
@@ -554,7 +627,7 @@ async function showTraces(box, changeId) {
     let t;
     try { t = await traceFetch(`/traces/${b.dataset.steps}?limit=500`); } catch (e) { ol.innerHTML = `<li class="meta">${esc(e.message)}</li>`; return; }
     ol.innerHTML = t.stepList.map((s) => `<li class="step ${s.kind}${s.loomCall ? " loom" : ""}">
-      <span class="k">${STEP_LABEL[s.kind] ?? s.kind}${s.tool ? ` <code>${esc(s.loomCall ? `loom ${s.loomCall}` : s.tool)}</code>` : ""}</span>
+      <span class="k">${STEP_LABEL[s.kind] ?? s.kind}${s.tool ? ` <code>${esc(s.loomCall ? `mergery ${s.loomCall}` : s.tool)}</code>` : ""}</span>
       ${s.files.length ? `<span class="meta mono">${s.files.slice(0, 3).map(esc).join(", ")}${s.files.length > 3 ? "…" : ""}</span>` : ""}
       <pre>${esc(s.preview)}</pre></li>`).join("") + (t.more ? `<li class="meta">First 500 steps shown; the full log has the rest.</li>` : "");
   }));
@@ -724,12 +797,29 @@ async function runSearch() {
   for (const a of $("#search-results").querySelectorAll("a")) a.addEventListener("click", () => ($("#search-results").hidden = true));
 }
 
+/** One folder from Where the work is: who is in it, the changes in flight, what landed or conflicted, and a link to its code. */
+async function showArea(path) {
+  const r = await api(`/area?path=${encodeURIComponent(path)}`);
+  const root = path === "(root)";
+  const folderHref = root ? "#code" : `#code/tree/${path.replace(/\/$/, "").split("/").map(encodeURIComponent).join("/")}`;
+  const files = (fs) => `<div class="meta mono">${fs.slice(0, 4).map(esc).join("  ")}${fs.length > 4 ? ` and ${fs.length - 4} more` : ""}</div>`;
+  const section = (title, rows, empty) => `<h2>${title}</h2>${rows.length ? rows.join("") : `<p class="meta">${empty}</p>`}`;
+  $("#detail-body").innerHTML = `<h3 class="mono">${esc(path)}</h3>
+    <div class="row"><a class="button mini" href="${folderHref}">Browse the code</a></div>
+    ${section("Working here now", r.intents.map((i) => `<div class="card">${who(i.agent)} on <a data-task="${i.task}">task #${i.task}</a> ${esc(i.taskTitle ?? "")} · ${ago(i.since)} ago${files(i.paths)}</div>`), "Nobody has declared these files right now.")}
+    ${section("Changes in flight", r.changes.map((c) => `<div class="card"><a data-change="${c.id}">#${c.id} ${esc(c.title)}</a> <span class="pill ${c.status}">${esc(c.status.replace(/_/g, " "))}</span> · ${who(c.agent)}${files(c.files)}</div>`), "No changes here are waiting on review or the merge queue.")}
+    ${section("Conflicts in the last hour", r.conflicts.map((x) => `<div class="card">${x.change ? `<a data-change="${x.change}">#${x.change}</a>` : ""} ${ago(x.at)} ago${files(x.files)}</div>`), "None.")}
+    ${section("Landed in the last hour", r.landed.map((x) => `<div class="card">${x.change ? `<a data-change="${x.change}">#${x.change} ${esc(x.title)}</a>` : ""} · ${ago(x.at)} ago${files(x.files)}</div>`), "Nothing landed here in the last hour.")}`;
+  wire($("#detail-body"));
+  if (!$("#detail").open) $("#detail").showModal();
+}
+
 async function showDirectory(st) {
   const r = await api(`/search?state=${encodeURIComponent(st)}&limit=200`);
   for (const a of r.agents) names[a.id] = a.name;
   $("#detail-body").innerHTML = `<h3>${r.total} agent${r.total === 1 ? "" : "s"} ${esc((STATES.find(([k]) => k === st) ?? [, st])[1])}</h3>
     <table class="dir"><thead><tr><th>Agent</th><th>Task</th><th>Last seen</th></tr></thead><tbody>
-    ${r.agents.map((a) => `<tr><td>${who(a.id)}${a.under ? ` <span class="meta">under ${esc(a.under.name)}</span>` : ""}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
+    ${r.agents.map((a) => `<tr><td>${who(a.id)}${a.under ? ` <span class="meta">under ${esc(a.under.name)}</span>` : ""}${a.records > 1 ? ` <span class="meta" title="This name joined ${a.records} times, with different keys or connections. It counts once">· ${a.records} connections</span>` : ""}</td><td>${a.task ? `#${a.task.id} ${esc(a.task.title)}` : `<span class="meta">none</span>`}</td><td>${ago(a.lastSeen)} ago</td></tr>`).join("")}</tbody></table>
     ${r.total > r.agents.length ? `<p class="meta">Showing ${r.agents.length} of ${r.total}. Search to narrow it down.</p>` : ""}`;
   wire($("#detail-body"));
   if (!$("#detail").open) $("#detail").showModal();
@@ -1150,7 +1240,7 @@ async function showSkill(joinCode, fresh = false) {
   // A pasted code is checked by the server, which only puts a live join code into the skill.
   if (joinCode?.pasted && !text.includes(joinCode.code)) { toast(`That join code isn't valid for ${project}: it may have expired, been used up or revoked`); return showSkill(); }
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
-  const save = `mkdir -p .claude/skills/loom-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/loom-${project}/SKILL.md`;
+  const save = `mkdir -p .claude/skills/mergery-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/mergery-${project}/SKILL.md`;
   const owner = isOwner();
   const codeRows = codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("");
   // Owners go in order: make a join code, then copy the skill that carries it.
@@ -1162,7 +1252,7 @@ async function showSkill(joinCode, fresh = false) {
       <p class="meta">Builders claim tasks and write code; reviewers also get every review request and fill in when no builder knows the code.</p>
       <div class="row"><select id="jc-role" title="Builders claim tasks and write code; reviewers also get every review request"><option value="builder">builders</option><option value="reviewer">reviewers</option></select><input id="jc-max" type="number" min="1" max="10000" value="50" title="How many agents may join with it"><span class="meta">agents, for</span><input id="jc-hours" type="number" min="1" max="2160" value="72" title="Hours until it expires"><span class="meta">hours</span><button id="jc-go">Create join code</button></div>`;
   const mcpUrl = `${location.origin}/mcp/${project}`;
-  const firstAsk = `Use the loom MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Mergery's merge queue.`;
+  const firstAsk = `Use the mergery MCP server for ${project}: read the code, file a few tasks for what you'd improve first, then claim one, do it, and submit it so it lands through Mergery's merge queue.`;
   // OpenCode has no one-line add for a remote server: it reads opencode.json, and signs in with OAuth on its own.
   const openCode = JSON.stringify({ mcp: { mergery: { type: "remote", url: mcpUrl } } });
   const oneLine = [
@@ -1771,7 +1861,7 @@ async function showSettings() {
     const scopes = [...$("#detail-body").querySelectorAll("[data-si-scope]")].filter((c) => c.checked).map((c) => c.dataset.siScope);
     let k;
     try { k = await act("POST", "/standins", { name, scopes, webhook: $("#si-hook").value.trim() || null }); } catch { return; }
-    const install = `mkdir -p .claude/skills/loom-${project}-standin && curl -s -H \"Authorization: Bearer $LOOM_STANDIN_KEY\" "${k.skill}" > .claude/skills/loom-${project}-standin/SKILL.md`;
+    const install = `mkdir -p .claude/skills/mergery-${project}-standin && curl -s -H \"Authorization: Bearer $LOOM_STANDIN_KEY\" "${k.skill}" > .claude/skills/mergery-${project}-standin/SKILL.md`;
     $("#si-out").innerHTML = `<p class="meta">Shown once. Give your agent the skill and the key; Mergery keeps only the key's hash.</p>
       <pre class="diff copy">export LOOM_STANDIN_KEY=${esc(k.key)}</pre>
       ${k.webhookSecret ? `<p class="meta">Webhook signing secret: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>.</p><pre class="diff copy">${esc(k.webhookSecret)}</pre>` : ""}
@@ -2390,8 +2480,13 @@ window.addEventListener("hashchange", route);
 // Closing the account or an org page leaves its link, so the same link opens it again.
 $("#detail").addEventListener("close", () => { if (/^#(account|org\/|incident\/|report|scorecards)/.test(location.hash)) history.replaceState(null, "", `${location.pathname}${location.search}`); });
 
+let reviewLoads = 0;
 async function loadReview(id, mode) {
+  // Opening a change while sign-in is still being checked loads it twice; only the newest load draws,
+  // so a slow first load can't draw the page as signed out after the signed-in one.
+  const load = ++reviewLoads;
   const [c, rv] = await Promise.all([api(`/changes/${id}`), api(`/changes/${id}/reviewers`), HL]);
+  if (load !== reviewLoads) return;
   if (c.error) { $("#review").innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(c.error)}</p></div>`; return; }
   const prev = review?.id === id ? review : null;
   review = { id, c, rv, pending: prev?.pending ?? [], view: store.get("loom-diff-view") ?? "unified", since: prev?.since ?? null, inter: null, file: prev?.file ?? 0,
@@ -2410,6 +2505,7 @@ async function loadReview(id, mode) {
     review.inter = await api(`/changes/${id}/interdiff?from=${review.lastMine}`);
     if (!review.inter.available) review.since = false;
   } else review.since = false;
+  if (load !== reviewLoads) return;
   drawReview();
 }
 
@@ -2464,8 +2560,9 @@ function drawReview() {
       <div class="row"><button class="ghost mini" data-browse title="See this change's version of every file">Browse files</button><a class="button ghost mini" href="/api/projects/${project}/archive?change=${c.id}${keyQuery()}" download title="A snapshot of the files with this change">Download zip</a><button class="ghost mini" data-clone title="A clone command for this change's workspace, and a git diff against main, to review it in your own editor">Check out locally</button>${c.contest ? `<a class="button ghost mini" href="#contest/${c.contest}">Compare attempts in contest #${c.contest}</a>` : ""}${c.preview?.url ? `<a class="button mini" href="${esc(c.preview.url)}" target="_blank" rel="noopener noreferrer nofollow" title="${c.preview.current ? "What this change builds" : "Built from an earlier version; the current one is building"}">Preview${c.preview.current ? "" : " (older version)"}</a>` : c.preview?.status === "building" ? `<span class="pill">preview building…</span>` : c.preview?.status === "failed" ? `<span class="pill checks_failed" title="${esc(c.preview.error ?? "")}">preview failed</span>` : ""}${c.reverts ? `<a class="button ghost mini" href="#change/${c.reverts}">Reverts #${c.reverts}</a>` : ""}${c.revertedBy ? `<a class="button ghost mini" href="#change/${c.revertedBy}">Reverted by #${c.revertedBy}</a><a class="button ghost mini" href="#incident/change/${c.id}">Incident view</a>` : c.status === "merged" && isHuman() ? `<button class="ghost mini" data-revert title="Take this change back out of main: a revert goes through the merge queue, so the checks still run">Revert</button>` : ""}</div>
       <div id="clone-box"></div>
     </div>
+    ${personAskHtml(c)}
     <div class="rv-brief ${c.brief.needsPerson ? "person" : "agents"}">
-      <div class="rv-verdict"><span class="badge">${c.brief.needsPerson ? "Needs a person" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
+      <div class="rv-verdict"><span class="badge">${c.brief.needsPerson ? "Needs a person" : c.personAsk?.length ? "The diff alone looks routine" : "Agents can handle it"}</span> ${esc(c.brief.verdict)}</div>
       ${reasons ? `<ul>${reasons}</ul>` : ""}
     </div>
     <div class="rv-grid">
@@ -2479,7 +2576,7 @@ function drawReview() {
           ${review.intent ? `<span class="seg" title="Read the change as code, or as what was asked and what the agent chose (i)"><button data-mode="code" class="${review.mode === "code" ? "on" : ""}">Code</button><button data-mode="intent" class="${review.mode === "intent" ? "on" : ""}">Intent</button></span>` : ""}
           <span class="seg"><button data-view="unified" class="${review.view === "unified" ? "on" : ""}" title="Old and new lines in one column">Unified</button><button data-view="split" class="${review.view === "split" ? "on" : ""}" title="Old on the left, new on the right">Split</button></span>
           ${review.lastMine ? `<span class="seg"><button data-since="0" class="${review.since ? "" : "on"}">All changes</button><button data-since="1" class="${review.since ? "on" : ""}">Since your review</button></span>` : ""}
-          <span class="meta grow">${canReview ? "Click a line to comment on it." : !me ? "Sign in to review." : me.id === c.agent_id ? "Your own change: answer the threads on it." : ""}</span>
+          <span class="meta grow">${canReview ? "Click a line to comment on it." : !me ? `<button class="ghost mini" data-signin>Sign in to review</button>` : me.id === c.agent_id ? "Your own change: answer the threads on it." : ""}</span>
           ${open.length ? `<span class="pill changes_requested">${plural(open.length, ["open thread", "open threads"])}</span>` : ""}
         </div>
         ${review.since ? `<p class="meta since">Showing what changed since you reviewed it (${review.lastMine.slice(0, 7)} → ${c.head.slice(0, 7)}).</p>` : ""}
@@ -2557,7 +2654,7 @@ function splitRow(f, left, right, at, canReview) {
 }
 
 function threadHtml(t, located = false) {
-  const posts = t.posts.map((p, i) => `<div class="tp${i ? " reply" : ""}">${who(p.author)} <span class="meta">${ago(p.created_at)} ago</span><div>${esc(p.body)}</div></div>`).join("");
+  const posts = t.posts.map((p, i) => `<div class="tp${i ? " reply" : ""}">${who(p.author)} <span class="meta">${ago(p.created_at)} ago</span><div class="md">${md(p.body)}</div></div>`).join("");
   const head = `${t.blocking && t.status === "open" ? `<span class="pill changes_requested" title="Must be resolved before the change merges">blocks merge</span>` : ""}${t.outdated ? `<span class="pill" title="The line changed since this comment">outdated</span>` : ""}${located ? `<span class="mono meta">${esc(t.path ?? "")}${t.line ? `:${t.line}` : ""}</span>` : ""}`;
   const actions = me ? `<div class="row"><input data-treply="${t.id}" placeholder="Reply…"><button class="mini ghost" data-tsend="${t.id}">Reply</button>${t.status === "open" ? `<button class="mini" data-tresolve="${t.id}">Resolve</button>` : `<button class="mini ghost" data-treopen="${t.id}">Reopen</button>`}</div>` : "";
   if (t.status !== "open") return `<details class="thr resolved" data-thread="${t.id}"><summary>${head} Resolved${t.resolvedByName ? ` by ${esc(t.resolvedByName)}` : ""}: <span class="meta">${esc(t.posts[0]?.body.slice(0, 90))}</span></summary>${posts}${actions}</details>`;
@@ -2636,6 +2733,14 @@ function wireReview(canReview) {
   });
   for (const a of root.querySelectorAll("[data-tocode]")) a.onclick = () => setMode("code", () => document.getElementById(fileId(a.dataset.tocode))?.scrollIntoView({ block: "start" }));
   root.querySelector("[data-clone]").onclick = () => showClone($("#clone-box"), { change: c.id });
+  const jump = root.querySelector("[data-jump-verdict]");
+  if (jump) jump.onclick = () => { const v = root.querySelector('[data-verdict="approve"]'); if (v) { v.scrollIntoView({ behavior: "smooth", block: "center" }); v.focus(); } else toast("Sign in as a person to approve"); };
+  const back = root.querySelector("[data-hand-back]");
+  if (back) back.onclick = async () => {
+    try { await act("POST", `/changes/${c.id}/reviewers/respond`, { accept: false, reason: "handed back to the agents" }); } catch { return; }
+    toast("Handed back; an agent will be asked");
+    loadReview(c.id);
+  };
   for (const b of root.querySelectorAll("[data-open]")) b.onclick = async () => {
     const f = await api(`/files?change=${c.id}&path=${encodeURIComponent(b.dataset.open)}`);
     $("#detail-body").innerHTML = `<h3 class="mono">${esc(b.dataset.open)} <small class="meta">as change #${c.id} leaves it</small></h3><pre class="diff file-full">${f.error ? esc(f.error) : codeLines(f.content, b.dataset.open).map((l, i) => `<span class="ln">${i + 1}</span>${l}`).join("\n")}</pre>`;
@@ -2779,7 +2884,7 @@ async function loadTask(id) {
           <div class="meta mono files">${c.files.map(esc).join("  ")}</div>`).join("") || `<p class="empty">${t.assignee ? "Nothing submitted yet." : "Nothing submitted. Someone has to claim it first."}</p>`)}
         ${v.attachments?.length ? panel("Attachments", attachmentsHtml(v.attachments, { where: false }), `<small>${v.attachments.length}</small>`) : ""}
         ${panel("Intent", v.intents.map((i) => `<div class="qrow">${who(i.agent_id)} <span class="mono grow">${i.paths.map(esc).join(", ")}</span><span class="meta">${i.released_at === null ? "declared" : "released"} ${ago(i.created_at)} ago</span></div>${i.description ? `<div class="meta">${esc(i.description)}</div>` : ""}`).join("") || `<p class="empty">No intent declared yet.</p>`, live.length ? `<small>${live.length} live</small>` : "")}
-        ${v.threads.length ? panel("Conversations", v.threads.map((th) => `<div class="card inbox"><div class="kicker">${esc(th.kind)} · ${esc(th.status)}</div>${th.title ? `<div class="q">${esc(th.title)}</div>` : ""}${(th.posts ?? []).slice(-3).map((p) => `<div class="post">${who(p.author)} ${esc(p.body)}</div>`).join("")}</div>`).join("")) : ""}
+        ${v.threads.length ? panel("Conversations", v.threads.map((th) => `<div class="card inbox"><div class="kicker">${esc(th.kind)} · ${esc(th.status)}</div>${th.title ? `<div class="q">${esc(th.title)}</div>` : ""}${(th.posts ?? []).slice(-3).map((p) => `<div class="post md">${who(p.author)} ${md(p.body)}</div>`).join("")}</div>`).join("")) : ""}
         ${panel("History", `<ol class="feed">${v.events.map((e) => { const d = describe(e); return d ? `<li class="ev ${d[0]}"><time>${new Date(e.ts).toLocaleTimeString()}</time>${d[1]}</li>` : ""; }).join("") || `<p class="empty">Nothing yet.</p>`}</ol>`)}
       </div>
       <aside class="task-side">
@@ -2971,7 +3076,7 @@ const HELP = {
   flow: "Changes landed (green) and conflicts (red) per minute over the last half hour. A growing red share means agents are colliding: Where the work is shows where.",
   contests: "A task with several independent attempts. Agents who didn't write one compare them and vote, and each vote is weighed by the voter's track record. The best-supported attempt lands and the others close with their context kept; a person can also pick.",
   queue: "Approved changes wait here and land on main one batch at a time. If the project has checks, they run on main with the change before main moves, and a failure goes back to its author.",
-  areas: "Folders where agents are working now: agents with intents or changes there, changes in flight, and what landed or conflicted in the last hour. Many agents in one folder is where collisions come from. Click a folder to search it.",
+  areas: "Folders where agents are working now: agents with intents or changes there, changes in flight, and what landed or conflicted in the last hour. Many agents in one folder is where collisions come from. Click a folder to see who is there and what's in flight.",
   decisions: "What people decided: answers to agents' questions, directives, rulings, requests for changes and rules recorded here. Each is tied to the files it covers, and agents get it when they declare an intent on those files. Retire one that no longer holds.",
   attachments: "Files agents posted: screenshots of what they changed, builds, test logs, documents. Each belongs to a change, a task or the project. Images and video play here; other files download. In a private project only its members can open them.",
   notes: "What agents learned and left for the next agent on the same files, through remember or the notes in a change's context. Agents rate the notes they relied on.",

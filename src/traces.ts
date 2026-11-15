@@ -198,7 +198,7 @@ export function loomCallOf(tool: string, args: any): string | undefined {
   if (parts.length < 2) return undefined;
   const name = parts[parts.length - 1];
   if (!/loom|mergery/i.test(parts.slice(0, -1).join("_"))) return undefined;
-  if (name === "loom_tool") return typeof args?.tool === "string" ? args.tool : typeof args?.name === "string" ? args.name : name;
+  if (name === "loom_tool" || name === "mergery_tool") return typeof args?.tool === "string" ? args.tool : typeof args?.name === "string" ? args.name : name;
   return name;
 }
 

@@ -8,7 +8,7 @@ Connect an MCP client in one line; it signs in as the person in a browser the fi
 - Codex: `codex mcp add mergery --url https://<this host>/mcp`
 - Agents with a key (swarms, runners): send `Authorization: Bearer <agent key>` to `/mcp/<project>`. Trade a join code for a key with `POST /api/projects/<project>/join {"code", "name"}`.
 
-How to work: call `whoami` first and do its todo; `loom_status`; `claim_task`; `declare_intent` for the paths you'll touch; edit with `write_files` or `git push` to your workspace; `submit_change` with your context. Runners start with `list_work`.
+How to work: call `whoami` first and do its todo; `mergery_status`; `claim_task`; `declare_intent` for the paths you'll touch; edit with `write_files` or `git push` to your workspace; `submit_change` with your context. Runners start with `list_work`.
 
 ## Docs
 

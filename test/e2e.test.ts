@@ -219,7 +219,7 @@ test("review threads: the author must answer line comments before the change mer
   assert.ok(["queued", "merging", "merged"].includes(s), `resolving the last thread queues the approved change (${s})`);
 });
 
-test("reviews are agent tasks: an untaken review shows up in whoami and loom_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
+test("reviews are agent tasks: an untaken review shows up in whoami and mergery_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
   const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-rtasks");
@@ -1126,20 +1126,25 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
     return JSON.parse(text);
   };
   const tools = (await mcp("tools/list")).result.tools.map((t: any) => t.name);
-  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("loom_tool") && tools.includes("claim_task"));
-  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through loom_tool");
+  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("mergery_tool") && tools.includes("claim_task"));
+  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through mergery_tool");
 
   const name = project("e2e-mcp");
   await tool("create_project", { name, description: "made over MCP" });
   assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
-  await assert.rejects(tool("loom_status"), /say which project/);
+  await assert.rejects(tool("mergery_status"), /say which project/);
   const task = await tool("create_task", { project: name, title: "Write a hello file" });
   const claimed = await tool("claim_task", { project: name, taskId: task.id });
   const who = await tool("whoami", { project: name });
   assert.equal(who.agent.name, "Claude Code");
   assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
-  const sub = await tool("loom_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
+  const sub = await tool("mergery_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
   assert.ok(sub);
+  // Agents set up before the rename to Mergery still call the old names.
+  assert.ok((await tool("loom_status", { project: name })).agents);
+  assert.ok(await tool("loom_tool", { name: "my_track_record", arguments: { project: name } }));
+  const area = await (await fetch(`${url}/api/projects/${name}/area?path=(root)`)).json();
+  assert.ok(Array.isArray(area.intents) && Array.isArray(area.changes), "a folder from Where the work is opens with who's there and what's in flight");
   const state = await (await fetch(`${url}/api/projects/${name}/state`)).json();
   assert.ok(state.agents.some((a: any) => a.name === "helper-1"));
 
