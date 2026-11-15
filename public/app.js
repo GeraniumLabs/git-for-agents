@@ -1060,11 +1060,16 @@ function colorPatch(files) {
 const lineHtml = (l, side) => { const h = side === "old" ? l.old_html : l.html; return h === undefined ? esc(l.text) : `<span class="hl">${h}</span>`; };
 const mark = (l) => `<span class="mk">${l.kind === "add" ? "+" : l.kind === "del" ? "-" : " "}</span>`;
 async function showClone(box, target) {
-  if (!me) { box.innerHTML = `<p class="meta">Sign in to get a clone command; it carries a read-only token for an hour.</p>`; return; }
+  if (!me) { box.innerHTML = `<p class="meta">Sign in, or use an agent key, to get clone and pull commands; they carry a read-only token for an hour.</p>`; return; }
   const r = await act("POST", "/checkout", target);
   if (!r || r.error) return;
-  box.innerHTML = `<pre class="diff copy">${esc(r.clone)}${r.compare ? `\n${esc(r.compare)}` : ""}</pre><p class="meta">${esc(r.note)} <button class="ghost mini" id="copy-clone">Copy</button></p>`;
-  $("#copy-clone").onclick = () => navigator.clipboard?.writeText(r.clone + (r.compare ? `\n${r.compare}` : "")).then(() => toast("Copied"));
+  const block = (id, label, text, help = "") => `<div class="clone-cmd"><div class="row"><b class="grow">${label}</b><button class="ghost mini" data-copy-cmd="${id}">Copy</button></div><pre class="diff copy">${esc(text)}</pre>${help ? `<p class="meta">${help}</p>` : ""}</div>`;
+  const cmds = { clone: r.clone + (r.compare ? `\n${r.compare}` : ""), pull: r.pull, key: r.pullWithKey };
+  box.innerHTML = block("clone", "Clone", cmds.clone)
+    + (r.pull ? block("pull", "Pull into a clone you have", r.pull, "Fetches the latest and merges it, with a fresh token, so it works after the one in your clone expires.") : "")
+    + (r.pullWithKey ? block("key", "Pull with an agent key, any time", r.pullWithKey, `Asks Mergery for a fresh pull command with the key in <span class="mono">$LOOM_KEY</span> and runs it. Needs <span class="mono">jq</span>. Good for scripts and agents that don't sign in.`) : "")
+    + `<p class="meta">${esc(r.note)}</p>`;
+  for (const b of box.querySelectorAll("[data-copy-cmd]")) b.onclick = () => navigator.clipboard?.writeText(cmds[b.dataset.copyCmd]).then(() => toast("Copied"));
 }
 // The code page: #code for main, #code/change/<id> or #code/workspace/<name>
 // for someone's work, then /tree/<folder>, /file/<path> or /history.

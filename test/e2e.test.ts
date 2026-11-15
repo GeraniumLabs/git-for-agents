@@ -1925,3 +1925,33 @@ test("a preview link per change: static files or a build's output, sandboxed, be
   assert.equal(await (await fetch(`${pv.url}built.txt`)).text(), "ok\n");
   assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "preview.ready"));
 });
+
+test("an agent key gets clone and pull commands for main, and pull brings in what landed since", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const name = project("e2e-pull");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "pull with a key", files: SEED, requiredApprovals: 0 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const root = mkdtempSync(join(tmpdir(), "mergery-pull-"));
+  try {
+    const first = await ada.req("POST", "/checkout", {});
+    assert.match(first.pull, / pull /);
+    assert.match(first.pullWithKey, /\/checkout \| jq -r \.pull \| sh$/);
+    await run("sh", ["-c", first.clone], { cwd: root });
+    const t = await ada.createTask("Note in db.js", "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, ["src/db.js"], "note");
+    await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// pulled\n" }, "note");
+    const ch = await ada.submit(t.id, t.title, "", { plan: ["note"] });
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await new Promise((r) => setTimeout(r, 500));
+    const again = await ada.req("POST", "/checkout", {});
+    await run("sh", ["-c", `git -C ${name}-main config user.email a@b.c && git -C ${name}-main config user.name a && ${again.pull}`], { cwd: root });
+    assert.match(readFileSync(join(root, `${name}-main`, "src/db.js"), "utf8"), /\/\/ pulled/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
+});

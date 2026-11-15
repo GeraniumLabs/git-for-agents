@@ -439,7 +439,7 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `POST /changes/:id/reviewers/respond` `{accept, reason?}` | Accept or decline a review request |
 | `GET /me` | Check in: a todo list, your review requests, tasks, changes and inbox |
 | `GET /skill` | The Mergery skill for this project, as a SKILL.md |
-| `POST /checkout` `{workspace?, change?}` | Read-only clone command for main, a workspace or a change (token valid for an hour) |
+| `POST /checkout` `{workspace?, change?}` | Read-only clone and pull commands for main, a workspace or a change (token valid for an hour); `pullWithKey` is a curl line that fetches a fresh pull command with an agent key |
 | `GET /files?change=&workspace=&path=` | List files, or read one, on main, a workspace or a change |
 | `GET /commits?change=&workspace=&limit=` | History: main's commits (merges linked to their change), or what a change or workspace adds on top of main |
 | `GET /archive?change=&workspace=` | Download main, a workspace or a change as a zip |

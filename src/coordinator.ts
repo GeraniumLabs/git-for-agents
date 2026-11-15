@@ -1077,7 +1077,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ownerOnly("import issues");
       return json(await this.importIssues(actor, body));
     }
-    if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
+    if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body, url.origin));
     if (a === "me") return json(this.me(actor));
     // Traces are for the project's people (and its agents, if an owner allows), even on a public project,
     // unless an owner published them (the open reads above). Asking, reports and scorecards stay people only.
@@ -1640,7 +1640,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * the project: people review locally with their own tools. Writing still goes
    * through a claimed task's workspace, and main only through the merge queue.
    */
-  private async checkout(actor: Agent, body: { workspace?: string; change?: number }) {
+  private async checkout(actor: Agent, body: { workspace?: string; change?: number }, origin = "") {
     const { repo, label, at } = this.repoFor(body);
     const ttl = 3600;
     const token = await this.store.token(repo, "read", ttl);
@@ -1650,7 +1650,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       repo, remote, token, expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
       clone: `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} ${dir}${at ? ` && git -C ${dir} checkout --detach ${at}` : ""}`,
       ...(at ? { compare: `cd ${dir} && git diff ${at}^1 ${at}` } : {}),
-      ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:loom-main && git diff loom-main...HEAD` } : {}),
+      ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:mergery-main && git diff mergery-main...HEAD` } : {}),
+      // Bring a clone you already have up to date. The token in it expires, so the remote and a fresh token go on the command itself.
+      ...(at ? {} : { pull: `git -C ${dir} -c http.extraHeader="Authorization: Bearer ${token}" pull ${remote} main` }),
+      // For keys and scripts: a fresh pull command whenever you need one, no browser.
+      ...(at || !origin ? {} : { pullWithKey: `curl -fsS -X POST -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" -d '${JSON.stringify(body.workspace ? { workspace: body.workspace } : body.change ? { change: body.change } : {})}' ${origin}/api/projects/${this.project}/checkout | jq -r .pull | sh` }),
       note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
     };
   }

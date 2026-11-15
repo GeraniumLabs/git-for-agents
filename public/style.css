@@ -821,3 +821,5 @@ pre.out { max-height: 220px; overflow: auto; font-size: var(--fs-11_5); white-sp
 .md pre.md-code { font-family: var(--mono, ui-monospace, monospace); font-size: var(--fs-12, 12px); background: var(--code-bg, rgba(127,127,127,.12)); padding: 8px 10px; border-radius: 6px; overflow-x: auto; white-space: pre; margin: 6px 0; }
 .md blockquote { margin: 4px 0; padding-left: 10px; border-left: 3px solid var(--line, rgba(127,127,127,.4)); color: var(--muted, inherit); }
 .md a { color: var(--info); text-decoration: underline; }
+.clone-cmd { margin: 6px 0 10px; }
+.clone-cmd pre { margin: 4px 0; }
