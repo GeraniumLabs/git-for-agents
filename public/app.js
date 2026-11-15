@@ -158,7 +158,12 @@ const GITHUB_MARK = `<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden
 async function showSignIn(why = "") {
   const logo = document.querySelector("header .logo svg")?.outerHTML ?? "";
   const owners = user && notMember ? (await api("/members").catch(() => [])).filter((p) => p.owner).map((p) => p.login) : [];
-  const where = project ? `<p class="si-sub">to continue to <b>${esc(project)}</b></p>` : "";
+  // Name the project only when it's one you'd sign in to. The showcase demos
+  // are where new people land, so they get a welcome rather than "continue to todo-swarm".
+  const demo = !project || (auth.showcase ?? []).includes(project);
+  const where = demo
+    ? `<p class="si-sub">New here? Signing in creates your free account.</p>`
+    : `<p class="si-sub">to continue to <b>${esc(project)}</b></p>`;
   let body;
   if (user && notMember) {
     body = `<h2 id="si-title">You're not a member yet</h2>${where}
