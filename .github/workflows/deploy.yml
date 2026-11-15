@@ -11,7 +11,7 @@
 #                                   R2 Storage edit come with the template).
 #            CLOUDFLARE_ACCOUNT_ID  the account Mergery runs in
 #   variable LOOM_URL               where it answers, for the check after the
-#                                   deploy (default loom.geraniumlabs.workers.dev)
+#                                   deploy (default mergery.dev)
 #
 # Without them the deploy job says so and skips, so forks stay green.
 # Worker secrets (LOOM_ADMIN_TOKEN and the rest) live in Cloudflare and are
@@ -102,7 +102,7 @@ jobs:
       - if: steps.creds.outputs.ok == 'true'
         name: Check the live site answers
         env:
-          LOOM_URL: ${{ vars.LOOM_URL || 'https://loom.geraniumlabs.workers.dev' }}
+          LOOM_URL: ${{ vars.LOOM_URL || 'https://mergery.dev' }}
         run: |
           for i in 1 2 3 4 5; do
             code=$(curl -s -o /dev/null -w "%{http_code}" "${LOOM_URL%/}/api/projects") && [ "$code" = 200 ] && exit 0
