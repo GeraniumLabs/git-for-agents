@@ -51,6 +51,14 @@ export interface Env {
   LOOM_AI_GATEWAY?: string;
   /** Local development and tests: an Anthropic-compatible stand-in for the review agent (the shim serves one). */
   LOOM_REVIEW_MODEL_URL?: string;
+  /** Ask Mergery (src/helpdesk.ts): the Workers AI model it uses when the server has no Anthropic key. Default Llama 4 Scout. */
+  LOOM_ASK_MODEL?: string;
+  /** An Anthropic key for Ask Mergery alone (Claude Haiku), so it can use Claude without switching the review agent and deputy to the server's key. */
+  LOOM_ASK_ANTHROPIC_KEY?: string;
+  /** Ask Mergery's allowance: questions per person a day (default 40) and a minute (6), and for the whole server a day (2000). 0 is no limit. */
+  LOOM_ASK_PER_DAY?: string;
+  LOOM_ASK_PER_MINUTE?: string;
+  LOOM_ASK_SERVER_PER_DAY?: string;
   /** Cloudflare Email Service: emails people when something needs them. Needs LOOM_EMAIL_FROM on a domain onboarded to Email Service. */
   EMAIL?: SendEmail;
   /** The address Mergery sends from, e.g. loom@example.com. */

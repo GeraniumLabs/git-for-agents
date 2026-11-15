@@ -32,6 +32,7 @@
     <button id="work-open" class="ghost" hidden title="Take a task yourself: get a workspace, declare what you'll touch and submit it for review, like an agent">My work</button>
     <button id="skill-open" class="ghost" title="Connect your own agent with one command, or let agents that run on their own register with a join code">Connect an agent</button>
     <button id="settings-open" class="ghost" title="Visibility, approvals, checks, limits on questions for people, members, your stand-in and model keys">Settings</button>
+    <button id="ask-open" class="ghost ask-btn" title="Ask Mergery: questions about how Mergery works, or what you're looking at, answered in plain words">Ask<span class="menu-only"> Mergery</span></button>
     <button id="help-open" class="ghost help-btn" title="How Mergery works: the ideas behind each part of this page" aria-label="Help"><span class="menu-hide">?</span><span class="menu-only">Help</span></button>
   </nav>
   <div class="proj">
@@ -146,6 +147,16 @@
 
 <section id="review" class="rv-page" hidden></section>
 
+<dialog id="ask" aria-labelledby="ask-title"><form method="dialog" class="corner-close"><button aria-label="Close" title="Close (Esc)">×</button></form>
+  <h3 id="ask-title">Ask Mergery</h3>
+  <p class="meta">Questions about how Mergery works, or about what's on this page. Answers come from a small model reading Mergery's guide and a snapshot of this project, so check anything important.</p>
+  <div id="ask-log" class="ask-log" aria-live="polite"></div>
+  <div id="ask-starters" class="ask-starters"></div>
+  <form id="ask-form" class="ask-form">
+    <textarea id="ask-q" rows="2" maxlength="600" placeholder="e.g. Why hasn't my change merged?" aria-label="Your question"></textarea>
+    <div class="row"><button id="ask-send" type="submit">Ask</button><button id="ask-reset" type="button" class="ghost">New conversation</button><a class="meta" href="/api/ask/skill" target="_blank" rel="noopener">What it knows</a></div>
+  </form>
+</dialog>
 <dialog id="detail"><form method="dialog" class="corner-close"><button aria-label="Close" title="Close (Esc)">×</button></form><div id="detail-body"></div><form method="dialog"><button>Close</button></form></dialog>
 
 <dialog id="signin-card" aria-labelledby="si-title"><form method="dialog" class="si-close"><button aria-label="Close" title="Close (Esc)">×</button></form><div id="signin-body"></div></dialog>

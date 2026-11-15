@@ -10,6 +10,8 @@ import { AGENT_HEADER, DIRECTIVES_HEADER, PERSON_AGENT_HEADER } from "./coordina
 import { formatCredential, parseCredentialRequest, projectCandidates, repoOf } from "./gitlogin";
 import { PLANS, billingOn, testMode, checkoutSession, planUpdate, portalSession, serverLimits, verifyStripe, type PlanRow, type ProjectPlan } from "./billing";
 import { ORG_SLUG, orgAccount, type OrgPeople, type OrgRole } from "./orgs";
+import { HELP_LIMITS, HELP_WORKERS_AI_MODEL, askHelp, parseHelpInput, projectDigest, type HelpModel } from "./helpdesk";
+import { MERGERY_SKILL } from "./askskill";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
@@ -236,6 +238,50 @@ function mcpAccount(env: Env, user: User): Account {
   };
 }
 
+
+/** Ask Mergery's model: Claude Haiku with the server's Anthropic key, else Workers AI; both through AI Gateway. Never a project's own key. */
+async function helpModel(env: Env): Promise<HelpModel | null> {
+  const gateway = env.LOOM_AI_GATEWAY || "default";
+  const key = env.LOOM_ASK_ANTHROPIC_KEY || env.ANTHROPIC_API_KEY;
+  if (env.LOOM_REVIEW_MODEL_URL) return { kind: "claude", apiKey: key ?? "dev", baseURL: env.LOOM_REVIEW_MODEL_URL };
+  if (key) return { kind: "claude", apiKey: key, baseURL: env.AI ? await env.AI.gateway(gateway).getUrl("anthropic") : undefined };
+  if (env.AI) return { kind: "workers-ai", ai: env.AI, model: env.LOOM_ASK_MODEL || HELP_WORKERS_AI_MODEL, gateway };
+  return null;
+}
+
+const limit = (v: string | undefined, d: number) => (v !== undefined && v !== "" && Number.isFinite(Number(v)) ? Number(v) : d);
+
+/** POST /api/ask: a person's question about how Mergery works, answered with what they're looking at. */
+async function helpAsk(env: Env, req: Request): Promise<Response> {
+  const user = await sessionUser(env, req);
+  if (!user) return Response.json({ error: "sign in with GitHub to ask Mergery" }, { status: 401 });
+  const parsed = parseHelpInput(await req.json<any>().catch(() => ({})));
+  if ("error" in parsed) return Response.json({ error: parsed.error }, { status: 400 });
+  const model = await helpModel(env);
+  if (!model) return Response.json({ error: "Ask Mergery has no model on this server: bind Workers AI or set ANTHROPIC_API_KEY" }, { status: 503 });
+  const quota = await registry(env).fetch("https://do/registry/help-quota", { method: "POST", body: JSON.stringify({
+    login: user.login,
+    perDay: limit(env.LOOM_ASK_PER_DAY, HELP_LIMITS.perPersonPerDay),
+    perMinute: limit(env.LOOM_ASK_PER_MINUTE, HELP_LIMITS.perPersonPerMinute),
+    serverPerDay: limit(env.LOOM_ASK_SERVER_PER_DAY, HELP_LIMITS.serverPerDay),
+  }) }).then((r) => r.json<{ ok: boolean; reason?: string; left: number | null }>());
+  if (!quota.ok) return Response.json({ error: quota.reason }, { status: 429 });
+  // What the person is looking at, read as them: a private project they can't see tells the model nothing.
+  if (parsed.project && (await locate(env, parsed.project)).exists) {
+    const headers = { [USER_HEADER]: JSON.stringify(user) };
+    const stub = await coordinator(env, parsed.project);
+    const get = (p: string) => stub.fetch(`https://do/${p}`, { headers }).then((r) => (r.ok ? r.json<any>() : null)).catch(() => null);
+    const [overview, state, me] = await Promise.all([get("overview"), get("state"), get("me")]);
+    if (overview) {
+      const role = me?.agent ? (me.agent.owner ? "an owner" : "a member") : "a visitor (not a member)";
+      parsed.digest = projectDigest(overview, state, parsed.view, role);
+    }
+  }
+  const r = await askHelp(model, parsed);
+  if (!r.ok) return Response.json({ error: `Ask Mergery couldn't answer: ${r.reason}` }, { status: 502 });
+  return Response.json({ answer: r.answer, model: r.model, grounded: !!parsed.digest, left: quota.left });
+}
+
 export default {
   async fetch(req: Request, env: Env): Promise<Response> {
     const url = new URL(req.url);
@@ -350,6 +396,10 @@ export default {
       }
       return Response.json({ error: "not found" }, { status: 404 });
     }
+
+    // Ask Mergery: the help assistant, and the skill it answers from.
+    if (path === "/api/ask/skill" && req.method === "GET") return new Response(MERGERY_SKILL, { headers: { "content-type": "text/markdown; charset=utf-8", "cache-control": "public, max-age=300" } });
+    if (path === "/api/ask" && req.method === "POST") return helpAsk(env, req);
 
     const auth = await handleAuth(env, req, (p, init) => registry(env).fetch(`https://do${p}`, init));
     if (auth) return auth;

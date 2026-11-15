@@ -824,6 +824,30 @@ pre.out { max-height: 220px; overflow: auto; font-size: var(--fs-11_5); white-sp
 .clone-cmd { margin: 6px 0 10px; }
 .clone-cmd pre { margin: 4px 0; }
 
+/* Ask Mergery: the help assistant. */
+dialog#ask { width: min(640px, 94vw); }
+#ask h3 { margin-top: 0; }
+.ask-log { display: flex; flex-direction: column; gap: 10px; max-height: 50vh; overflow: auto; margin: 10px 0; }
+.ask-log:empty { display: none; }
+.ask-msg { padding: 10px 12px; border-radius: 10px; font-size: var(--fs-13_5); line-height: 1.5; border: 1px solid var(--line); }
+.ask-msg.you { align-self: flex-end; max-width: 85%; background: var(--chip); }
+.ask-msg.bot { background: var(--panel); }
+.ask-msg.bot p { margin: 0 0 6px; }
+.ask-msg.bot p:last-child, .ask-msg.bot ul:last-child, .ask-msg.bot ol:last-child { margin-bottom: 0; }
+.ask-msg.bot ul, .ask-msg.bot ol { margin: 4px 0 6px; padding-left: 20px; }
+.ask-msg.bot code { font-size: .92em; }
+.ask-msg.err { color: var(--bad, #b42318); }
+.ask-msg .ask-meta { margin-top: 6px; color: var(--muted); font-size: var(--fs-12); }
+.ask-starters { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
+.ask-starters:empty { display: none; }
+dialog .ask-starters button { margin: 0; font-size: var(--fs-12); border-radius: 99px; padding: 4px 10px; }
+.ask-form textarea { width: 100%; box-sizing: border-box; resize: vertical; font: inherit; padding: 8px 10px; border: 1px solid var(--line); border-radius: 8px; background: var(--bg, var(--panel)); color: var(--ink); }
+.ask-form .row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ask-form .row a { margin-left: auto; margin-top: 10px; }
+.ask-thinking { color: var(--muted); font-style: italic; }
+dialog #ask-send { background: var(--accent); border-color: var(--accent); color: #fff; }
+dialog #ask-send:disabled { opacity: .6; cursor: default; }
+@media (max-width: 640px) { #ask:has(.ask-log:not(:empty)) > p.meta { display: none; } }
 /* Sign-in card: a small centered card, the way most sites do it. Logo, heading,
    one full-width GitHub button, fine print. Stays a card on phones too. */
 dialog#signin-card { width: min(400px, calc(100vw - 32px)); max-height: none; padding: 36px 32px 28px; border-radius: 14px; text-align: center; position: relative; }
