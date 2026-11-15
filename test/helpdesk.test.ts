@@ -61,3 +61,12 @@ test("Workers AI: history and the question go in order, and an empty reply is a 
   const empty = { run: async () => ({ response: "" }) } as unknown as Ai;
   assert.equal((await askHelp({ kind: "workers-ai", ai: empty, model: "m" }, { question: "q", history: [], project: null, view: null, digest: null })).ok, false);
 });
+
+test("made-up links become the guide; Mergery's own links stay", async () => {
+  const { keepKnownLinks } = await import("../src/helpdesk");
+  const guide = "https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md";
+  assert.equal(keepKnownLinks("See https://docs.mergery.dev/."), `See ${guide}.`);
+  assert.equal(keepKnownLinks("[Docs](https://mergery.dev/docs)"), `[Docs](${guide})`);
+  assert.equal(keepKnownLinks("Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm"), "Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm");
+  assert.equal(keepKnownLinks(`Read ${guide}, or https://mergery.dev/pricing`), `Read ${guide}, or https://mergery.dev/pricing`);
+});
