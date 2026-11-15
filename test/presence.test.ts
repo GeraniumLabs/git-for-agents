@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { GONE_MS, RELEASE_MS, canTakeOver, nextRelease, releaseNow, type Holding } from "../src/presence.ts";
+import { GONE_MS, RELEASE_MS, byName, canTakeOver, nextRelease, releaseNow, type Holding } from "../src/presence.ts";
 
 const now = 10 * GONE_MS;
 const h = (taskStatus: string, quietMs: number, more: Partial<Holding> = {}): Holding => ({ taskStatus, changeStatus: null, lastSeen: now - quietMs, paused: false, ...more });
@@ -49,4 +49,16 @@ test("another agent can take over a quiet holder's task, but not a live one's, n
   assert.equal(canTakeOver("open", now - quiet - 1, now, quiet), false);
   assert.equal(canTakeOver("open", now - GONE_MS - 1, now, quiet), true);
   assert.equal(canTakeOver("claimed", null, now, quiet), true);
+});
+
+test("agents count once per name, in the busiest state of their records", () => {
+  const agents = [
+    { name: "builder", state: "away" }, { name: "Builder", state: "working" }, { name: "builder ", state: "gone" },
+    { name: "reviewer", state: "away" }, { name: "reviewer", state: "idle" },
+    { name: "jonathan", state: "human" },
+  ];
+  const named = byName(agents);
+  assert.equal(named.length, 2, "the person isn't an agent, and each name counts once");
+  assert.equal(named.find((a) => a.name.toLowerCase() === "builder")!.state, "working");
+  assert.equal(named.find((a) => a.name === "reviewer")!.state, "idle");
 });

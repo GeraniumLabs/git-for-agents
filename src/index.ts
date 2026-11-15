@@ -204,7 +204,7 @@ function mcpAccount(env: Env, user: User): Account {
       const res = await createProject(env, user, body);
       const data = await res.json<any>();
       if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
-      return { ...data, next: `Pass project "${body.name}" to the other tools: loom_status, then create_task or claim_task.` };
+      return { ...data, next: `Pass project "${body.name}" to the other tools: mergery_status, then create_task or claim_task.` };
     },
   };
 }
