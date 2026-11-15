@@ -149,19 +149,35 @@ function renderMe() {
   $("#work-open").hidden = !me;
 }
 
-/** Sign in with GitHub; or, if already signed in but not a member, say who can add you. */
+const GITHUB_MARK = `<svg viewBox="0 0 16 16" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>`;
+
+/**
+ * The sign-in card: logo, one heading, the GitHub button and a line of fine
+ * print. Signed in but not a member, it says who can add you instead.
+ */
 async function showSignIn(why = "") {
-  const ghButton = auth.github ? `<a class="button" href="${githubUrl()}">Sign in with GitHub</a>` : `<p class="meta">GitHub sign-in isn't set up on this server yet. <a href="/auth/setup">Set it up</a> (one click, needs the admin token once).</p>`;
-  const dev = auth.dev ? `<div class="row"><input id="si-dev" placeholder="Any GitHub login (local development)"><button class="ghost" id="si-dev-go">Sign in locally</button></div>` : "";
+  const logo = document.querySelector("header .logo svg")?.outerHTML ?? "";
   const owners = user && notMember ? (await api("/members").catch(() => [])).filter((p) => p.owner).map((p) => p.login) : [];
-  $("#detail-body").innerHTML = `
-    <h3>Sign in to ${esc(project)}</h3>
-    ${why ? `<p>${esc(why)}</p>` : ""}
-    ${user && notMember
-      ? `<p>You're signed in as <b>${esc(user.login)}</b>, but you aren't a member of ${esc(project)} yet. ${owners.length ? `Ask ${owners.map(esc).join(" or ")} to add you in Settings.` : "Ask one of its owners to add you in Settings."}</p>`
-      : `<p class="meta">People sign in with GitHub. Your answers, reviews and decisions carry your name.</p><div class="row">${ghButton}</div>${dev}`}`;
+  const where = project ? `<p class="si-sub">to continue to <b>${esc(project)}</b></p>` : "";
+  let body;
+  if (user && notMember) {
+    body = `<h2 id="si-title">You're not a member yet</h2>${where}
+      <p class="si-note">You're signed in as <b>${esc(user.login)}</b>. ${owners.length ? `Ask ${owners.map(esc).join(" or ")} to add you in Settings.` : "Ask one of the project's owners to add you in Settings."}</p>`;
+  } else {
+    const gh = auth.github
+      ? `<a class="si-github" href="${githubUrl()}">${GITHUB_MARK}<span>Continue with GitHub</span></a>`
+      : `<p class="si-note">GitHub sign-in isn't set up on this server yet. <a href="/auth/setup">Set it up</a> (one click, needs the admin token once).</p>`;
+    const dev = auth.dev ? `<div class="si-or"><span>or, for local development</span></div><div class="si-dev"><input id="si-dev" placeholder="Any GitHub login" aria-label="GitHub login"><button id="si-dev-go">Sign in locally</button></div>` : "";
+    body = `<h2 id="si-title">Sign in to Mergery</h2>${where}
+      ${why ? `<p class="si-why">${esc(why)}</p>` : ""}
+      ${gh}${dev}
+      <p class="si-fine">Your reviews, answers and decisions carry your GitHub name. By continuing you agree to the <a href="/terms" target="_blank">Terms</a> and <a href="/privacy" target="_blank">Privacy Policy</a>.</p>`;
+  }
+  $("#signin-body").innerHTML = `<div class="si-logo">${logo}</div>${body}`;
   if ($("#si-dev-go")) $("#si-dev-go").onclick = () => { const l = $("#si-dev").value.trim(); if (l) location.href = `/auth/dev?login=${encodeURIComponent(l)}&return=${encodeURIComponent(location.pathname + location.search)}`; };
-  if (!$("#detail").open) $("#detail").showModal();
+  const d = $("#signin-card");
+  if (!d.open) d.showModal();
+  ($("#signin-body .si-github") ?? $("#si-dev"))?.focus({ focusVisible: false });
 }
 
 /**
@@ -2540,7 +2556,6 @@ function route() {
   $("#review").hidden = !(m || cm);
   if (!cm) code = null;
   if (!m && !cm) { review = null; $("#review").innerHTML = ""; return; }
-  if ($("#detail").open) $("#detail").close();
   if (cm) {
     review = null;
     const target = cm[1] ? { change: Number(cm[1]) } : cm[2] ? { workspace: decodeURIComponent(cm[2]) } : {};
