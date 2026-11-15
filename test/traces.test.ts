@@ -224,3 +224,54 @@ test("OpenCode sessions (as opencode export prints them) become steps, with Merg
   const intent = intentOf(t.steps, { paths: ["src/db.js"], changeId: 9 });
   assert.ok(intent.acts.some((a) => a.kind === "edit" && a.what === "src/db.js"));
 });
+
+test("OpenCode `run --format json` lines become steps, with usage from each step's finish and mergery_ tools as Mergery calls", () => {
+  const log = [
+    "Starting session…",
+    line({ type: "step_start", timestamp: 1762938000000, sessionID: "ses_run", part: { id: "p0", sessionID: "ses_run", messageID: "msg_1", type: "step-start" } }),
+    line({ type: "text", timestamp: 1762938001000, sessionID: "ses_run", part: { id: "p1", sessionID: "ses_run", messageID: "msg_1", type: "text", text: "Reading the engine first." } }),
+    line({ type: "tool_use", timestamp: 1762938002000, sessionID: "ses_run", part: { id: "p2", sessionID: "ses_run", messageID: "msg_1", type: "tool", tool: "mergery_declare_intent", callID: "c1", state: { status: "completed", input: { taskId: 5, paths: ["packages/engine/src/engine.ts"] }, output: "{\"id\":7}", time: { start: 1762938002000, end: 1762938003000 } } } }),
+    line({ type: "tool_use", timestamp: 1762938004000, sessionID: "ses_run", part: { id: "p3", sessionID: "ses_run", messageID: "msg_1", type: "tool", tool: "edit", callID: "c2", state: { status: "completed", input: { filePath: "packages/engine/src/engine.ts" }, output: "ok", time: { start: 1762938004000, end: 1762938005000 } } } }),
+    line({ type: "step_finish", timestamp: 1762938006000, sessionID: "ses_run", part: { id: "p4", sessionID: "ses_run", messageID: "msg_1", type: "step-finish", tokens: { input: 300, output: 40, reasoning: 10, cache: { read: 100, write: 0 } }, cost: 0.01 } }),
+  ].join("\n");
+  assert.equal(detectSource(log), "opencode");
+  const t = parseTrace(log);
+  assert.equal(t.sessionId, "ses_run");
+  assert.deepEqual(t.steps.map((s) => s.kind), ["message", "tool_call", "tool_result", "tool_call", "tool_result"]);
+  assert.equal(t.steps[1].loomCall, "declare_intent");
+  assert.deepEqual(t.steps[3].files, ["packages/engine/src/engine.ts"]);
+  assert.equal(t.tokensIn, 400);
+  assert.equal(t.tokensOut, 50);
+  assert.equal(t.costUsd, 0.01);
+  assert.ok(t.startedAt && t.endedAt && t.endedAt > t.startedAt);
+});
+
+test("an OpenCode export whose session info runs past 20 KB, after a line of prose, is still read", () => {
+  const doc = JSON.parse(opencode);
+  doc.info.summary = { diffs: [{ file: "src/db.js", before: "x".repeat(40_000), after: "y".repeat(40_000) }] };
+  const big = `Exporting session: ses_1\n${JSON.stringify(doc, null, 2)}`;
+  assert.equal(detectSource(big), "opencode");
+  assert.equal(parseTrace(big).steps.length, 9);
+});
+
+test("Mergery's step lines: any harness can write them, and thoughts can be dropped", () => {
+  const log = [
+    line({ ts: "2026-11-15T09:30:00Z", kind: "prompt", text: "Wire the daemon" }),
+    line({ ts: "2026-11-15T09:30:05Z", kind: "thought", text: "The socket path goes in config" }),
+    line({ ts: "2026-11-15T09:30:06Z", kind: "tool_call", tool: "mergery_submit_change", input: { taskId: 5 }, model: "glm-5", tokensIn: 10, tokensOut: 2 }),
+    line({ ts: "2026-11-15T09:30:07Z", kind: "tool_result", tool: "mergery_submit_change", output: "change #6" }),
+    line({ ts: "2026-11-15T09:30:08Z", kind: "tool_call", tool: "write", input: { path: "src/daemon.ts" } }),
+  ].join("\n");
+  assert.equal(detectSource(log), "steps");
+  const t = parseTrace(log);
+  assert.equal(t.source, "steps");
+  assert.deepEqual(t.steps.map((s) => s.kind), ["prompt", "thought", "tool_call", "tool_result", "tool_call"]);
+  assert.equal(t.steps[2].loomCall, "submit_change");
+  assert.deepEqual(t.steps[4].files, ["src/daemon.ts"]);
+  assert.deepEqual(t.models, ["glm-5"]);
+  assert.ok(!dropThoughts(log, "steps").includes("socket path"));
+});
+
+test("a summary written as prose stays plain text", () => {
+  assert.equal(detectSource("## What I did\n- built the daemon\n- ran 145 tests\nses_e234aea74ffeC9SWwzuLeHBVPR"), "text");
+});

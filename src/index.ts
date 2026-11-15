@@ -463,7 +463,7 @@ export default {
           const pending = res.headers.get(DIRECTIVES_HEADER);
           directives = pending ? JSON.parse(decodeURIComponent(pending)) : [];
           const data = await res.json<any>();
-          if (!res.ok) throw new Error(data?.error ?? `HTTP ${res.status}`);
+          if (!res.ok) throw Object.assign(new Error(data?.error ?? `HTTP ${res.status}`), { status: res.status });
           return data;
         };
         return Object.assign(call, { directives: () => directives });

@@ -27,6 +27,8 @@ export interface BriefInput {
   knownBy: Record<string, string[]>;
   /** Paths the author wrote before this change. */
   authorKnows: string[];
+  /** Why a file is in the change, in the author's words (submit_change explanations, or intent reasons). */
+  explained?: Record<string, string>;
   /** Times the change was sent back. */
   sentBack: number;
   /** Open review threads that must be resolved before merge. */
@@ -50,6 +52,14 @@ export interface Brief {
 
 const TEST = /(^|\/)(tests?|__tests__|spec)\/|\.(test|spec)\.[a-z]+$/i;
 const NOT_CODE = /\.(md|txt|json|ya?ml|toml|lock|png|jpe?g|gif|svg|css|html?)$/i;
+/**
+ * Files a change touches as a side effect, not as its substance: lockfiles,
+ * ignore lists, OS litter. Installing a package rewrites the lockfile whatever
+ * the task, so these never make a change look risky, never count as other
+ * agents' territory, and never pick its reviewers.
+ */
+const HOUSEKEEPING = /(^|\/)(package-lock\.json|npm-shrinkwrap\.json|yarn\.lock|pnpm-lock\.yaml|bun\.lockb?|deno\.lock|Cargo\.lock|poetry\.lock|uv\.lock|Pipfile\.lock|Gemfile\.lock|composer\.lock|go\.sum|flake\.lock|mix\.lock|pubspec\.lock|Package\.resolved|\.gitignore|\.gitattributes|\.dockerignore|\.npmignore|\.prettierignore|\.eslintignore|\.DS_Store|Thumbs\.db)$/;
+export const isHousekeeping = (p: string) => HOUSEKEEPING.test(p);
 export const isTest = (p: string) => TEST.test(p);
 export const isCode = (p: string) => !isTest(p) && !NOT_CODE.test(p);
 export const countTests = (paths: Iterable<string> | Map<string, unknown>) => [...(paths instanceof Map ? paths.keys() : paths)].filter(isTest).length;
@@ -75,7 +85,7 @@ export function fileStats(patch: string): FileStat[] {
 }
 
 // What each signal adds to a file's risk. A person is asked for at NEEDS_PERSON.
-const W = { protected: 5, outside: 3, contested: 2, unfamiliar: 1, large: 1 };
+const W = { protected: 5, outside: 3, explained: 1, contested: 2, unfamiliar: 1, large: 1 };
 const NEEDS_PERSON = 6;
 
 export function buildBrief(i: BriefInput): Brief {
@@ -84,7 +94,14 @@ export function buildBrief(i: BriefInput): Brief {
     let score = 0;
     const flag = (kind: keyof typeof W, text: string) => { flags.push({ kind, text }); score += W[kind]; };
     if (i.guarded.includes(f.path)) flag("protected", "protected path");
-    if (i.undeclared.includes(f.path)) flag("outside", "outside the declared intent");
+    if (isHousekeeping(f.path)) {
+      flags.push({ kind: "housekeeping", text: "lockfile or ignore list: not weighed" });
+      return { ...f, score, flags };
+    }
+    const why = i.explained?.[f.path];
+    // Outside the intent but explained by its author: a reviewer reads the reason instead of guessing at it.
+    if (i.undeclared.includes(f.path)) why ? flag("explained", `outside the declared intent; the author says: ${why}`) : flag("outside", "outside the declared intent");
+    else if (why) flags.push({ kind: "why", text: `the author says: ${why}` });
     const others = [...new Set(i.othersIntents.filter((x) => x.paths.some((p) => matches(p, f.path))).map((x) => x.agent))];
     if (others.length) flag("contested", `${others.join(", ")} ${others.length === 1 ? "is" : "are"} also working here`);
     const knowers = i.knownBy[f.path] ?? [];
@@ -100,7 +117,11 @@ export function buildBrief(i: BriefInput): Brief {
   if (i.checks && !i.checks.ok) { score += 5; reasons.push({ kind: "checks", text: "Checks fail" }); }
   else if (!i.checks && i.checksConfigured) { score += 1; reasons.push({ kind: "checks", text: "Checks haven't run on it yet" }); }
   else if (i.checks?.ok) reasons.push({ kind: "ok", text: "Checks pass" });
-  if (i.undeclared.length) reasons.push({ kind: "outside", text: `${i.undeclared.length} file${i.undeclared.length === 1 ? "" : "s"} outside the declared intent`, files: i.undeclared });
+  const outside = i.undeclared.filter((p) => !isHousekeeping(p)), chores = i.undeclared.filter(isHousekeeping);
+  const unexplained = outside.filter((p) => !i.explained?.[p]), explainedOutside = outside.filter((p) => i.explained?.[p]);
+  if (unexplained.length) reasons.push({ kind: "outside", text: `${unexplained.length} file${unexplained.length === 1 ? "" : "s"} outside the declared intent, unexplained`, files: unexplained });
+  if (explainedOutside.length) reasons.push({ kind: "explained", text: `${explainedOutside.length} file${explainedOutside.length === 1 ? "" : "s"} outside the declared intent, with the author's reason`, files: explainedOutside });
+  if (chores.length) reasons.push({ kind: "ok", text: `${chores.join(", ")} changed too (outside the intent, but lockfiles and ignore lists aren't weighed)`, files: chores });
   const code = i.files.filter((f) => isCode(f.path)), tests = i.files.filter((f) => isTest(f.path));
   if (code.length && !tests.length && i.mainHasTests !== false) { score += 2; reasons.push({ kind: "tests", text: "Changes code without changing any tests" }); }
   else if (tests.length) reasons.push({ kind: "ok", text: `Changes ${tests.length} test file${tests.length === 1 ? "" : "s"}` });

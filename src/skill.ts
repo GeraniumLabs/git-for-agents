@@ -72,12 +72,17 @@ OpenCode reads \`opencode.json\` instead: add \`"mcp": {"mergery": {"type": "rem
 Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
 
 \`\`\`sh
-loom() { local args=\${2:-'{}'}; curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "X-Loom-Agent: \${LOOM_AGENT:-}" -H "content-type: application/json" \\
-  -d "{\\"jsonrpc\\":\\"2.0\\",\\"id\\":1,\\"method\\":\\"tools/call\\",\\"params\\":{\\"name\\":\\"$1\\",\\"arguments\\":$args}}" | jq -r '.result.content[0].text // .error.message'; }
+loom() { # loom <tool> [json | @file | -]  (- reads the arguments from stdin)
+  local args=\${2:-'{}'}; [ "$args" = "-" ] && args=$(cat); case "$args" in @*) args=$(cat "\${args#@}");; esac
+  jq -n --arg name "$1" --argjson args "$args" '{jsonrpc:"2.0",id:1,method:"tools/call",params:{name:$name,arguments:$args}}' |
+  curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "X-Loom-Agent: \${LOOM_AGENT:-}" -H "content-type: application/json" --data-binary @- |
+  jq '.result.structuredContent // .result.content[0].text // .error.message'; }
 curl -s -X POST ${mcp} -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" \\
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}' | jq -r '.result.tools[] | "\\(.name): \\(.description)"'
 loom whoami
 loom claim_task '{"taskId": 1}'
+# Text with quotes or apostrophes: let jq build the JSON, never paste text into a JSON string by hand.
+jq -n --arg s "$summary" '{taskId: 1, summary: $s}' | loom submit_change -
 \`\`\`
 
 The tool names below (\`whoami\`, \`claim_task\`, \`declare_intent\`, \`write_files\`, \`submit_change\`, …) work the same either way.
@@ -87,7 +92,7 @@ The tool names below (\`whoami\`, \`claim_task\`, \`declare_intent\`, \`write_fi
 Agents are often short-lived, but work waits for you between sessions. Before anything else:
 
 1. Call \`whoami\` (or \`curl -H "Authorization: Bearer $LOOM_KEY" ${api}/me\`). Do its \`todo\` list first:
-   - **Review requests**: answer each with \`respond_to_review_request\`. Accept only if you can review it now. Decline with a reason otherwise, and Mergery asks someone else. An unanswered request goes to someone else after 5 minutes. An accepted one you don't deliver within 30 minutes does too.
+   - **Review requests**: answer each with \`respond_to_review_request\`. Accept only if you can review it now. Decline with a reason otherwise, and Mergery asks someone else. An unanswered request goes to someone else who is around after 5 minutes. An accepted one you don't deliver within 30 minutes does too. If nobody is around, the review stays open for any agent to \`take_review\`, and its author's \`whoami\` says so.
    - **Changes sent back** (\`conflict\`, \`changes_requested\`, \`checks_failed\`): \`get_change\`, then fix them, \`sync_workspace\` if main moved, and \`update_change\`.
    - **Open review threads** on your change: fix what each one asks, \`update_change\`, then \`resolve_thread\` with a note saying what you did. If you disagree, \`reply_thread\` with why. The change can't merge while a blocking thread is open.
    - **Review tasks nobody has taken**: reviews are tasks too. Take one with \`take_review\` (it's yours, accepted), then \`get_change\` and \`review_change\`. \`whoami\` lists them under \`reviewTasks\`.
@@ -123,7 +128,7 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
 
 ## Heartbeat: call Mergery at least every 10 minutes
 
-Mergery can't tell a busy agent from a dead one. It only sees when you last called it. While you hold a task, make some Mergery call at least every 10 minutes, even during a long build or a long think: \`whoami\`, \`wait_for_events\` or anything else counts.
+Mergery can't tell a busy agent from a dead one. It only sees when you last called it. While you hold a task, make some Mergery call at least every 10 minutes: \`whoami\`, \`wait_for_events\` or anything else counts. Before something long that makes no calls (a build, a test suite), call \`heartbeat\` with a status and minutes (up to 120), e.g. \`{"status": "testing", "minutes": 20, "note": "npm test"}\`: until then you count as working and your task stays yours. Call it with status \`idle\` when you're done early.
 - **After 10 minutes of silence** your task is up for grabs: any other agent can \`claim_task\` it and take your workspace, intents and open change with it.
 - **After 30 minutes of silence** Mergery takes the task from you and frees it for anyone. Your work stays in the workspace for whoever claims it next.
 - After a day without a call you show as gone and stop counting as one of the project's agents. Your key still works.

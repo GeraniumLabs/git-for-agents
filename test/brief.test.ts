@@ -60,3 +60,25 @@ test("a check command is suggested only for what the checks image runs as is", a
   assert.equal(await suggestCheck(...repo({ "Makefile": "build:\n\tcc x.c\ntest: build\n\t./t\n" })), "make test");
   assert.equal(await suggestCheck(...repo({ "pyproject.toml": "" })), null);
 });
+
+test("lockfiles and ignore lists never make a change need a person, or look contested", () => {
+  const b = buildBrief({
+    ...base, files: [f("src/daemon.ts"), f("test/daemon.test.ts"), f("package-lock.json", 900, 20), f(".gitignore")],
+    undeclared: ["package-lock.json", ".gitignore"], othersIntents: [{ paths: ["package-lock.json", ".gitignore"], agent: "bex" }],
+    knownBy: { "package-lock.json": ["cyd"] },
+  });
+  assert.equal(b.needsPerson, false);
+  assert.ok(!b.reasons.some((r) => r.kind === "outside" || r.kind === "contested" || r.kind === "unfamiliar"));
+  assert.equal(b.files.find((x) => x.path === "package-lock.json")!.score, 0);
+  const real = buildBrief({ ...base, files: [f("src/daemon.ts"), f("src/engine.ts")], undeclared: ["src/engine.ts", "package-lock.json"] });
+  assert.deepEqual(real.reasons.find((r) => r.kind === "outside")!.files, ["src/engine.ts"]);
+});
+
+test("a file outside the intent with the author's reason is weighed less and shows the reason", () => {
+  const blind = buildBrief({ ...base, files: [f("src/a.ts"), f("src/b.ts"), f("test/a.test.ts")], undeclared: ["src/b.ts"] });
+  const told = buildBrief({ ...base, files: [f("src/a.ts"), f("src/b.ts"), f("test/a.test.ts")], undeclared: ["src/b.ts"], explained: { "src/b.ts": "the bin field moved here, agreed with bex" } });
+  assert.ok(told.score < blind.score);
+  assert.match(told.files.find((x) => x.path === "src/b.ts")!.flags[0].text, /agreed with bex/);
+  assert.equal(told.reasons.find((r) => r.kind === "explained")!.files![0], "src/b.ts");
+  assert.ok(!told.reasons.some((r) => r.kind === "outside"));
+});

@@ -595,8 +595,10 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
   const files = ["src/db.js", "src/routes/todos.js", "src/server.js"];
   const contest = await admin.req("POST", "/tasks", { title: "Log every request", description: "", attempts: 3 });
   const changes: number[] = [];
+  const attempters: any[] = [];
   for (const who of ["kai", "lou", "mo"]) {
     const a = admin.as((await admin.addAgent(who, "builder")).key);
+    attempters.push(a);
     const claim = await a.claim(contest.id);
     const ws = claim.workspace.name;
     await a.intent(claim.task.id, files, "log requests");
@@ -619,6 +621,10 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
   const other = await zed.createTask("Rename routes", "");
   await zed.claim(other.id);
   await zed.intent(other.id, files, "rename");
+  attention = await needs();
+  assert.ok(!attention.some((i: any) => i.kind === "contest"), "an intent declared after the attempts were submitted is the later task's overlap, not theirs");
+  // Once the attempts move again, zed's intent counts against them.
+  for (const [n, a] of attempters.entries()) await a.update(changes[n], "log, again");
   attention = await needs();
   const card = attention.find((i: any) => i.kind === "contest");
   assert.equal(card?.contest, contest.id);
@@ -1301,6 +1307,10 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.equal(again.version, 2);
   assert.equal(again.supersedes, tr.id);
   assert.equal(again.steps, 2);
+  // Exactly the same log once more adds nothing: the trace on record comes back.
+  const dup = await (await upload(transcript)).json();
+  assert.equal(dup.id, again.id);
+  assert.equal(dup.duplicate, true);
   const mine = await ada.req("GET", `/traces?change=${ch.id}`);
   assert.equal(mine.traces.length, 1, "agents can read once an owner allows it; only the latest version is listed");
   assert.equal((await admin.req("GET", `/traces?change=${ch.id}&history=1`)).traces.length, 2);
@@ -1954,4 +1964,44 @@ test("an agent key gets clone and pull commands for main, and pull brings in wha
   } finally {
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+test("agents say why: a widened intent, explanations on submit, a busy heartbeat that holds the task, one result shape", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const name = project("e2e-why");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "why", files: { "src/db.js": "a\n", "src/api.js": "b\n", "package.json": "{}\n", "package-lock.json": "{}\n" } });
+  const keys: Record<string, string> = {};
+  for (const n of ["ada", "bex"]) keys[n] = (await admin.addAgent(n, "builder")).key;
+  const tool = async (who: string, name_: string, args: Record<string, unknown> = {}) => {
+    const r = await (await fetch(`${url}/mcp/${name}`, { method: "POST", headers: { authorization: `Bearer ${keys[who]}`, "content-type": "application/json" }, body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/call", params: { name: name_, arguments: args } }) })).json();
+    return r.result;
+  };
+  const ada = admin.as(keys.ada);
+  const t = await ada.createTask("Trim", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  const first = (await tool("ada", "declare_intent", { taskId: t.id, paths: ["src/db.js"], description: "trim" })).structuredContent;
+  const wider = (await tool("ada", "declare_intent", { taskId: t.id, paths: ["src/api.js"], reasons: { "src/api.js": "the route calls trim" } })).structuredContent;
+  assert.equal(wider.intentId ?? wider.intent, first.intentId ?? first.intent, "declaring again widens the same intent");
+  assert.deepEqual(wider.added, ["src/api.js"]);
+  await ada.write(ws, { "src/db.js": "a2\n", "src/api.js": "b2\n", "package.json": "{\"bin\":1}\n", "package-lock.json": "{\"v\":2}\n" }, "v1");
+  const ch = (await tool("ada", "submit_change", { taskId: t.id, summary: "trim", explanations: { "package.json": "bin moved here, agreed with bex" } })).structuredContent;
+  assert.deepEqual(ch.undeclared, ["package.json"], "the lockfile needs no declaring");
+  const detail = (await tool("bex", "get_change", { changeId: ch.id })).structuredContent;
+  assert.equal(detail.brief.needsPerson, false);
+  assert.match(detail.brief.files.find((f: any) => f.path === "package.json").flags[0].text, /agreed with bex/);
+  assert.match(detail.brief.files.find((f: any) => f.path === "src/api.js").flags[0].text, /route calls trim/);
+  assert.ok(detail.intents.every((i: any) => "agentId" in i && !("agent_id" in i)), "one shape: camelCase everywhere");
+  // A busy agent's task can't be taken over, and status shows who is busy.
+  await tool("ada", "heartbeat", { status: "testing", minutes: 20 });
+  const status = (await tool("bex", "mergery_status")).structuredContent;
+  assert.equal(status.agents.find((a: any) => a.name === "ada").state, "working");
+  assert.match(status.agents.find((a: any) => a.name === "ada").busy.status, /testing/);
+  assert.equal(status.stalledReviews[0].changeId, ch.id);
+  const grab = await tool("bex", "claim_task", { taskId: t.id });
+  assert.equal(grab.isError, true);
+  assert.match(grab.content[0].text, /busy \(testing\)/);
+  assert.equal(grab.structuredContent.error.code, "CONFLICT");
+  await tool("ada", "heartbeat", { status: "idle" });
+  assert.equal((await tool("bex", "mergery_status")).structuredContent.agents.find((a: any) => a.name === "ada").busy, null);
 });
