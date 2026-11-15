@@ -36,6 +36,27 @@ const obj = (properties: Record<string, unknown>, required: string[] = []) => ({
 const str = (description: string) => ({ type: "string", description });
 const num = (description: string) => ({ type: "number", description });
 
+/**
+ * Where read_file and list_files read: a change (changeId, or ref
+ * change:<id>), a workspace (or ref workspace:<name>), or main at a ref.
+ */
+function fileQuery(a: any): URLSearchParams {
+  const q = new URLSearchParams();
+  if (a.path) q.set("path", String(a.path));
+  let ref = typeof a.ref === "string" ? a.ref.trim() : "";
+  const change = a.changeId ?? (/^change[:/#]\s*\d+$/i.test(ref) ? ref.replace(/\D/g, "") : undefined);
+  if (/^change[:/#]/i.test(ref)) ref = "";
+  let workspace = a.workspace;
+  if (/^workspace:/i.test(ref)) { workspace = ref.slice("workspace:".length).trim(); ref = ""; }
+  if (change !== undefined && change !== null && change !== "") {
+    if (!Number.isFinite(Number(change))) throw new Error(`changeId must be a number (got ${JSON.stringify(change)})`);
+    if (workspace) throw new Error("pass changeId or workspace, not both");
+    q.set("change", String(Number(change)));
+  } else if (workspace) q.set("workspace", String(workspace));
+  if (ref) q.set("ref", ref);
+  return q;
+}
+
 const TOOLS: Tool[] = [
   {
     name: "loom_status",
@@ -54,7 +75,8 @@ const TOOLS: Tool[] = [
         protectedPaths: s.project.protectedPaths,
         openThreads: (s.threads ?? []).filter((t: any) => ["open"].includes(t.status)).map((t: any) => ({ id: t.id, kind: t.kind, title: t.title, by: t.created_by, to: t.to_agent })),
         contracts: (s.threads ?? []).filter((t: any) => t.kind === "contract").map((t: any) => ({ id: t.id, title: t.title, body: t.posts[0]?.body })),
-        recentEvents: s.events.slice(-15).map((e: any) => `${e.type} ${e.actor ?? ""} ${JSON.stringify(e.data).slice(0, 140)}`),
+        // One readable line each, never JSON cut mid-string: wait_for_events with full=true has the payloads.
+        recentEvents: s.events.slice(-15).map((e: any) => brief(e, false)),
       };
     },
   },
@@ -96,9 +118,9 @@ const TOOLS: Tool[] = [
   },
   {
     name: "list_files",
-    description: "List files on main, or in a workspace.",
-    inputSchema: obj({ workspace: str("Workspace name; omit for main") }),
-    run: (a, call) => call("GET", `/files${a.workspace ? `?workspace=${encodeURIComponent(a.workspace)}` : ""}`),
+    description: "List files on main, in a workspace, or in a change (changeId: the files as that change has them, whether it is in review or landed).",
+    inputSchema: obj({ workspace: str("Workspace name; omit for main"), changeId: num("A change id: list the change's files instead of main's") }),
+    run: (a, call) => call("GET", `/files?${fileQuery(a)}`),
   },
   {
     name: "code_map",
@@ -120,14 +142,9 @@ const TOOLS: Tool[] = [
   },
   {
     name: "read_file",
-    description: "Read a file from main or from a workspace.",
-    inputSchema: obj({ path: str("Repository path"), workspace: str("Workspace name; omit for main"), ref: str("Branch, tag or commit; default main") }, ["path"]),
-    run: (a, call) => {
-      const q = new URLSearchParams({ path: a.path });
-      if (a.workspace) q.set("workspace", a.workspace);
-      if (a.ref) q.set("ref", a.ref);
-      return call("GET", `/files?${q}`);
-    },
+    description: "Read a file from main, a workspace, or a change. To review a change, pass changeId: you get the file as the change has it (the result's ref says which version you read). ref also takes change:<id> or workspace:<name>.",
+    inputSchema: obj({ path: str("Repository path"), changeId: num("A change id: read the file as that change has it"), workspace: str("Workspace name; omit for main"), ref: str("Branch, tag or commit; default main. Also change:<id> or workspace:<name>") }, ["path"]),
+    run: (a, call) => call("GET", `/files?${fileQuery(a)}`),
   },
   {
     name: "write_files",
@@ -155,8 +172,8 @@ const TOOLS: Tool[] = [
   },
   {
     name: "attach_trace",
-    description: "Upload your session log (the transcript of what you read, thought and did) so people can review your decisions later. Usually a hook does this for you; call it yourself if no hook is set up, or when submit_change or whoami asks you to (your person turned traces on). Mergery removes secrets before storing anything, works out the format (Claude Code, Codex, OpenCode, OpenTelemetry JSON, or plain text) and links it to the changes you had open during the session. Uploading the same session again adds a new version; earlier ones stay on record, fingerprinted. Up to 25 MB; for larger logs, POST the raw file to /api/projects/<project>/traces?session=<id> with your key.",
-    inputSchema: obj({ text: str("The session log"), session: str("Your session id, so later uploads replace this one"), change: num("Change it belongs to, if you know"), task: num("Task it belongs to, if you know"), source: str("claude-code, codex, opencode, otel or text; leave it out to detect"), model: str("Model you ran as, if the log doesn't say"), append: { type: "boolean", description: "Add to the earlier upload of this session instead of replacing it" } }, ["text"]),
+    description: "Upload your session log (the transcript of what you read, thought and did) so people can review your decisions later. Usually a hook does this for you; call it yourself if no hook is set up, or when submit_change or whoami asks you to (your person turned traces on). Mergery removes secrets before storing anything, works out the format (Claude Code, Codex, OpenCode export or `opencode run --format json`, OpenTelemetry JSON, Mergery's step lines, or plain text) and links it to the changes you had open during the session. Send your real session log, not a summary: a log it can't read into steps comes back with a warning saying how to send one it can. Uploading the same session again adds a new version; earlier ones stay on record, fingerprinted. The exact same log again adds nothing. Up to 25 MB; for larger logs, POST the raw file to /api/projects/<project>/traces?session=<id> with your key.",
+    inputSchema: obj({ text: str("The session log"), session: str("Your session id, so later uploads replace this one"), change: num("Change it belongs to, if you know"), task: num("Task it belongs to, if you know"), source: str("claude-code, codex, opencode, otel, steps or text; leave it out to detect"), model: str("Model you ran as, if the log doesn't say"), append: { type: "boolean", description: "Add to the earlier upload of this session instead of replacing it" } }, ["text"]),
     run: (a, call) => call("POST", "/traces", a),
   },
   {
@@ -382,7 +399,7 @@ const TOOLS: Tool[] = [
       const me = (await call("GET", "/me")).agent;
       const r = await call("GET", `/events?after=${a.after ?? 0}&wait=${Math.min(a.wait ?? 20, 25)}&agent=${encodeURIComponent(me.id)}${a.all ? "" : "&mine=1"}`);
       if (a.full) return { ...r, next: `call again with after=${r.cursor}` };
-      return { events: r.events.map(brief), cursor: r.cursor, next: r.events.length ? `call again with after=${r.cursor}` : `nothing new; call again with after=${r.cursor} to keep waiting` };
+      return { events: r.events.map((e: any) => brief(e, e.to_agent === me.id)), cursor: r.cursor, next: r.events.length ? `call again with after=${r.cursor}` : `nothing new; call again with after=${r.cursor} to keep waiting` };
     },
   },
   {
@@ -541,14 +558,43 @@ async function handleOne(m: any, call: CallAs, opts: McpOptions): Promise<any> {
         if (account && !where) throw new Error("say which project: pass `project` (list_projects shows yours)");
         c = call(typeof as === "string" && as.trim() ? as.trim() : null, where);
         const result = await tool.run(rest, c);
-        return reply({ content: [...notice(c), { type: "text", text: JSON.stringify(result, null, 2) }] });
+        return reply({ content: [...notice(c), { type: "text", text: JSON.stringify(result, null, 2) }, ...ignored(tool, rest)], ...structured(result) });
       } catch (e: any) {
-        return reply({ content: [...notice(c), { type: "text", text: String(e?.message ?? e) }], isError: true });
+        return reply({ content: [...notice(c), { type: "text", text: String(e?.message ?? e) }, ...ignored(tool, args)], isError: true, structuredContent: { error: errorOf(e) } });
       }
     }
     default:
       return { jsonrpc: "2.0", id: m.id, error: { code: -32601, message: `method not found: ${m.method}` } };
   }
+}
+
+/**
+ * The result as structured content too, so a client can read it without
+ * parsing the text a second time. MCP wants an object there, so a list is
+ * wrapped as {items}.
+ */
+function structured(result: unknown) {
+  if (Array.isArray(result)) return { structuredContent: { items: result } };
+  if (result && typeof result === "object") return { structuredContent: result as Record<string, unknown> };
+  return {};
+}
+
+const ERROR_CODES: Record<number, string> = { 400: "INVALID", 401: "UNAUTHORIZED", 402: "PLAN_LIMIT", 403: "FORBIDDEN", 404: "NOT_FOUND", 409: "CONFLICT", 410: "GONE", 413: "TOO_LARGE", 422: "INVALID", 423: "LOCKED", 429: "RATE_LIMITED" };
+
+/** An error an agent can branch on: a stable code and the HTTP status, with the message as it was. */
+function errorOf(e: any): { code: string; status: number | null; message: string } {
+  const status = typeof e?.status === "number" ? e.status : null;
+  const message = String(e?.message ?? e);
+  const code = status ? ERROR_CODES[status] ?? (status >= 500 ? "SERVER_ERROR" : "ERROR") : /not found|^no (project|workspace|agent|task|change)\b/i.test(message) ? "NOT_FOUND" : "INVALID";
+  return { code, status, message };
+}
+
+/** Arguments the tool doesn't take: said out loud, so a typo or a wrong guess (changeId on a tool without one) isn't silently ignored. */
+function ignored(tool: Tool, args: Record<string, unknown>) {
+  const known = new Set([...Object.keys((tool.inputSchema.properties as Record<string, unknown>) ?? {}), "as", "project"]);
+  const extra = Object.keys(args ?? {}).filter((k) => !known.has(k) && args[k] !== undefined);
+  if (!extra.length) return [];
+  return [{ type: "text", text: `Note: ${tool.name} ignored ${extra.map((k) => `\`${k}\``).join(", ")}; it takes ${[...known].filter((k) => k !== "project").map((k) => `\`${k}\``).join(", ")}.` }];
 }
 
 /**
@@ -563,11 +609,11 @@ function notice(c: Call | null) {
 }
 
 /** One line per event: who did what, to which task or change, and the gist. */
-function brief(e: { seq: number; type: string; actor: string | null; task_id: number | null; change_id: number | null; to_agent: string | null; data: any }) {
+function brief(e: { seq: number; type: string; actor: string | null; task_id: number | null; change_id: number | null; to_agent: string | null; data: any }, forYou = true) {
   const d = e.data ?? {};
   const gist = d.advice ?? d.reason ?? d.body ?? d.message ?? d.text ?? d.summary ?? d.question ?? d.why ?? d.title ?? "";
   const extra = [d.verdict && `verdict ${d.verdict}`, d.winner && `winner #${d.winner}`, d.files && `${d.files.length} files`, d.paths && `paths ${[].concat(d.paths).slice(0, 4).join(", ")}`].filter(Boolean).join("; ");
   const where = [e.task_id != null && `task #${e.task_id}`, e.change_id != null && `change #${e.change_id}`].filter(Boolean).join(", ");
   const text = [extra, typeof gist === "string" ? gist : JSON.stringify(gist)].filter(Boolean).join(": ");
-  return `${e.seq} ${e.type}${where ? ` (${where})` : ""}${e.actor ? ` by ${d.actorName ?? e.actor}` : ""}${e.to_agent ? " to you" : ""}${text ? `: ${text.slice(0, 240)}` : ""}`;
+  return `${e.seq} ${e.type}${where ? ` (${where})` : ""}${e.actor ? ` by ${d.actorName ?? e.actor}` : ""}${e.to_agent ? ` to ${forYou ? "you" : e.to_agent}` : ""}${text ? `: ${text.length > 240 ? `${text.slice(0, 239)}…` : text}` : ""}`;
 }

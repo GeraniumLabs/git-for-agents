@@ -9,15 +9,25 @@
 //
 // Formats read: Claude Code transcripts and Codex session logs (one JSON
 // object per line), OpenCode sessions (one document, as `opencode export`
-// prints it), and OpenTelemetry spans that follow the GenAI conventions. Anything else is kept as plain text, with no steps.
+// prints it, or the JSON lines of `opencode run --format json`),
+// OpenTelemetry spans that follow the GenAI conventions, and Mergery's own
+// step lines (STEP_FORMAT), which any harness can write. Anything else is
+// kept as plain text, with no steps, and the upload says so.
 
 import { billingOn } from "./billing";
 import type { Env } from "./env";
 
 export const MAX_TRACE_BYTES = 25 * 1024 * 1024;
 
-export type TraceSource = "claude-code" | "codex" | "opencode" | "otel" | "text";
-export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "opencode", "otel", "text"];
+export type TraceSource = "claude-code" | "codex" | "opencode" | "otel" | "steps" | "text";
+export const TRACE_SOURCES: TraceSource[] = ["claude-code", "codex", "opencode", "otel", "steps", "text"];
+
+/**
+ * Mergery's own step format, for a harness Mergery has no reader for: one
+ * JSON object per line. Told to agents whose upload came out as plain text.
+ */
+export const STEP_FORMAT = 'One JSON object per line: {"ts": "2026-11-15T09:30:00Z" or epoch ms, "kind": "prompt" | "message" | "thought" | "tool_call" | "tool_result" | "error", "text": "what was said", "tool": "the tool\'s name", "input": {its arguments}, "output": "its result", "model": "model id", "tokensIn": n, "tokensOut": n}. Only kind is required; send source "steps".';
+const STEP_KINDS = new Set(["prompt", "context", "thought", "message", "tool_call", "tool_result", "error"]);
 
 export type StepKind = "prompt" | "context" | "thought" | "message" | "tool_call" | "tool_result" | "error";
 
@@ -189,8 +199,29 @@ export function detectSource(text: string): TraceSource {
   }
   if (lines.some((l) => ["session_meta", "response_item", "event_msg", "turn_context"].includes(l?.type) && l.payload)) return "codex";
   if (lines.some((l) => ["user", "assistant", "summary", "system"].includes(l?.type) && (l.message || l.sessionId || l.summary))) return "claude-code";
+  if (lines.some(isOpenCodeLine)) return "opencode";
+  if (lines.length && lines.filter((l) => STEP_KINDS.has(l?.kind)).length >= Math.ceil(lines.length / 2)) return "steps";
+  // An `opencode export` document whose session info (with its file diffs) runs past the first 20 KB.
+  if (/^\s*\{/m.test(head) && /"info"\s*:/.test(head) && text.length < 30_000_000) {
+    const doc = jsonDoc(text);
+    if (Array.isArray(doc?.messages) && doc.messages.some((m: any) => m?.info && Array.isArray(m.parts))) return "opencode";
+  }
   return "text";
 }
+
+/** The whole text as one JSON value, allowing a line of prose before it (a CLI's "Exporting session…"). */
+function jsonDoc(text: string): any {
+  try { return JSON.parse(text); } catch { /* maybe a preamble */ }
+  const at = text.search(/^\s*[{[]/m);
+  if (at <= 0) return undefined;
+  try { return JSON.parse(text.slice(at)); } catch { return undefined; }
+}
+
+/** A line OpenCode writes: a {info, parts} message, a `run --format json` event, or a stored message or part. */
+const isOpenCodeLine = (l: any) => !!l && typeof l === "object" && (
+  (l.info && Array.isArray(l.parts) && (l.info.sessionID || l.info.role)) ||
+  (typeof l.sessionID === "string" && (l.part || l.role || l.messageID)) ||
+  (l.part && typeof l.part.sessionID === "string"));
 
 /** A call to Mergery: the server's name has "mergery" or "loom" in it, e.g. mcp__mergery__declare_intent, mcp__loom__declare_intent or loom.declare_intent. */
 export function loomCallOf(tool: string, args: any): string | undefined {
@@ -367,20 +398,56 @@ function parseCodex(text: string, keepThoughts: boolean): ParsedTrace {
 
 /**
  * OpenCode: a session as `opencode export` prints it, or as Mergery's plugin sends
- * it: {info: Session, messages: [{info: Message, parts: Part[]}]}. Its MCP tools
- * are named <server>_<tool>, so Mergery's are loom_<tool>.
+ * it: {info: Session, messages: [{info: Message, parts: Part[]}]}. Also the
+ * JSON lines of `opencode run --format json` ({type, sessionID, part}), and
+ * stored messages and parts one per line. Its MCP tools are named
+ * <server>_<tool>, so Mergery's are mergery_<tool> or loom_<tool>.
  */
+function openCodeMessages(text: string): { sessionId: string | null; messages: any[] } | null {
+  const doc = jsonDoc(text);
+  if (doc && typeof doc === "object" && (Array.isArray(doc.messages) || Array.isArray(doc))) {
+    const messages: any[] = Array.isArray(doc.messages) ? doc.messages : doc;
+    return { sessionId: doc.info?.id ?? messages[0]?.info?.sessionID ?? null, messages };
+  }
+  const lines = jsonLines(text).filter(isOpenCodeLine);
+  if (!lines.length) return null;
+  // Rebuild messages from lines: whole messages, bare message infos, and parts by their message id.
+  const byId = new Map<string, { info: any; parts: any[] }>();
+  const order: { info: any; parts: any[] }[] = [];
+  const msg = (id: string | undefined, info: any = {}) => {
+    const key = id ?? `_${order.length}`;
+    let m = byId.get(key);
+    if (!m) { m = { info: { role: "assistant", ...info }, parts: [] }; byId.set(key, m); order.push(m); }
+    else if (Object.keys(info).length) m.info = { ...m.info, ...info };
+    return m;
+  };
+  let sessionId: string | null = null;
+  for (const l of lines) {
+    sessionId ??= l.info?.sessionID ?? l.sessionID ?? l.part?.sessionID ?? null;
+    if (l.info && Array.isArray(l.parts)) { const m = msg(l.info.id, l.info); m.parts.push(...l.parts); continue; }
+    if (l.part) {
+      const part = { ...l.part, time: l.part.time ?? (l.timestamp ? { start: l.timestamp } : undefined) };
+      msg(l.part.messageID).parts.push(part);
+      continue;
+    }
+    if (l.type === "error" && l.error) { msg(undefined).parts.push({ type: "error", text: asText(l.error?.data?.message ?? l.error?.message ?? l.error) }); continue; }
+    if (l.role && l.id) { msg(l.id, l); continue; }
+    if (l.messageID && l.type) msg(l.messageID).parts.push(l);
+  }
+  return { sessionId, messages: order };
+}
+
 function parseOpenCode(text: string, keepThoughts: boolean): ParsedTrace {
   const b = new Builder(keepThoughts);
-  let doc: any;
-  try { doc = JSON.parse(text); } catch {
+  const read = openCodeMessages(text);
+  if (!read) {
     // Only the start of a log (Mergery reads one to find its session): no steps, just the id.
     b.sessionId = (text.match(/^\s*\{\s*"info"\s*:\s*\{\s*"id"\s*:\s*"([^"]+)"/) ?? text.match(/"sessionID"\s*:\s*"([^"]+)"/))?.[1] ?? null;
     return b.done("opencode");
   }
-  const messages: any[] = Array.isArray(doc?.messages) ? doc.messages : Array.isArray(doc) ? doc : [];
-  b.sessionId = doc?.info?.id ?? messages[0]?.info?.sessionID ?? null;
-  const loomOf = (tool: string, args: any) => loomCallOf(tool, args) ?? (/^loom_/i.test(tool) ? tool.replace(/^loom_/i, "") : undefined);
+  const { messages } = read;
+  b.sessionId = read.sessionId;
+  const loomOf = (tool: string, args: any) => loomCallOf(tool, args) ?? (/^(loom|mergery)_/i.test(tool) ? tool.replace(/^(loom|mergery)_/i, "") : undefined);
   let cost = 0, costed = false;
   for (const m of messages) {
     const info = m?.info ?? {};
@@ -389,10 +456,11 @@ function parseOpenCode(text: string, keepThoughts: boolean): ParsedTrace {
     if (model) b.models.add(model);
     const ts = time(info.time?.created);
     b.seen(time(info.time?.completed));
-    if (!user && info.tokens) {
-      b.tokensIn += (info.tokens.input ?? 0) + (info.tokens.cache?.read ?? 0) + (info.tokens.cache?.write ?? 0);
-      b.tokensOut += (info.tokens.output ?? 0) + (info.tokens.reasoning ?? 0);
-    }
+    const tokens = (t: any) => {
+      b.tokensIn += (t.input ?? 0) + (t.cache?.read ?? 0) + (t.cache?.write ?? 0);
+      b.tokensOut += (t.output ?? 0) + (t.reasoning ?? 0);
+    };
+    if (!user && info.tokens) tokens(info.tokens);
     if (!user && typeof info.cost === "number") { cost += info.cost; costed = true; }
     for (const part of Array.isArray(m?.parts) ? m.parts : []) {
       const pts = time(part?.time?.start) ?? ts;
@@ -413,11 +481,41 @@ function parseOpenCode(text: string, keepThoughts: boolean): ParsedTrace {
         else if (st.status === "error") b.add({ ts: time(st.time?.end) ?? pts, kind: "error", tool: name, loomCall: loomOf(name, null), preview: asText(st.error), error: true });
       } else if (part?.type === "patch" && Array.isArray(part.files)) {
         b.add({ ts: pts, kind: "tool_call", tool: "patch", preview: part.files.join(", "), files: part.files.filter((f: unknown) => typeof f === "string"), model });
+      } else if ((part?.type === "step-finish" || part?.type === "step_finish") && !info.tokens && !user) {
+        // `opencode run --format json` has no message infos: the usage rides on each step's finish.
+        if (part.tokens) tokens(part.tokens);
+        if (typeof part.cost === "number") { cost += part.cost; costed = true; }
+        b.seen(pts);
+      } else if (part?.type === "error") {
+        b.add({ ts: pts, kind: "error", preview: asText(part.text), error: true });
       }
     }
   }
   if (costed) b.cost = cost;
   return b.done("opencode");
+}
+
+/** Mergery's own step lines (STEP_FORMAT). */
+function parseSteps(text: string, keepThoughts: boolean): ParsedTrace {
+  const b = new Builder(keepThoughts);
+  for (const l of jsonLines(text)) {
+    if (!l || typeof l !== "object" || !STEP_KINDS.has(l.kind)) continue;
+    b.sessionId ??= typeof l.session === "string" ? l.session : typeof l.sessionId === "string" ? l.sessionId : null;
+    const ts = time(l.ts ?? l.timestamp);
+    const model = typeof l.model === "string" ? l.model : undefined;
+    if (model) b.models.add(model);
+    const tokensIn = Number(l.tokensIn) || undefined, tokensOut = Number(l.tokensOut) || undefined;
+    b.tokensIn += tokensIn ?? 0;
+    b.tokensOut += tokensOut ?? 0;
+    if (typeof l.costUsd === "number") b.cost = (b.cost ?? 0) + l.costUsd;
+    const tool = typeof l.tool === "string" ? l.tool : undefined;
+    const kind = l.kind as StepKind;
+    const body = kind === "tool_call" ? (l.input ?? l.text) : kind === "tool_result" || kind === "error" ? (l.output ?? l.text ?? l.error) : l.text;
+    const files = Array.isArray(l.files) ? l.files.filter((f: unknown) => typeof f === "string") : kind === "tool_call" ? filesOf(l.input) : [];
+    b.add({ ts, kind, tool, loomCall: tool ? loomCallOf(tool, l.input) ?? (/^(loom|mergery)_/i.test(tool) ? tool.replace(/^(loom|mergery)_/i, "") : undefined) : undefined,
+      preview: asText(body), files, model, tokensIn, tokensOut, ...(kind === "error" || l.error === true ? { error: true } : {}) });
+  }
+  return b.done("steps");
 }
 
 function parseOtel(text: string, keepThoughts: boolean): ParsedTrace {
@@ -467,6 +565,7 @@ export function parseTrace(text: string, source: TraceSource = detectSource(text
   if (source === "codex") return parseCodex(text, keepThoughts);
   if (source === "opencode") return parseOpenCode(text, keepThoughts);
   if (source === "otel") return parseOtel(text, keepThoughts);
+  if (source === "steps") return parseSteps(text, keepThoughts);
   return parseText(text);
 }
 
@@ -481,15 +580,21 @@ export function dropThoughts(text: string, source: TraceSource): string {
       const doc = JSON.parse(text);
       for (const m of Array.isArray(doc?.messages) ? doc.messages : []) if (Array.isArray(m?.parts)) m.parts = m.parts.filter((p: any) => p?.type !== "reasoning");
       return JSON.stringify(doc);
-    } catch { return text; }
+    } catch { /* JSON lines: below */ }
   }
-  if (source !== "claude-code" && source !== "codex") return text;
+  if (source !== "claude-code" && source !== "codex" && source !== "opencode" && source !== "steps") return text;
   return text.split("\n").flatMap((line) => {
     const t = line.trim();
     if (!t) return [line];
     let l: any;
     try { l = JSON.parse(t); } catch { return [line]; }
     if (source === "codex") return l?.type === "response_item" && l.payload?.type === "reasoning" ? [] : [line];
+    if (source === "steps") return l?.kind === "thought" ? [] : [line];
+    if (source === "opencode") {
+      if (l?.part?.type === "reasoning" || (l?.type === "reasoning" && l?.messageID)) return [];
+      if (l?.info && Array.isArray(l.parts)) { l.parts = l.parts.filter((p: any) => p?.type !== "reasoning"); return [JSON.stringify(l)]; }
+      return [line];
+    }
     const c = l?.message?.content;
     if (!Array.isArray(c) || !c.some((x: any) => x?.type === "thinking" || x?.type === "redacted_thinking")) return [line];
     l.message.content = c.filter((x: any) => x?.type !== "thinking" && x?.type !== "redacted_thinking");

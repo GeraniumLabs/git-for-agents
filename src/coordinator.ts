@@ -19,12 +19,12 @@ import { FilesShapeError, normalizeFiles } from "./files";
 import { runCheck, untar, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
-import { buildBrief, countTests, fileStats, isTest, suggestCheck } from "./brief";
+import { buildBrief, countTests, fileStats, isHousekeeping, isTest, suggestCheck } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
-import { MAX_TRACE_BYTES, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, intentOf, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
+import { MAX_TRACE_BYTES, STEP_FORMAT, TRACE_SOURCES, checkPattern, dropThoughts, gunzip, gzip, parseTrace, redact, detectSource, intentOf, sha256Hex, traceKeys, traceLimits, type Step, type TraceSource } from "./traces";
 import { DEFAULT_REVIEW_AGENT, reviewChange, type ReviewAgentConfig, type ReviewModel } from "./reviewer";
 import { needsYouEmail } from "./email";
 import { MAX_FILE_BYTES, SKIP, buildMap, findSymbol, mapView, searchMap, type CodeMap } from "./codemap";
@@ -1714,24 +1714,28 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   private async readFiles(q: URLSearchParams) {
-    const { repo, at } = this.repoFor({ workspace: q.get("workspace"), change: q.get("change") });
+    const change = q.get("change");
+    const { repo, at, label } = this.repoFor({ workspace: q.get("workspace"), change });
     const ref = at ?? q.get("ref") ?? "main";
+    // Say which version was read, so a reviewer can't mistake main's file for the change's.
+    const where = change ? `change #${Number(change)} (${at ? `landed as ${at.slice(0, 7)}` : `workspace ${repo}`})` : repo === this.mainRepo ? (ref === "main" ? "main" : ref) : `workspace ${repo}${ref === "main" ? "" : ` at ${ref}`}`;
+    const read = { repo, ref: change ? label.replace(/^change-/, "change:") : ref, readFrom: where };
     const path = q.get("path");
     if (path && at) {
       // A landed change: read the file as main had it at that commit.
       const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
       const e = (await w.flatten(at)).get(path);
-      if (!e) throw new HttpError(404, `${path} not found at ${ref}`);
-      return { repo, ref, path, content: await w.readText(e.oid) };
+      if (!e) throw new HttpError(404, `${path} not found in ${where}`);
+      return { ...read, path, content: await w.readText(e.oid) };
     }
     if (path) {
       const content = await this.store.readFile(repo, ref, path);
-      if (content === null) throw new HttpError(404, `${path} not found at ${ref}`);
-      return { repo, ref, path, content };
+      if (content === null) throw new HttpError(404, change ? `${path} not found in ${where}; the change may delete it (get_change lists its files)` : `${path} not found in ${where}`);
+      return { ...read, path, content };
     }
     const w = await Workspace.open(this.remote(repo, await this.token(repo, "read")), "main", this.seed());
     const flat = await w.flatten(at ?? (await w.head()));
-    return { repo, ref, files: [...flat.keys()].sort() };
+    return { ...read, files: [...flat.keys()].sort() };
   }
 
   // ── push events: a git push to a workspace refreshes its change ──────────
@@ -1939,10 +1943,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
   }
 
-  /** Files a change touches that its task never declared an intent for. */
+  /** Files a change touches that its task never declared an intent for. Lockfiles and ignore lists don't need declaring. */
   private undeclared(taskId: number, files: FileChange[]): string[] {
     const declared = this.sql.exec("SELECT paths FROM intents WHERE task_id = ?", taskId).toArray().flatMap((r) => JSON.parse(r.paths as string) as string[]);
-    return files.map((f) => f.path).filter((f) => !declared.some((p) => matches(p, f)));
+    return files.map((f) => f.path).filter((f) => !isHousekeeping(f) && !declared.some((p) => matches(p, f)));
   }
 
   private requestReview(id: number, author: string) {
@@ -2081,7 +2085,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
       checks: ch.checks, checksConfigured: !!this.checks, mainHasTests: this.mainTests !== 0,
-      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id)).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
+      // Only intents declared before it was submitted: a later task on the same files is that task's overlap, not this change's risk.
+      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id) && !((i.created_at as number) > (ch.created_at as number))).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
@@ -5216,7 +5221,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
    */
   private reviewerCandidates(id: number, limit = 5): Candidate[] {
     const ch = this.change(id);
-    const files = (ch.files as FileChange[]).map((f) => f.path);
+    // Who last touched a lockfile or .gitignore says nothing about who can review the change.
+    const files = (ch.files as FileChange[]).map((f) => f.path).filter((p) => !isHousekeeping(p));
     const symbols: Record<string, string[]> = ch.symbols ?? {};
     const folders = [...new Set(files.map(folderOf).filter(Boolean))];
     const reviewed = new Set(this.sql.exec("SELECT reviewer FROM reviews WHERE change_id = ? AND head = ?", id, ch.head).toArray().map((r) => r.reviewer as string));
@@ -5238,6 +5244,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       JSON.stringify(files), JSON.stringify(folders.map((f) => `${f}/%`))).toArray() : [];
     for (const r of rows) {
       const path = r.path as string, sym = r.symbol as string, wrote = r.kind === "wrote";
+      if (isHousekeeping(path)) continue;
       const n = Math.min(3, r.n as number) * recency(r.last_at as number);
       if (files.includes(path)) {
         if (sym && symbols[path]?.includes(sym)) add(r.agent_id as string, (wrote ? 5 : 3) * n, `${wrote ? "wrote" : "reviewed"} ${sym} in ${path}`);
@@ -5589,10 +5596,31 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // Only agents who are around: asking absent ones walks the whole roster one
     // deadline at a time. With nobody around, the review stays an open task (and
     // shows as stuck) until someone comes back and takes it.
-    const next = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent) && c.present).sort((x, y) => y.score - x.score)[0];
-    this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: next?.agent ?? null, toName: next?.name ?? null } });
-    if (next) this.assignReviewer(id, next.agent, "loom", `${next.reasons[0]} (${why})`);
-    else if (this.reviewAgent.enabled) void this.armAlarm(Date.now() + 1000);
+    let next: { agent: string; name: string; reason: string } | undefined;
+    const known = this.reviewerCandidates(id, 10).filter((c) => !asked.has(c.agent) && c.present).sort((x, y) => y.score - x.score)[0];
+    if (known) next = { agent: known.agent, name: known.name, reason: known.reasons[0] };
+    else {
+      // Nobody who knows the code is around: any agent who is, those between tasks first, then the least asked.
+      const busy = new Set(this.sql.exec("SELECT DISTINCT assignee FROM tasks WHERE status IN ('claimed','blocked') AND assignee IS NOT NULL").toArray().map((r) => r.assignee as string));
+      const load = new Map(this.sql.exec("SELECT reviewer, COUNT(*) AS n FROM review_requests WHERE status IN ('open','accepted') GROUP BY reviewer").toArray().map((r) => [r.reviewer as string, r.n as number]));
+      const any = this.reviewersLeft(id).filter((a) => a.present && !asked.has(a.id))
+        .sort((x, y) => Number(busy.has(x.id)) - Number(busy.has(y.id)) || (load.get(x.id) ?? 0) - (load.get(y.id) ?? 0))[0];
+      if (any) next = { agent: any.id, name: this.agentName(any.id) ?? any.id, reason: busy.has(any.id) ? "around now, though working on a task" : "around now and between tasks" };
+    }
+    if (next) {
+      this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: next.agent, toName: next.name } });
+      this.assignReviewer(id, next.agent, "loom", `${next.reason} (${why})`);
+    } else if (this.reviewAgent.enabled) {
+      // Mergery's own review agent takes it: say so, rather than "to nobody".
+      this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: REVIEW_AGENT_ID, toName: "Mergery's review agent", fallback: "review-agent" } });
+      void this.armAlarm(Date.now() + 1000);
+    } else {
+      // Nobody to ask. The review stays an open task every agent's whoami lists, the author is told,
+      // and people see it in Needs a person (stuck) until someone takes it.
+      this.emit("review.rerouted", { change: id, task: ch.task_id, to: ch.agent_id, data: { why, to: null, toName: null, unowned: true } });
+      this.emit("review.unowned", { change: id, task: ch.task_id, to: ch.agent_id, data: {
+        why, advice: `Nobody who could review #${id} is around (${why}). It is an open review task now: any agent can take_review it, you can request_review an agent who comes back (suggest_reviewers), or a person can review it.` } });
+    }
   }
 
   /** Requests nobody accepted in time, or accepted and never delivered, go to someone else. */
@@ -6205,6 +6233,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...directives.map((d) => `Directive #${d.seq} from ${d.from}${d.toYouAlone ? " to you" : " to all agents"}: "${d.body}". Follow it over your own plan, then ack_directive (seq ${d.seq})`),
       ...reviewRequests.map((r) => r.status === "open" ? `Answer the review request on #${r.change_id} (respond_to_review_request), then review it` : `Review #${r.change_id}: you accepted it`),
       ...changes.filter((c) => ["conflict", "changes_requested", "checks_failed"].includes(c.status as string)).map((c) => `Your change #${c.id} is ${c.status}: get_change, then fix and update_change`),
+      // A change waiting on a review nobody holds: say so, rather than let the author wait on silence.
+      ...this.reviewTasks().filter((t) => t.author === actor.id && t.status === "open").map((t) => `Your change #${t.change} has no reviewer: request_review an agent who is around (suggest_reviewers shows who), or wait for one to take_review it`),
       ...changes.map((c) => ({ c, n: this.openBlockingThreads(c.id as number) })).filter((x) => x.n).map(({ c, n }) => `Your change #${c.id} has ${n} open review thread${n === 1 ? "" : "s"}: fix each and resolve_thread it, or reply_thread if you disagree (get_change lists them)`),
       ...tasks.filter((t) => t.status === "open").map((t) => `Task #${t.id} "${t.title}" was assigned to you: claim_task it to get its workspace, then work on it`),
       ...tasks.filter((t) => t.status !== "open" && !submitted.has(t.id)).map((t) => `Your task #${t.id} has no change yet: finish it and submit_change`),
@@ -6462,6 +6492,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // An earlier upload of this session: replaced, or added to.
     const sessionOf = sessionGiven ?? parseTrace(text.slice(0, 200_000), (wanted as TraceSource) ?? detectSource(text), false).sessionId;
     const earlier = sessionOf ? this.sql.exec(`SELECT * FROM traces WHERE agent_id = ? AND session_id = ? AND ${LIVE_TRACE} ORDER BY id DESC LIMIT 1`, actor.id, sessionOf).toArray()[0] as any : undefined;
+    // The same log sent again (a retry, a hook firing twice) is the trace already on record, not a new version.
+    const same = !append && (earlier?.original_sha256 === originalSha ? earlier
+      : this.sql.exec(`SELECT * FROM traces WHERE agent_id = ? AND original_sha256 = ? AND ${LIVE_TRACE} ORDER BY id DESC LIMIT 1`, actor.id, originalSha).toArray()[0] as any);
+    // Unless Mergery can now read steps from it that it couldn't before: then it is a new version.
+    if (same && (same.step_count > 0 || !parseTrace(text, (wanted as TraceSource) ?? detectSource(text), false).steps.length)) {
+      const view = this.traceView(this.traceRow(same.id as number));
+      return { ...view, duplicate: true, note: `Trace #${same.id} already has exactly this log, so nothing new was stored.`, ...this.traceWarning(view) };
+    }
     if (append && earlier) {
       const prev = await this.context.get(traceKeys(this.project, earlier.id).log);
       text = `${prev ? await gunzip(new Uint8Array(await prev.arrayBuffer())) : ""}\n${text}`;
@@ -6528,7 +6566,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (earlier) this.sql.exec("UPDATE traces SET superseded_by = ? WHERE id = ?", id, earlier.id);
     const view = this.traceView(this.traceRow(id));
     this.emit("trace.added", { actor: actor.id, task: taskId, change: changeId, data: { id, source, steps: view.steps, redactions: red.count, version, sha256: sha, ...(earlier ? { supersedes: earlier.id } : {}) } });
-    return { ...view, supersedes: earlier?.id ?? null, appended: !!earlier && append };
+    return { ...view, supersedes: earlier?.id ?? null, appended: !!earlier && append, ...this.traceWarning(view) };
+  }
+
+  /**
+   * An upload Mergery couldn't read into steps is kept, but reviewers get no
+   * steps from it: say so, and how to send one it can read.
+   */
+  private traceWarning(view: { source: string; steps: number }) {
+    if (view.steps > 0) return {};
+    const why = view.source === "text"
+      ? "Mergery didn't recognize this log's format, so it is kept as plain text"
+      : `Mergery read this as ${view.source} but found no steps in it`;
+    return { warning: `${why}: reviewers can read it, but the Intent view can't link to its steps. Send the agent's own session log (Claude Code's transcript .jsonl, Codex's rollout .jsonl, \`opencode export <session>\`, or \`opencode run --format json\` output), or write steps yourself. ${STEP_FORMAT}` };
   }
 
   private async serveTrace(id: number): Promise<Response> {
