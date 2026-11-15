@@ -2085,8 +2085,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
       files: paths.map((p) => statOf.get(p) ?? { path: p, added: 0, removed: 0 }),
       undeclared: ch.undeclared, guarded: this.guardedFiles(files),
       checks: ch.checks, checksConfigured: !!this.checks, mainHasTests: this.mainTests !== 0,
-      // Only intents declared before it was submitted: a later task on the same files is that task's overlap, not this change's risk.
-      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id) && !((i.created_at as number) > (ch.created_at as number))).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
+      // Only intents declared before the change last moved (submitted, updated, reviewed): a task started on the same
+      // files after that is the later task's overlap to sort out, not a risk in what the reviewer is reading.
+      othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id) && !((i.created_at as number) > (ch.updated_at as number))).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
@@ -6495,8 +6496,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // The same log sent again (a retry, a hook firing twice) is the trace already on record, not a new version.
     const same = !append && (earlier?.original_sha256 === originalSha ? earlier
       : this.sql.exec(`SELECT * FROM traces WHERE agent_id = ? AND original_sha256 = ? AND ${LIVE_TRACE} ORDER BY id DESC LIMIT 1`, actor.id, originalSha).toArray()[0] as any);
-    // Unless Mergery can now read steps from it that it couldn't before: then it is a new version.
-    if (same && (same.step_count > 0 || !parseTrace(text, (wanted as TraceSource) ?? detectSource(text), false).steps.length)) {
+    // Unless it would now be stored differently: the project changed whether it keeps thoughts, or Mergery
+    // can now read steps from it that it couldn't before. Then it is a new version.
+    if (same && !!same.thoughts === settings.thoughts && (same.step_count > 0 || !parseTrace(text, (wanted as TraceSource) ?? detectSource(text), false).steps.length)) {
       const view = this.traceView(this.traceRow(same.id as number));
       return { ...view, duplicate: true, note: `Trace #${same.id} already has exactly this log, so nothing new was stored.`, ...this.traceWarning(view) };
     }

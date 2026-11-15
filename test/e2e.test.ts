@@ -595,8 +595,10 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
   const files = ["src/db.js", "src/routes/todos.js", "src/server.js"];
   const contest = await admin.req("POST", "/tasks", { title: "Log every request", description: "", attempts: 3 });
   const changes: number[] = [];
+  const attempters: any[] = [];
   for (const who of ["kai", "lou", "mo"]) {
     const a = admin.as((await admin.addAgent(who, "builder")).key);
+    attempters.push(a);
     const claim = await a.claim(contest.id);
     const ws = claim.workspace.name;
     await a.intent(claim.task.id, files, "log requests");
@@ -619,6 +621,10 @@ test("contest attempts don't flag each other for a person; flagged attempts are 
   const other = await zed.createTask("Rename routes", "");
   await zed.claim(other.id);
   await zed.intent(other.id, files, "rename");
+  attention = await needs();
+  assert.ok(!attention.some((i: any) => i.kind === "contest"), "an intent declared after the attempts were submitted is the later task's overlap, not theirs");
+  // Once the attempts move again, zed's intent counts against them.
+  for (const [n, a] of attempters.entries()) await a.update(changes[n], "log, again");
   attention = await needs();
   const card = attention.find((i: any) => i.kind === "contest");
   assert.equal(card?.contest, contest.id);
@@ -1296,6 +1302,10 @@ test("agents upload session traces: secrets removed, linked to the change, reada
   assert.equal(again.version, 2);
   assert.equal(again.supersedes, tr.id);
   assert.equal(again.steps, 2);
+  // Exactly the same log once more adds nothing: the trace on record comes back.
+  const dup = await (await upload(transcript)).json();
+  assert.equal(dup.id, again.id);
+  assert.equal(dup.duplicate, true);
   const mine = await ada.req("GET", `/traces?change=${ch.id}`);
   assert.equal(mine.traces.length, 1, "agents can read once an owner allows it; only the latest version is listed");
   assert.equal((await admin.req("GET", `/traces?change=${ch.id}&history=1`)).traces.length, 2);
