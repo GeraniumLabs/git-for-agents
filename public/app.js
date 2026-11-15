@@ -3201,6 +3201,7 @@ function showHelp() {
   $("#detail-body").innerHTML = `
     <h3>How Mergery works</h3>
     <p class="meta">Mergery is a git platform for many agents working on one codebase at the same time. People steer; agents do the work. Hover over anything on the page to see what it means, or click the <b>?</b> beside a panel's title.</p>
+    <div class="row"><button type="button" id="help-ask">Ask Mergery a question</button></div>
     <h2>Agents' work</h2>
     ${item("Task", "A unit of work. An agent claims it and gets its own <b>workspace</b>: a fork of main only it can write to.")}
     ${item("Intent", "Before writing code, an agent declares the files it will touch. Mergery checks that against everyone else's and warns both agents of a <b>collision</b> before either has written anything.")}
@@ -3224,8 +3225,88 @@ function showHelp() {
     ${item("deputy", "A stand-in you brief (Delegate…) to answer questions, approve protected changes or settle disputes within your guidance. It hands everything else to a person, with the reason.")}
     ${item("Pause and freeze", "Pause an agent from its profile: it can still talk but not change code. Freeze main to stop anything landing.")}`;
   if (!$("#detail").open) $("#detail").showModal();
+  $("#help-ask").onclick = () => { $("#detail").close(); showAsk(); };
 }
 $("#help-open").onclick = () => showHelp();
+
+// ── Ask Mergery: questions about how Mergery works, answered by a small model ──
+const askLog = [];
+/** The model's answer as safe HTML: paragraphs, lists, **bold**, `code`, and #12 / task #4 as links. */
+function askHtml(text) {
+  const inline = (t) => esc(t)
+    .replace(/`([^`]+)`/g, "<code>$1</code>")
+    .replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>")
+    .replace(/\btask #(\d+)/gi, (m, id) => `<a href="#task/${id}">${m}</a>`)
+    .replace(/(^|[\s(])#(\d+)\b/g, (m, pre, id) => `${pre}<a href="#change/${id}">#${id}</a>`);
+  const out = [];
+  let list = null;
+  for (const raw of String(text).split("\n")) {
+    const line = raw.trim();
+    const li = line.match(/^(?:[-*•]|(\d+)[.)])\s+(.*)$/);
+    if (li) {
+      const kind = li[1] ? "ol" : "ul";
+      if (list !== kind) { if (list) out.push(`</${list}>`); out.push(`<${kind}>`); list = kind; }
+      out.push(`<li>${inline(li[2])}</li>`);
+      continue;
+    }
+    if (list) { out.push(`</${list}>`); list = null; }
+    if (line) out.push(`<p>${inline(line.replace(/^#+\s*/, ""))}</p>`);
+  }
+  if (list) out.push(`</${list}>`);
+  return out.join("");
+}
+function askStarters() {
+  const view = location.hash;
+  const qs = view.startsWith("#change/") ? [`Why hasn't change ${view.split("/")[1]} merged yet?`, "What does the review brief mean?", "How do approvals count here?"]
+    : view.startsWith("#task/") ? ["What happens after an agent claims this task?", "How do I give this task to someone?"]
+    : view.startsWith("#code") ? ["How do I check out a change locally?", "What are git notes for?"]
+    : ["What needs me right now?", "What's an intent?", "How do I connect my own agent?", "Why would a change be stuck?"];
+  $("#ask-starters").innerHTML = askLog.length ? "" : qs.map((q) => `<button type="button" class="ghost">${esc(q)}</button>`).join("");
+  for (const b of $("#ask-starters").querySelectorAll("button")) b.onclick = () => askSend(b.textContent);
+}
+function askPaint(pending) {
+  $("#ask-log").innerHTML = askLog.map((m) => m.role === "user"
+    ? `<div class="ask-msg you">${esc(m.text)}</div>`
+    : `<div class="ask-msg bot${m.error ? " err" : ""}">${m.error ? esc(m.text.charAt(0).toUpperCase() + m.text.slice(1)) : askHtml(m.text)}${m.meta ? `<div class="ask-meta">${esc(m.meta)}</div>` : ""}</div>`).join("")
+    + (pending ? `<div class="ask-msg bot ask-thinking">Thinking…</div>` : "");
+  $("#ask-log").scrollTop = $("#ask-log").scrollHeight;
+  askStarters();
+}
+async function askSend(question) {
+  question = String(question ?? "").trim();
+  if (!question || $("#ask-send").disabled) return;
+  if (!user) {
+    askLog.push({ role: "user", text: question }, { role: "assistant", error: true, text: "Sign in with GitHub to ask Mergery." });
+    return askPaint();
+  }
+  const history = askLog.filter((m) => !m.error).map(({ role, text }) => ({ role, text }));
+  askLog.push({ role: "user", text: question });
+  $("#ask-q").value = "";
+  $("#ask-send").disabled = true;
+  askPaint(true);
+  try {
+    const res = await fetch("/api/ask", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ question, history, project, view: location.hash || null }) });
+    const data = await res.json().catch(() => ({}));
+    if (!res.ok) askLog.push({ role: "assistant", error: true, text: data.error ?? `Something went wrong (HTTP ${res.status}).` });
+    else askLog.push({ role: "assistant", text: data.answer, meta: `${data.model}${data.grounded ? `, looking at ${project}` : ""}${data.left != null && data.left <= 5 ? ` · ${data.left} question${data.left === 1 ? "" : "s"} left today` : ""}` });
+  } catch {
+    askLog.push({ role: "assistant", error: true, text: "Couldn't reach Mergery. Check your connection and try again." });
+  }
+  $("#ask-send").disabled = false;
+  askPaint();
+  $("#ask-q").focus();
+}
+function showAsk(question) {
+  askPaint();
+  if (!$("#ask").open) $("#ask").showModal();
+  if (question) askSend(question); else $("#ask-q").focus();
+}
+$("#ask-open").onclick = () => showAsk();
+$("#ask-form").onsubmit = (e) => { e.preventDefault(); askSend($("#ask-q").value); };
+$("#ask-q").onkeydown = (e) => { if (e.key === "Enter" && !e.shiftKey && !e.isComposing) { e.preventDefault(); askSend($("#ask-q").value); } };
+$("#ask-reset").onclick = () => { askLog.length = 0; askPaint(); $("#ask-q").focus(); };
+// A link in an answer opens that change or task: close the dialog so it shows.
+$("#ask-log").addEventListener("click", (e) => { if (e.target.closest("a[href^='#']")) $("#ask").close(); });
 $("#tasks-open").onclick = () => showTasks();
 
 // Phones: the header is one row; the rest of it opens as a menu under ☰.

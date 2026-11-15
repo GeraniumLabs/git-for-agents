@@ -268,6 +268,16 @@ async function reviewStandIn(req, res) {
   for await (const c of req) chunks.push(c);
   const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
   const prompt = String(body.messages?.[0]?.content ?? "");
+  const system = Array.isArray(body.system) ? body.system.map((b) => b.text ?? "").join("") : String(body.system ?? "");
+  if (system.startsWith("You are Ask Mergery")) {
+    // The help assistant: answer in plain text, saying what it was given, so tests can see the snapshot and history arrived.
+    const last = String(body.messages?.at(-1)?.content ?? "");
+    const q = last.match(/Question: (.*)$/s)?.[1] ?? "";
+    const snap = last.match(/<project_snapshot>\n(.*?)\n/)?.[1] ?? "no project";
+    const text = `An intent is the list of files an agent declares before writing code. (stand-in; asked "${q}"; ${snap}; ${body.messages.length - 1} earlier turns)`;
+    return send(res, 200, { id: "msg_standin", type: "message", role: "assistant", model: body.model, stop_reason: "end_turn", stop_sequence: null,
+      content: [{ type: "text", text }], usage: { input_tokens: system.length + last.length, output_tokens: 30 } });
+  }
   if (body.output_config?.format?.schema?.properties?.score) {
     // Scoring a review eval: a diff that adds a TODO scores low, anything else high.
     const low = /^\+.*TODO/m.test(prompt);

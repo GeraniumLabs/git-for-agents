@@ -367,6 +367,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
       CREATE TABLE IF NOT EXISTS plans (login TEXT PRIMARY KEY, plan TEXT, status TEXT, customer TEXT, subscription TEXT, renews INTEGER, event_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
+      CREATE TABLE IF NOT EXISTS help_quota (who TEXT NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, minute INTEGER NOT NULL DEFAULT 0, mn INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (who, day));
       ${ORG_TABLES}
       CREATE TABLE IF NOT EXISTS threads (
         id INTEGER PRIMARY KEY AUTOINCREMENT, kind TEXT NOT NULL DEFAULT 'discussion',
@@ -841,6 +842,24 @@ export class ProjectCoordinator extends DurableObject<Env> {
         const login = String(body.login ?? "").trim().toLowerCase();
         this.sql.exec("INSERT INTO waitlist (login, name, asked_at) VALUES (?, ?, ?) ON CONFLICT(login) DO UPDATE SET asks = asks + 1", login, body.name ?? login, Date.now());
         return json({ ok: true });
+      }
+      // Ask Mergery's allowance (src/helpdesk.ts): questions per person a day and a minute, and for the whole server a day.
+      if (b === "help-quota" && m === "POST") {
+        const now = Date.now(), day = new Date(now).toISOString().slice(0, 10), minute = Math.floor(now / 60_000);
+        const login = String(body.login ?? "").toLowerCase();
+        if (!login) throw new HttpError(400, "give a login");
+        this.sql.exec("DELETE FROM help_quota WHERE day <> ?", day);
+        const row = (who: string) => this.sql.exec("SELECT n, minute, mn FROM help_quota WHERE who = ? AND day = ?", who, day).toArray()[0] as { n: number; minute: number; mn: number } | undefined;
+        const server = row("*"), me = row(login);
+        const perDay = Number(body.perDay), perMinute = Number(body.perMinute), serverPerDay = Number(body.serverPerDay);
+        if (serverPerDay > 0 && (server?.n ?? 0) >= serverPerDay) return json({ ok: false, reason: "Ask Mergery has answered all the questions it can today; try again tomorrow (UTC)" });
+        if (perDay > 0 && (me?.n ?? 0) >= perDay) return json({ ok: false, reason: `you've asked ${perDay} questions today, the most a day; try again tomorrow (UTC)` });
+        const thisMinute = me && me.minute === minute ? me.mn : 0;
+        if (perMinute > 0 && thisMinute >= perMinute) return json({ ok: false, reason: "that's a lot of questions at once; wait a minute and ask again" });
+        const bump = (who: string) => this.sql.exec(`INSERT INTO help_quota (who, day, n, minute, mn) VALUES (?, ?, 1, ?, 1)
+          ON CONFLICT(who, day) DO UPDATE SET n = n + 1, mn = CASE WHEN minute = excluded.minute THEN mn + 1 ELSE 1 END, minute = excluded.minute`, who, day, minute);
+        bump("*"); bump(login);
+        return json({ ok: true, left: perDay > 0 ? perDay - (me?.n ?? 0) - 1 : null });
       }
       if (m === "GET" && b === "creator") {
         const login = (url.searchParams.get("login") ?? "").toLowerCase();
