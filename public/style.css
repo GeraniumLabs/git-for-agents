@@ -823,3 +823,30 @@ pre.out { max-height: 220px; overflow: auto; font-size: var(--fs-11_5); white-sp
 .md a { color: var(--info); text-decoration: underline; }
 .clone-cmd { margin: 6px 0 10px; }
 .clone-cmd pre { margin: 4px 0; }
+
+/* Sign-in card: a small centered card, the way most sites do it. Logo, heading,
+   one full-width GitHub button, fine print. Stays a card on phones too. */
+dialog#signin-card { width: min(400px, calc(100vw - 32px)); max-height: none; padding: 36px 32px 28px; border-radius: 14px; text-align: center; position: relative; }
+dialog#signin-card::backdrop { background: rgb(20 18 12 / .55); backdrop-filter: blur(3px); }
+#signin-card .si-close { position: absolute; top: 10px; right: 10px; margin: 0; }
+#signin-card .si-close button { margin: 0; width: 32px; height: 32px; min-height: 32px; padding: 0; font-size: 20px; line-height: 1; border-radius: 99px; background: transparent; border: 0; color: var(--muted); }
+#signin-card .si-close button:hover { color: var(--ink); background: var(--chip); }
+#signin-card .si-logo svg { width: 56px; height: 56px; display: block; margin: 0 auto 14px; }
+#signin-card .si-logo .i { stroke: var(--ink); } #signin-card .si-logo .a { fill: var(--accent); } #signin-card .si-logo .s { stroke: var(--accent); }
+#signin-card h2 { margin: 0; font-size: 22px; font-weight: 650; letter-spacing: -.01em; color: var(--ink); text-transform: none; border: 0; padding: 0; }
+#signin-card .si-sub { margin: 6px 0 0; color: var(--muted); font-size: 14px; }
+#signin-card .si-sub b { color: var(--ink); font-weight: 600; }
+#signin-card .si-why { margin: 16px 0 0; font-size: 13.5px; color: var(--muted); line-height: 1.45; }
+#signin-card .si-note { margin: 18px 0 0; font-size: 14px; line-height: 1.5; }
+#signin-card .si-github { display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%; margin: 24px 0 0; padding: 0 16px; height: 46px; border-radius: 8px; background: #1f2328; color: #fff; font-size: 15px; font-weight: 600; text-decoration: none; border: 1px solid #1f2328; transition: background .15s; }
+#signin-card .si-github:hover { background: #32383f; }
+#signin-card .si-github:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+:root[data-theme="dark"] #signin-card .si-github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) #signin-card .si-github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; } }
+#signin-card .si-or { display: flex; align-items: center; gap: 10px; margin: 20px 0 12px; color: var(--muted); font-size: 12px; }
+#signin-card .si-or::before, #signin-card .si-or::after { content: ""; flex: 1; border-top: 1px solid var(--line); }
+#signin-card .si-dev { display: flex; gap: 8px; }
+#signin-card .si-dev input { flex: 1; min-width: 0; }
+#signin-card .si-dev button { margin: 0; }
+#signin-card .si-fine { margin: 22px 0 0; padding-top: 18px; border-top: 1px solid var(--line); font-size: 12px; line-height: 1.5; color: var(--muted); }
+#signin-card .si-fine a { color: inherit; text-decoration: underline; }
