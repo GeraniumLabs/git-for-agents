@@ -61,3 +61,24 @@ export function canTakeOver(taskStatus: string, lastSeen: number | null, now: nu
   // A person's assignment holds for a day; a claimed task for as long as the holder keeps calling.
   return now - lastSeen > (taskStatus === "open" ? GONE_MS : quietMs);
 }
+
+/** The busiest state wins when one name covers several agent records. */
+const STATE_RANK = ["working", "conflict", "waiting", "quiet", "paused", "idle", "away", "gone"];
+
+/**
+ * Agents as people count them: one per name. An agent that joins again with a
+ * new key, or comes back through another connection, gets a new record under
+ * the same name; counting records showed 14 agents for a few names. Each name
+ * takes the busiest state of its records.
+ */
+export function byName<T extends { name: string; state: string }>(agents: T[]): T[] {
+  const best = new Map<string, T>();
+  const rank = (s: string) => { const i = STATE_RANK.indexOf(s); return i < 0 ? STATE_RANK.length : i; };
+  for (const a of agents) {
+    if (a.state === "human") continue;
+    const k = a.name.trim().toLowerCase();
+    const had = best.get(k);
+    if (!had || rank(a.state) < rank(had.state)) best.set(k, a);
+  }
+  return [...best.values()];
+}

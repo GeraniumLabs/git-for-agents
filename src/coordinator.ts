@@ -12,7 +12,7 @@ import { subscribePushes, unsubscribe, type Push } from "./events";
 import type { Env } from "./env";
 import { rankReviewers, checkIntent, DEFAULT_DELEGATE, decideApproval, decideDispute, decideFlagged, decideQuestion, normalizeOptions, type DelegateConfig, type Judge, type ProjectContext } from "./delegate";
 import { PRESENT_MS, sameQuestion, similarity, type Decision } from "./memory";
-import { GONE_MS, RELEASE_MS, canTakeOver, nextRelease, releaseNow, type Holding } from "./presence";
+import { GONE_MS, RELEASE_MS, byName, canTakeOver, nextRelease, releaseNow, type Holding } from "./presence";
 import { folderOf, symbolsTouched, type Candidate } from "./familiarity";
 import { zip } from "./zip";
 import { FilesShapeError, normalizeFiles } from "./files";
@@ -128,9 +128,10 @@ export interface Agent {
 }
 
 /**
- * The `Loom-Submit:` trailer of a commit message, if it has one: the title
- * (the trailer's value, or the subject), the summary (the body without
- * trailers) and an optional `Loom-Approach:`.
+ * The `Mergery-Submit:` trailer of a commit message (or the older
+ * `Loom-Submit:`), if it has one: the title (the trailer's value, or the
+ * subject), the summary (the body without trailers) and an optional
+ * `Mergery-Approach:` (or `Loom-Approach:`).
  */
 export function submitTrailers(message: string): { title: string; summary: string; approach?: string } | null {
   const lines = message.replace(/\r/g, "").trimEnd().split("\n");
@@ -138,12 +139,12 @@ export function submitTrailers(message: string): { title: string; summary: strin
   while (end > 1 && /^[A-Za-z][\w-]*:\s?.*$/.test(lines[end - 1])) end--;
   const trailers = lines.slice(end);
   const get = (name: string) => trailers.find((l) => l.toLowerCase().startsWith(`${name.toLowerCase()}:`))?.slice(name.length + 1).trim();
-  const submit = get("Loom-Submit");
+  const submit = get("Mergery-Submit") ?? get("Loom-Submit");
   if (submit === undefined) return null;
   const subject = lines[0]?.trim() ?? "";
   const title = (submit && !/^(yes|true|1)$/i.test(submit) ? submit : subject).slice(0, 200);
   const summary = lines.slice(1, end).join("\n").trim() || subject;
-  const approach = get("Loom-Approach");
+  const approach = get("Mergery-Approach") ?? get("Loom-Approach");
   return { title: title || "Change", summary, ...(approach ? { approach } : {}) };
 }
 
@@ -891,6 +892,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (a === "work") return json(await this.workFeed(url.searchParams.get("known"), Number(url.searchParams.get("wait") ?? 0), url.origin));
       if (a === "overview") return json(this.overview());
       if (a === "search") return json(this.search(url.searchParams));
+      if (a === "area") return json(this.area(url.searchParams.get("path") ?? ""));
       if (a === "agents" && b && c === "trust") return json(this.trustOf(this.profile(b).agent.id));
       if (a === "agents" && b && c !== "limits") return json(this.profile(b));
       if (a === "events") return json(await this.events(Number(url.searchParams.get("after") ?? 0), Number(url.searchParams.get("wait") ?? 0), url.searchParams.get("agent"), url.searchParams.get("mine") === "1"));
@@ -1075,7 +1077,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ownerOnly("import issues");
       return json(await this.importIssues(actor, body));
     }
-    if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body));
+    if (a === "checkout" && m === "POST") return json(await this.checkout(actor, body, url.origin));
     if (a === "me") return json(this.me(actor));
     // Traces are for the project's people (and its agents, if an owner allows), even on a public project,
     // unless an owner published them (the open reads above). Asking, reports and scorecards stay people only.
@@ -1638,7 +1640,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
    * the project: people review locally with their own tools. Writing still goes
    * through a claimed task's workspace, and main only through the merge queue.
    */
-  private async checkout(actor: Agent, body: { workspace?: string; change?: number }) {
+  private async checkout(actor: Agent, body: { workspace?: string; change?: number }, origin = "") {
     const { repo, label, at } = this.repoFor(body);
     const ttl = 3600;
     const token = await this.store.token(repo, "read", ttl);
@@ -1648,7 +1650,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
       repo, remote, token, expiresAt: new Date(Date.now() + ttl * 1000).toISOString(),
       clone: `git -c http.extraHeader="Authorization: Bearer ${token}" clone ${remote} ${dir}${at ? ` && git -C ${dir} checkout --detach ${at}` : ""}`,
       ...(at ? { compare: `cd ${dir} && git diff ${at}^1 ${at}` } : {}),
-      ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:loom-main && git diff loom-main...HEAD` } : {}),
+      ...(repo !== this.mainRepo ? { compare: `cd ${dir} && git -c http.extraHeader="Authorization: Bearer ${await this.store.token(this.mainRepo, "read", ttl)}" fetch ${this.remoteUrl(this.mainRepo)} main:mergery-main && git diff mergery-main...HEAD` } : {}),
+      // Bring a clone you already have up to date. The token in it expires, so the remote and a fresh token go on the command itself.
+      ...(at ? {} : { pull: `git -C ${dir} -c http.extraHeader="Authorization: Bearer ${token}" pull ${remote} main` }),
+      // For keys and scripts: a fresh pull command whenever you need one, no browser.
+      ...(at || !origin ? {} : { pullWithKey: `curl -fsS -X POST -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" -d '${JSON.stringify(body.workspace ? { workspace: body.workspace } : body.change ? { change: body.change } : {})}' ${origin}/api/projects/${this.project}/checkout | jq -r .pull | sh` }),
       note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
     };
   }
@@ -2010,8 +2016,41 @@ export class ProjectCoordinator extends DurableObject<Env> {
       patch: text, context: ctx ? await ctx.json() : null,
       threads: this.reviewThreads(id), brief: this.briefFor(ch, text), attachments: this.attachmentsWhere("change_id = ?", id),
       traceCount: this.traceCount(id),
+      personAsk: this.personAskFor(id),
       reviewedHeads: this.sql.exec("SELECT reviewer, head, MAX(created_at) AS at FROM reviews WHERE change_id = ? AND COALESCE(vote, 0) = 0 GROUP BY reviewer, head ORDER BY at", id).toArray(),
     };
+  }
+
+  /**
+   * Why this change is in "Needs a person", if it is, and what the person
+   * should do: the same items the dashboard lists, so the review page and the
+   * dashboard can't disagree. The brief scores the diff alone; a change can
+   * still wait on a person because an agent asked one, the project needs a
+   * person's approval, or it is one attempt in a contest.
+   */
+  private personAskFor(id: number): { kind: string; why: string; todo: string }[] {
+    const out: { kind: string; why: string; todo: string }[] = [];
+    for (const it of this.attention(this.agentStates())) {
+      const mine = it.change === id || (it.kind === "contest" && it.changes.some((x: any) => x.change === id));
+      if (!mine) continue;
+      if (it.kind === "approval") {
+        const guarded = this.guardedFiles((it.files as string[]).map((path) => ({ path } as FileChange))).length > 0;
+        out.push({ kind: "approval", why: guarded ? "It touches protected paths, so a person has to approve it before it lands." : "This task was set to need a person's approval before it lands.",
+          todo: "Read the diff, then Approve it or Request changes with what to fix. Agents' approvals don't count here." });
+      } else if (it.kind === "brief") {
+        out.push({ kind: "brief", why: `The brief flagged it: ${(it.reasons as string[]).join("; ") || "several small risks add up"}.`,
+          todo: "Look at the flagged files first, then Approve or Request changes. If it's fine for agents to review, approve it and they'll carry on." });
+      } else if (it.kind === "review") {
+        out.push({ kind: "review", why: `${this.agentName(it.agent) ?? it.agent} asked ${it.reviewer === "admin" ? "a person" : this.agentName(it.reviewer) ?? "a person"} to review it${it.reason && !/^asked by /i.test(it.reason) ? `: “${it.reason}”` : "."}`,
+          todo: "Review it and Approve or Request changes. If an agent can do it instead, hand it back and Mergery asks an agent." });
+      } else if (it.kind === "contest") {
+        out.push({ kind: "contest", why: "It is one of several attempts at the same task, and only one lands.",
+          todo: `Compare the attempts in contest #${it.contest} and pick the one that should land.` });
+      } else if (it.kind === "stuck" && it.action === "review") {
+        out.push({ kind: "stuck", why: `Its review is stuck: ${it.reason}.`, todo: "Review it yourself, or connect another agent that can review it." });
+      }
+    }
+    return out;
   }
 
   // ── review threads, the brief, and what changed since a review ──────────
@@ -4120,7 +4159,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       concept: (this.meta("description") ?? "").slice(0, 1000),
       age_days: first ? Math.floor((Date.now() - first) / 86_400_000) : 0,
       agents: {
-        total: agents.filter((a) => a.role !== "human").length,
+        total: byName(agents).length,
         working_now: agents.filter((a) => a.state === "working" || a.state === "waiting" || a.state === "conflict").length,
         people: agents.filter((a) => a.role === "human").length,
       },
@@ -4964,7 +5003,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const now = Date.now();
     const agents = this.agentStates();
     const byState: Record<string, number> = {};
-    for (const a of agents) if (a.state !== "human") byState[a.state] = (byState[a.state] ?? 0) + 1;
+    const named = byName(agents);
+    for (const a of named) byState[a.state] = (byState[a.state] ?? 0) + 1;
     const taskCounts = Object.fromEntries(this.sql.exec("SELECT status, COUNT(*) AS n FROM tasks GROUP BY status").toArray().map((r) => [r.status, r.n]));
     const changeCounts = Object.fromEntries(this.sql.exec("SELECT status, COUNT(*) AS n FROM changes GROUP BY status").toArray().map((r) => [r.status, r.n]));
 
@@ -4986,7 +5026,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
-        agents: { total: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
+        agents: { total: named.filter((a) => a.state !== "gone").length, records: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
         tasks: taskCounts, changes: changeCounts,
         reviewTasks: this.reviewTasks().reduce((n: Record<string, number>, t) => ({ ...n, [t.status]: (n[t.status] ?? 0) + 1 }), { open: 0, assigned: 0, in_progress: 0 }),
         queue: { depth: queued.length, oldestWaitMs: queued.length ? now - Math.min(...queued.slice(0, 50).map((q) => waitedFor(q.id as number))) : 0 },
@@ -5173,6 +5213,38 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .slice(0, 24);
   }
 
+  /**
+   * One folder from Where the work is: who is working there and on what, the
+   * changes in flight, and what landed or conflicted there in the last hour.
+   */
+  private area(path: string) {
+    const now = Date.now();
+    const root = path === "(root)";
+    const prefix = path.replace(/\/?$/, "/");
+    const inside = (p: string) => root ? !p.replace(/\*.*$/, "").includes("/") : p.startsWith(prefix) || p.replace(/\*.*$/, "") === prefix.slice(0, -1);
+    const intents = this.activeIntents().filter((i) => (i.paths as string[]).some(inside)).map((i) => ({
+      agent: i.agent_id as string, agentName: this.agentName(i.agent_id) ?? i.agent_id, task: i.task_id as number, taskTitle: (this.sql.exec("SELECT title FROM tasks WHERE id = ?", i.task_id).toArray()[0]?.title as string) ?? null,
+      paths: (i.paths as string[]).filter(inside), since: i.created_at as number,
+    }));
+    const changes = this.sql.exec("SELECT id, title, status, agent_id, files, updated_at FROM changes WHERE status IN ('review','queued','merging','conflict','changes_requested','checks_failed') ORDER BY updated_at DESC").toArray()
+      .map((c) => ({ c, files: (JSON.parse(c.files as string) as FileChange[]).map((f) => f.path).filter(inside) }))
+      .filter((x) => x.files.length)
+      .map(({ c, files }) => ({ id: c.id as number, title: c.title as string, status: c.status as string, agent: c.agent_id as string, agentName: this.agentName(c.agent_id as string), files, since: c.updated_at as number }));
+    const landed: { change: number | null; title: string; files: string[]; at: number }[] = [];
+    const conflicts: { change: number | null; files: string[]; at: number }[] = [];
+    for (const r of this.sql.exec("SELECT type, ts, change_id, data FROM events WHERE ts > ? AND type IN ('change.merged','change.conflict') ORDER BY seq DESC", now - 3600_000).toArray()) {
+      const d = JSON.parse(r.data as string);
+      if (r.type === "change.merged") {
+        const files = ((d.files ?? []) as any[]).map((f) => f.path).filter(inside);
+        if (files.length) landed.push({ change: r.change_id as number | null, title: r.change_id != null ? (this.sql.exec("SELECT title FROM changes WHERE id = ?", r.change_id).toArray()[0]?.title as string) ?? "" : "", files, at: r.ts as number });
+      } else {
+        const files = ((d.conflicts ?? []) as any[]).map((c) => c.path).filter(inside);
+        if (files.length) conflicts.push({ change: r.change_id as number | null, files, at: r.ts as number });
+      }
+    }
+    return { path, intents, changes, landed, conflicts };
+  }
+
   /** Find agents, tasks, changes and files by name, title, path or number. */
   private search(q: URLSearchParams) {
     const text = (q.get("q") ?? "").trim();
@@ -5185,6 +5257,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...(text ? [like, like, like, num || -1, like, num || -1] : []),
     ).filter((a) => a.state !== "human" || !state);
     // "present": every agent that isn't away, the ones a person might steer right now.
+    // A state's list matches the dashboard's count: one row per name, in its busiest state.
+    if (state) {
+      const records = new Map<string, number>();
+      for (const a of agents) if (a.state !== "human") records.set(a.name.trim().toLowerCase(), (records.get(a.name.trim().toLowerCase()) ?? 0) + 1);
+      agents = byName(agents).map((a) => ({ ...a, records: records.get(a.name.trim().toLowerCase()) ?? 1 }));
+    }
     if (state === "present") agents = agents.filter((a) => a.state !== "human" && a.state !== "away" && a.state !== "gone");
     else if (state) agents = agents.filter((a) => a.state === state);
     agents.sort((a, b) => b.lastSeen - a.lastSeen);

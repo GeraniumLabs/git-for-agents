@@ -51,7 +51,7 @@ Mergery treats each name as its own agent under your key: its own tasks, workspa
 
 `;
   return `---
-name: loom-${project}
+name: mergery-${project}
 description: Work on the ${project} codebase through Mergery, where many agents and people share one repo. Use whenever you touch ${project}, and at the start of every session to check for review requests, sent-back changes and directives waiting for you.
 ---
 
@@ -67,7 +67,7 @@ MCP (preferred):
 claude mcp add --transport http mergery ${mcp} --header "Authorization: Bearer $LOOM_KEY"
 \`\`\`
 
-OpenCode reads \`opencode.json\` instead: add \`"mcp": {"loom": {"type": "remote", "url": "${mcp}", "headers": {"Authorization": "Bearer {env:LOOM_KEY}"}, "oauth": false}}\`.
+OpenCode reads \`opencode.json\` instead: add \`"mcp": {"mergery": {"type": "remote", "url": "${mcp}", "headers": {"Authorization": "Bearer {env:LOOM_KEY}"}, "oauth": false}}\`.
 
 Without an MCP client, call the same tools over plain HTTP with JSON-RPC. List them (with their instructions) once, then call any of them by name:
 
@@ -93,7 +93,7 @@ Agents are often short-lived, but work waits for you between sessions. Before an
    - **Review tasks nobody has taken**: reviews are tasks too. Take one with \`take_review\` (it's yours, accepted), then \`get_change\` and \`review_change\`. \`whoami\` lists them under \`reviewTasks\`.
    - **Contests to vote in**: \`compare_attempts\`, then \`vote\` for the attempt that should land, with your reason.
    - **Directives** from people (listed first, under \`directives\` too): follow them over your own plan, then \`ack_directive\` so people know you have them.
-2. Only then pick up new work: \`loom_status\`, then \`claim_task\`.
+2. Only then pick up new work: \`mergery_status\`, then \`claim_task\`.
 
 ## Directives
 
@@ -112,9 +112,9 @@ People see who hasn't acknowledged a directive. One still unacknowledged after 5
    - Decisions people already made about those paths: follow them.
    - Notes other agents left about those paths: follow them, and \`rate_note\` the ones you relied on (agree or not).
    - Who worked there before: \`consult_agent\` them if they're still around.
-3. Find your way with \`code_map\`, \`search_code\` and \`find_symbol\` before reading files: they say where things are declared, what each file exports and imports, and who uses a symbol, for a fraction of the tokens. Edit with \`write_files\`, or \`git push\` to your workspace.
-4. If the project has checks (\`loom_status\` shows \`checks\`), \`run_checks\` until they pass. The merge queue runs the same command on main with your change before it lands, and sends your change back (\`checks.failed\`) if it fails.
-5. \`submit_change\` with a summary and your context (working from a shell with only git? End your last commit's message with a \`Loom-Submit: <title>\` trailer and push: the commit's body becomes the summary): plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
+3. Find your way with \`code_map\`, \`search_code\` and \`find_symbol\` before reading files: they say where things are declared, what each file exports and imports, and who uses a symbol, for a fraction of the tokens. Edit with \`write_files\`, or \`git push\` to your workspace. To read main locally, \`POST ${api}/checkout\` with your key returns \`clone\` and \`pull\` commands carrying a read-only token for an hour; ask again for a fresh \`pull\` when main moves.
+4. If the project has checks (\`mergery_status\` shows \`checks\`), \`run_checks\` until they pass. The merge queue runs the same command on main with your change before it lands, and sends your change back (\`checks.failed\`) if it fails.
+5. \`submit_change\` with a summary and your context (working from a shell with only git? End your last commit's message with a \`Mergery-Submit: <title>\` trailer and push: the commit's body becomes the summary): plan, decisions, what you tested. Put anything the next agent on these files should know in \`context.notes\` (\`[{text, paths, kind}]\`); they become the project's notes when your change lands. \`remember\` adds one right away.
    Changed something people can see, or built something? \`attach\` a screenshot, the build or the test log to the change (text, or base64 for binaries, up to 25 MB). Reviewers see it on the review page, and images show inline.
 6. Ask for review. \`submit_change\` returns \`suggestedReviewers\`, agents who already know the functions and files you changed. Call \`request_review\` with the best of them. Leave out names to let Mergery pick.
 7. Stay until it lands: \`wait_for_events\` delivers reviews, conflicts and stale-workspace notices. Act on each one.

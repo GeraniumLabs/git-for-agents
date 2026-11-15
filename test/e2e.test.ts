@@ -219,7 +219,7 @@ test("review threads: the author must answer line comments before the change mer
   assert.ok(["queued", "merging", "merged"].includes(s), `resolving the last thread queues the approved change (${s})`);
 });
 
-test("reviews are agent tasks: an untaken review shows up in whoami and loom_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
+test("reviews are agent tasks: an untaken review shows up in whoami and mergery_status, and any agent can take it", { skip: !url, timeout: 120_000 }, async () => {
   const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const name = project("e2e-rtasks");
@@ -1126,20 +1126,25 @@ test("one line connects an MCP client: it signs in as a person through OAuth, th
     return JSON.parse(text);
   };
   const tools = (await mcp("tools/list")).result.tools.map((t: any) => t.name);
-  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("loom_tool") && tools.includes("claim_task"));
-  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through loom_tool");
+  assert.ok(tools.includes("list_projects") && tools.includes("create_project") && tools.includes("mergery_tool") && tools.includes("claim_task"));
+  assert.ok(!tools.includes("open_dispute"), "the rest are one call away through mergery_tool");
 
   const name = project("e2e-mcp");
   await tool("create_project", { name, description: "made over MCP" });
   assert.deepEqual((await tool("list_projects")).map((p: any) => p.name), [name]);
-  await assert.rejects(tool("loom_status"), /say which project/);
+  await assert.rejects(tool("mergery_status"), /say which project/);
   const task = await tool("create_task", { project: name, title: "Write a hello file" });
   const claimed = await tool("claim_task", { project: name, taskId: task.id });
   const who = await tool("whoami", { project: name });
   assert.equal(who.agent.name, "Claude Code");
   assert.equal(who.agent.under.name, login, "the client works as the person's agent, grouped under them");
-  const sub = await tool("loom_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
+  const sub = await tool("mergery_tool", { name: "my_track_record", arguments: { project: name, as: "helper-1" } });
   assert.ok(sub);
+  // Agents set up before the rename to Mergery still call the old names.
+  assert.ok((await tool("loom_status", { project: name })).agents);
+  assert.ok(await tool("loom_tool", { name: "my_track_record", arguments: { project: name } }));
+  const area = await (await fetch(`${url}/api/projects/${name}/area?path=(root)`)).json();
+  assert.ok(Array.isArray(area.intents) && Array.isArray(area.changes), "a folder from Where the work is opens with who's there and what's in flight");
   const state = await (await fetch(`${url}/api/projects/${name}/state`)).json();
   assert.ok(state.agents.some((a: any) => a.name === "helper-1"));
 
@@ -1919,4 +1924,34 @@ test("a preview link per change: static files or a build's output, sandboxed, be
   assert.match(await (await fetch(pv.url)).text(), /Hello v2 again/);
   assert.equal(await (await fetch(`${pv.url}built.txt`)).text(), "ok\n");
   assert.ok((await admin.req("GET", "/events?after=0")).events.some((e: any) => e.type === "preview.ready"));
+});
+
+test("an agent key gets clone and pull commands for main, and pull brings in what landed since", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const { mkdtempSync, readFileSync, rmSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const name = project("e2e-pull");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "pull with a key", files: SEED, requiredApprovals: 0 });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const root = mkdtempSync(join(tmpdir(), "mergery-pull-"));
+  try {
+    const first = await ada.req("POST", "/checkout", {});
+    assert.match(first.pull, / pull /);
+    assert.match(first.pullWithKey, /\/checkout \| jq -r \.pull \| sh$/);
+    await run("sh", ["-c", first.clone], { cwd: root });
+    const t = await ada.createTask("Note in db.js", "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, ["src/db.js"], "note");
+    await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// pulled\n" }, "note");
+    const ch = await ada.submit(t.id, t.title, "", { plan: ["note"] });
+    for (let i = 0; i < 60 && (await ada.change(ch.id)).status !== "merged"; i++) await new Promise((r) => setTimeout(r, 500));
+    const again = await ada.req("POST", "/checkout", {});
+    await run("sh", ["-c", `git -C ${name}-main config user.email a@b.c && git -C ${name}-main config user.name a && ${again.pull}`], { cwd: root });
+    assert.match(readFileSync(join(root, `${name}-main`, "src/db.js"), "utf8"), /\/\/ pulled/);
+  } finally {
+    rmSync(root, { recursive: true, force: true });
+  }
 });
