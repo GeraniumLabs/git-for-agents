@@ -1162,6 +1162,9 @@ async function showClone(box, target) {
 // The code page: #code for main, #code/change/<id> or #code/workspace/<name>
 // for someone's work, then /tree/<folder>, /file/<path> or /history.
 let code = null; // what the page shows: { key, target, q, files, tree, label }
+let codeLoads = 0; // only the newest click on the code page draws
+/** A spinner and what it's waiting on. */
+const loadingHtml = (text) => `<p class="loading" role="status" aria-live="polite"><span class="spinner" aria-hidden="true"></span>${text}</p>`;
 const encPath = (p) => p.split("/").map(encodeURIComponent).join("/");
 const codeHref = (t, view = "") => `${t.change ? `#code/change/${t.change}` : t.workspace ? `#code/workspace/${encodeURIComponent(t.workspace)}` : "#code"}${view ? `/${view}` : ""}`;
 function showCode(target = {}, view = "") {
@@ -1247,8 +1250,19 @@ async function loadCode(target, view, path) {
   const q = target.change ? `change=${target.change}` : target.workspace ? `workspace=${encodeURIComponent(target.workspace)}` : "";
   const key = q || "main";
   const page = $("#review");
+  const load = ++codeLoads;
   if (code?.key !== key || !$("#code-main")) {
+    // Listing the files fetches the repository, which can take a few seconds: say so instead of a blank page.
+    page.innerHTML = `
+      <div class="rv-top">
+        <a class="button ghost mini" href="${target.change ? `#change/${target.change}` : "#"}">← ${target.change ? `Change #${target.change}` : "Dashboard"}</a>
+        <h1>Code</h1>
+      </div>
+      ${loadingHtml(`Fetching ${target.change ? `change #${target.change}'s` : target.workspace ? `workspace ${esc(target.workspace)}'s` : "main's"} files…`)}`;
+    window.scrollTo(0, 0);
     const [list, c] = await Promise.all([api(`/files?${q}`), target.change ? api(`/changes/${target.change}`) : null]);
+    // A newer click (another target, or leaving the page) wins over this slow one.
+    if (load !== codeLoads || !/^#code/.test(location.hash)) return;
     if (list.error) { page.innerHTML = `<div class="rv-top"><a class="button ghost mini" href="#">← Back</a><p class="empty">${esc(list.error)}</p></div>`; code = null; return; }
     const label = target.change
       ? `change #${target.change}${c && !c.error ? ` · ${esc(c.title)} · ${esc(c.agentName)}${c.status === "merged" ? " · landed" : "'s workspace"}` : ""}`
@@ -1291,10 +1305,12 @@ async function loadCode(target, view, path) {
   $(".code-grid").classList.toggle("reading", view === "file");
   drawCodeTree();
   const main = $("#code-main");
-  main.innerHTML = `<p class="meta">Reading…</p>`;
-  main.innerHTML = view === "history"
+  main.innerHTML = loadingHtml(view === "history" ? "Reading the history…" : view === "file" ? `Reading ${esc(path.split("/").at(-1))}…` : "Reading…");
+  const html = view === "history"
     ? historyHtml(await api(`/commits?${q}`), !target.change && !target.workspace, target.change && /landed/.test(code.label))
     : view === "file" ? await codeFile(path) : await codeFolder(path);
+  if (load !== codeLoads || !main.isConnected) return;
+  main.innerHTML = html;
   wire(main);
   if ($("#code-copy")) $("#code-copy").onclick = () => navigator.clipboard?.writeText(code.content).then(() => toast("Copied"));
   if (main.getBoundingClientRect().top < 0) main.scrollIntoView();
