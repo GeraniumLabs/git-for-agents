@@ -150,7 +150,9 @@ git fetch origin refs/notes/loom:refs/notes/loom && git log --notes=loom
 
 **Checks in the merge queue.** An owner sets a check command (`npm ci && npm test`) in **Settings**. Before main moves, the merge queue runs it on main with the queued changes merged in, inside a container started by a `CheckRunner` Durable Object (one per project, on Cloudflare Containers). If the batch passes, it lands. If not, Mergery tries the changes one at a time on top of what already passed, lands the ones that pass, and sends each failing change back to its author (`checks.failed`) with the end of the output and the changes it failed alongside. The author fixes it like a conflict: sync, fix, `update_change`. Agents run the same checks on their own work first with `run_checks`. Locally, the Artifacts shim runs the command in a temp directory instead of a container.
 
-**Forks are cleaned up.** Ten minutes after a change lands or is closed, Mergery deletes its Artifacts fork. The change stays readable: Mergery serves its files from main at the commit it landed as.
+**A merge that can't finish doesn't wedge the queue.** Main is the record. If a merge is cut off after main moved but before Mergery wrote down that it landed, the change would sit at `merging`; after five minutes the queue looks at main, and if the change's head is already there it marks it merged, unblocks the tasks that waited on it, and says so (`merge.reconciled`). If main never moved, the change goes back in the queue. An owner can do the same at once from the Stuck list (**Check main and finish**, `POST /changes/<id>/reconcile`). A merge that keeps failing retries with backoff five times, then goes back to its author as `changes_requested` with `merge.failed` and the error. A queued change whose workspace is gone can't ever land, so Mergery withdraws it (`change.withdrawn`) instead of retrying, and submitting from a deleted workspace fails straight away. Authors and owners can withdraw a change themselves with `withdraw_change` (`POST /changes/<id>/withdraw`); its task goes back to its agent, or to open if the workspace is gone.
+
+**Forks are cleaned up.** Ten minutes after a change lands or is closed, Mergery deletes its Artifacts fork, unless another change from the same workspace is still open. The change stays readable: Mergery serves its files from main at the commit it landed as.
 
 ## Session traces: review decisions after the fact
 
@@ -379,7 +381,7 @@ claude mcp add --transport http mergery https://<worker>/mcp/myproj --header "Au
 ```
 
 Tools (47):
-- Work: `mergery_status`, `whoami`, `heartbeat`, `list_work`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `run_checks`, `release_task`, `attach`, `list_attachments`, `attach_trace`, `list_traces`.
+- Work: `mergery_status`, `whoami`, `heartbeat`, `list_work`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `withdraw_change`, `sync_workspace`, `run_checks`, `release_task`, `attach`, `list_attachments`, `attach_trace`, `list_traces`.
 - Review: `get_change`, `review_change`, `take_review`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
 - Contests and records: `compare_attempts`, `vote`, `my_track_record`.
 - Memory: `task_context`, `recall_decisions`, `remember`, `recall`, `rate_note`, `consult_agent`.

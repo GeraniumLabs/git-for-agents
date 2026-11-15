@@ -2045,3 +2045,68 @@ test("git login: plain git reads main and pushes to your own workspace, and noth
   await assert.rejects(git(bobKey, `${dir}/ws`, "push", "origin", "HEAD:main"));
   await assert.rejects(git("", `${dir}/ws`, "-c", "mergery.key=", "fetch"), /no agent key/);
 });
+
+test("a merge cut off after main moved finishes from main; a change whose workspace is gone is withdrawn, not retried", { skip: !url || !/127\.0\.0\.1|localhost/.test(url), timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const name = project("e2e-wedge");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "wedge", requiredApprovals: 0, files: { "src/a.js": "a\n", "src/b.js": "b\n", "src/c.js": "c\n" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const bex = admin.as((await admin.addAgent("bex", "builder")).key);
+  // Only wrangler dev's explorer can reach into a coordinator's tables, to recreate what a cut-off merge leaves behind.
+  const sql = async (q: string, ...params: unknown[]) => {
+    const r = await fetch(`${url}/cdn-cgi/local/explorer/api/workers/durable_objects/namespaces/loom-local-ProjectCoordinator/query`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ durable_object_name: name, queries: [{ sql: q, params }] }) });
+    assert.ok(r.ok, `explorer query failed: ${r.status} ${await r.text()}`);
+  };
+  const until = async (id: number, ok: (c: any) => boolean) => {
+    for (let i = 0; i < 60; i++) { const c = await admin.change(id); if (ok(c)) return c; await new Promise((r) => setTimeout(r, 500)); }
+    return admin.change(id);
+  };
+  const work = async (who: any, title: string, path: string, dependsOn: number[] = []) => {
+    const t = await who.createTask(title, "", dependsOn);
+    const ws = (await who.claim(t.id)).workspace.name;
+    await who.intent(t.id, [path], title);
+    await who.write(ws, { [path]: `${title}\n` }, title);
+    return { t, ws };
+  };
+
+  // B5: change A landed, but the row says merging (the coordinator was cut off before its bookkeeping).
+  const a = await work(ada, "Land A", "src/a.js");
+  const chA = await ada.submit(a.t.id, "Land A", "", { plan: ["a"] });
+  const landed = await until(chA.id, (c) => c.status === "merged");
+  assert.equal(landed.status, "merged");
+  const b = await ada.createTask("After A", "", [a.t.id]);
+  await sql("UPDATE changes SET status = 'merging', merged_commit = NULL, merged_version = NULL, updated_at = ? WHERE id = ?", Date.now() - 10 * 60_000, chA.id);
+  await sql("UPDATE tasks SET status = 'in_review' WHERE id = ?", a.t.id);
+  await assert.rejects(bex.claim(b.id), /waits on task \d+ \(in_review, change #\d+ merging\)/);
+  const stuck = (await admin.req("GET", "/overview")).attention.find((i: any) => i.kind === "stuck" && i.change === chA.id);
+  assert.equal(stuck?.reason, "merge cut off partway");
+  await assert.rejects(bex.req("POST", `/changes/${chA.id}/reconcile`), /403/);
+  const fixed = await admin.req("POST", `/changes/${chA.id}/reconcile`);
+  assert.equal(fixed.outcome, "merged");
+  assert.equal(fixed.commit, landed.mergedCommit ?? landed.merged_commit);
+  assert.equal(fixed.change, "merged");
+  await bex.claim(b.id);
+
+  // Withdrawing: only the author or an owner, and the task goes back to its agent.
+  await admin.req("POST", "/settings", { requiredApprovals: 1 });
+  const c = await work(ada, "Land C", "src/c.js");
+  const chC = await ada.submit(c.t.id, "Land C", "", { plan: ["c"] });
+  await assert.rejects(bex.req("POST", `/changes/${chC.id}/withdraw`, {}), /403/);
+  const w = await ada.req("POST", `/changes/${chC.id}/withdraw`, { reason: "not needed" });
+  assert.equal(w.status, "closed");
+  assert.equal(w.task.status, "claimed");
+  assert.equal((await admin.change(chC.id)).status, "closed");
+
+  // B6: an open change whose workspace was deleted is withdrawn by the queue, and submitting from a deleted workspace fails at once.
+  const d = await work(ada, "Land D", "src/b.js");
+  const chD = await ada.submit(d.t.id, "Land D", "", { plan: ["d"] });
+  await sql("UPDATE workspaces SET status = 'deleted' WHERE name = ?", d.ws);
+  await admin.req("POST", `/changes/${chD.id}/reconcile`);
+  const gone = await admin.change(chD.id);
+  assert.equal(gone.status, "closed");
+  assert.equal((await admin.state()).tasks.find((t: any) => t.id === d.t.id).status, "open");
+  const e = await work(ada, "Land E", "src/c.js");
+  await sql("UPDATE workspaces SET status = 'deleted' WHERE name = ?", e.ws);
+  await assert.rejects(ada.submit(e.t.id, "Land E", "", { plan: ["e"] }), /409.*was deleted/);
+});
