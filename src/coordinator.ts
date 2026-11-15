@@ -44,6 +44,24 @@ const MAX_UNDER_KEY = 200;
 const DELEGATE_ID = "delegate";
 /** Mergery's own review agent, which reviews a change nobody else is around to (src/reviewer.ts). */
 const REVIEW_AGENT_ID = "loom-reviewer";
+/** {path: why} from either {path: why} or [{path, why}]; reasons cut to 300 characters. */
+function explanationsOf(v: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  const add = (p: unknown, why: unknown) => { if (typeof p === "string" && p.trim() && typeof why === "string" && why.trim()) out[p.trim()] = why.trim().slice(0, 300); };
+  if (Array.isArray(v)) for (const x of v) add(x?.path, x?.why ?? x?.reason);
+  else if (v && typeof v === "object") for (const [p, why] of Object.entries(v)) add(p, why);
+  if (Object.keys(out).length > 200) throw new HttpError(400, "explain at most 200 files");
+  return out;
+}
+
+/** The longest an agent can say it is busy for in one heartbeat. */
+const BUSY_MAX_MIN = 120;
+/**
+ * When an agent was last known to be alive: its last call, or now while it is
+ * inside a busy window it declared (a long build makes no calls). Once the
+ * window ends, the quiet clock starts from its end.
+ */
+const aliveAt = (lastSeen: unknown, busyUntil: unknown, now = Date.now()) => Math.max((lastSeen as number) ?? 0, Math.min((busyUntil as number) ?? 0, now));
 /** How long an unacknowledged directive keeps nagging the agents it went to. */
 const DIRECTIVE_TTL = 7 * 24 * 3600_000;
 /** The project's check minutes for the day are used up; the merge queue waits until `until`. */
@@ -242,6 +260,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.migrateTables();
     for (const ddl of [
       "ALTER TABLE agents ADD COLUMN paused TEXT",
+      // An agent that said it is busy (a long build, a test run): counts as around until busy_until.
+      "ALTER TABLE agents ADD COLUMN busy TEXT",
+      "ALTER TABLE agents ADD COLUMN busy_until INTEGER",
+      // Why a file is in a change or an intent, in the author's words: {path: why}. The brief shows it.
+      "ALTER TABLE intents ADD COLUMN reasons TEXT",
+      "ALTER TABLE changes ADD COLUMN explained TEXT",
       // Session traces as evidence: fingerprints, versions instead of overwrites, and a record of removals.
       "ALTER TABLE traces ADD COLUMN sha256 TEXT",
       "ALTER TABLE traces ADD COLUMN original_sha256 TEXT",
@@ -739,6 +763,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       symbols: c.symbols ? JSON.parse(c.symbols as string) : {},
       checks: c.checks ? JSON.parse(c.checks as string) : null,
       intent_check: c.intent_check ? JSON.parse(c.intent_check as string) : null,
+      explained: c.explained ? JSON.parse(c.explained as string) : {},
     } as any;
   }
   private activeIntents(excludeAgent?: string) {
@@ -746,7 +771,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .exec("SELECT * FROM intents WHERE released_at IS NULL")
       .toArray()
       .filter((r) => r.agent_id !== excludeAgent)
-      .map((r) => ({ ...r, paths: JSON.parse(r.paths as string) })) as any[];
+      .map((r) => ({ ...r, paths: JSON.parse(r.paths as string), reasons: r.reasons ? JSON.parse(r.reasons as string) : {} })) as any[];
   }
 
   // ── HTTP entry point (called by the Worker) ──────────────────────────────
@@ -1107,6 +1132,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (b && !c) return json(await this.traceDetail(Number(b), url.searchParams));
     }
 
+    if (a === "heartbeat" && m === "POST") return json(this.heartbeat(actor, body));
     // Agents acknowledge directives (paused ones too: a directive may be why they're paused).
     if (a === "directives" && c === "ack" && m === "POST") return json(this.ackDirectives(actor, b === "all" ? null : [Number(b)], body.note));
     if (a === "directives" && b === "ack" && m === "POST") return json(this.ackDirectives(actor, Array.isArray(body.seqs) ? body.seqs.map(Number) : null, body.note));
@@ -1466,7 +1492,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // work stays in the workspace and its change, and both pass to whoever claims it.
     // A person's assignment holds for a day, so an agent can't take a task meant for another.
     if (task.assignee && task.assignee !== actor.id) {
-      const holder = this.sql.exec("SELECT last_seen, role FROM agents WHERE id = ?", task.assignee).toArray()[0];
+      const holder = this.sql.exec("SELECT last_seen, busy_until, busy, role FROM agents WHERE id = ?", task.assignee).toArray()[0];
+      if (holder && (holder.busy_until as number) > Date.now()) {
+        throw new HttpError(409, `task ${taskId} is held by ${this.agentName(task.assignee)}, who said it is busy (${holder.busy}) until ${new Date(holder.busy_until as number).toISOString()}`);
+      }
+      if (holder) holder.last_seen = aliveAt(holder.last_seen, holder.busy_until);
       if ((holder?.role === "human" && task.status === "open") || !canTakeOver(task.status as string, holder ? holder.last_seen as number : null, Date.now(), PRESENT_MS)) {
         throw new HttpError(409, task.status === "open"
           ? `task ${taskId} was assigned to ${this.agentName(task.assignee)}; a person can reassign it`
@@ -1532,23 +1562,39 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   // ── intents: say what you'll touch before you touch it ──────────────────
 
-  private async declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string }) {
-    const paths = (body.paths ?? []).map(normalizePattern).filter(Boolean);
+  private async declareIntent(actor: Agent, body: { taskId?: number; paths: string[]; description?: string; reasons?: unknown }) {
+    let paths = (body.paths ?? []).map(normalizePattern).filter(Boolean);
     if (!paths.length) throw new HttpError(400, "paths is required");
     this.assertInScope(actor, paths, "declare an intent on", true);
     body = { ...body, taskId: this.intentTask(actor, body) };
-    const row = this.sql
-      .exec("INSERT INTO intents (agent_id, task_id, paths, description, created_at) VALUES (?, ?, ?, ?, ?) RETURNING id",
-        actor.id, body.taskId ?? null, JSON.stringify(paths), body.description ?? "", Date.now())
-      .one();
-    const id = row.id as number;
+    const reasons = explanationsOf(body.reasons);
+    // Declaring again for the same task widens the intent you already have, rather than stacking another.
+    const had = body.taskId != null ? this.sql.exec("SELECT * FROM intents WHERE agent_id = ? AND task_id = ? AND released_at IS NULL ORDER BY id DESC LIMIT 1", actor.id, body.taskId).toArray()[0] : undefined;
+    let id: number;
+    let added = paths;
+    if (had) {
+      const old: string[] = JSON.parse(had.paths as string);
+      added = paths.filter((p) => !old.includes(p));
+      paths = [...old, ...added];
+      const why = { ...(had.reasons ? JSON.parse(had.reasons as string) : {}), ...reasons };
+      this.sql.exec("UPDATE intents SET paths = ?, description = ?, reasons = ? WHERE id = ?", JSON.stringify(paths), body.description || (had.description as string) || "",
+        Object.keys(why).length ? JSON.stringify(why) : null, had.id);
+      id = had.id as number;
+      this.refreshUndeclared(body.taskId!);
+    } else {
+      id = this.sql
+        .exec("INSERT INTO intents (agent_id, task_id, paths, description, reasons, created_at) VALUES (?, ?, ?, ?, ?, ?) RETURNING id",
+          actor.id, body.taskId ?? null, JSON.stringify(paths), body.description ?? "", Object.keys(reasons).length ? JSON.stringify(reasons) : null, Date.now())
+        .one().id as number;
+    }
     // Attempts at the same contest overlap by design; that isn't a collision.
     const siblings = new Set<number>(body.taskId && this.task(body.taskId).attempt ? this.contestAttempts(this.task(body.taskId).parent).map((t) => t.id as number) : []);
+    // Only what's new can newly collide: a widened intent doesn't warn others again about paths they already heard of.
     const overlaps = this.activeIntents(actor.id)
       .filter((i) => !siblings.has(i.task_id))
-      .map((i) => ({ intent: i.id, agent: i.agent_id, agentName: this.agentName(i.agent_id), task: i.task_id, description: i.description, paths: anyOverlap(paths, i.paths) }))
+      .map((i) => ({ intent: i.id, agent: i.agent_id, agentName: this.agentName(i.agent_id), task: i.task_id, description: i.description, paths: anyOverlap(added, i.paths) }))
       .filter((o) => o.paths.length);
-    this.emit("intent.declared", { actor: actor.id, task: body.taskId, data: { intent: id, paths, description: body.description ?? "" } });
+    this.emit("intent.declared", { actor: actor.id, task: body.taskId, data: { intent: id, paths, description: body.description ?? "", ...(had ? { widened: true, added } : {}) } });
     for (const o of overlaps) {
       // Tell both sides, so they can split the work or agree on an order.
       this.emit("collision.forecast", {
@@ -1567,7 +1613,14 @@ export class ProjectCoordinator extends DurableObject<Env> {
       memory.notes.length ? `Agents left ${memory.notes.length} note(s) about these paths: read them, and rate_note the ones you can confirm or refute.` : "",
       memory.consult.length ? `${memory.consult.map((c) => c.agentName).join(", ")} worked on these files before and is still around: consult them (consult_agent) if their reasons matter to you.` : "",
     ].filter(Boolean).join(" ");
-    return { intent: id, paths, overlaps, pendingChanges: pending, memory, advice };
+    return { intent: id, paths, ...(had ? { widened: true, added } : {}), overlaps, pendingChanges: pending, memory, advice };
+  }
+
+  /** A task's open change re-checks which of its files are outside the intent, once the intent grew. */
+  private refreshUndeclared(taskId: number) {
+    for (const c of this.sql.exec("SELECT id, files FROM changes WHERE task_id = ? AND status NOT IN ('merged','abandoned','closed')", taskId).toArray()) {
+      this.sql.exec("UPDATE changes SET undeclared = ? WHERE id = ?", JSON.stringify(this.undeclared(taskId, JSON.parse(c.files as string))), c.id);
+    }
   }
 
   private releaseIntent(actor: Agent, id: number) {
@@ -1843,10 +1896,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) || this.meta(`person_approves:t${body.taskId}`) === "1" ? "review" : "queued";
     const row = this.sql
-      .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, symbols, created_at, updated_at)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
+      .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, symbols, explained, created_at, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
         body.taskId, actor.id, task.workspace, body.title ?? task.title, body.summary ?? "", analysis.head, analysis.base, wsRow.base_version,
-        status, JSON.stringify(analysis.files), JSON.stringify(undeclared), JSON.stringify(analysis.symbols), now, now)
+        status, JSON.stringify(analysis.files), JSON.stringify(undeclared), JSON.stringify(analysis.symbols), JSON.stringify(explanationsOf((body as any).explanations)), now, now)
       .one();
     const id = row.id as number;
     this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
@@ -1866,7 +1919,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return { ...this.change(id), suggestedReviewers: status === "review" ? await this.rankedCandidates(id, 3) : [], ...(traceAsk ? { traceAsk } : {}) };
   }
 
-  private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string }, via: "push" | null = null) {
+  private async updateChange(actor: Agent, id: number, body: { summary?: string; context?: any; title?: string; explanations?: unknown }, via: "push" | null = null) {
     const ch = this.change(id);
     if (ch.agent_id !== actor.id) throw new HttpError(403, `change ${id} is ${this.agentName(ch.agent_id as string)}'s, not yours (${actor.name})`);
     if (ch.status === "merged" || ch.status === "merging") throw new HttpError(409, `change ${id} is ${ch.status}`);
@@ -1883,8 +1936,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) || this.personApproves(id) ? "review" : "queued";
     this.adoptIntents(ch.task_id, ch.agent_id, analysis.files);
-    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
-      analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), status, body.summary ?? null, Date.now(), id);
+    const explained = { ...ch.explained, ...explanationsOf(body.explanations) };
+    this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, explained = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
+      analysis.head, analysis.base, JSON.stringify(analysis.files), JSON.stringify(this.undeclared(ch.task_id, analysis.files)), JSON.stringify(analysis.symbols), JSON.stringify(explained), status, body.summary ?? null, Date.now(), id);
     // An update (or a sync) without new context keeps what the author said
     // at submit; new context is merged over it, key by key.
     const prev = (await (await this.context.get(`${this.project}/changes/${id}/context.json`))?.json<{ context?: Record<string, unknown> }>())?.context ?? {};
@@ -2101,6 +2155,20 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
 
   /** Where a reviewer should look, and whether a person needs to. */
+  /** Why each file is in the change, in the author's words: from submit or update_change, else from their intents' reasons. */
+  private explainedFor(ch: any): Record<string, string> {
+    const out: Record<string, string> = {};
+    const intents = this.sql.exec("SELECT paths, reasons FROM intents WHERE task_id = ? AND reasons IS NOT NULL", ch.task_id).toArray();
+    for (const f of ch.files as FileChange[]) {
+      for (const i of intents) {
+        const why = JSON.parse(i.reasons as string) as Record<string, string>;
+        const hit = Object.keys(why).find((p) => matches(p, f.path));
+        if (hit) out[f.path] = why[hit];
+      }
+    }
+    return { ...out, ...(ch.explained ?? {}) };
+  }
+
   private briefFor(ch: any, patch: string) {
     const files: FileChange[] = ch.files;
     const paths = files.map((f) => f.path);
@@ -2128,6 +2196,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // files after that is the later task's overlap to sort out, not a risk in what the reviewer is reading.
       othersIntents: this.activeIntents(ch.agent_id).filter((i) => !siblings.has(i.task_id) && !((i.created_at as number) > (ch.updated_at as number))).map((i) => ({ paths: i.paths, agent: this.agentName(i.agent_id) ?? i.agent_id })),
       knownBy, authorKnows,
+      explained: this.explainedFor(ch),
       sentBack: this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ? AND verdict = 'request_changes'", ch.id).one().n as number,
       openThreads: this.openBlockingThreads(ch.id),
       intentCheck: ch.intent_check?.head === ch.head ? ch.intent_check : null,
@@ -4975,24 +5044,27 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** What each agent is doing, derived from what it holds. */
   private agentStates(where = "", ...args: SqlStorageValue[]) {
     const now = Date.now();
-    return this.sql.exec(`SELECT a.id, a.name, a.role, a.paused, a.last_seen, a.via,
+    return this.sql.exec(`SELECT a.id, a.name, a.role, a.paused, a.last_seen, a.busy, a.busy_until, a.via,
         (SELECT k.name FROM agents k WHERE k.id = a.via) AS via_name, (SELECT k.paused FROM agents k WHERE k.id = a.via) AS via_paused,
         (SELECT t.id FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_id,
         (SELECT t.status FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_status,
         (SELECT t.title FROM tasks t WHERE t.assignee = a.id AND t.status != 'merged' ORDER BY t.updated_at DESC LIMIT 1) AS task_title
       FROM agents a ${where}`, ...args).toArray().map((r) => {
-      const quiet = now - (r.last_seen as number) > PRESENT_MS;
+      const busy = (r.busy_until as number) > now ? { status: r.busy as string, until: r.busy_until as number } : null;
+      const quiet = now - aliveAt(r.last_seen, r.busy_until, now) > PRESENT_MS;
       const st = r.task_status as string | null;
       const state = r.paused || r.via_paused ? "paused"
         : r.role === "human" || r.id === DELEGATE_ID ? "human"
         : st === "blocked" ? "waiting"
         : st === "conflict" ? "conflict"
+        // Said it is busy (a long build, a review): working, whether or not it holds a task.
+        : busy ? "working"
         : st && quiet ? "quiet"
         : st ? "working"
         // Not seen for a day: still on the project (its key works if it comes back), but no longer counted.
         : now - (r.last_seen as number) > GONE_MS ? "gone"
         : quiet ? "away" : "idle";
-      return { id: r.id as string, name: r.name as string, role: r.role as string, state, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null,
+      return { id: r.id as string, name: r.name as string, role: r.role as string, state, busy, lastSeen: r.last_seen as number, task: r.task_id ? { id: r.task_id as number, title: r.task_title as string, status: st } : null,
         under: r.via ? { id: r.via as string, name: r.via_name as string } : null };
     });
   }
@@ -5541,13 +5613,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** Start Mergery's review agent on every change that has waited long enough; returns when the next one is due. */
   /** Tasks held by agents, with what the release rules need to know. */
   private holdings() {
-    return this.sql.exec(`SELECT t.id, t.title, t.status, t.assignee, a.name, a.last_seen, a.paused,
+    return this.sql.exec(`SELECT t.id, t.title, t.status, t.assignee, a.name, a.last_seen, a.busy_until, a.paused,
         (SELECT k.paused FROM agents k WHERE k.id = a.via) AS via_paused,
         (SELECT c.status FROM changes c WHERE c.task_id = t.id AND c.status NOT IN ('merged','abandoned') ORDER BY c.id DESC LIMIT 1) AS change_status
       FROM tasks t JOIN agents a ON a.id = t.assignee
       WHERE t.status NOT IN ('merged','closed') AND a.role != 'human' AND a.id NOT IN (?, ?)`, DELEGATE_ID, REVIEW_AGENT_ID).toArray()
       .map((r) => ({ id: r.id as number, title: r.title as string, agent: r.assignee as string, name: r.name as string,
-        taskStatus: r.status as string, changeStatus: r.change_status as string | null, lastSeen: (r.last_seen as number) ?? 0, paused: !!(r.paused || r.via_paused) } satisfies Holding & Record<string, unknown>));
+        taskStatus: r.status as string, changeStatus: r.change_status as string | null, lastSeen: aliveAt(r.last_seen, r.busy_until), paused: !!(r.paused || r.via_paused) } satisfies Holding & Record<string, unknown>));
   }
 
   /**
@@ -5680,7 +5752,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (known) next = { agent: known.agent, name: known.name, reason: known.reasons[0] };
     else {
       // Nobody who knows the code is around: any agent who is, those between tasks first, then the least asked.
-      const busy = new Set(this.sql.exec("SELECT DISTINCT assignee FROM tasks WHERE status IN ('claimed','blocked') AND assignee IS NOT NULL").toArray().map((r) => r.assignee as string));
+      const busy = new Set(this.sql.exec("SELECT DISTINCT assignee AS id FROM tasks WHERE status IN ('claimed','blocked') AND assignee IS NOT NULL UNION SELECT id FROM agents WHERE busy_until > ?", Date.now()).toArray().map((r) => r.id as string));
       const load = new Map(this.sql.exec("SELECT reviewer, COUNT(*) AS n FROM review_requests WHERE status IN ('open','accepted') GROUP BY reviewer").toArray().map((r) => [r.reviewer as string, r.n as number]));
       const any = this.reviewersLeft(id).filter((a) => a.present && !asked.has(a.id))
         .sort((x, y) => Number(busy.has(x.id)) - Number(busy.has(y.id)) || (load.get(x.id) ?? 0) - (load.get(y.id) ?? 0))[0];
@@ -6298,6 +6370,25 @@ export class ProjectCoordinator extends DurableObject<Env> {
       .filter((r) => (r.ready as number) >= 2).map((r) => ({ id: r.id as number, title: r.title as string, ready: r.ready as number }));
   }
 
+  /**
+   * "Still here, and busy": an agent about to run a long build or test suite
+   * says so, and for that long counts as around (its task can't be taken over
+   * or freed) without calling in. Status idle (or minutes 0) ends it.
+   */
+  private heartbeat(actor: Agent, body: { status?: string; minutes?: number; note?: string }) {
+    const status = String(body.status ?? "busy").trim().slice(0, 40) || "busy";
+    const minutes = body.minutes === undefined ? 30 : Number(body.minutes);
+    if (!Number.isFinite(minutes) || minutes < 0) throw new HttpError(400, "minutes is how long you'll be busy, 0 to 120");
+    const done = status === "idle" || minutes === 0;
+    const until = done ? null : Date.now() + Math.min(minutes, BUSY_MAX_MIN) * 60_000;
+    this.sql.exec("UPDATE agents SET busy = ?, busy_until = ? WHERE id = ?", done ? null : `${status}${body.note ? `: ${String(body.note).slice(0, 120)}` : ""}`, until, actor.id);
+    // The release sweep reads aliveAt; wake it when the window ends so a dead agent's task is still freed.
+    if (until) void this.armAlarm(until + RELEASE_MS + 1000);
+    return done
+      ? { ok: true, busy: null, next: "You count as around while you keep calling Mergery (every 10 minutes)." }
+      : { ok: true, busy: { status, until }, next: `Your task is yours until ${new Date(until!).toISOString()} without calling in. Call heartbeat again if you need longer (up to ${BUSY_MAX_MIN} minutes at a time), or with status idle when you're done.` };
+  }
+
   private me(actor: Agent) {
     const reviewRequests = this.sql.exec(`SELECT r.change_id, r.status, r.reason, r.created_at, r.deadline, c.title FROM review_requests r JOIN changes c ON c.id = r.change_id
                                           WHERE r.reviewer = ? AND r.status IN ('open','accepted') ORDER BY r.created_at`, actor.id).toArray();
@@ -6855,7 +6946,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
-      agents, tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
+      agents, agentStates: this.agentStates(), tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
     };

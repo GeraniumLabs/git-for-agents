@@ -55,6 +55,7 @@ Keeping agents out of each other's way is only half the job. Mergery also gives 
 
 **Memory**
 - **Decisions**: human answers to agents' questions, broadcast directives, human requests for changes, dispute rulings and notes humans record directly all land in one log, tagged with the files they cover. Humans can retire a decision that no longer holds.
+- **Intents grow, with reasons**: declaring again for the same task widens the agent's intent instead of stacking another, and `reasons` ({path: why}) say why a path is in it. `submit_change` and `update_change` take `explanations` ({path: why}) for files outside the intent. The review brief shows each reason beside its file, and an explained file weighs less than an unexplained one.
 - **Recall on intent**: `declare_intent` returns the decisions that apply to those paths, earlier finished changes there (summary, the author's recorded decisions, objections from reviews), and which of those authors is still around.
 - **Delegation with memory**: claiming or being handed a task returns related earlier tasks, either named by a human (`related`) or similar in wording, with what they did and the decisions along the way.
 - **Precedent**: asking the humans returns earlier decisions that may already answer the question. The deputy answers a repeated question by citing the earlier decision, so people decide once.
@@ -175,7 +176,7 @@ A signed-out visitor at `/` (with no query) gets the landing page, `public/welco
 
 At swarm scale the dashboard stops showing agents and shows the work. Agents are just users: you find one by searching, and you don't watch them while they work.
 
-- **Dead agents** don't hold work forever. Once an agent holding a task has been silent for 10 minutes, any other agent can `claim_task` it and takes over its workspace, intents and open change. After 30 minutes Mergery frees the task on its own: back to the open list if nothing was submitted, or left in place (still in conflict or with changes requested) for anyone to claim and fix. Paused agents and changes that only wait on reviewers keep their holder. A task a person assigned waits a day for its agent. An agent not seen for a day is *gone*: it no longer counts toward the project's agents, but its key still works if it comes back.
+- **Dead agents** don't hold work forever. Once an agent holding a task has been silent for 10 minutes, any other agent can `claim_task` it and takes over its workspace, intents and open change. After 30 minutes Mergery frees the task on its own: back to the open list if nothing was submitted, or left in place (still in conflict or with changes requested) for anyone to claim and fix. Paused agents and changes that only wait on reviewers keep their holder. A task a person assigned waits a day for its agent. An agent not seen for a day is *gone*: it no longer counts toward the project's agents, but its key still works if it comes back. Before a long build or test run that makes no calls, an agent calls `heartbeat` with a status and up to 120 minutes: until then it counts as working, its task can't be taken over or freed, and review routing asks someone else first.
 - **Home** shows what needs a person, what is stuck (unanswered proposals, unresolved conflicts, an agent gone quiet holding a task, a review nobody answered), health tiles, merge flow, the merge queue and where the work is. Agent-to-agent chatter (collision forecasts, consults) leaves the *Notable* feed once there are more than 20 agents.
 - **Contribution grids** in the GitHub style, for the project and for each agent: commits, changes and reviews. A project older than a week gets a year of days. A younger one gets small squares, so the grid shows something on day one.
 - **Search** finds agents, tasks, changes and files. An agent's **profile** has its grid, the code it knows, its open review requests and how quickly it answers them, plus controls to pause it, direct it, or reassign its work.
@@ -377,12 +378,14 @@ An agent with a key (a swarm, a runner) sends it instead:
 claude mcp add --transport http mergery https://<worker>/mcp/myproj --header "Authorization: Bearer <agent key>"
 ```
 
-Tools (46):
-- Work: `mergery_status`, `whoami`, `list_work`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `run_checks`, `release_task`, `attach`, `list_attachments`, `attach_trace`, `list_traces`.
+Tools (47):
+- Work: `mergery_status`, `whoami`, `heartbeat`, `list_work`, `create_task`, `claim_task`, `declare_intent`, `release_intent`, `list_files`, `read_file`, `write_files`, `submit_change`, `update_change`, `sync_workspace`, `run_checks`, `release_task`, `attach`, `list_attachments`, `attach_trace`, `list_traces`.
 - Review: `get_change`, `review_change`, `take_review`, `suggest_reviewers`, `request_review`, `respond_to_review_request`.
 - Contests and records: `compare_attempts`, `vote`, `my_track_record`.
 - Memory: `task_context`, `recall_decisions`, `remember`, `recall`, `rate_note`, `consult_agent`.
 - Talking: `send_message`, `ask_human`, `start_discussion`, `reply_thread`, `resolve_thread`, `list_threads`, `propose`, `answer_proposal`, `publish_contract`, `open_dispute`, `state_position`, `wait_for_events`.
+
+Every result comes as `structuredContent` as well as text, in one shape: camelCase keys, and a reference to another record is `<kind>Id` (`agentId`, `taskId`, `changeId`), the same names the tools take. An agent's own context and maps keyed by file path keep their keys. Errors carry `structuredContent.error` with a `code` (`NOT_FOUND`, `CONFLICT`, `FORBIDDEN`, `INVALID`, …), the HTTP `status` and the `message`. A tool that was passed an argument it doesn't take says so.
 
 **git**: `claim_task` returns ready-to-run commands, for example:
 
