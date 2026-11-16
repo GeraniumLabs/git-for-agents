@@ -20,7 +20,7 @@ import { FilesShapeError, normalizeFiles } from "./files";
 import { runCheck, untar, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
-import { buildBrief, countTests, fileStats, isHousekeeping, isTest, suggestCheck } from "./brief";
+import { buildBrief, checkHint, countTests, fileStats, isHousekeeping, isTest, suggestCheck, withInstall } from "./brief";
 import { USER_HEADER, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
@@ -109,10 +109,10 @@ const MERGE_IDENTITY = { name: "Mergery merge queue", email: "merge-queue@merger
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
-const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "merge.failed", "proposal.made", "task.assigned"]);
+const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "merge.failed", "checks.misconfigured", "proposal.made", "task.assigned"]);
 /** Most queued changes merged together in one pass of the queue. */
 const CHATTER = new Set(["collision.forecast", "memory.recalled", "consult.requested", "task.assigned"]);
 const CHATTER_LIMIT = 20;
@@ -543,6 +543,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (command.length > 2000) throw new HttpError(400, "checks.command is too long");
     if (command && !this.env.CHECKS && !this.env.ARTIFACTS_SHIM_URL) throw new HttpError(409, "this server has no check runner yet: it needs the CHECKS container binding");
     this.setMeta("checks_command", command);
+    this.setMeta("checks_misconfigured", null);
     if (body?.timeoutSec !== undefined) {
       const t = Number(body.timeoutSec);
       if (!(t >= 10 && t <= 1800)) throw new HttpError(400, "checks.timeoutSec is between 10 and 1800");
@@ -2008,12 +2009,34 @@ export class ProjectCoordinator extends DurableObject<Env> {
     await this.checkChangeIntent(id, analysis.patch);
     const outdated = this.markOutdated(id, analysis.snapshot);
     this.emit("change.updated", { actor: actor.id, task: ch.task_id, change: id, data: { head: analysis.head, files: analysis.files, ...(via ? { via } : {}), ...(outdated.length ? { outdatedThreads: outdated } : {}) } });
-    if (status === "review") this.requestReview(id, actor.id);
-    else await this.enqueue(id);
+    if (status === "review") {
+      this.requestReview(id, actor.id);
+      this.askAgainAfterRework(ch, actor);
+    } else await this.enqueue(id);
     this.queueEvals(id);
     const contest = this.openContest(ch.task_id);
     if (contest) await this.settleContest(contest.id as number);
     return { ...this.change(id), openThreads: this.openThreadList(id) };
+  }
+
+  /**
+   * A change that went back to its author and came back is a new round of
+   * review. The people asked last round (or who reviewed it) are asked again,
+   * so a person who was asked once, and whose request lapsed or went to the
+   * review agent, sees it in their list instead of it slipping by silently.
+   */
+  private askAgainAfterRework(before: any, author: Agent) {
+    const id = before.id as number;
+    if (before.status === "review") return; // still the same round: a push while in review
+    const rounds = this.sql.exec("SELECT COUNT(*) AS n FROM reviews WHERE change_id = ?", id).one().n as number;
+    const asked = this.sql.exec("SELECT COUNT(*) AS n FROM review_requests WHERE change_id = ?", id).one().n as number;
+    if (!rounds && !asked) return;
+    const people = this.sql.exec(`SELECT DISTINCT a.id FROM agents a WHERE a.role = 'human' AND a.id != ? AND a.id != 'admin' AND (
+        a.id IN (SELECT reviewer FROM review_requests WHERE change_id = ?) OR a.id IN (SELECT reviewer FROM reviews WHERE change_id = ?))`, author.id, id, id).toArray().map((r) => r.id as string);
+    const last = this.sql.exec("SELECT reviewer FROM reviews WHERE change_id = ? AND verdict = 'request_changes' ORDER BY id DESC LIMIT 1", id).toArray()[0];
+    const why = before.status === "checks_failed" ? "its checks failed" : before.status === "conflict" ? "it conflicted with main" : last ? `${this.agentName(last.reviewer as string)} asked for changes` : "it was reworked";
+    for (const p of people) this.assignReviewer(id, p, author.id, `back for review after ${why}; you were asked last round`);
+    this.emit("review.requeued", { actor: author.id, change: id, task: before.task_id, data: { from: before.status, why, askedAgain: people, askedAgainNames: people.map((p) => this.agentName(p)) } });
   }
 
   /** An attempt came in: once two are in, everyone who can vote hears about it. */
@@ -3776,13 +3799,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const files = new Map<string, { bytes: Uint8Array; mode: string }>();
     for (const [path, { oid, mode }] of flat) files.set(path, { bytes: await w.readBytes(oid), mode });
     const { timeoutSec } = this.checks!;
-    const command = commandOverride ?? this.checks!.command;
+    const pkg = files.get("package.json");
+    const { command, added } = withInstall(commandOverride ?? this.checks!.command, files, pkg ? new TextDecoder().decode(pkg.bytes) : null);
     const day = new Date().toISOString().slice(0, 10);
     const budget = this.limits.checkMinutes * 60_000;
     const used = Number(this.meta(`checks_ms:${day}`) ?? 0);
     if (budget > 0 && used >= budget) throw new CheckBudgetError(budget / 60_000, Date.parse(`${day}T00:00:00Z`) + 86_400_000);
     const r = await runCheck(this.env, this.project, files, command, timeoutSec, await this.secretsFor(onDemand));
     this.setMeta(`checks_ms:${day}`, String(used + r.ms));
+    // Say what ran where, so a failure reads as the code's or the setup's.
+    r.output = `[Mergery] ${files.size} files at ${commit.slice(0, 7)}, a fresh copy with nothing installed; ran \`${command}\`${added ? ` (Mergery added \`${added}\`: the check command installs nothing)` : ""}\n${r.output}`;
     return r;
   }
 
@@ -3829,19 +3855,29 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private recordChecks(ch: any, r: CheckResult, commit: string) {
     this.sql.exec("UPDATE changes SET checks = ? WHERE id = ?", JSON.stringify({ ...r, commit, at: Date.now() }), ch.id);
     this.emit("checks.passed", { change: ch.id, task: ch.task_id, data: { command: r.command, ms: r.ms } });
+    this.setMeta("checks_misconfigured", null);
   }
 
   /** The tests failed with this change on main: back to its author, like a conflict. */
   private checksFailed(ch: any, r: CheckResult, alongside: number[] = []) {
     this.sql.exec("UPDATE changes SET status = 'checks_failed', checks = ?, updated_at = ? WHERE id = ?", JSON.stringify({ ...r, at: Date.now(), alongside }), Date.now(), ch.id);
+    const touched = ((ch.files ?? []) as FileChange[]).map((f) => f.path);
+    const why = checkHint(r.output, r.exitCode, touched);
     this.emit("checks.failed", {
       change: ch.id, task: ch.task_id, to: ch.agent_id,
       data: {
-        command: r.command, exitCode: r.exitCode, output: r.output.slice(-1500),
+        command: r.command, exitCode: r.exitCode, output: r.output.slice(-1500), hint: why?.hint, blame: why?.blame,
         alongside: alongside.length ? alongside.map((id) => `#${id} ${this.change(id).title}`) : undefined,
-        advice: `The project's checks fail with your change on main${alongside.length ? ` (after ${alongside.map((id) => `#${id}`).join(", ")}, which land first)` : ""}. sync_workspace, fix it, run_checks to see it pass, then update_change.`,
+        advice: why?.blame === "project"
+          ? `The checks couldn't run, and it isn't your change: ${why.hint} Tell the humans (ask_human) if nobody has; once the command is fixed, update_change to queue it again.`
+          : `The project's checks fail with your change on main${alongside.length ? ` (after ${alongside.map((id) => `#${id}`).join(", ")}, which land first)` : ""}.${why ? ` ${why.hint}` : ""} sync_workspace, fix it, run_checks to see it pass, then update_change.`,
       },
     });
+    // A check command that can't run is the owner's to fix: say so where people look, once per command.
+    if (why?.blame === "project" && JSON.parse(this.meta("checks_misconfigured") ?? "{}").command !== this.checks?.command) {
+      this.setMeta("checks_misconfigured", JSON.stringify({ command: this.checks?.command, hint: why.hint, since: Date.now(), change: ch.id }));
+      this.emit("checks.misconfigured", { change: ch.id, data: { command: this.checks?.command, hint: why.hint } });
+    }
     if (!alongside.length) this.maybeAutoBisect();
   }
 
@@ -5463,6 +5499,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     }
     for (const r of this.sql.exec("SELECT change_id, COUNT(*) AS n, MIN(ts) AS t FROM events WHERE type = 'merge.retry' AND change_id IN (SELECT id FROM changes WHERE status = 'queued') GROUP BY change_id HAVING n >= 3").toArray()) {
       items.push({ kind: "stuck", reason: `merge failed ${r.n} times`, detail: `#${r.change_id}`, change: r.change_id, since: r.t, action: "merge" });
+    }
+    const misconfigured = JSON.parse(this.meta("checks_misconfigured") ?? "null");
+    if (misconfigured && misconfigured.command === this.checks?.command) {
+      items.push({ kind: "stuck", reason: "the check command can't run", detail: misconfigured.hint, change: misconfigured.change, since: misconfigured.since, action: "settings" });
     }
     // The queue normally finishes these itself (reconcileMerging); listed so an owner can see and nudge it.
     for (const r of this.sql.exec("SELECT id, updated_at FROM changes WHERE status = 'merging' AND updated_at < ?", now - MERGE_STALL_MS).toArray()) {

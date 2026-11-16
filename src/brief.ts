@@ -151,6 +151,39 @@ export function buildBrief(i: BriefInput): Brief {
  * the checks image can run as is (Node and make); anything else is left to
  * the person.
  */
+/**
+ * Each check runs on a fresh copy of the code, with no node_modules. A Node
+ * project's check command that never installs fails on its first tool
+ * ("tsc: not found"), which looks like the change's fault. So when the
+ * command has no install step and package.json has dependencies, install
+ * first (dev dependencies included: builds and tests need them).
+ */
+export function withInstall(command: string, files: { has(path: string): boolean }, packageJson: string | null): { command: string; added: string | null } {
+  if (!packageJson || /\b(npm (ci|install|i)|pnpm|yarn|bun (install|i)|node_modules)\b/.test(command)) return { command, added: null };
+  let pkg: any;
+  try { pkg = JSON.parse(packageJson); } catch { return { command, added: null }; }
+  const deps = Object.keys(pkg?.dependencies ?? {}).length + Object.keys(pkg?.devDependencies ?? {}).length;
+  if (!deps || !/\b(npm|node)\b/.test(command)) return { command, added: null };
+  const install = files.has("package-lock.json") || files.has("npm-shrinkwrap.json") ? "npm ci --include=dev" : "npm install --include=dev";
+  return { command: `${install} && ${command}`, added: install };
+}
+
+/**
+ * Why a check failed, when the output says it wasn't the code under test:
+ * the setup (nothing installed) or a package.json without the script.
+ */
+export function checkHint(output: string, exitCode: number, touched: string[]): { blame: "project" | "change"; hint: string } | null {
+  const missing = output.match(/Missing script: "?([\w:.-]+)"?/);
+  if (missing) {
+    return touched.includes("package.json")
+      ? { blame: "change", hint: `npm found no "${missing[1]}" script in package.json as this change leaves it. Check that the file still has its "scripts" key (an edit that wrote only part of the file drops it).` }
+      : { blame: "project", hint: `package.json has no "${missing[1]}" script, so the project's check command can't run; an owner fixes the command in Settings.` };
+  }
+  const notFound = output.match(/(?:sh: \d+: )?([\w.-]+): (?:command )?not found/);
+  if (exitCode === 127 && notFound) return { blame: "project", hint: `\`${notFound[1]}\` isn't installed where the check ran. Each check starts from a fresh copy of the code with nothing installed, so the check command has to install dependencies first (for example \`npm ci && npm test\`); an owner sets it in Settings.` };
+  return null;
+}
+
 export async function suggestCheck(paths: Set<string>, read: (path: string) => Promise<string | null>): Promise<string | null> {
   if (paths.has("package.json")) {
     try {

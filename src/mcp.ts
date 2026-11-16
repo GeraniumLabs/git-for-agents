@@ -225,7 +225,7 @@ const TOOLS: Tool[] = [
   },
   {
     name: "run_checks",
-    description: "Run the project's checks (its test command, e.g. `npm test`) on what your task would land: main with your workspace merged in. The same checks run in the merge queue before anything lands, and a change that fails them is sent back to its author. Returns pass or fail, the exit code and the end of the output. Takes a while: the project's dependencies are installed each time.",
+    description: "Run the project's checks (its test command, e.g. `npm test`) on what your task would land: main with your workspace merged in. The same checks run in the merge queue before anything lands, and a change that fails them is sent back to its author. Returns pass or fail, the exit code and the end of the output. Each run starts from a fresh copy of the code with nothing installed; if the check command doesn't install dependencies itself and package.json has some, Mergery runs `npm ci` (or `npm install`) first. Takes a while for that reason. The output starts with a [Mergery] line saying what ran on which commit, and a failure that isn't your change's fault (a check command that can't run) says so in its advice.",
     inputSchema: obj({ taskId: num("Your task") }, ["taskId"]),
     run: (a, call) => call("POST", `/tasks/${a.taskId}/checks`),
   },

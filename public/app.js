@@ -518,10 +518,11 @@ function personAskHtml(c) {
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   paint($("#stuck"), items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
-    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
+    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "settings" && isOwner() ? `<div class="row"><button class="ghost mini" data-open-settings>Fix it in Settings</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`);
   wire($("#stuck"));
+  for (const b of $("#stuck").querySelectorAll("[data-open-settings]")) b.onclick = () => showSettings();
   for (const b of $("#stuck").querySelectorAll("[data-reconcile]")) b.onclick = async () => {
     let r; try { r = await act("POST", `/changes/${b.dataset.reconcile}/reconcile`, {}); } catch { return; }
     const o = r?.outcome;
@@ -827,7 +828,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -2334,6 +2335,7 @@ function describe(e) {
     case "review.declined": return ["review", `${who} declined to review #${e.change_id}${d.reason ? `: “${esc(d.reason)}”` : ""}`];
     case "review.rerouted": return ["review", `Review of #${e.change_id} rerouted: ${esc(d.why)}${d.toName ? `; asked ${esc(d.toName)}` : "; nobody else knows this code, so it waits for the reviewer pool"}`];
     case "review.requested": return ["review", `Review requested on #${e.change_id}`];
+    case "review.requeued": return ["review", `#${e.change_id} is back for review after ${esc(d.why)}${d.askedAgainNames?.length ? `; asked ${esc(d.askedAgainNames.join(", "))} again` : ""}`];
     case "review.submitted": return ["review", `${who} ${d.verdict === "approve" ? "approved" : d.verdict === "request_changes" ? "requested changes on" : "commented on"} #${e.change_id}${d.body ? `: “${esc(d.body.slice(0, 140))}”` : ""}`];
     case "attachment.added": return ["", `${who} attached <a href="/api/projects/${project}/attachments/${d.id}/raw?${keyQuery()}" target="_blank" rel="noopener">${esc(d.name)}</a>${e.change_id ? ` to #${e.change_id}` : e.task_id ? ` to task #${e.task_id}` : ""}${d.caption ? `: ${esc(d.caption)}` : ""}`];
     case "trace.added": return ["", `${who} uploaded a session trace${e.change_id ? ` for #${e.change_id}` : ""} (${plural(d.steps ?? 0, ["step", "steps"])}${d.redactions ? `, ${d.redactions} secret${d.redactions === 1 ? "" : "s"} removed` : ""})`];
@@ -2349,7 +2351,8 @@ function describe(e) {
     case "change.withdrawn": return ["", `#${e.change_id} was withdrawn by ${esc(d.by ?? "Mergery")}${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "checks.started": return ["", `Running the checks on main with ${d.changes.map((x) => `#${x}`).join(", ")}: <span class="mono">${esc(d.command)}</span>`];
     case "checks.passed": return ["merged", `Checks passed with #${e.change_id} (${Math.round(d.ms / 100) / 10}s)`];
-    case "checks.failed": return ["conflict", `#${e.change_id} fails the checks on main${d.alongside ? ` after ${esc(d.alongside.join(", "))}` : ""} (exit ${d.exitCode}). Sent back to ${to}.`];
+    case "checks.failed": return ["conflict", d.blame === "project" ? `The checks couldn't run on #${e.change_id}: ${esc(d.hint)}` : `#${e.change_id} fails the checks on main${d.alongside ? ` after ${esc(d.alongside.join(", "))}` : ""} (exit ${d.exitCode})${d.hint ? `: ${esc(d.hint)}` : ""}. Sent back to ${to}.`];
+    case "checks.misconfigured": return ["conflict", `The check command <span class="mono">${esc(d.command)}</span> can't run: ${esc(d.hint)}`];
     case "checks.ran": return ["", `${who} ran the checks on task #${e.task_id}: ${d.ok ? "pass" : "fail"}`];
     case "change.conflict": return ["conflict", `#${e.change_id} conflicts in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Routed to ${to}.`];
     case "workspace.stale": return ["stale", `Main moved under ${to}: <span class="mono">${d.paths.map(esc).join(", ")}</span> changed. Told to sync now.`];
