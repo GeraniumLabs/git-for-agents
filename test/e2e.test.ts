@@ -2158,3 +2158,37 @@ test("a check command that can't run is the project's, not the change's; a rewor
   await admin.req("POST", "/settings", { checks: { command: "true" } });
   assert.ok(!(await admin.req("GET", "/overview")).attention.some((i: any) => i.reason === "the check command can't run"), "fixing the command clears it");
 });
+
+test("changes that touch only no-review paths land once the checks pass; anything else still waits for review", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const name = project("e2e-noreview");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "docs land", requiredApprovals: 1, files: { "docs/a.md": "a\n", "src/a.js": "a\n", "secret/k.md": "k\n" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  await assert.rejects(admin.req("POST", "/settings", { noReviewPaths: ["**"] }), /400/);
+  const s = await admin.req("POST", "/settings", { noReviewPaths: ["docs/**", "secret/**"], checks: { command: "true" } });
+  assert.deepEqual(s.noReviewPaths, ["docs/**", "secret/**"]);
+  await admin.req("POST", "/protect", { paths: ["secret/"] });
+  const until = async (id: number, ok: (c: any) => boolean) => {
+    for (let i = 0; i < 60; i++) { const c = await admin.change(id); if (ok(c)) return c; await new Promise((r) => setTimeout(r, 500)); }
+    return admin.change(id);
+  };
+  const work = async (title: string, files: Record<string, string>) => {
+    const t = await ada.createTask(title, "");
+    const ws = (await ada.claim(t.id)).workspace.name;
+    await ada.intent(t.id, Object.keys(files), title);
+    await ada.write(ws, files, title);
+    return ada.submit(t.id, title, "", { plan: [title] });
+  };
+  const docs = await work("Docs", { "docs/a.md": "a2\n", "docs/b.md": "b\n" });
+  const landed = await until(docs.id, (c) => c.status === "merged");
+  assert.equal(landed.status, "merged", "docs land with no review");
+  assert.equal(landed.reviews.length, 0);
+  const merged = (await admin.events(0, 0)).events.find((e: any) => e.type === "change.merged" && e.change_id === docs.id);
+  assert.equal(merged.data.noReview, true);
+  const mixed = await work("Docs and code", { "docs/a.md": "a3\n", "src/a.js": "a2\n" });
+  assert.equal((await admin.change(mixed.id)).status, "review", "one file outside the paths and it needs review");
+  assert.equal((await admin.change(mixed.id)).approval.needed, 1);
+  const guarded = await work("Secret", { "secret/k.md": "k2\n" });
+  assert.equal((await admin.change(guarded.id)).status, "review", "protected paths still need their person");
+});

@@ -828,7 +828,7 @@ $("#decision-save").onclick = async () => {
 
 // ── activity: notable by default, everything on request ────────────────
 const NOTABLE = new Set(["change.conflict", "checks.failed", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "settings.key_saved", "settings.key_removed", "member.added", "member.removed", "standin.acted", "standin.created", "standin.revoked", "project.visibility", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "paths.no_review", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published",
   "contest.ready", "contest.decided", "note.added"]);
 // Agent-to-agent chatter: notable in a small swarm, noise in a big one.
@@ -1864,6 +1864,8 @@ async function showSettings() {
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
     <h2>Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
+    <p class="meta">${state?.project?.noReviewPaths?.length ? `<b>These land without review:</b> <span class="mono">${state.project.noReviewPaths.map(esc).join(", ")}</span>. A change that touches only these goes straight to the merge queue${state?.project?.checks ? ", where the checks still run before it lands" : "; with no check command set, nothing tests it first"}. The activity marks it as landed without review, and <span class=\"mono\">revert_change</span> undoes it in one call.` : "<b>Every change needs review.</b> List paths (for example <span class=\"mono\">docs/**, **/*.md</span>) whose changes can land once the checks pass, with no review. Protected paths still need their person."}</p>
+    ${isOwner() ? `<div class="row"><input id="noreview-paths" class="mono grow" placeholder="docs/**, **/*.md" value="${esc((state?.project?.noReviewPaths ?? []).join(", "))}"><button class="ghost" id="noreview-save">Save</button></div>` : ""}
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
     <p class="meta">${state?.project?.resolveThreads === false ? "<b>Threads don't hold changes back.</b> Line comments are advice; an approved change merges with threads still open." : "<b>Threads must be resolved.</b> A line comment sent with a request for changes (or marked as one to fix) keeps the change out of the merge queue until its author resolves it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="threads-toggle">${state?.project?.resolveThreads === false ? "Require open threads to be resolved" : "Let changes merge with open threads"}</button></div>` : ""}
@@ -2064,6 +2066,11 @@ async function showSettings() {
   };
   if ($("#bisect-toggle")) $("#bisect-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { autoBisect: state.project.autoBisect === false }); state.project.autoBisect = r.autoBisect; } catch { return; }
+    showSettings();
+  };
+  if ($("#noreview-save")) $("#noreview-save").onclick = async () => {
+    try { const r = await act("POST", "/settings", { noReviewPaths: $("#noreview-paths").value.split(",").map((p) => p.trim()).filter(Boolean) }); state.project.noReviewPaths = r.noReviewPaths; } catch { return; }
+    toast(state.project.noReviewPaths.length ? "Saved: those paths land without review" : "Every change needs review again");
     showSettings();
   };
   if ($("#checks-save")) $("#checks-save").onclick = async () => {
@@ -2328,13 +2335,14 @@ function describe(e) {
     case "workspace.committed": return ["", `${who} committed to their workspace: ${esc(d.message)}`];
     case "workspace.pushed": return ["", `${who} pushed ${d.commits ? `${d.commits} commit${d.commits === 1 ? "" : "s"} ` : ""}to their workspace${d.head ? ` <span class="mono">${esc(d.head.slice(0, 7))}</span>` : ""}`];
     case "change.off_intent": return ["conflict", `${esc(d.model)} doubts change #${e.change_id} does what its intent declared (${Math.round(d.score * 100)}%)`];
-    case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}`];
+    case "change.submitted": return ["review", `${who} submitted change #${e.change_id} (${d.files.length} files)${d.undeclared?.length ? `, ${d.undeclared.length} outside intent` : ""}${d.noReview ? "; it touches only paths that land without review" : ""}`];
     case "change.updated": return ["review", `Change #${e.change_id} updated${d.via === "push" ? " from a git push" : ""}${d.reason ? `: ${esc(d.reason)}` : ""}`];
     case "review.assigned": return ["review", `${who} asked ${to} to review #${e.change_id}${d.reason ? ` (${esc(d.reason)})` : ""}${d.note ? `: “${esc(d.note.slice(0, 140))}”` : ""}`];
     case "review.accepted": return ["review", `${who} accepted the review of #${e.change_id}`];
     case "review.declined": return ["review", `${who} declined to review #${e.change_id}${d.reason ? `: “${esc(d.reason)}”` : ""}`];
     case "review.rerouted": return ["review", `Review of #${e.change_id} rerouted: ${esc(d.why)}${d.toName ? `; asked ${esc(d.toName)}` : "; nobody else knows this code, so it waits for the reviewer pool"}`];
     case "review.requested": return ["review", `Review requested on #${e.change_id}`];
+    case "paths.no_review": return ["", d.paths?.length ? `${who} let changes to <span class="mono">${d.paths.map(esc).join(", ")}</span> land without review` : `${who} made every change need review again`];
     case "review.requeued": return ["review", `#${e.change_id} is back for review after ${esc(d.why)}${d.askedAgainNames?.length ? `; asked ${esc(d.askedAgainNames.join(", "))} again` : ""}`];
     case "review.submitted": return ["review", `${who} ${d.verdict === "approve" ? "approved" : d.verdict === "request_changes" ? "requested changes on" : "commented on"} #${e.change_id}${d.body ? `: “${esc(d.body.slice(0, 140))}”` : ""}`];
     case "attachment.added": return ["", `${who} attached <a href="/api/projects/${project}/attachments/${d.id}/raw?${keyQuery()}" target="_blank" rel="noopener">${esc(d.name)}</a>${e.change_id ? ` to #${e.change_id}` : e.task_id ? ` to task #${e.task_id}` : ""}${d.caption ? `: ${esc(d.caption)}` : ""}`];
@@ -2343,7 +2351,7 @@ function describe(e) {
     case "attachment.removed": return ["", `${who} removed the attachment ${esc(d.name)}`];
     case "change.queued": return ["", `#${e.change_id} entered the merge queue (position ${d.position})`];
     case "merge.started": return ["", `Merging #${e.change_id}…`];
-    case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})`];
+    case "change.merged": return ["merged", `${who}'s change #${e.change_id} landed on main <span class="mono">${(d.commit ?? "").slice(0, 7)}</span> (v${d.version})${d.noReview ? " without review" : ""}`];
     case "workspace.conflict": return ["conflict", `Syncing ${to}'s workspace hit a conflict in ${d.conflicts.map((c) => `<span class="mono">${esc(c.path)}</span>${c.causedBy.length ? ` (with ${esc(c.causedBy.join(", "))})` : ""}`).join(", ")}. Hunks sent back for resolution.`];
     case "merge.retry": return ["stale", d.reconciled ? `Merge of #${e.change_id} was cut off before main moved; it's back in the queue` : `Merge of #${e.change_id} will retry${d.attempt ? ` (attempt ${d.attempt} of ${d.of})` : ""}: ${esc(d.error)}`];
     case "merge.failed": return ["conflict", `Merging #${e.change_id} failed ${d.attempts} times (${esc(d.error)}). Sent back to ${to}.`];
