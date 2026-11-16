@@ -109,7 +109,7 @@ const MERGE_IDENTITY = { name: "Mergery merge queue", email: "merge-queue@merger
 const STEERING = new Set(["directive", "main.frozen", "main.unfrozen", "paths.protected", "delegate.configured"]);
 /** Events a person might care about, shown on the overview instead of the full stream. */
 const NOTABLE = ["checks.budget", "change.conflict", "change.off_intent", "dispute.opened", "dispute.ruled", "delegate.escalated", "delegate.decided", "directive", "main.frozen", "main.unfrozen",
-  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "task.reassigned", "task.released", "task.assigned", "task.deleted",
+  "agent.paused", "agent.resumed", "decision.recorded", "question.asked", "question.answered", "consult.requested", "merge.retry", "merge.failed", "merge.reconciled", "change.withdrawn", "checks.misconfigured", "review.requeued", "paths.no_review", "task.reassigned", "task.released", "task.assigned", "task.deleted",
   "paths.protected", "proposal.made", "proposal.accepted", "proposal.rejected", "collision.forecast", "memory.recalled", "contract.published", "standin.acted", "review.agent_failed"];
 /** Events that can put something in front of a person; stand-in webhooks are checked after them. */
 const NEEDS_PERSON = new Set(["question.asked", "dispute.opened", "dispute.ready", "delegate.escalated", "approval.needs_human", "review.requested", "change.submitted", "change.updated", "change.conflict", "merge.retry", "merge.failed", "checks.misconfigured", "proposal.made", "task.assigned"]);
@@ -500,6 +500,15 @@ export class ProjectCoordinator extends DurableObject<Env> {
   }
   private get protectedPaths(): string[] {
     return JSON.parse(this.meta("protected_paths") ?? "[]");
+  }
+  /** Paths an owner lets land without review: a change touching only these goes straight to the merge queue, where the checks still run. */
+  private get noReviewPaths(): string[] {
+    return JSON.parse(this.meta("no_review_paths") ?? "[]");
+  }
+  /** Whether every file in a change is on a no-review path (protected paths still need their person). */
+  private skipsReview(files: FileChange[]): boolean {
+    const free = this.noReviewPaths;
+    return free.length > 0 && files.length > 0 && files.every((f) => free.some((p) => matches(p, f.path)));
   }
   private get isPrivate(): boolean {
     return this.meta("visibility") === "private";
@@ -1110,6 +1119,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ownerOnly("change settings");
       if (body.requiredApprovals !== undefined) this.setMeta("required_approvals", String(body.requiredApprovals));
       if (body.protectedPaths !== undefined) this.setMeta("protected_paths", JSON.stringify(body.protectedPaths));
+      if (body.noReviewPaths !== undefined) this.setNoReviewPaths(actor, body.noReviewPaths);
       if (body.visibility !== undefined) await this.setVisibility(actor, body.visibility);
       if (body.checks !== undefined) this.setChecks(body.checks);
       if (body.autoBisect !== undefined) this.setMeta("auto_bisect", body.autoBisect ? "on" : "off");
@@ -1123,7 +1133,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -1956,7 +1966,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (existing) return this.updateChange(actor, existing.id as number, body);
     this.assertChangeQuota(actor);
 
-    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) || this.meta(`person_approves:t${body.taskId}`) === "1" ? "review" : "queued";
+    const noReview = this.skipsReview(analysis.files);
+    const status = (this.requiredApprovals > 0 && !noReview) || this.guardedFiles(analysis.files).length || this.openContest(body.taskId) || this.meta(`person_approves:t${body.taskId}`) === "1" ? "review" : "queued";
     const row = this.sql
       .exec(`INSERT INTO changes (task_id, agent_id, workspace, title, summary, head, base, base_version, status, files, undeclared, symbols, explained, created_at, updated_at)
              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING id`,
@@ -1967,7 +1978,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.sql.exec("UPDATE tasks SET status = 'in_review', updated_at = ? WHERE id = ?", now, body.taskId);
     await this.saveContext(id, actor, body, analysis.patch, analysis.head, analysis.snapshot);
     await this.checkChangeIntent(id, analysis.patch);
-    this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status } });
+    this.emit("change.submitted", { actor: actor.id, task: body.taskId, change: id, data: { title: body.title ?? task.title, files: analysis.files, undeclared, status, ...(noReview && status === "queued" && this.requiredApprovals > 0 ? { noReview: this.noReviewPaths } : {}) } });
     // A reviewer can find the change, approve it and the queue land it while
     // the context is saved; then there's nothing left to ask for or enqueue.
     const current = this.change(id).status;
@@ -1996,7 +2007,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       this.emit("change.out_of_scope", { change: id, task: ch.task_id, to: ch.agent_id, data: { files: outside.slice(0, 20), allowed: this.limitsOf(actor).paths, advice: `Your push changes files outside the paths ${actor.name} may change (${outside.slice(0, 5).join(", ")}${outside.length > 5 ? ", …" : ""}). Revert those files and push again, or ask an owner to widen your scope.` } });
       return { ...this.change(id), outOfScope: outside };
     }
-    const status = this.requiredApprovals > 0 || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) || this.personApproves(id) ? "review" : "queued";
+    const status = (this.requiredApprovals > 0 && !this.skipsReview(analysis.files)) || this.guardedFiles(analysis.files).length || this.openContest(ch.task_id) || this.personApproves(id) ? "review" : "queued";
     this.adoptIntents(ch.task_id, ch.agent_id, analysis.files);
     const explained = { ...ch.explained, ...explanationsOf(body.explanations) };
     this.sql.exec("UPDATE changes SET head = ?, base = ?, files = ?, undeclared = ?, symbols = ?, explained = ?, status = ?, summary = COALESCE(?, summary), conflicts = NULL, updated_at = ? WHERE id = ?",
@@ -2445,7 +2456,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const rows = this.sql.exec("SELECT DISTINCT r.reviewer, a.role FROM reviews r LEFT JOIN agents a ON a.id = r.reviewer WHERE r.change_id = ? AND r.verdict = 'approve' AND r.head = ?", id, ch.head).toArray();
     const approvers = rows.map((r) => ({ agent: r.reviewer as string, name: this.agentName(r.reviewer as string), human: r.role === "human" || r.reviewer === "admin", weight: this.weightOf(r.reviewer as string) }));
     const weight = Math.round(approvers.reduce((sum, a) => sum + a.weight, 0) * 100) / 100;
-    const needed = this.requiredApprovals;
+    const noReview = this.skipsReview(ch.files);
+    const needed = noReview ? 0 : this.requiredApprovals;
     const guarded = this.guardedFiles(ch.files);
     const humanNeeded = (guarded.length > 0 || this.personApproves(id)) && !approvers.some((a) => a.human);
     const openThreads = this.threadsMustResolve ? this.openBlockingThreads(id) : 0;
@@ -2455,7 +2467,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const reviewing = this.sql.exec(`SELECT r.reviewer FROM review_requests r JOIN agents a ON a.id = r.reviewer
         WHERE r.change_id = ? AND r.status = 'accepted' AND a.role != 'human' AND r.deadline > ?`, id, Date.now()).toArray()
       .map((r) => this.agentName(r.reviewer as string) ?? (r.reviewer as string));
-    return { mode: this.approvalMode, needed, weight, approvers, humanNeeded, guarded, openThreads, reviewing, ok: weight >= needed && !humanNeeded && !openThreads && !reviewing.length };
+    return { mode: this.approvalMode, needed, noReview, weight, approvers, humanNeeded, guarded, openThreads, reviewing, ok: weight >= needed && !humanNeeded && !openThreads && !reviewing.length };
   }
 
   /** A person-readable track record and the weight it earns. */
@@ -2772,7 +2784,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     for (const [n, { ch, before, commit }] of landed.entries()) this.markMerged(ch, before, commit, versions[n], true);
     for (const [n, { ch, before, commit }] of landed.entries()) {
       const files = await w.changes(before, commit);
-      await this.afterMerged(ch, commit, versions[n], files, { batch: landed.length });
+      const unreviewed = this.skipsReview(ch.files) && !this.sql.exec("SELECT 1 FROM reviews WHERE change_id = ? LIMIT 1", ch.id).toArray().length;
+      await this.afterMerged(ch, commit, versions[n], files, { batch: landed.length, ...(unreviewed ? { noReview: true } : {}) });
     }
     // Why each change landed travels with the repository, as git notes on main.
     const notes = landed.filter((l) => l.commit !== l.before).map(({ ch, commit }) => ({ id: ch.id as number, oid: commit }));
@@ -4326,6 +4339,16 @@ export class ProjectCoordinator extends DurableObject<Env> {
     return this.task(taskId);
   }
 
+  /** Paths whose changes land once the checks pass, with no review. */
+  private setNoReviewPaths(actor: Agent, given: unknown) {
+    const list = (Array.isArray(given) ? given : String(given ?? "").split(",")).map((p) => String(p).trim()).filter(Boolean);
+    if (list.length > 50) throw new HttpError(400, "at most 50 no-review paths");
+    if (list.some((p) => p === "*" || p === "**" || p === "/" || p === "**/*")) throw new HttpError(400, "a no-review path can't cover the whole repository; set required approvals to 0 for that");
+    const paths = list.map(normalizePattern);
+    this.setMeta("no_review_paths", JSON.stringify(paths));
+    this.emit("paths.no_review", { actor: actor.id, data: { paths } });
+  }
+
   private protect(actor: Agent, paths: string[]) {
     this.setMeta("protected_paths", JSON.stringify(paths.map(normalizePattern)));
     this.emit("paths.protected", { actor: actor.id, data: { paths: this.protectedPaths } });
@@ -5343,7 +5366,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: named.filter((a) => a.state !== "gone").length, records: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
