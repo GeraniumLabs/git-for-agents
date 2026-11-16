@@ -82,3 +82,28 @@ test("a file outside the intent with the author's reason is weighed less and sho
   assert.equal(told.reasons.find((r) => r.kind === "explained")!.files![0], "src/b.ts");
   assert.ok(!told.reasons.some((r) => r.kind === "outside"));
 });
+
+test("a Node check command that installs nothing gets an install first; one that installs is left alone", async () => {
+  const { withInstall } = await import("../src/brief.ts");
+  const pkg = JSON.stringify({ scripts: { test: "tsc && node --test" }, devDependencies: { typescript: "^5" } });
+  const lock = new Set(["package.json", "package-lock.json"]);
+  assert.deepEqual(withInstall("npm test", lock, pkg), { command: "npm ci --include=dev && npm test", added: "npm ci --include=dev" });
+  assert.equal(withInstall("npm test", new Set(["package.json"]), pkg).command, "npm install --include=dev && npm test");
+  assert.equal(withInstall("npm ci && npm test", lock, pkg).added, null);
+  assert.equal(withInstall("pnpm i && pnpm test", lock, pkg).added, null);
+  assert.equal(withInstall("make test", lock, pkg).added, null, "not an npm command");
+  assert.equal(withInstall("npm test", lock, JSON.stringify({ scripts: { test: "node --test" } })).added, null, "nothing to install");
+  assert.equal(withInstall("npm test", new Set(), null).added, null);
+});
+
+test("a check that can't run says whose it is: the setup, or a package.json the change broke", async () => {
+  const { checkHint } = await import("../src/brief.ts");
+  const missing = 'npm error Missing script: "test"\nnpm error To see a list of scripts, run:';
+  assert.equal(checkHint(missing, 1, ["package.json", "README.md"])?.blame, "change");
+  assert.match(checkHint(missing, 1, ["package.json"])!.hint, /"scripts" key/);
+  assert.equal(checkHint(missing, 1, ["src/a.ts"])?.blame, "project");
+  const tsc = "> build\n> tsc -p tsconfig.json\n\nsh: 1: tsc: not found\n";
+  assert.equal(checkHint(tsc, 127, ["src/a.ts"])?.blame, "project");
+  assert.match(checkHint(tsc, 127, [])!.hint, /`tsc` isn't installed/);
+  assert.equal(checkHint("1 failing test", 1, ["src/a.ts"]), null);
+});

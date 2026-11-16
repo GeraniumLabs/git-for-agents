@@ -2111,3 +2111,50 @@ test("a merge cut off after main moved finishes from main; a change whose worksp
   await sql("UPDATE workspaces SET status = 'deleted' WHERE name = ?", e.ws);
   await assert.rejects(ada.submit(e.t.id, "Land E", "", { plan: ["e"] }), /409.*was deleted/);
 });
+
+test("a check command that can't run is the project's, not the change's; a reworked change asks its human reviewer again", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const name = project("e2e-rework");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "rework", requiredApprovals: 1, files: { "src/a.js": "a\n", "src/b.js": "b\n" } });
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const bex = admin.as((await admin.addAgent("bex", "builder")).key);
+  const jo = admin.as((await admin.req("POST", "/agents", { name: "jo", role: "human" })).key);
+  const until = async (id: number, ok: (c: any) => boolean) => {
+    for (let i = 0; i < 60; i++) { const c = await admin.change(id); if (ok(c)) return c; await new Promise((r) => setTimeout(r, 500)); }
+    return admin.change(id);
+  };
+  const t = await ada.createTask("Edit a", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/a.js"], "a");
+  await ada.write(ws, { "src/a.js": "a1\n" }, "v1");
+  const ch = await ada.submit(t.id, "Edit a", "", { plan: ["a"] });
+  await ada.req("POST", `/changes/${ch.id}/reviewers`, { reviewers: ["jo"] });
+
+  // Round one: another agent asks for changes; the author reworks it.
+  await bex.review(ch.id, "request_changes", "rename it");
+  assert.equal((await admin.change(ch.id)).status, "changes_requested");
+  await jo.review(ch.id, "comment", "looking");
+  await ada.write(ws, { "src/a.js": "a2\n" }, "v2");
+  await ada.update(ch.id, "renamed");
+  const reqs = (await admin.req("GET", `/changes/${ch.id}/reviewers`)).requested;
+  const forJo = reqs.find((r: any) => r.reviewerName === "jo" && r.status === "open");
+  assert.ok(forJo, `jo is asked again: ${JSON.stringify(reqs)}`);
+  assert.match(forJo.reason, /back for review after bex asked for changes/);
+  const ev = (await admin.events(0, 0)).events.find((e: any) => e.type === "review.requeued" && e.change_id === ch.id);
+  assert.deepEqual(ev?.data.askedAgainNames, ["jo"]);
+
+  // The checks can't run: a tool that isn't there. The failure says it's the setup, and the Stuck list says so too.
+  await admin.req("POST", "/settings", { checks: { command: "definitely-not-a-tool --run" } });
+  await jo.review(ch.id, "approve", "ok");
+  const failed = await until(ch.id, (c) => c.status === "checks_failed");
+  assert.equal(failed.status, "checks_failed");
+  const fe = (await admin.events(0, 0)).events.filter((e: any) => e.type === "checks.failed" && e.change_id === ch.id).pop();
+  assert.equal(fe.data.blame, "project");
+  assert.match(fe.data.advice, /isn't your change/);
+  assert.match(fe.data.output, /^\[Mergery\] \d+ files at [0-9a-f]{7}/);
+  const stuck = (await admin.req("GET", "/overview")).attention.find((i: any) => i.kind === "stuck" && i.reason === "the check command can't run");
+  assert.match(stuck?.detail ?? "", /`definitely-not-a-tool` isn't installed/);
+  await admin.req("POST", "/settings", { checks: { command: "true" } });
+  assert.ok(!(await admin.req("GET", "/overview")).attention.some((i: any) => i.reason === "the check command can't run"), "fixing the command clears it");
+});
