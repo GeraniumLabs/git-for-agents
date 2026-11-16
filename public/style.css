@@ -98,6 +98,10 @@ dialog button { margin-top: 10px; background: var(--chip); color: var(--ink); bo
 pre.diff { background: var(--code); border: 1px solid var(--line); border-radius: 8px; padding: 10px; overflow: auto; max-height: 50vh; }
 .add { color: var(--ok); } .del { color: var(--bad); } .hunk { color: var(--info); }
 .empty { color: var(--muted); font-size: var(--fs-13); padding: 6px 0; }
+.loading { display: flex; align-items: center; gap: 10px; color: var(--muted); font-size: var(--fs-13); padding: 18px 0; }
+.spinner { width: 16px; height: 16px; flex: none; border: 2px solid color-mix(in srgb, var(--muted) 30%, transparent); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 2.4s; } }
 
 button { background: var(--accent); color: #fff; border: 1px solid var(--accent); border-radius: 6px; padding: 5px 12px; cursor: pointer; font: inherit; font-size: var(--fs-13); }
 button.ghost { background: var(--chip); color: var(--ink); border-color: var(--line); }
