@@ -152,11 +152,11 @@ async function startSession(env: Env, req: Request, user: User, to: string): Pro
  * The change the landing page shows off: LOOM_FEATURED is "<project>/<change id>",
  * a change whose Intent view a visitor can open (a public project with published traces).
  */
-/** The site's analytics settings for /auth/me: the GA4 measurement ID, when set and well formed, and
+/** The site's analytics settings for /auth/me: a GA4 measurement ID (G-…) or Tag Manager container (GTM-…), when set and well formed, and
  *  whether this visitor needs consent first (EU/EEA, by Cloudflare's country). Never anything about the user. */
 export function analytics(env: Env, req: Request): { id: string; consent: boolean } | null {
   const id = (env.LOOM_GA_ID ?? "").trim();
-  if (!/^G-[A-Z0-9]{4,16}$/.test(id)) return null;
+  if (!/^(G|GTM)-[A-Z0-9]{4,16}$/.test(id)) return null;
   const cf = (req as Request & { cf?: { isEUCountry?: string } }).cf;
   return { id, consent: cf?.isEUCountry === "1" };
 }
