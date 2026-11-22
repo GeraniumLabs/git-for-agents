@@ -15,6 +15,7 @@
 <meta name="twitter:card" content="summary_large_image">
 <link rel="icon" type="image/svg+xml" href="/logo.svg">
 <link rel="stylesheet" href="/site.css">
+<script src="/ga.js" defer></script>
 <script src="/site.js" defer></script>
 </head>
 <body>
@@ -31,8 +32,8 @@
 <main>
 <section class="doc"><div class="wrap narrow">
   <h1>Privacy policy</h1>
-  <p class="updated">Last updated November 14, 2026</p>
-  <div class="summary"><p><b>The short version.</b> We keep what it takes to host your projects and nothing more. No ads, no trackers, no selling data. Session traces are opt-in, private to your project's people by default, and secrets are removed before they're stored. Everything runs on Cloudflare, and a project can keep its data in the EU.</p></div>
+  <p class="updated">Last updated November 22, 2026</p>
+  <div class="summary"><p><b>The short version.</b> We keep what it takes to host your projects and nothing more. No ads and no selling data. We count visits with Google Analytics, which sees which pages are opened and never your projects or anything you type, and you can turn it off. Session traces are opt-in, private to your project's people by default, and secrets are removed before they're stored. Everything runs on Cloudflare, and a project can keep its data in the EU.</p></div>
 
   <h2>What we collect</h2>
   <table>
@@ -43,12 +44,24 @@
     <tr><td>Session traces, only if you or a project owner turn uploads on</td><td>So reviewers can see what was asked and decided behind a change.</td></tr>
     <tr><td>Billing details, if you subscribe</td><td>Stripe handles your card. We keep only your Stripe customer and subscription ids and your plan.</td></tr>
     <tr><td>Keys you save in Settings (model keys, secrets for checks)</td><td>To use them for your project. They're encrypted, and removed from traces before storage.</td></tr>
+    <tr><td>Visit counts, through Google Analytics</td><td>To learn which pages people open and where sign-up stalls. <a href="#analytics">What it sees</a>.</td></tr>
     <tr><td>Basic request logs</td><td>To keep the service running and find abuse. Cloudflare keeps them for a short time.</td></tr>
   </table>
   <p>When you import a private repository with your GitHub access, the token stays in a short-lived, encrypted cookie in your browser for 15 minutes. We don't store it.</p>
 
   <h2>Cookies and local storage</h2>
-  <p>We use only what's needed: a signed session cookie (30 days), a short-lived cookie during GitHub sign-in, and the short-lived import cookie above. Your browser's local storage remembers your theme, whether you hid the welcome banner, and any agent key you pasted into the page. There are no analytics or advertising cookies.</p>
+  <p>We use only what's needed: a signed session cookie (30 days), a short-lived cookie during GitHub sign-in, and the short-lived import cookie above. Your browser's local storage remembers your theme, whether you hid the welcome banner, and any agent key you pasted into the page. Google Analytics sets its own cookies (named <code>_ga</code>, up to 14 months) when it is on, as described below. There are no advertising cookies.</p>
+
+  <h2 id="analytics">Visit counts (Google Analytics)</h2>
+  <p>We use Google Analytics 4 to count visits to mergery.dev and see how people get from the landing page to their first project. What it receives is kept small on purpose:</p>
+  <ul>
+    <li>The page's path only, such as <code>/</code>, <code>/pricing</code> or <code>/app</code>. Never a project name, link query or anything after <code>#</code>.</li>
+    <li>A few named steps with no content: opening the app, starting an import, copying setup lines, starting and finishing GitHub sign-in, and creating a project (only whether it was imported and public or private).</li>
+    <li>What Google gathers from any page view: rough location, device, browser, and the site that sent you (its address only).</li>
+  </ul>
+  <p>It never receives your GitHub login, email, projects, code, traces, keys or anything you type. Google signals and ad personalization are off, and nothing is shared for advertising.</p>
+  <p>It doesn't run at all if your browser sends Global Privacy Control or Do Not Track. Visitors in the EU and EEA are asked first, and it stays off unless they allow it. You can change your choice for this browser here:</p>
+  <p id="analytics-choice" class="fine">Turn on JavaScript to see or change your choice.</p>
 
   <h2>Session traces</h2>
   <p>Traces are uploaded only when a person or a project owner turns them on. Before storing a trace, Mergery removes secrets it recognizes, the project's saved keys and any patterns the owner adds. Owners can also drop the models' reasoning. Traces are private to the project's people, even on a public project, unless an owner of a public project publishes them. They're kept for as long as the plan allows (30 days on Free, a year on Pro), and deleting one removes its content and keeps only a record that it existed.</p>
@@ -57,6 +70,7 @@
   <table>
     <tr><th>Service</th><th>What for</th></tr>
     <tr><td>Cloudflare</td><td>Hosting, storage (Artifacts, Durable Objects, R2), check containers, email, and AI models through Workers AI and AI Gateway.</td></tr>
+    <tr><td>Google</td><td>Visit counts through Google Analytics, as described above.</td></tr>
     <tr><td>GitHub</td><td>Sign-in, and importing repositories and issues you ask for.</td></tr>
     <tr><td>Stripe</td><td>Payments, if you subscribe.</td></tr>
     <tr><td>Anthropic</td><td>Claude models for the review agent and the deputy, when a project or the service uses an Anthropic key. Only the change or question being decided is sent.</td></tr>

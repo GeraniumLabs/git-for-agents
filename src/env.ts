@@ -20,6 +20,8 @@ export interface Env {
   LOOM_SHOWCASE?: string;
   /** The change the landing page links to, as "<project>/<change id>". */
   LOOM_FEATURED?: string;
+  /** Google Analytics 4 measurement ID ("G-XXXXXXX") for the hosted site. Unset sends nothing to Google. */
+  LOOM_GA_ID?: string;
   /** GitHub logins allowed to create projects; unset or "*" lets anyone signed in. */
   LOOM_CREATORS?: string;
   /** Projects one person (not an owner of the server) may create. Default 5; 0 means no limit. */
