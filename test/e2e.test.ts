@@ -2219,6 +2219,9 @@ test("with the Trust add-on on, notes and decisions are mirrored, and a merge fl
   assert.equal(s.lastError, null);
   assert.equal(s.mirrored, 2, "the note and the decision; the note from before is left alone");
   assert.ok(s.space);
+  const shown = (await admin.state()).project.trust;
+  assert.equal(shown.on, true, "the dashboard's Settings page sees it");
+  assert.equal(shown.mirrored, 2);
   // Mergery's own notes are untouched by the add-on.
   assert.ok(((await admin.req("GET", "/notes")) as any[]).some((n) => n.id === note.id));
 
