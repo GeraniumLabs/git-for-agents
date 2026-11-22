@@ -98,7 +98,7 @@ LOOM_FEATURED = ""
 # (docs/guide.md, "Visitor counts"). Empty sends nothing to Google. Only page paths and a few named
 # clicks are sent, never project names, query strings or anything about a user
 # (public/ga.js). Self-hosting? Leave it empty or use your own property.
-LOOM_GA_ID = "GTM-MNPD43C8"
+LOOM_GA_ID = "G-6V92TVSK6F"
 # Who may create projects: "*" is anyone signed in, on the free plan until
 # they pay for Mergery Pro (needs STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET).
 # A list of logins makes it invite-only: anyone else joins a waitlist, and the
