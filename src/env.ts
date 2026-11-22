@@ -45,9 +45,9 @@ export interface Env {
   LOOM_DEV_LOGIN?: string;
   /** Where preview links point, e.g. a separate domain routed to this Worker; defaults to Mergery's own origin. */
   LOOM_PREVIEW_ORIGIN?: string;
-  /** A Trust server (github.com/GeraniumLabs/Trust) projects can use with one click; each gets its own space there. Projects can also connect their own space without it. */
+  /** A Trust server (github.com/GeraniumLabs/Trust). Settings › Trust links to its /new page, where an owner signs in with GitHub and makes a space to connect. */
   TRUST_URL?: string;
-  /** Optional service binding to that Trust Worker, when it runs on the same Cloudflare account. */
+  /** A service binding to that Trust Worker (same Cloudflare account). With it, owners can also use Trust in one click: Mergery makes the project's space itself. */
   TRUST?: Fetcher;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;

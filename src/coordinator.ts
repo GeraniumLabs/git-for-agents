@@ -2804,7 +2804,9 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private trustLink: TrustLink | null = null;
   private trustChain: Promise<void> = Promise.resolve();
   private get trustAvailable(): boolean {
-    return !!this.env.TRUST_URL;
+    // Trust only lets the operator's own Workers (over a service binding) create spaces without a person
+    // signed in, so one-click needs the TRUST binding. Local development reaches Trust directly.
+    return !!this.env.TRUST_URL && (!!this.env.TRUST || this.env.LOOM_DEV_LOGIN === "1");
   }
   /** On when an owner turned it on and there's somewhere to write: the project's own space, or the server's Trust. */
   private get trustOn(): boolean {
