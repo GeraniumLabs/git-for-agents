@@ -193,7 +193,7 @@ async function showSignIn(why = "") {
  */
 async function signInNow() {
   if (!user) await loadUser();
-  if (!user && auth.github) { location.href = githubUrl(); return; }
+  if (!user && auth.github) { signingIn(); location.href = githubUrl(); return; }
   if (user && !me) await signIn();
   if (me) return toast(`Signed in as ${me.name}`);
   showSignIn("Answering, reviewing and replying are signed with your name.");
@@ -214,8 +214,19 @@ function startImport(url) {
   showNewProject(null, "", url);
 }
 
+function signingIn() {
+  window.mergeryAnalytics?.event("sign_in_start");
+  try { sessionStorage.setItem("mergery-signing-in", "1"); } catch {}
+}
+
 async function boot() {
   await loadUser();
+  // Visitor counts (public/ga.js): the app reports one fixed path, never a project name or query.
+  window.mergeryAnalytics?.start(auth.analytics, "/app");
+  window.mergeryAnalytics?.event("app_open", { signed_in: !!user });
+  // The sign-in funnel: started here, finished when the page comes back signed in.
+  try { if (sessionStorage.getItem("mergery-signing-in")) { sessionStorage.removeItem("mergery-signing-in"); if (user) window.mergeryAnalytics?.event("login", { method: "GitHub" }); } } catch {}
+  document.addEventListener("click", (e) => { if (e.target.closest?.('a[href^="/auth/github"]')) signingIn(); });
   const invite = new URLSearchParams(location.search).get("invite");
   if (invite) showInvite(invite);
   const importing = new URLSearchParams(location.search).get("import");
@@ -1694,6 +1705,7 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
     // Start with a join code, so the agents you connect each register as themselves.
     const code = await fetch(`/api/projects/${name}/join-codes`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ role: "builder" }) }).then((r) => r.ok ? r.json() : null).catch(() => null);
     try { if (code) sessionStorage.setItem("loom-new-join", JSON.stringify({ project: name, code })); } catch {}
+    window.mergeryAnalytics?.event("create_project", { imported: !!imp, visibility: $('input[name="np-vis"]:checked').value === "private" ? "private" : "public" });
     location.search = `?project=${name}`;
   };
   if (!$("#detail").open) $("#detail").showModal();

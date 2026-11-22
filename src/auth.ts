@@ -152,6 +152,15 @@ async function startSession(env: Env, req: Request, user: User, to: string): Pro
  * The change the landing page shows off: LOOM_FEATURED is "<project>/<change id>",
  * a change whose Intent view a visitor can open (a public project with published traces).
  */
+/** The site's analytics settings for /auth/me: the GA4 measurement ID, when set and well formed, and
+ *  whether this visitor needs consent first (EU/EEA, by Cloudflare's country). Never anything about the user. */
+export function analytics(env: Env, req: Request): { id: string; consent: boolean } | null {
+  const id = (env.LOOM_GA_ID ?? "").trim();
+  if (!/^G-[A-Z0-9]{4,16}$/.test(id)) return null;
+  const cf = (req as Request & { cf?: { isEUCountry?: string } }).cf;
+  return { id, consent: cf?.isEUCountry === "1" };
+}
+
 export function featuredLink(env: Env): string | null {
   const m = /^([a-z0-9][a-z0-9-]{1,40})\/(\d+)$/.exec((env.LOOM_FEATURED ?? "").trim());
   return m ? `/?project=${m[1]}#change/${m[2]}/intent` : null;
@@ -166,7 +175,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (path === "/auth/me") {
     const app = await githubApp(env, registry);
     const me = await sessionUser(env, req);
-    return Response.json({ user: me, github: !!app, githubInstall: installUrl(env, app), repoAccess: !!(me && (await githubGrant(env, req, me))), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), featured: featuredLink(env), regions: regions(env) }, { headers: { "cache-control": "no-store" } });
+    return Response.json({ user: me, github: !!app, githubInstall: installUrl(env, app), repoAccess: !!(me && (await githubGrant(env, req, me))), dev: devLogin(env), showcase: (env.LOOM_SHOWCASE ?? "").split(",").map((s) => s.trim()).filter(Boolean), featured: featuredLink(env), regions: regions(env), analytics: analytics(env, req) }, { headers: { "cache-control": "no-store" } });
   }
 
   if (path === "/auth/logout" && req.method === "POST") {
