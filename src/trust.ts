@@ -19,7 +19,8 @@ export interface TrustStore {
 
 export interface TrustOptions {
   url: string;
-  bootstrap: string;
+  /** Lets the link create the project's space on first use. Without it, the space must already be connected. */
+  bootstrap?: string;
   project: string;
   store: TrustStore;
   fetch?: typeof fetch;
@@ -58,6 +59,7 @@ export class TrustLink {
   async space(): Promise<{ id: string; adminToken: string }> {
     const have = await this.o.store.space();
     if (have) return have;
+    if (!this.o.bootstrap) throw new Error("no Trust space is connected, and this server can't create one");
     const r = await this.call(this.o.bootstrap, "POST", "/api/spaces", {
       name: `mergery/${this.o.project}`,
       scopes: [{ id: TRUST_SCOPE, label: this.o.project, kind: "project" }],
@@ -136,4 +138,32 @@ export function titleFor(text: string): string {
 /** Note paths as Trust sources, pinned to the commit main was at when the note was written. */
 export function sourcesFor(paths: string[], commit: string | null): TrustSource[] {
   return paths.map((uri) => ({ uri, kind: "file", ...(commit ? { hash: commit } : {}) }));
+}
+
+/** "https://trust.example/api/spaces/abc123" -> its server and space id, or null. */
+export function parseSpaceUrl(raw: string): { base: string; space: string } | null {
+  const m = String(raw ?? "").trim().match(/^(https?:\/\/[^/\s]+)\/api\/spaces\/([A-Za-z0-9-]{1,64})\/?$/);
+  return m ? { base: m[1], space: m[2] } : null;
+}
+
+/**
+ * Check a space URL and admin key someone pasted, and make sure the space has the project scope
+ * Mergery writes to. Throws a message fit to show them.
+ */
+export async function checkSpace(base: string, space: string, key: string, project: string, f: typeof fetch = fetch.bind(globalThis)) {
+  const headers = { "content-type": "application/json", authorization: `Bearer ${key}` };
+  let r: Response;
+  try {
+    r = await f(`${base}/api/spaces/${space}`, { headers, signal: AbortSignal.timeout(8000) });
+  } catch (e: any) {
+    throw new Error(`couldn't reach Trust at ${base} (${String(e?.message ?? e).slice(0, 120)})`);
+  }
+  const info: any = await r.json().catch(() => ({}));
+  if (r.status === 401 || r.status === 403) throw new Error("Trust refused that key; it must be the space's admin key");
+  if (!r.ok || !Array.isArray(info.scopes)) throw new Error(`Trust didn't answer for that space (HTTP ${r.status}${info.error ? `: ${info.error}` : ""})`);
+  if (!info.scopes.some((x: any) => x.id === TRUST_SCOPE)) {
+    const add = await f(`${base}/api/spaces/${space}/scopes`, { method: "POST", headers, body: JSON.stringify({ id: TRUST_SCOPE, label: project, kind: "project" }) });
+    if (!add.ok) throw new Error(`Trust didn't add a "${TRUST_SCOPE}" scope to that space (HTTP ${add.status})`);
+  }
+  return { name: (info.name as string) ?? null, persistent: !!info.persistent };
 }

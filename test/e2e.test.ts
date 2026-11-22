@@ -2238,3 +2238,37 @@ test("with the Trust add-on on, notes and decisions are mirrored, and a merge fl
   s = await until((x) => x.lastError !== undefined);
   assert.equal(s.lastError, null);
 });
+
+// Needs LOOM_E2E_TRUST_URL (a Trust server Mergery can reach) and LOOM_E2E_TRUST_BOOT (its bootstrap token),
+// to make a space the way Trust's /new page does.
+test("an owner connects the project's own Trust space with its URL and admin key", { skip: !url || !process.env.LOOM_E2E_TRUST_URL, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const trust = process.env.LOOM_E2E_TRUST_URL!;
+  const made = await (await fetch(`${trust}/api/spaces`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.LOOM_E2E_TRUST_BOOT}` }, body: JSON.stringify({ name: "own", scopes: [{ id: "project", label: "own", kind: "project" }] }) })).json();
+  const spaceUrl = `${trust}/api/spaces/${made.space}`;
+  const name = project("e2e-trust-own");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "own Trust space", files: SEED, requiredApprovals: 0 });
+  await assert.rejects(admin.req("POST", "/settings", { trust: { url: spaceUrl, key: "trust_adm_wrong" } }), /refused that key/);
+  await assert.rejects(admin.req("POST", "/settings", { trust: { url: "https://trust.example/not-a-space", key: "x" } }), /api\/spaces/);
+  const on = (await admin.req("POST", "/settings", { trust: { url: spaceUrl, key: made.adminToken } })).trust;
+  assert.equal(on.on, true);
+  assert.equal(on.own, trust);
+  assert.equal(on.space, made.space);
+  assert.equal(JSON.stringify(on).includes(made.adminToken), false, "the key is never sent back");
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  await ada.req("POST", "/notes", { text: "Dates are stored as UTC ISO strings.", paths: ["src/db.js"] });
+  let s: any;
+  for (let i = 0; i < 40; i++) { s = (await admin.req("POST", "/settings", {})).trust; if (s.mirrored || s.lastError) break; await new Promise((r) => setTimeout(r, 250)); }
+  assert.equal(s.lastError, null);
+  assert.equal(s.mirrored, 1);
+  // It landed in the space the owner pasted.
+  const exported = await (await fetch(`${spaceUrl}/export/project`, { headers: { authorization: `Bearer ${made.adminToken}` } })).text();
+  assert.match(exported, /UTC ISO strings/);
+
+  const off = (await admin.req("POST", "/settings", { trust: null })).trust;
+  assert.equal(off.own, null);
+  assert.equal(off.mirrored, 0);
+});

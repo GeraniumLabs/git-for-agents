@@ -35,7 +35,7 @@ import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 import { hookBody, isGitHubDispatch, runnerPrompt, validHookEvents } from "./runners";
 import { contextOf } from "./changecontext";
-import { TrustLink, sourcesFor, titleFor } from "./trust";
+import { TrustLink, checkSpace, parseSpaceUrl, sourcesFor, titleFor } from "./trust";
 
 const TOKEN_TTL = 6 * 3600;
 /** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
@@ -1130,7 +1130,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
       if (body.traces !== undefined) this.setTraceSettings(body.traces ?? {});
-      if (body.trust !== undefined) this.setTrust(!!body.trust);
+      if (body.trust !== undefined) await this.setTrust(body.trust);
       if (body.model !== undefined) this.setMeta("model_options", JSON.stringify({ ...this.modelOptions, ...Object.fromEntries(Object.entries(body.model ?? {}).filter(([k]) => k === "reviewers" || k === "intent").map(([k, v]) => [k, !!v])) }));
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
@@ -2806,24 +2806,63 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private get trustAvailable(): boolean {
     return !!(this.env.TRUST_URL && this.env.TRUST_BOOTSTRAP_TOKEN);
   }
+  /** On when an owner turned it on and there's somewhere to write: the project's own space, or the server's Trust. */
   private get trustOn(): boolean {
-    return this.trustAvailable && this.meta("trust") === "on";
+    return this.meta("trust") === "on" && (!!this.meta("trust_url") || this.trustAvailable);
   }
   private get trustStatus() {
     const mirrored = (this.sql.exec("SELECT COUNT(*) AS n FROM trust_links").one().n as number) ?? 0;
     const lastMerge = this.meta("trust_last_merge");
-    return { available: this.trustAvailable, on: this.trustOn, space: this.meta("trust_space"), mirrored, lastMerge: lastMerge ? JSON.parse(lastMerge) : null, lastError: this.meta("trust_error") };
+    return { available: this.trustAvailable, on: this.trustOn, own: this.meta("trust_url"), space: this.meta("trust_space"), mirrored, lastMerge: lastMerge ? JSON.parse(lastMerge) : null, lastError: this.meta("trust_error") };
   }
-  private setTrust(on: boolean) {
-    if (on && !this.trustAvailable) throw new HttpError(400, "this server isn't connected to Trust; set TRUST_URL and TRUST_BOOTSTRAP_TOKEN on the Worker first");
+  /**
+   * true / false turns the add-on on or off (writing to the project's own space if one is
+   * connected, otherwise the server's Trust). { url, key } connects the project's own space;
+   * null forgets it.
+   */
+  private async setTrust(v: unknown) {
+    if (v === null) {
+      if (this.meta("trust_url")) this.forgetTrustSpace();
+      return;
+    }
+    if (typeof v === "object") {
+      const { url, key } = v as { url?: string; key?: string };
+      const at = parseSpaceUrl(url ?? "");
+      if (!at) throw new HttpError(400, "the space URL looks like https://<your Trust>/api/spaces/<id>; Trust's /new page gives you one");
+      if (!at.base.startsWith("https://") && !this.env.LOOM_DEV_LOGIN) throw new HttpError(400, "the space URL must use https");
+      if (!key?.trim()) throw new HttpError(400, "paste the space's admin key too");
+      if (!sealer(this.env)) throw new HttpError(400, "set LOOM_SECRET_KEY on the Worker first, so the key can be kept encrypted");
+      try {
+        await checkSpace(at.base, at.space, key.trim(), this.project);
+      } catch (e: any) {
+        throw new HttpError(400, String(e?.message ?? e));
+      }
+      if (this.meta("trust_space") !== at.space) this.forgetTrustSpace();
+      const { ct, iv, by } = await seal(this.env, this.project, key.trim());
+      this.setMeta("trust_url", at.base);
+      this.setMeta("trust_space", at.space);
+      this.setMeta("trust_admin", JSON.stringify({ ct, iv, sealed_by: by }));
+      this.setMeta("trust", "on");
+      this.trustLink = null;
+      return;
+    }
+    const on = !!v;
+    if (on && !this.meta("trust_url") && !this.trustAvailable) throw new HttpError(400, "connect a Trust space first (its URL and admin key), or set TRUST_URL and TRUST_BOOTSTRAP_TOKEN on the Worker");
     if (on && !sealer(this.env)) throw new HttpError(400, "set LOOM_SECRET_KEY on the Worker first, so Trust's admin token can be kept encrypted");
     this.setMeta("trust", on ? "on" : "off");
   }
+  /** Drop the connected space: its key, and which notes were copied there. */
+  private forgetTrustSpace() {
+    for (const k of ["trust_url", "trust_space", "trust_admin", "trust_last_merge", "trust_error"]) this.setMeta(k, null);
+    this.sql.exec("DELETE FROM trust_links");
+    this.trustLink = null;
+  }
   private trust(label: string, work: (t: TrustLink) => Promise<unknown>) {
     if (!this.trustOn) return;
+    const own = this.meta("trust_url");
     this.trustLink ??= new TrustLink({
-      url: this.env.TRUST_URL!,
-      bootstrap: this.env.TRUST_BOOTSTRAP_TOKEN!,
+      url: own ?? this.env.TRUST_URL!,
+      bootstrap: own ? undefined : this.env.TRUST_BOOTSTRAP_TOKEN,
       project: this.project,
       store: {
         space: async () => {

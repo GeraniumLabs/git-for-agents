@@ -108,3 +108,24 @@ test("titles are the first sentence, cut short", () => {
   assert.equal(titleFor("x".repeat(150)).length, 98);
   assert.deepEqual(sourcesFor(["a"], null), [{ uri: "a", kind: "file" }]);
 });
+
+test("a pasted space URL is split into its server and space", async () => {
+  const { parseSpaceUrl } = await import("../src/trust.ts");
+  assert.deepEqual(parseSpaceUrl(" https://trust.example.dev/api/spaces/ab12cd34ef56/ "), { base: "https://trust.example.dev", space: "ab12cd34ef56" });
+  assert.equal(parseSpaceUrl("https://trust.example.dev/demo/ab12"), null);
+  assert.equal(parseSpaceUrl("trust.example.dev/api/spaces/x"), null);
+});
+
+test("checking a space refuses a wrong key and adds the project scope when it's missing", async () => {
+  const { checkSpace } = await import("../src/trust.ts");
+  const seen: string[] = [];
+  const f = (async (url: string, init: any = {}) => {
+    seen.push(`${init.method ?? "GET"} ${new URL(url).pathname}`);
+    if (init.headers.authorization !== "Bearer good") return new Response('{"error":"no"}', { status: 401 });
+    if ((init.method ?? "GET") === "GET") return new Response(JSON.stringify({ name: "x", persistent: true, scopes: [{ id: "other" }] }));
+    return new Response("{}");
+  }) as unknown as typeof fetch;
+  await assert.rejects(checkSpace("https://t", "s1", "bad", "demo", f), /refused that key/);
+  assert.deepEqual(await checkSpace("https://t", "s1", "good", "demo", f), { name: "x", persistent: true });
+  assert.equal(seen.at(-1), "POST /api/spaces/s1/scopes");
+});

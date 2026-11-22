@@ -1876,10 +1876,16 @@ async function showSettings() {
     ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
     ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
     ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
-    ${state?.project?.trust?.available || state?.project?.trust?.on ? `<h2>Trust</h2>
-    <p class="meta">${state.project.trust.on ? `<b>Trust is on.</b> New notes and decisions are copied to this project's <a href="https://github.com/GeraniumLabs/Trust" target="_blank" rel="noopener">Trust</a> space with the files they cite, and each merge marks the memories on files it changed as stale. Mergery's own notes stay the record. ${state.project.trust.mirrored} copied so far${state.project.trust.lastMerge ? `; the last merge (#${state.project.trust.lastMerge.change}) marked ${state.project.trust.lastMerge.stale} stale` : ""}.` : "<b>Trust is off.</b> Turn it on to copy new notes and decisions to a Trust space that tracks where each one came from and marks it stale when those files change. Notes from before you turn it on aren't copied."}</p>
-    ${state.project.trust.on && state.project.trust.lastError ? `<p class="meta"><b>Trust's last call failed:</b> ${esc(state.project.trust.lastError)}. Mergery carries on without it; this clears on the next call that works.</p>` : ""}
-    ${isOwner() ? `<div class="row"><button class="ghost" id="trust-toggle">${state.project.trust.on ? "Turn Trust off" : "Turn Trust on"}</button></div>` : ""}` : ""}
+    ${isOwner() || state?.project?.trust?.on ? (() => {
+      const tr = state?.project?.trust ?? {};
+      const where = tr.own ? `your Trust space at <span class="mono">${esc(tr.own)}</span>` : "this server's Trust";
+      return `<h2>Trust</h2>
+    <p class="meta">${tr.on ? `<b>Trust is on.</b> New notes and decisions are copied to ${where} with the files they cite, and each merge marks the memories on files it changed as stale. Mergery's own notes stay the record. ${tr.mirrored ?? 0} copied so far${tr.lastMerge ? `; the last merge (#${tr.lastMerge.change}) marked ${tr.lastMerge.stale} stale` : ""}.` : `<b>Trust is off.</b> <a href="https://github.com/GeraniumLabs/Trust" target="_blank" rel="noopener">Trust</a> keeps where each note came from and marks it stale when those files change. Turn it on to copy new notes and decisions there; earlier ones aren't copied.`}</p>
+    ${tr.on && tr.lastError ? `<p class="meta"><b>Trust's last call failed:</b> ${esc(tr.lastError)}. Mergery carries on without it; this clears on the next call that works.</p>` : ""}
+    ${isOwner() ? `${tr.own || tr.available ? `<div class="row"><button class="ghost" id="trust-toggle">${tr.on ? "Turn Trust off" : tr.own ? "Turn Trust on" : "Use this server's Trust"}</button>${tr.own ? `<button class="ghost" id="trust-forget">Disconnect your space</button>` : ""}</div>` : ""}
+    <p class="meta">${tr.own ? "Connect a different space:" : "Or use your own Trust space: make one on your Trust's <span class=\"mono\">/new</span> page and paste its URL and admin key here."}</p>
+    <div class="row"><input id="trust-url" class="mono grow" placeholder="https://trust.example.dev/api/spaces/…" autocomplete="off"><input id="trust-key" class="grow" type="password" placeholder="Admin key" autocomplete="off"><button class="ghost" id="trust-connect">Connect</button></div>` : ""}`;
+    })() : ""}
     <h2>Previews</h2>
     <p class="meta">${state?.project?.preview ? `Every change gets a link to ${state.project.preview.command ? `what <span class="mono">${esc(state.project.preview.command)}</span> builds into <span class="mono">${esc(state.project.preview.dir || ".")}/</span>` : `the files in <span class="mono">${esc(state.project.preview.dir || "/")}</span>`}, rebuilt on each version. Anyone with the link can open it, even in a private project; the page runs sandboxed, so it can't act as whoever opens it.` : "<b>Off.</b> Give each change a link to see what it builds before it lands: a static folder, or a build command's output (run in the check container, using the author's check minutes)."}</p>
     ${isOwner() ? `<div class="row"><input id="pv-cmd" class="mono grow" placeholder="Build command (optional), e.g. npm ci && npm run build" value="${esc(state?.project?.preview?.command ?? "")}"><input id="pv-dir" class="mono" style="width:9em" placeholder="Folder, e.g. dist" value="${esc(state?.project?.preview?.dir ?? "")}"><button class="ghost" id="pv-save">${state?.project?.preview ? "Save" : "Turn on"}</button>${state?.project?.preview ? `<button class="ghost" id="pv-off">Turn off</button>` : ""}</div>` : ""}
@@ -2070,6 +2076,15 @@ async function showSettings() {
   };
   if ($("#trust-toggle")) $("#trust-toggle").onclick = async () => {
     try { const r = await act("POST", "/settings", { trust: !state.project.trust.on }); state.project.trust = r.trust; } catch { return; }
+    showSettings();
+  };
+  if ($("#trust-connect")) $("#trust-connect").onclick = async () => {
+    try { const r = await act("POST", "/settings", { trust: { url: $("#trust-url").value.trim(), key: $("#trust-key").value.trim() } }); state.project.trust = r.trust; } catch { return; }
+    toast("Trust space connected");
+    showSettings();
+  };
+  if ($("#trust-forget")) $("#trust-forget").onclick = async () => {
+    try { const r = await act("POST", "/settings", { trust: null }); state.project.trust = r.trust; } catch { return; }
     showSettings();
   };
   if ($("#bisect-toggle")) $("#bisect-toggle").onclick = async () => {
