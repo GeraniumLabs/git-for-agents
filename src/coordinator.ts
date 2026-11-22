@@ -35,6 +35,7 @@ import { projectLimits, type PlanRow, type ProjectPlan } from "./billing";
 import { SCOPES, isScope, itemKey, itemScope, itemText, scopeFor, shortKey, signBody, standinSkill, validWebhook, type Scope } from "./standin";
 import { hookBody, isGitHubDispatch, runnerPrompt, validHookEvents } from "./runners";
 import { contextOf } from "./changecontext";
+import { TrustLink, checkSpace, parseSpaceUrl, sourcesFor, titleFor } from "./trust";
 
 const TOKEN_TTL = 6 * 3600;
 /** Sent with an agent key to act as one of several agents sharing it, e.g. the sub-agents of one session. */
@@ -392,6 +393,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS project_keys (
         kind TEXT PRIMARY KEY, ct TEXT NOT NULL, iv TEXT NOT NULL, sealed_by TEXT NOT NULL,
         last4 TEXT, set_by TEXT, set_at INTEGER);
+      CREATE TABLE IF NOT EXISTS trust_links (local TEXT PRIMARY KEY, entry TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS notes (
         id INTEGER PRIMARY KEY AUTOINCREMENT, by TEXT, kind TEXT NOT NULL DEFAULT 'fact', text TEXT NOT NULL,
         paths TEXT DEFAULT '[]', task_id INTEGER, change_id INTEGER, created_at INTEGER, retired_at INTEGER, retired_by TEXT);
@@ -1128,12 +1130,13 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (body.questions !== undefined) this.setQuestionRules(body.questions ?? {});
       if (body.reviewAgent !== undefined) this.setReviewAgent(body.reviewAgent ?? {});
       if (body.traces !== undefined) this.setTraceSettings(body.traces ?? {});
+      if (body.trust !== undefined) await this.setTrust(body.trust);
       if (body.model !== undefined) this.setMeta("model_options", JSON.stringify({ ...this.modelOptions, ...Object.fromEntries(Object.entries(body.model ?? {}).filter(([k]) => k === "reviewers" || k === "intent").map(([k, v]) => [k, !!v])) }));
       if (body.approvalMode !== undefined) {
         if (!["weighted", "count"].includes(body.approvalMode)) throw new HttpError(400, "approvalMode is weighted or count");
         this.setMeta("approval_mode", body.approvalMode);
       }
-      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings });
+      return json({ requiredApprovals: this.requiredApprovals, protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, visibility: this.isPrivate ? "private" : "public", approvalMode: this.approvalMode, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, resolveThreads: this.threadsMustResolve, questions: this.questionRules, model: this.modelOptions, reviewAgent: this.reviewAgent, traces: this.traceSettings, trust: this.trustStatus });
     }
     if (a === "import" && b === "issues" && m === "POST") {
       ownerOnly("import issues");
@@ -2795,6 +2798,100 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   private notesChain: Promise<void> = Promise.resolve();
 
+  // Trust add-on (src/trust.ts): mirrors notes, decisions and merges into a Trust space when the
+  // server has TRUST_URL and TRUST_BOOTSTRAP_TOKEN and an owner turned it on. Mergery's notes stay
+  // the source of truth; Trust failing never fails a request. Calls run one at a time, in order.
+  private trustLink: TrustLink | null = null;
+  private trustChain: Promise<void> = Promise.resolve();
+  private get trustAvailable(): boolean {
+    return !!(this.env.TRUST_URL && this.env.TRUST_BOOTSTRAP_TOKEN);
+  }
+  /** On when an owner turned it on and there's somewhere to write: the project's own space, or the server's Trust. */
+  private get trustOn(): boolean {
+    return this.meta("trust") === "on" && (!!this.meta("trust_url") || this.trustAvailable);
+  }
+  private get trustStatus() {
+    const mirrored = (this.sql.exec("SELECT COUNT(*) AS n FROM trust_links").one().n as number) ?? 0;
+    const lastMerge = this.meta("trust_last_merge");
+    return { available: this.trustAvailable, on: this.trustOn, own: this.meta("trust_url"), space: this.meta("trust_space"), mirrored, lastMerge: lastMerge ? JSON.parse(lastMerge) : null, lastError: this.meta("trust_error") };
+  }
+  /**
+   * true / false turns the add-on on or off (writing to the project's own space if one is
+   * connected, otherwise the server's Trust). { url, key } connects the project's own space;
+   * null forgets it.
+   */
+  private async setTrust(v: unknown) {
+    if (v === null) {
+      if (this.meta("trust_url")) this.forgetTrustSpace();
+      return;
+    }
+    if (typeof v === "object") {
+      const { url, key } = v as { url?: string; key?: string };
+      const at = parseSpaceUrl(url ?? "");
+      if (!at) throw new HttpError(400, "the space URL looks like https://<your Trust>/api/spaces/<id>; Trust's /new page gives you one");
+      if (!at.base.startsWith("https://") && !this.env.LOOM_DEV_LOGIN) throw new HttpError(400, "the space URL must use https");
+      if (!key?.trim()) throw new HttpError(400, "paste the space's admin key too");
+      if (!sealer(this.env)) throw new HttpError(400, "set LOOM_SECRET_KEY on the Worker first, so the key can be kept encrypted");
+      try {
+        await checkSpace(at.base, at.space, key.trim(), this.project);
+      } catch (e: any) {
+        throw new HttpError(400, String(e?.message ?? e));
+      }
+      if (this.meta("trust_space") !== at.space) this.forgetTrustSpace();
+      const { ct, iv, by } = await seal(this.env, this.project, key.trim());
+      this.setMeta("trust_url", at.base);
+      this.setMeta("trust_space", at.space);
+      this.setMeta("trust_admin", JSON.stringify({ ct, iv, sealed_by: by }));
+      this.setMeta("trust", "on");
+      this.trustLink = null;
+      return;
+    }
+    const on = !!v;
+    if (on && !this.meta("trust_url") && !this.trustAvailable) throw new HttpError(400, "connect a Trust space first (its URL and admin key), or set TRUST_URL and TRUST_BOOTSTRAP_TOKEN on the Worker");
+    if (on && !sealer(this.env)) throw new HttpError(400, "set LOOM_SECRET_KEY on the Worker first, so Trust's admin token can be kept encrypted");
+    this.setMeta("trust", on ? "on" : "off");
+  }
+  /** Drop the connected space: its key, and which notes were copied there. */
+  private forgetTrustSpace() {
+    for (const k of ["trust_url", "trust_space", "trust_admin", "trust_last_merge", "trust_error"]) this.setMeta(k, null);
+    this.sql.exec("DELETE FROM trust_links");
+    this.trustLink = null;
+  }
+  private trust(label: string, work: (t: TrustLink) => Promise<unknown>) {
+    if (!this.trustOn) return;
+    const own = this.meta("trust_url");
+    this.trustLink ??= new TrustLink({
+      url: own ?? this.env.TRUST_URL!,
+      bootstrap: own ? undefined : this.env.TRUST_BOOTSTRAP_TOKEN,
+      project: this.project,
+      store: {
+        space: async () => {
+          const id = this.meta("trust_space"), sealed = this.meta("trust_admin");
+          if (!id || !sealed) return null;
+          const token = await unseal(this.env, this.project, JSON.parse(sealed));
+          return token ? { id, adminToken: token } : null;
+        },
+        saveSpace: async (id, adminToken) => {
+          const { ct, iv, by } = await seal(this.env, this.project, adminToken);
+          this.setMeta("trust_space", id);
+          this.setMeta("trust_admin", JSON.stringify({ ct, iv, sealed_by: by }));
+        },
+        entryFor: (local) => (this.sql.exec("SELECT entry FROM trust_links WHERE local = ?", local).toArray()[0]?.entry as string) ?? null,
+        link: (local, entry) => void this.sql.exec("INSERT OR REPLACE INTO trust_links (local, entry) VALUES (?, ?)", local, entry),
+      },
+    });
+    const link = this.trustLink;
+    this.trustChain = this.trustChain
+      .then(() => work(link))
+      .then(() => this.setMeta("trust_error", null))
+      .catch((e) => {
+        const msg = `${label}: ${String(e?.message ?? e).slice(0, 300)}`;
+        console.error("trust", msg);
+        this.setMeta("trust_error", msg);
+      });
+    this.ctx.waitUntil(this.trustChain);
+  }
+
   /**
    * The records that say a change landed, in one synchronous step (a Durable
    * Object can't be cut off between these): the change, its task, its
@@ -2823,6 +2920,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
     await this.notesFromContext(ch).catch((e) => console.error("notes", e));
     this.adviseStale(ch.id, files.map((f) => f.path));
+    this.trust(`merge of #${ch.id}`, async (t) => {
+      const { flagged } = await t.merged(ch.agent_id, commit, `#${ch.id} ${ch.title ?? ""}`.trim(), files.map((f) => f.path));
+      this.setMeta("trust_last_merge", JSON.stringify({ change: ch.id, commit, stale: flagged.length }));
+    });
     const unblocked = new Set<number>();
     for (const r of this.sql.exec("SELECT id FROM tasks WHERE waits_for = ? AND status NOT IN ('merged','closed')", ch.task_id).toArray()) unblocked.add(r.id as number);
     for (const r of this.sql.exec("SELECT t.id FROM tasks t, json_each(t.depends_on) d WHERE d.value = ? AND t.status = 'open'", ch.task_id).toArray()) unblocked.add(r.id as number);
@@ -5366,7 +5467,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), trust: this.trustStatus },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: named.filter((a) => a.state !== "gone").length, records: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
@@ -6190,12 +6291,18 @@ export class ProjectCoordinator extends DurableObject<Env> {
       kind, d.question, d.decision, actor.id, JSON.stringify(paths), d.task ?? null, d.change ?? null, d.thread ?? null, Date.now()).one();
     const id = row.id as number;
     this.emit("decision.recorded", { actor: actor.id, task: d.task ?? null, change: d.change ?? null, data: { decision: id, kind, question: d.question, text: d.decision, paths } });
+    const head = this.meta("main_head");
+    this.trust(`decision ${id}`, (t) => t.remember(`decision:${id}`, actor.id, {
+      title: titleFor(d.question?.trim() || d.decision), body: d.question?.trim() ? `${d.question.trim()}\n\n${d.decision}` : d.decision,
+      kind: "decision", sources: sourcesFor(paths, head), derivation: "stated",
+    }));
     return this.decisionRows("id = ?", id)[0];
   }
 
   private retireDecision(actor: Agent, id: number) {
     this.sql.exec("UPDATE decisions SET retired_at = ? WHERE id = ?", Date.now(), id);
     this.emit("decision.retired", { actor: actor.id, data: { decision: id } });
+    this.trust(`retire decision ${id}`, (t) => t.retract(`decision:${id}`, actor.id, `retired in Mergery by ${actor.name ?? actor.id}`));
     return { ok: true };
   }
 
@@ -6331,6 +6438,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
       actor.id, kind, text, JSON.stringify(paths), body.taskId ?? null, body.changeId ?? null, Date.now()).one();
     const id = row.id as number;
     if (!quiet) this.emit("note.added", { actor: actor.id, task: body.taskId ?? null, change: body.changeId ?? null, data: { note: id, kind, text, paths } });
+    const head = this.meta("main_head");
+    this.trust(`note ${id}`, (t) => t.remember(`note:${id}`, actor.id, {
+      title: titleFor(text), body: text, kind, sources: sourcesFor(paths, head), derivation: actor.role === "human" ? "stated" : "observed",
+    }));
     return this.noteRows("id = ?", id)[0];
   }
 
@@ -6349,6 +6460,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (n.by !== actor.id && actor.role !== "human") throw new HttpError(403, "only its author or a person can retire a note; rate_note to dispute it");
     this.sql.exec("UPDATE notes SET retired_at = ?, retired_by = ? WHERE id = ?", Date.now(), actor.id, id);
     this.emit("note.retired", { actor: actor.id, data: { note: id } });
+    this.trust(`retire note ${id}`, (t) => t.retract(`note:${id}`, actor.id, `retired in Mergery by ${actor.name ?? actor.id}`));
     return { ok: true };
   }
 
@@ -7218,7 +7330,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null") },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), trust: this.trustStatus },
       agents, agentStates: this.agentStates(), tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
