@@ -1,6 +1,6 @@
-// Visitor counts for the hosted site, with Google Analytics 4. Off unless the server sets
-// LOOM_GA_ID (it arrives in /auth/me as `analytics`). What goes to Google is deliberately small:
-// a page path with no query string or hash ("/", "/pricing", "/app"), and a few named clicks
+// Visitor counts for the hosted site, with Google Analytics 4, directly (G-…) or through a Tag
+// Manager container (GTM-…). Off unless the server sets LOOM_GA_ID (it arrives in /auth/me as
+// `analytics`). What goes to Google is deliberately small: a page path with no query string or hash ("/", "/pricing", "/app"), and a few named clicks
 // with no values. Never project names, import URLs, logins, keys or anything typed.
 //
 // Skipped entirely when the browser sends Global Privacy Control or Do Not Track, or when the
@@ -23,22 +23,40 @@
   function load(id, path) {
     if (on) return;
     on = true;
+    mode = gtm(id) ? "gtm" : "gtag";
     window.dataLayer = window.dataLayer || [];
     gtag("consent", "default", { ad_storage: "denied", ad_user_data: "denied", ad_personalization: "denied", analytics_storage: "granted" });
-    gtag("js", new Date());
-    gtag("config", id, {
+    // What every Google tag on the page reports: this path with no query or hash, and another site's
+    // origin as referrer (a page of ours would carry its query). A Tag Manager container's Google tag
+    // reads these too, as long as it doesn't override page_location itself.
+    const page = {
       page_location: location.origin + path,
       page_path: path,
-      // Another site that sent the visitor, by its origin only; a page of ours as referrer would carry its query.
       page_referrer: externalReferrer(),
       allow_google_signals: false,
       allow_ad_personalization_signals: false,
-    });
+    };
+    gtag("set", page);
+    gtag("js", new Date());
     const s = document.createElement("script");
     s.async = true;
-    s.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(id)}`;
+    if (gtm(id)) {
+      window.dataLayer.push({ event: "gtm.js", "gtm.start": Date.now(), mergery_page_path: path, mergery_page_location: page.page_location });
+      s.src = `https://www.googletagmanager.com/gtm.js?id=${encodeURIComponent(id)}`;
+    } else {
+      gtag("config", id, page);
+      s.src = `https://www.googletagmanager.com/gtag/js?id=${encodeURIComponent(id)}`;
+    }
     document.head.appendChild(s);
-    for (const [n, p] of queue.splice(0)) gtag("event", n, p);
+    for (const [n, p] of queue.splice(0)) send(n, p);
+  }
+  const gtm = (id) => id.startsWith("GTM-");
+  let mode = "";
+  // GA4 directly takes gtag events; a Tag Manager container takes dataLayer events, which its
+  // GA4 event tag forwards with the event's name.
+  function send(name, params) {
+    if (mode === "gtm") window.dataLayer.push({ event: name, ...params });
+    else gtag("event", name, params);
   }
 
   function banner(id, path) {
@@ -66,7 +84,7 @@
     },
     /** A named event with only the small, fixed params the caller passes. Dropped when analytics is off. */
     event(name, params = {}) {
-      if (on) gtag("event", name, params);
+      if (on) send(name, params);
       else if (queue.length < 20) queue.push([name, params]);
     },
     /** For the privacy page: the visitor's choice in this browser. */

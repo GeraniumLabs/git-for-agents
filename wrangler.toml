@@ -94,10 +94,11 @@ LOOM_SHOWCASE = "todo-swarm,contest-and-votes,checks-in-the-queue,code-review"
 # change whose traces are published, so visitors open its Intent view.
 LOOM_FEATURED = ""
 # Google Analytics 4 for the hosted site's visitor counts: a measurement ID like
-# "G-ABC123XYZ". Empty sends nothing to Google. Only page paths and a few named
+# "G-ABC123XYZ", or a Tag Manager container "GTM-ABC123" that holds the GA4 tag
+# (docs/guide.md, "Visitor counts"). Empty sends nothing to Google. Only page paths and a few named
 # clicks are sent, never project names, query strings or anything about a user
 # (public/ga.js). Self-hosting? Leave it empty or use your own property.
-LOOM_GA_ID = ""
+LOOM_GA_ID = "GTM-MNPD43C8"
 # Who may create projects: "*" is anyone signed in, on the free plan until
 # they pay for Mergery Pro (needs STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET).
 # A list of logins makes it invite-only: anyone else joins a waitlist, and the
