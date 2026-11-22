@@ -522,7 +522,7 @@ function renderStuck() {
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`);
   wire($("#stuck"));
-  for (const b of $("#stuck").querySelectorAll("[data-open-settings]")) b.onclick = () => showSettings();
+  for (const b of $("#stuck").querySelectorAll("[data-open-settings]")) b.onclick = () => showSettings("checks");
   for (const b of $("#stuck").querySelectorAll("[data-reconcile]")) b.onclick = async () => {
     let r; try { r = await act("POST", `/changes/${b.dataset.reconcile}/reconcile`, {}); } catch { return; }
     const o = r?.outcome;
@@ -1392,7 +1392,7 @@ async function showSkill(joinCode, fresh = false) {
       <button role="tab" class="path-card" data-path="me" aria-selected="${shown === "me"}"><b>Through your account</b><span>A coding agent you run at your computer: Claude Code, Codex, OpenCode. You sign in once in the browser, and it works on the project under your account. No skill, no key.</span></button>
       <button role="tab" class="path-card" data-path="own" aria-selected="${shown === "own"}"><b>With its own key</b><span>Headless agents that run without you: a swarm, a CI job, a server. No browser: each registers with a join code and gets its own name, key and track record, not tied to you.${joinCode ? " <em>Join code ready</em>" : ""}</span></button>
     </div>
-    <p class="meta standin-note"><b>Not a worker: your stand-in.</b> Both of these connect agents that do the work. A stand-in is a different kind of agent: it does no work on the project, but acts as you, making only the calls you set it up to handle (answering questions, approving, steering), and reaches you when something needs a person. Set one up in <a href="#" id="connect-settings">Settings › Stand-in for you</a>.</p>
+    <p class="meta standin-note"><b>Not a worker: your stand-in.</b> Both of these connect agents that do the work. A stand-in is a different kind of agent: it does no work on the project, but acts as you, making only the calls you set it up to handle (answering questions, approving, steering), and reaches you when something needs a person. Set one up in <a href="#" id="connect-settings">Settings › Just for you</a>.</p>
     <section class="connect-body" data-path-body="me" ${shown === "me" ? "" : "hidden"}>
       <h2>Run this where your agent runs</h2>
       <p class="meta">It opens your browser once to sign in with GitHub, then works here as your agent, named after the app${me ? "" : `, once you're a member of ${esc(project)}`}. Mergery's MCP server tells the agent how to work here, so it doesn't need the skill.</p>
@@ -1415,13 +1415,13 @@ async function showSkill(joinCode, fresh = false) {
       <details class="alt"><summary>Read the skill</summary><pre class="diff copy skill">${esc(text)}</pre></details>
     </section>
     ${traceSection(me && isHuman() && me.id !== "admin" && !me.standin ? await api("/trace-keys").catch(() => []) : null, p)}
-    <p class="meta connect-foot">People don't need any of this: they sign in with GitHub and are added under People in Settings. Model keys (Anthropic and others) for Mergery's own reviewer and deputy are in Settings too.</p>`;
+    <p class="meta connect-foot">People don't need any of this: they sign in with GitHub and are added under People in Settings. Model keys (Anthropic and others) for Mergery's own reviewer and deputy are in Settings › AI models.</p>`;
   for (const t of $("#detail-body").querySelectorAll("[data-path]")) t.onclick = () => {
     connectPath = t.dataset.path;
     for (const x of $("#detail-body").querySelectorAll("[data-path]")) x.setAttribute("aria-selected", String(x === t));
     for (const s of $("#detail-body").querySelectorAll("[data-path-body]")) s.hidden = s.dataset.pathBody !== connectPath;
   };
-  if ($("#connect-settings")) $("#connect-settings").onclick = (e) => { e.preventDefault(); showSettings(); };
+  if ($("#connect-settings")) $("#connect-settings").onclick = (e) => { e.preventDefault(); showSettings("you"); };
   wireTraceSection(() => showSkill(joinCode, fresh));
   if ($("#mk-go")) $("#mk-go").onclick = async () => {
     const n = $("#mk-name").value.trim();
@@ -1842,8 +1842,23 @@ async function showInvite(code) {
   };
 }
 
-// ── settings: keys people bring for this project ────────────────────────
-async function showSettings() {
+// ── settings: grouped pages, a nav with each group's state, and search ──
+// Each <h2 data-sec> section is assigned to a group here; showSettings renders
+// them all (so every handler finds its inputs) and shows one group at a time.
+const SETTINGS_GROUPS = [
+  ["general", "General", ["visibility", "imported", "residency", "delete"]],
+  ["people", "People", ["people", "organization"]],
+  ["agents", "Agents", ["agents", "agent-limits", "questions"]],
+  ["review", "Review", ["approvals", "review-agent", "evals"]],
+  ["checks", "Checks & previews", ["checks", "previews"]],
+  ["traces", "Session traces", ["traces"]],
+  ["models", "AI models", ["model-keys", "decision-model"]],
+  ["integrations", "Integrations", ["runners", "trust"]],
+  ["you", "Just for you", ["email", "standin"]],
+];
+let settingsTab = null, settingsQuery = "";
+async function showSettings(tab) {
+  if (tab !== undefined) { settingsTab = tab; settingsQuery = ""; }
   if (!isHuman()) return showSignIn("Settings hold this project's people and keys, so only its members can see them.");
   let s, people, si;
   let mail = null, account = null, hooks = [], cs = null, ev = null;
@@ -1853,62 +1868,61 @@ async function showSettings() {
   const vis = state?.project?.visibility ?? "public";
   const when = (t) => new Date(t).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
   $("#detail-body").innerHTML = `
-    <h3>Settings · ${esc(project)}</h3>
-    <h2>Visibility</h2>
+    <h2 data-sec="visibility">Visibility</h2>
     <p class="meta">${vis === "private" ? "<b>Private.</b> Only members, owners and the project's agents can see it; to everyone else it doesn't exist." : "<b>Public.</b> Anyone can see the work. Only members can act on it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="vis-toggle">Make it ${vis === "private" ? "public" : "private"}</button></div>` : ""}
-    ${state?.project?.importedFrom ? `<h2>Imported</h2>
+    ${state?.project?.importedFrom ? `<h2 data-sec="imported">Imported</h2>
     <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Mergery is its home: nothing is written back.</p>
     ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
-    <h2>Where the data lives</h2>
+    <h2 data-sec="residency">Where the data lives</h2>
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
-    <h2>Approvals</h2>
+    <h2 data-sec="approvals">Approvals</h2>
     <p class="meta">${state?.project?.approvalMode === "count" ? "<b>Counted.</b> Every approval counts for one." : "<b>Weighted by track record.</b> An agent's approval counts for more when its earlier approvals and votes held up, and for less when they didn't. A newcomer's counts for one; a person's always does."} A change needs ${state?.project?.requiredApprovals ?? 1}.</p>
     <p class="meta">${state?.project?.noReviewPaths?.length ? `<b>These land without review:</b> <span class="mono">${state.project.noReviewPaths.map(esc).join(", ")}</span>. A change that touches only these goes straight to the merge queue${state?.project?.checks ? ", where the checks still run before it lands" : "; with no check command set, nothing tests it first"}. The activity marks it as landed without review, and <span class=\"mono\">revert_change</span> undoes it in one call.` : "<b>Every change needs review.</b> List paths (for example <span class=\"mono\">docs/**, **/*.md</span>) whose changes can land once the checks pass, with no review. Protected paths still need their person."}</p>
     ${isOwner() ? `<div class="row"><input id="noreview-paths" class="mono grow" placeholder="docs/**, **/*.md" value="${esc((state?.project?.noReviewPaths ?? []).join(", "))}"><button class="ghost" id="noreview-save">Save</button></div>` : ""}
     ${isOwner() ? `<div class="row"><button class="ghost" id="mode-toggle">${state?.project?.approvalMode === "count" ? "Weigh approvals by track record" : "Count every approval as one"}</button></div>` : ""}
     <p class="meta">${state?.project?.resolveThreads === false ? "<b>Threads don't hold changes back.</b> Line comments are advice; an approved change merges with threads still open." : "<b>Threads must be resolved.</b> A line comment sent with a request for changes (or marked as one to fix) keeps the change out of the merge queue until its author resolves it."}</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="threads-toggle">${state?.project?.resolveThreads === false ? "Require open threads to be resolved" : "Let changes merge with open threads"}</button></div>` : ""}
-    <h2>Checks</h2>
+    <h2 data-sec="checks">Checks</h2>
     <p class="meta">${state?.project?.checks ? `Before anything lands, the merge queue runs <span class="mono">${esc(state.project.checks.command)}</span> on main with the change in it, in a container. A change that fails goes back to its author with the output, like a conflict.` : "No checks yet. Set a command (for example <span class=\"mono\">npm ci && npm test</span>) and the merge queue runs it on main with each change before main moves."}</p>
     ${isOwner() ? `<div class="row"><input id="checks-cmd" class="mono grow" placeholder="npm ci && npm test" value="${esc(state?.project?.checks?.command ?? "")}"><button class="ghost" id="checks-save">Save</button></div>` : ""}
     ${state?.project?.checks ? `<p class="meta">${state.project.autoBisect === false ? "<b>Auto-bisect is off.</b>" : "<b>Auto-bisect is on.</b> When changes by different agents keep failing the checks, Mergery checks main itself and, if main fails, finds the change that broke it and opens its revert for a person to approve."}${state.project.lastBisect ? ` Last bisect: ${esc(state.project.lastBisect.verdict ?? state.project.lastBisect.status)}${state.project.lastBisect.culprit ? ` (<a href="#change/${state.project.lastBisect.culprit.id}">#${state.project.lastBisect.culprit.id} ${esc(state.project.lastBisect.culprit.title)}</a>, <a href="#incident/bisect/${state.project.lastBisect.id}">incident view</a>)` : ""}.` : ""}</p>${isOwner() ? `<div class="row"><button class="ghost" id="bisect-toggle">${state.project.autoBisect === false ? "Turn auto-bisect on" : "Turn auto-bisect off"}</button></div>` : ""}` : ""}
-    ${cs ? `<p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
+    ${cs ? `<details class="set-more"${cs.secrets.length ? " open" : ""}><summary>Secrets for checks${cs.secrets.length ? ` (${cs.secrets.length})` : ""}</summary><p class="meta"><b>Secrets</b> the check command gets as environment variables, such as a registry token. They're encrypted at rest, never shown again, and replaced with <span class="mono">[secret NAME]</span> wherever they show up in check output or traces. The merge queue's checks get them all; an agent's own <span class="mono">run_checks</span> gets only the ones you allow, because code an agent wrote can print or send what it's given.</p>
     ${cs.secrets.map((x) => `<div class="qrow"><span class="grow"><span class="mono">${esc(x.name)}</span> <span class="meta">${x.onDemand ? "merge queue and agents' run_checks" : "merge queue only"} · set by ${esc(x.setBy ?? "?")} ${ago(x.updatedAt)}${x.readable ? "" : " · can't be read: the Worker secret that sealed it is gone"}</span></span><button class="ghost mini" data-secret-demand="${esc(x.name)}" data-on="${x.onDemand ? "" : "1"}">${x.onDemand ? "Merge queue only" : "Allow in run_checks"}</button><button class="ghost mini" data-secret-remove="${esc(x.name)}">Remove</button></div>`).join("")}
-    ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}` : ""}
+    ${cs.canSave ? `<div class="row"><input id="cs-name" class="mono" placeholder="NPM_TOKEN" style="width:12em"><input id="cs-value" class="grow" type="password" autocomplete="off" placeholder="Value"><label class="check"><input type="checkbox" id="cs-demand"> Also in run_checks</label><button class="ghost" id="cs-save">Add</button></div>` : `<p class="meta">Set LOOM_SECRET_KEY on the Worker to add secrets.</p>`}</details>` : ""}
     ${isOwner() || state?.project?.trust?.on ? (() => {
       const tr = state?.project?.trust ?? {};
       const where = tr.own ? `your Trust space at <span class="mono">${esc(tr.own)}</span>` : "this server's Trust";
-      return `<h2>Trust</h2>
+      return `<h2 data-sec="trust">Trust</h2>
     <p class="meta">${tr.on ? `<b>Trust is on.</b> New notes and decisions are copied to ${where} with the files they cite, and each merge marks the memories on files it changed as stale. Mergery's own notes stay the record. ${tr.mirrored ?? 0} copied so far${tr.lastMerge ? `; the last merge (#${tr.lastMerge.change}) marked ${tr.lastMerge.stale} stale` : ""}.` : `<b>Trust is off.</b> <a href="https://github.com/GeraniumLabs/Trust" target="_blank" rel="noopener">Trust</a> keeps where each note came from and marks it stale when those files change. Turn it on to copy new notes and decisions there; earlier ones aren't copied.`}</p>
     ${tr.on && tr.lastError ? `<p class="meta"><b>Trust's last call failed:</b> ${esc(tr.lastError)}. Mergery carries on without it; this clears on the next call that works.</p>` : ""}
     ${isOwner() ? `${tr.own || tr.available ? `<div class="row"><button class="ghost" id="trust-toggle">${tr.on ? "Turn Trust off" : tr.own ? "Turn Trust on" : "Use this server's Trust"}</button>${tr.own ? `<button class="ghost" id="trust-forget">Disconnect your space</button>` : ""}</div>` : ""}
     <p class="meta">${tr.own ? "Connect a different space:" : (tr.newSpace ? `Or use a space of your own: <a href="${esc(tr.newSpace)}" target="_blank" rel="noopener">make one on Trust</a> (no account needed) and paste its URL and admin key here.` : "Or use a space of your own: make one on any Trust server's <span class=\"mono\">/new</span> page and paste its URL and admin key here.")}</p>
     <div class="row"><input id="trust-url" class="mono grow" placeholder="https://trust.example.dev/api/spaces/…" autocomplete="off"><input id="trust-key" class="grow" type="password" placeholder="Admin key" autocomplete="off"><button class="ghost" id="trust-connect">Connect</button></div>` : ""}`;
     })() : ""}
-    <h2>Previews</h2>
+    <h2 data-sec="previews">Previews</h2>
     <p class="meta">${state?.project?.preview ? `Every change gets a link to ${state.project.preview.command ? `what <span class="mono">${esc(state.project.preview.command)}</span> builds into <span class="mono">${esc(state.project.preview.dir || ".")}/</span>` : `the files in <span class="mono">${esc(state.project.preview.dir || "/")}</span>`}, rebuilt on each version. Anyone with the link can open it, even in a private project; the page runs sandboxed, so it can't act as whoever opens it.` : "<b>Off.</b> Give each change a link to see what it builds before it lands: a static folder, or a build command's output (run in the check container, using the author's check minutes)."}</p>
     ${isOwner() ? `<div class="row"><input id="pv-cmd" class="mono grow" placeholder="Build command (optional), e.g. npm ci && npm run build" value="${esc(state?.project?.preview?.command ?? "")}"><input id="pv-dir" class="mono" style="width:9em" placeholder="Folder, e.g. dist" value="${esc(state?.project?.preview?.dir ?? "")}"><button class="ghost" id="pv-save">${state?.project?.preview ? "Save" : "Turn on"}</button>${state?.project?.preview ? `<button class="ghost" id="pv-off">Turn off</button>` : ""}</div>` : ""}
-    <h2>Evals</h2>
+    <h2 data-sec="evals">Evals</h2>
     <p class="meta">Scores from 0 to 1 on every version of every change. A <b>command</b> eval runs in the check container (a last line like <span class="mono">score: 0.8</span> sets the score; otherwise passing is 1) and uses check minutes. A <b>review</b> eval is a job for an agent other than the author: runners see it on /work and agents in their todo; Mergery doesn't run that agent. A blocking eval under its threshold sends the change back.</p>
     ${(ev?.evals ?? []).map((e) => `<div class="qrow"><span class="grow"><b>${esc(e.name)}</b> <span class="meta">${e.kind}${e.blocking ? ` · blocks under ${e.threshold}` : ""} · ${e.scored ? `average ${e.average} over ${e.scored}${e.trend.length > 1 ? `, by week: ${e.trend.slice().reverse().map((w) => w.average).join(" → ")}` : ""}` : "nothing scored yet"}${e.waiting ? ` · ${e.waiting} waiting` : ""}</span><br><span class="meta mono">${esc(e.command ?? e.rubric ?? "")}</span></span>${isOwner() ? `<button class="ghost mini" data-eval-remove="${esc(e.name)}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="card key-card"><div class="row"><input id="ev-name" placeholder="Name, e.g. Security" style="width:12em"><select id="ev-kind"><option value="review">Review by an agent</option><option value="command">Command</option></select><label class="check"><input type="checkbox" id="ev-block"> Blocking under <input id="ev-th" type="number" min="0" max="1" step="0.05" value="0.5" style="width:4.5em"></label></div>
       <textarea id="ev-text" rows="2" class="grow" style="width:100%" placeholder="Review: the rubric, what a 1 and a 0 look like. Command: e.g. npm run lint"></textarea><div class="row"><button class="ghost" id="ev-save">Add eval</button></div></div>` : ""}
-    <h2>Questions for people</h2>
+    <h2 data-sec="questions">Questions for people</h2>
     <p class="meta">${(() => { const q = state?.project?.questions ?? { maxOpen: 3, deadlineMinutes: 30 }; return `${q.maxOpen ? `Each agent may have <b>${q.maxOpen}</b> open question${q.maxOpen === 1 ? "" : "s"} for people at a time; past that, it has to wait or decide for itself.` : "<b>No limit</b> on how many questions an agent may have open for people."} An agent can ask with a default; if nobody answers within <b>${q.deadlineMinutes} minutes</b>, it goes ahead with that default. Similar questions show as one card, and one answer goes to every agent that asked.`; })()}</p>
     ${isOwner() ? `<div class="row"><label class="check">Open questions per agent <input id="q-max" type="number" min="0" max="100" style="width:5em" value="${state?.project?.questions?.maxOpen ?? 3}"></label><label class="check">Default after (minutes) <input id="q-deadline" type="number" min="1" max="10080" style="width:6em" value="${state?.project?.questions?.deadlineMinutes ?? 30}"></label><button class="ghost" id="q-save">Save</button></div><p class="meta">0 open questions means no limit.</p>` : ""}
-    <h2>Decision model</h2>
+    <h2 data-sec="decision-model">Decision model</h2>
     <p class="meta">${s.jevUses ? `Mergery can also use the deputy's decision model (<b>${esc(s.jevUses)}</b>) beyond the deputy. Both are off unless you turn them on, and if the model fails Mergery does what it does without one.` : "No decision model is connected, so these options have no effect."}</p>
     ${(() => { const o = state?.project?.model ?? {}; const box = (id, on, label, help) => `<label class="check" title="${esc(help)}"><input type="checkbox" id="${id}" ${on ? "checked" : ""} ${isOwner() ? "" : "disabled"}> ${label}</label><p class="meta">${help}</p>`;
       return box("model-reviewers", o.reviewers, "Pick reviewers with the model", "When reviewers are requested, the model reorders the best-placed few by who knows the changed code and can get to it. Their familiarity with the files still decides who is considered.")
         + box("model-intent", o.intent, "Check changes against their intent", "When a change is submitted or updated, the model judges whether the diff does what its agent declared, and nothing else. A doubtful score shows in the review brief and tells the author."); })()}
-    <h2>Agent limits</h2>
+    <h2 data-sec="agent-limits">Agent limits</h2>
     <p class="meta">What each agent may do unless its own limits say otherwise: which paths it may change, how many changes it may open a day, and how many check minutes it may use a day. Sub-agents share their key's limits. ${state?.project?.agentLimits ? `Now: <b>${esc(limitsText(state.project.agentLimits))}</b>.` : "<b>No limits</b> beyond the project's."} Set one agent's limits from its profile.</p>
     ${isOwner() ? limitsForm("dl", state?.project?.agentLimits) : ""}
-    <h2>Review agent</h2>
-    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Mergery reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key under Model keys below." : ""}</p>`
+    <h2 data-sec="review-agent">Review agent</h2>
+    ${(() => { const r = state?.project?.reviewAgent ?? { enabled: true, afterMinutes: 5 }; return `<p class="meta">${r.enabled ? `When a change has waited <b>${r.afterMinutes} minute${r.afterMinutes === 1 ? "" : "s"}</b> and no agent is around to review it, Mergery reviews it itself${r.uses ? ` with <b>${esc(r.uses)}</b>` : ""}. Its review counts like an agent's: an approval can land the change, and a blocking comment sends it back. Protected paths still need a person.` : "<b>Off.</b> Changes wait for an agent or a person to review them."}${r.enabled && !r.uses ? " No model is connected, so it can't run yet: add an Anthropic key under <a href=\"#\" data-settings-tab=\"models\">AI models</a>." : ""}</p>`
       + (isOwner() ? `<div class="row"><label class="check"><input type="checkbox" id="review-agent-on" ${r.enabled ? "checked" : ""}> Let Mergery review changes nobody else is around to review</label><label class="check">after (minutes) <input id="review-agent-after" type="number" min="0" max="10080" style="width:5em" value="${r.afterMinutes}"></label><button class="ghost" id="review-agent-save">Save</button></div>` : ""); })()}
-    <h2>Session traces</h2>
+    <h2 data-sec="traces">Session traces</h2>
     ${(() => { const t = state?.project?.traces ?? { thoughts: true, agentsCanRead: false, redactRules: 0, limits: { days: 90, bytes: 0 } };
       const keep = t.limits.days ? `${t.limits.days} days` : "until deleted";
       return `<p class="meta"><a href="#report">Factory report</a>: what a week of traces says to change. <a href="#scorecards">Scorecards</a>: how each model and agent is doing.</p><p class="meta">Agents upload their session logs (a hook does it when a session ends), so you can see later what they read, thought and did behind a change. Mergery removes secrets before storing anything. ${t.public ? "<b>Published:</b> anyone can read this project's traces and the Intent view of its changes, signed out too." : "Only this project's people can read traces, even when the project is public."} Traces are kept ${keep}.</p>`
@@ -1916,10 +1930,10 @@ async function showSettings() {
       <label class="check"><input type="checkbox" id="trace-ask-all" ${t.askAll ? "checked" : ""}> Ask every agent for its trace</label><p class="meta">Agents with their own key too: each is asked to attach its session with attach_trace when it submits a change.</p>
       <label class="check"><input type="checkbox" id="trace-agents" ${t.agentsCanRead ? "checked" : ""}> Let agents read traces</label><p class="meta">So an agent can see what an earlier attempt tried. Costs them tokens.</p>
       <label class="check"><input type="checkbox" id="trace-public" ${t.public ? "checked" : ""} ${state?.project?.visibility === "private" ? "disabled" : ""}> Publish traces: anyone can read them</label><p class="meta">For an open-source or showcase project: visitors see what each agent was asked and why it changed what it did, without signing in. Prompts and the models' reasoning become public too, so check the redaction rules first.${state?.project?.visibility === "private" ? " Only a public project can publish its traces." : ""}</p>
-      <label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
-      <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea>
+      <details class="set-more"${t.redactRules ? " open" : ""}><summary>Redaction rules${t.redactRules ? ` (${t.redactRules})` : ""}</summary><label class="meta" for="trace-redact">Also remove anything matching these regular expressions, one per line${t.redactRules ? ` (${t.redactRules} set)` : ""}:</label>
+      <textarea id="trace-redact" rows="3" class="grow mono" placeholder="ACME-[0-9]{6}" style="width:100%"></textarea></details>
       <div class="row"><button class="ghost" id="trace-save">Save</button><span id="trace-out" class="meta"></span></div>` : ""); })()}
-    <h2>Runners</h2>
+    <h2 data-sec="runners">Runners</h2>
     <p class="meta">Mergery doesn't run agents; whatever already does (a GitHub Action, a cron job, a Claude Code routine) can keep this project moving. Mergery tells it when there's work an agent could pick up: reviews nobody is on, contests ready to judge, changes sent back to an author who has gone, open tasks. A runner polls <a class="mono" href="/api/projects/${esc(project)}/work" target="_blank">/work</a>, or gets a webhook. <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/runners.md" target="_blank" rel="noopener">Ready-made runners</a>.</p>
     ${isOwner() ? `${hooks.map((h) => `<div class="qrow"><span class="grow"><span class="mono">${esc(h.url)}</span> <span class="meta">${esc(h.events.join(", "))}${h.github ? " · GitHub dispatch" : ""}${h.lastDelivery ? ` · last ${h.lastDelivery.status && h.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(h.lastDelivery.error || String(h.lastDelivery.status))}`} ${ago(h.lastDelivery.at)}` : " · nothing sent yet"}</span></span><button class="ghost mini" data-hook-test="${esc(h.id)}">Test</button><button class="ghost mini" data-hook-delete="${esc(h.id)}">Delete</button></div>`).join("")}
     <div class="card key-card">
@@ -1927,21 +1941,21 @@ async function showSettings() {
       <div class="row"><select id="hook-events"><option value="work">New work for agents</option><option value="work,change.merged">New work, and merges</option><option value="*">Every event</option></select><input id="hook-auth" type="password" autocomplete="off" class="grow" placeholder="Authorization header (optional), e.g. Bearer <token>"><button id="hook-add">Add webhook</button></div>
       <div id="hook-out"></div>
     </div>` : ""}
-    <h2>Agents</h2>
-    <p class="meta">Agents connect from <b>Connect an agent</b>, in two ways that work side by side, so a project can have both: <b>through your account</b> (Claude Code, Codex, OpenCode or any MCP client you work with, after one browser sign-in), or <b>with its own key</b> (headless: a swarm, CI, a server), where each agent registers with a join code and the skill. Join codes and single-agent keys are made and revoked there. Your stand-in is something else: it does no work, it makes the calls you set it up for (below).</p>
+    <h2 data-sec="agents">Agents</h2>
+    <p class="meta">Agents connect from <b>Connect an agent</b>, in two ways that work side by side, so a project can have both: <b>through your account</b> (Claude Code, Codex, OpenCode or any MCP client you work with, after one browser sign-in), or <b>with its own key</b> (headless: a swarm, CI, a server), where each agent registers with a join code and the skill. Join codes and single-agent keys are made and revoked there. Your stand-in is something else: it does no work, it makes the calls you set it up for (under <a href="#" data-settings-tab="you">Just for you</a>).</p>
     <div class="row"><button class="ghost" id="settings-connect">Connect an agent…</button></div>
-    <h2>People</h2>
+    <h2 data-sec="people">People</h2>
     <p class="meta">People sign in with GitHub. Members can answer agents, review, steer and manage keys; owners can also add people and create agent keys.</p>
     ${people.map((p) => `<div class="qrow"><span class="grow">${esc(p.login)}</span><span class="role">${p.owner ? "owner" : "member"}</span><span class="meta">${p.lastSeen ? `seen ${ago(p.lastSeen)}` : "hasn't signed in yet"}</span>${isOwner() && p.id !== me.id ? `<button class="ghost mini" data-member-remove="${p.id}">Remove</button>` : ""}</div>`).join("")}
     ${isOwner() ? `<div class="row"><input id="mem-login" placeholder="GitHub login, e.g. octocat"><label class="check"><input id="mem-owner" type="checkbox"> Owner</label><button class="ghost" id="mem-add">Add</button></div>` : ""}
-    <h2>Organization</h2>
+    <h2 data-sec="organization">Organization</h2>
     <p class="meta">${org ? `${esc(project)} belongs to <a href="#org/${esc(org)}">${esc(org)}</a>: everyone in it is a member here, its owners own it, and it runs on ${esc(org)}'s plan.` : `${esc(project)} isn't in an organization: its people are the ones above${account ? `, and it runs on its creator's plan. Yours is on <a href="#account">your account page</a>` : ""}.`}</p>
     ${isOwner() && user && (moveTo.length || org) ? `<div class="row"><select id="org-move">${org ? `<option value="">Make it mine, outside ${esc(org)}</option>` : ""}${moveTo.map((o) => `<option value="${esc(o.slug)}">Move it into ${esc(o.name)}</option>`).join("")}</select><button class="ghost" id="org-move-go">Move</button></div>` : ""}
     ${isOwner() && user && !moveTo.length && !org ? `<p class="meta">To share it with a team, <a href="#account">create an organization</a>, then move it in here.</p>` : ""}
-    ${mail ? `<h2>Email me</h2>
+    ${mail ? `<h2 data-sec="email">Email me</h2>
     <p class="meta">${mail.email ? `Mergery emails you at <b>${esc(account?.email ?? mail.email)}</b> when something on ${esc(project)} needs you: a question, an approval, a review or task asked of you, stuck work. Each thing once, and at most one email every 10 minutes. An approval's email links straight to its Approve button.` : account?.email ? `Get an email at <b>${esc(account.email)}</b> when something on ${esc(project)} needs you, with a link straight to it.` : `Get an email when something on ${esc(project)} needs you. First set your address on <a href="#account">your account page</a>.`}${mail.sending ? "" : " This server isn't set up to send email yet, so nothing goes out until it is."}</p>
     ${mail.email || account?.email ? `<div class="row">${mail.email ? `<button class="ghost" id="mail-off">Stop emailing me about ${esc(project)}</button>${mail.sending ? `<button class="ghost" id="mail-test">Send a test</button>` : ""}` : `<button class="ghost" id="mail-on" data-to="${esc(account.email)}">Email me about ${esc(project)}</button>`}</div>` : ""}` : ""}
-    <h2>Stand-in for you</h2>
+    <h2 data-sec="standin">Stand-in for you</h2>
     <p class="meta">Not for connecting agents to do the work (that's <a href="#" id="settings-connect2">Connect an agent</a>). A stand-in is your own assistant watching this project for you: it reaches you where you are (Slack, email, a text) when agents need a person, and can act for you with the rights you tick. Its stand-in key signs in as you, but never touches settings, people or keys. With nothing ticked it only tells you. Everything it does is recorded under your name, marked as through it.</p>
     <div class="card key-card">
       <div class="row"><input id="si-name" placeholder="Your agent's name, e.g. my-assistant"></div>
@@ -1950,7 +1964,7 @@ async function showSettings() {
       <div id="si-out"></div>
     </div>
     ${si.standins.map((x) => `<div class="qrow"><span class="grow"><b>${esc(x.name)}</b>${x.for !== me?.id ? ` <span class="meta">for ${esc(x.forName)}</span>` : ""} <span class="meta">${x.scopes.length ? esc(x.scopes.join(", ")) : "watch only"}${x.webhook ? " · webhook" : ""}${x.lastDelivery ? ` (last ${x.lastDelivery.status && x.lastDelivery.status < 300 ? "delivered" : `failed: ${esc(x.lastDelivery.error || String(x.lastDelivery.status))}`})` : ""} · ${x.revoked ? "revoked" : x.lastUsed ? `used ${ago(x.lastUsed)}` : "not used yet"}</span></span>${!x.revoked && x.webhook ? `<button class="ghost mini" data-si-test="${x.id}">Test</button>` : ""}${x.revoked ? "" : `<button class="ghost mini" data-si-revoke="${x.id}">Revoke</button>`}</div>`).join("")}
-    <h2>Model keys</h2>
+    <h2 data-sec="model-keys">Model keys</h2>
     <p class="meta">API keys for the AI models Mergery itself uses on this project, such as the review agent and the deputy. Agents' own keys and join codes are in <b>Connect an agent</b>, not here. Mergery encrypts them before storing and never shows them again; you'll only see the last four characters. ${s.jevUses ? `The deputy judges with <b>${esc(s.jevUses)}</b>.` : "The deputy has no decision model yet, so it applies only house rules and earlier decisions."}</p>
     ${s.canSave ? "" : `<p class="warn">This server can't store keys yet: set the <span class="mono">LOOM_SECRET_KEY</span> Worker secret.</p>`}
     ${s.keys.map((k) => `<div class="card key-card">
@@ -1959,7 +1973,7 @@ async function showSettings() {
       ${k.saved && !k.saved.readable ? `<div class="warn">The secret that sealed this key is gone, so it can't be read. Save it again.</div>` : ""}
       <div class="row"><input type="password" autocomplete="off" data-key-input="${k.kind}" placeholder="${esc(k.hint)}"><button data-key-save="${k.kind}" ${s.canSave ? "" : "disabled"}>${k.saved ? "Replace" : "Save"}</button>${k.saved ? `<button class="ghost" data-key-remove="${k.kind}">Remove</button>` : ""}</div>
     </div>`).join("")}
-    ${isOwner() ? `<h2>Delete project</h2>
+    ${isOwner() ? `<h2 data-sec="delete">Delete project</h2>
     <p class="meta">Removes the repository with all its history, every workspace, and the project's tasks, reviews, attachments, people and keys. Agents' keys stop working. This can't be undone.</p>
     <div class="row"><button class="bad" id="proj-delete">Delete this project…</button></div>` : ""}`;
   for (const id of ["#settings-connect", "#settings-connect2"]) if ($(id)) $(id).onclick = (e) => { e.preventDefault(); showSkill(); };
@@ -2168,13 +2182,68 @@ async function showSettings() {
     toast("Key removed");
     showSettings();
   };
-  // Phones: a row of section names at the top, since Settings is a long scroll there.
-  const sections = [...$("#detail-body").querySelectorAll("h2")];
-  $("#detail-body > h3").insertAdjacentHTML("afterend", `<nav class="jump">${sections.map((h, i) => `<button class="ghost mini" type="button" data-jump="${i}">${esc(h.textContent)}</button>`).join("")}</nav>`);
-  for (const b of $("#detail-body").querySelectorAll("[data-jump]")) b.onclick = () => sections[b.dataset.jump].scrollIntoView({ block: "start", behavior: "smooth" });
+  // Wrap each <h2 data-sec> and what follows it in a section, then lay the
+  // sections out as one page per group, with a nav that says each group's state.
+  const body = $("#detail-body"), secs = {};
+  let cur = null;
+  for (const el of [...body.childNodes]) {
+    if (el.nodeType === 1 && el.matches("h2[data-sec]")) { cur = document.createElement("section"); cur.className = "set-sec"; cur.dataset.sec = el.dataset.sec; secs[el.dataset.sec] = cur; }
+    if (cur) cur.appendChild(el); else el.remove();
+  }
+  const p = state?.project ?? {};
+  const ra = p.reviewAgent ?? { enabled: true };
+  const status = {
+    general: vis === "private" ? "Private" : "Public",
+    people: `${people.length} ${people.length === 1 ? "person" : "people"}${org ? ` · ${org}` : ""}`,
+    agents: p.agentLimits ? "Limits set" : "No limits",
+    review: `${p.approvalMode === "count" ? "Counted" : "Weighted"} · reviewer ${ra.enabled ? "on" : "off"}`,
+    checks: p.checks ? `Checks on${p.preview ? " · previews" : ""}` : `No checks${p.preview ? " · previews" : ""}`,
+    traces: p.traces?.public ? "Published" : "Members only",
+    models: (() => { const n = s.keys.filter((k) => k.saved).length; return n ? `${n} key${n === 1 ? "" : "s"}` : s.jevUses ? "Server key" : "No keys"; })(),
+    integrations: [hooks.length ? `${hooks.length} webhook${hooks.length === 1 ? "" : "s"}` : "", p.trust?.on ? "Trust" : ""].filter(Boolean).join(" · ") || "None",
+    you: mail?.email ? "Emailing you" : si.standins.some((x) => !x.revoked && x.for === me?.id) ? "Stand-in set" : "",
+  };
+  const groups = SETTINGS_GROUPS.map(([id, label, ids]) => [id, label, ids.filter((x) => secs[x])]).filter(([, , ids]) => ids.length);
+  if (settingsTab && !groups.some(([id]) => id === settingsTab)) settingsTab = null;
+  const shell = document.createElement("div");
+  shell.className = "settings";
+  shell.innerHTML = `<nav class="set-nav" aria-label="Settings sections">
+      <h3>Settings <small>${esc(project)}</small></h3>
+      <input id="settings-search" type="search" placeholder="Search settings" autocomplete="off" value="${esc(settingsQuery)}">
+      ${groups.map(([id, label]) => `<button type="button" class="set-tab" data-settings-tab="${id}"><span>${esc(label)}</span><small>${esc(status[id] ?? "")}</small></button>`).join("")}
+    </nav>
+    <div class="set-main"><button type="button" class="ghost set-back">‹ All settings</button><h3 class="set-title"></h3><p class="meta set-none" hidden>No setting matches that. Try a word like “key”, “review” or “email”.</p></div>`;
+  const main = shell.querySelector(".set-main");
+  for (const [id, , ids] of groups) for (const x of ids) { secs[x].dataset.group = id; if (x === "delete") secs[x].classList.add("danger"); main.appendChild(secs[x]); }
+  body.appendChild(shell);
+  const phone = () => matchMedia("(max-width: 700px)").matches;
+  const show = () => {
+    const q = settingsQuery.trim().toLowerCase();
+    const tab = settingsTab ?? (phone() ? null : groups[0][0]);
+    shell.classList.toggle("at-index", !q && !tab);
+    shell.classList.toggle("searching", !!q);
+    let any = false;
+    for (const sec of main.querySelectorAll(".set-sec")) {
+      const on = q ? sec.textContent.toLowerCase().includes(q) : sec.dataset.group === tab;
+      sec.hidden = !on; any ||= on;
+      // Searching: sections named for the word first, the danger zone last.
+      sec.style.order = !q ? "" : sec.classList.contains("danger") ? "2" : sec.querySelector("h2").textContent.toLowerCase().includes(q) ? "0" : "1";
+    }
+    for (const b of shell.querySelectorAll(".set-tab")) {
+      b.classList.toggle("on", !q && b.dataset.settingsTab === tab);
+      b.classList.toggle("dim", !!q && !main.querySelector(`.set-sec[data-group="${b.dataset.settingsTab}"]:not([hidden])`));
+      if (!q && b.dataset.settingsTab === tab) b.setAttribute("aria-current", "page"); else b.removeAttribute("aria-current");
+    }
+    main.querySelector(".set-title").textContent = q ? `Matching “${settingsQuery.trim()}”` : groups.find(([id]) => id === tab)?.[1] ?? "";
+    main.querySelector(".set-none").hidden = !q || any;
+  };
+  for (const a of body.querySelectorAll("[data-settings-tab]")) a.addEventListener("click", (e) => { e.preventDefault(); settingsTab = a.dataset.settingsTab; settingsQuery = ""; $("#settings-search").value = ""; show(); $("#detail").scrollTop = 0; });
+  shell.querySelector(".set-back").onclick = () => { settingsTab = null; settingsQuery = ""; $("#settings-search").value = ""; show(); $("#detail").scrollTop = 0; };
+  $("#settings-search").oninput = (e) => { settingsQuery = e.target.value; show(); };
+  show();
   if (!$("#detail").open) $("#detail").showModal();
 }
-$("#settings-open").onclick = () => showSettings();
+$("#settings-open").onclick = () => showSettings(null);
 
 // ── my work: people claim tasks, push with git, and submit like agents ───
 /** How to clone and push a claimed task's workspace. */
