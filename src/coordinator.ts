@@ -2799,12 +2799,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private notesChain: Promise<void> = Promise.resolve();
 
   // Trust add-on (src/trust.ts): mirrors notes, decisions and merges into a Trust space when the
-  // server has TRUST_URL and TRUST_BOOTSTRAP_TOKEN and an owner turned it on. Mergery's notes stay
+  // project connected its own space, or the server has TRUST_URL, and an owner turned it on. Mergery's notes stay
   // the source of truth; Trust failing never fails a request. Calls run one at a time, in order.
   private trustLink: TrustLink | null = null;
   private trustChain: Promise<void> = Promise.resolve();
   private get trustAvailable(): boolean {
-    return !!(this.env.TRUST_URL && this.env.TRUST_BOOTSTRAP_TOKEN);
+    return !!this.env.TRUST_URL;
   }
   /** On when an owner turned it on and there's somewhere to write: the project's own space, or the server's Trust. */
   private get trustOn(): boolean {
@@ -2813,7 +2813,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   private get trustStatus() {
     const mirrored = (this.sql.exec("SELECT COUNT(*) AS n FROM trust_links").one().n as number) ?? 0;
     const lastMerge = this.meta("trust_last_merge");
-    return { available: this.trustAvailable, on: this.trustOn, own: this.meta("trust_url"), space: this.meta("trust_space"), mirrored, lastMerge: lastMerge ? JSON.parse(lastMerge) : null, lastError: this.meta("trust_error") };
+    return { available: this.trustAvailable, newSpace: this.env.TRUST_URL ? `${this.env.TRUST_URL.replace(/\/$/, "")}/new/` : null, on: this.trustOn, own: this.meta("trust_url"), space: this.meta("trust_space"), mirrored, lastMerge: lastMerge ? JSON.parse(lastMerge) : null, lastError: this.meta("trust_error") };
   }
   /**
    * true / false turns the add-on on or off (writing to the project's own space if one is
@@ -2847,7 +2847,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       return;
     }
     const on = !!v;
-    if (on && !this.meta("trust_url") && !this.trustAvailable) throw new HttpError(400, "connect a Trust space first (its URL and admin key), or set TRUST_URL and TRUST_BOOTSTRAP_TOKEN on the Worker");
+    if (on && !this.meta("trust_url") && !this.trustAvailable) throw new HttpError(400, "connect a Trust space first (its URL and admin key), or set TRUST_URL on the Worker");
     if (on && !sealer(this.env)) throw new HttpError(400, "set LOOM_SECRET_KEY on the Worker first, so Trust's admin token can be kept encrypted");
     this.setMeta("trust", on ? "on" : "off");
   }
@@ -2862,7 +2862,10 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const own = this.meta("trust_url");
     this.trustLink ??= new TrustLink({
       url: own ?? this.env.TRUST_URL!,
-      bootstrap: own ? undefined : this.env.TRUST_BOOTSTRAP_TOKEN,
+      canCreate: !own,
+      // Over a service binding to the server's Trust when there is one: no public hop, and Trust
+      // doesn't count Mergery against its per-visitor limit on new spaces.
+      fetch: !own && this.env.TRUST ? (input, init) => this.env.TRUST!.fetch(input as any, init as any) : undefined,
       project: this.project,
       store: {
         space: async () => {

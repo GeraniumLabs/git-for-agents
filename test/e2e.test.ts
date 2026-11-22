@@ -2193,8 +2193,8 @@ test("changes that touch only no-review paths land once the checks pass; anythin
   assert.equal((await admin.change(guarded.id)).status, "review", "protected paths still need their person");
 });
 
-// Needs a Trust server too (github.com/GeraniumLabs/Trust), and Mergery started with TRUST_URL and
-// TRUST_BOOTSTRAP_TOKEN pointing at it. LOOM_E2E_TRUST=1 says that's set up.
+// Needs a Trust server too (github.com/GeraniumLabs/Trust), and Mergery started with TRUST_URL
+// pointing at it. LOOM_E2E_TRUST=1 says that's set up.
 test("with the Trust add-on on, notes and decisions are mirrored, and a merge flags the memories on files it changed", { skip: !url || !process.env.LOOM_E2E_TRUST, timeout: 120_000 }, async () => {
   const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
@@ -2239,13 +2239,12 @@ test("with the Trust add-on on, notes and decisions are mirrored, and a merge fl
   assert.equal(s.lastError, null);
 });
 
-// Needs LOOM_E2E_TRUST_URL (a Trust server Mergery can reach) and LOOM_E2E_TRUST_BOOT (its bootstrap token),
-// to make a space the way Trust's /new page does.
+// Needs LOOM_E2E_TRUST_URL, a Trust server Mergery can reach, to make a space the way its /new page does.
 test("an owner connects the project's own Trust space with its URL and admin key", { skip: !url || !process.env.LOOM_E2E_TRUST_URL, timeout: 120_000 }, async () => {
   const { Mergery } = await import("../demo/client.mjs");
   const { SEED } = await import("../demo/seed.mjs");
   const trust = process.env.LOOM_E2E_TRUST_URL!;
-  const made = await (await fetch(`${trust}/api/spaces`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${process.env.LOOM_E2E_TRUST_BOOT}` }, body: JSON.stringify({ name: "own", scopes: [{ id: "project", label: "own", kind: "project" }] }) })).json();
+  const made = await (await fetch(`${trust}/api/spaces`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: "own", scopes: [{ id: "project", label: "own", kind: "project" }] }) })).json();
   const spaceUrl = `${trust}/api/spaces/${made.space}`;
   const name = project("e2e-trust-own");
   const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);

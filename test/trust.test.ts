@@ -7,15 +7,15 @@ function fakeTrust() {
   const calls: { method: string; path: string; auth: string; body: any }[] = [];
   let n = 0;
   const revoked = new Set<string>();
-  const state = { down: false };
+  const state = { down: false, full: false };
   const f = (async (url: string, init: any) => {
     if (state.down) throw new Error("connect ECONNREFUSED");
     const path = new URL(url).pathname;
     const body = init.body ? JSON.parse(init.body) : undefined;
-    const auth = (init.headers.authorization as string).replace("Bearer ", "");
+    const auth = ((init.headers.authorization as string) ?? "").replace("Bearer ", "");
     calls.push({ method: init.method, path, auth, body });
     const ok = (data: unknown) => new Response(JSON.stringify(data), { status: 200 });
-    if (path === "/api/spaces") return auth === "boot" ? ok({ space: "sp1", adminToken: "adm" }) : new Response('{"error":"no"}', { status: 401 });
+    if (path === "/api/spaces") return state.full ? new Response('{"error":"as many spaces as one visitor can today"}', { status: 429 }) : ok({ space: "sp1", adminToken: "adm" });
     if (path.endsWith("/sessions")) { n++; return ok({ id: `s${n}`, token: `agt${n}`, token_expires_at: Date.now() + 3_600_000 }); }
     if (revoked.has(auth)) return new Response('{"error":"expired"}', { status: 401 });
     if (path.endsWith("/remember")) return ok({ id: `e${calls.length}` });
@@ -41,13 +41,13 @@ function memoryStore(): TrustStore & { saved: number } {
 
 test("creates the project's space once and keeps its admin token", async () => {
   const t = fakeTrust(), store = memoryStore();
-  const link = new TrustLink({ url: "http://trust.test", bootstrap: "boot", project: "demo", store, fetch: t.f });
+  const link = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
   await link.remember("note:1", "agent-a", { title: "x", body: "x", kind: "fact", sources: [], derivation: "observed" });
   await link.remember("note:2", "agent-a", { title: "y", body: "y", kind: "fact", sources: [], derivation: "observed" });
   assert.equal(store.saved, 1);
   const create = t.calls.filter((c) => c.path === "/api/spaces");
   assert.equal(create.length, 1);
-  assert.equal(create[0].auth, "boot");
+  assert.equal(create[0].auth, "", "creating a space needs no key");
   assert.deepEqual(create[0].body.scopes, [{ id: "project", label: "demo", kind: "project" }]);
   // One session per agent, reused; sessions are started with the admin token, writes use the agent's.
   assert.equal(t.calls.filter((c) => c.path.endsWith("/sessions")).length, 1);
@@ -56,7 +56,7 @@ test("creates the project's space once and keeps its admin token", async () => {
 
 test("a note is mirrored once, and retiring it retracts the same entry", async () => {
   const t = fakeTrust(), store = memoryStore();
-  const link = new TrustLink({ url: "http://trust.test", bootstrap: "boot", project: "demo", store, fetch: t.f });
+  const link = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
   await link.remember("note:7", "agent-a", { title: "t", body: "b", kind: "fact", sources: sourcesFor(["src/a.ts"], "abc123"), derivation: "observed" });
   assert.equal(await link.remember("note:7", "agent-a", { title: "t", body: "b", kind: "fact", sources: [], derivation: "observed" }), null);
   const sent = t.calls.find((c) => c.path.endsWith("/remember"))!;
@@ -72,7 +72,7 @@ test("a note is mirrored once, and retiring it retracts the same entry", async (
 
 test("a refused agent token gets one fresh session and a retry", async () => {
   const t = fakeTrust(), store = memoryStore();
-  const link = new TrustLink({ url: "http://trust.test", bootstrap: "boot", project: "demo", store, fetch: t.f });
+  const link = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
   await link.remember("note:1", "agent-a", { title: "a", body: "a", kind: "fact", sources: [], derivation: "observed" });
   t.revoked.add("agt1");
   await link.remember("note:2", "agent-a", { title: "b", body: "b", kind: "fact", sources: [], derivation: "observed" });
@@ -82,7 +82,7 @@ test("a refused agent token gets one fresh session and a retry", async () => {
 
 test("a merge records the change and flags memories on each changed file", async () => {
   const t = fakeTrust(), store = memoryStore();
-  const link = new TrustLink({ url: "http://trust.test", bootstrap: "boot", project: "demo", store, fetch: t.f });
+  const link = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
   const out = await link.merged("agent-a", "def456", "#3 Fix rounding", ["src/a.ts", "src/b.ts"]);
   assert.deepEqual(out.flagged, ["e9"]);
   const change = t.calls.find((c) => c.path.endsWith("/changes"))!;
@@ -94,11 +94,15 @@ test("a merge records the change and flags memories on each changed file", async
 
 test("failures surface as errors for the caller to log, never as partial state", async () => {
   const t = fakeTrust(), store = memoryStore();
-  const bad = new TrustLink({ url: "http://trust.test", bootstrap: "wrong", project: "demo", store, fetch: t.f });
-  await assert.rejects(bad.remember("note:1", "a", { title: "a", body: "a", kind: "fact", sources: [], derivation: "observed" }), /didn't create a space \(HTTP 401/);
+  t.state.full = true;
+  const bad = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
+  await assert.rejects(bad.remember("note:1", "a", { title: "a", body: "a", kind: "fact", sources: [], derivation: "observed" }), /didn't create a space \(HTTP 429/);
+  const own = new TrustLink({ url: "http://trust.test", project: "demo", store, fetch: t.f });
+  await assert.rejects(own.remember("note:1", "a", { title: "a", body: "a", kind: "fact", sources: [], derivation: "observed" }), /no Trust space is connected/);
+  t.state.full = false;
   assert.equal(await store.space(), null);
   t.state.down = true;
-  const link = new TrustLink({ url: "http://trust.test", bootstrap: "boot", project: "demo", store, fetch: t.f });
+  const link = new TrustLink({ url: "http://trust.test", canCreate: true, project: "demo", store, fetch: t.f });
   await assert.rejects(link.remember("note:1", "a", { title: "a", body: "a", kind: "fact", sources: [], derivation: "observed" }), /ECONNREFUSED/);
   assert.equal(store.entryFor("note:1"), null);
 });
