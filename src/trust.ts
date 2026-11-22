@@ -19,8 +19,8 @@ export interface TrustStore {
 
 export interface TrustOptions {
   url: string;
-  /** Lets the link create the project's space on first use. Without it, the space must already be connected. */
-  bootstrap?: string;
+  /** Create the project's space on first use (the server's Trust). Off when the project connected its own space. */
+  canCreate?: boolean;
   project: string;
   store: TrustStore;
   fetch?: typeof fetch;
@@ -38,13 +38,13 @@ export class TrustLink {
     this.f = o.fetch ?? fetch.bind(globalThis);
   }
 
-  private async call(token: string, method: string, path: string, body?: unknown): Promise<{ status: number; data: any }> {
+  private async call(token: string | null, method: string, path: string, body?: unknown): Promise<{ status: number; data: any }> {
     const ctl = new AbortController();
     const timer = setTimeout(() => ctl.abort(), this.o.timeoutMs ?? 5000);
     try {
       const r = await this.f(`${this.o.url.replace(/\/$/, "")}${path}`, {
         method,
-        headers: { "content-type": "application/json", authorization: `Bearer ${token}` },
+        headers: { "content-type": "application/json", ...(token ? { authorization: `Bearer ${token}` } : {}) },
         body: body === undefined ? undefined : JSON.stringify(body),
         signal: ctl.signal,
       });
@@ -59,8 +59,8 @@ export class TrustLink {
   async space(): Promise<{ id: string; adminToken: string }> {
     const have = await this.o.store.space();
     if (have) return have;
-    if (!this.o.bootstrap) throw new Error("no Trust space is connected, and this server can't create one");
-    const r = await this.call(this.o.bootstrap, "POST", "/api/spaces", {
+    if (!this.o.canCreate) throw new Error("no Trust space is connected");
+    const r = await this.call(null, "POST", "/api/spaces", {
       name: `mergery/${this.o.project}`,
       scopes: [{ id: TRUST_SCOPE, label: this.o.project, kind: "project" }],
     });

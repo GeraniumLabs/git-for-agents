@@ -45,9 +45,10 @@ export interface Env {
   LOOM_DEV_LOGIN?: string;
   /** Where preview links point, e.g. a separate domain routed to this Worker; defaults to Mergery's own origin. */
   LOOM_PREVIEW_ORIGIN?: string;
-  /** Trust (github.com/GeraniumLabs/Trust): with both set, an owner can turn on the Trust add-on in a project's settings. */
+  /** A Trust server (github.com/GeraniumLabs/Trust) projects can use with one click; each gets its own space there. Projects can also connect their own space without it. */
   TRUST_URL?: string;
-  TRUST_BOOTSTRAP_TOKEN?: string;
+  /** Optional service binding to that Trust Worker, when it runs on the same Cloudflare account. */
+  TRUST?: Fetcher;
   /** Workers AI, for Clef: the deputy's judge when no TypeSafe or Anthropic key is set. Absent in local development. */
   AI?: Ai;
   /** The AI Gateway that Mergery's review agent calls models through. Default "default". */
