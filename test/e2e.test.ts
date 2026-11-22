@@ -2192,3 +2192,46 @@ test("changes that touch only no-review paths land once the checks pass; anythin
   const guarded = await work("Secret", { "secret/k.md": "k2\n" });
   assert.equal((await admin.change(guarded.id)).status, "review", "protected paths still need their person");
 });
+
+// Needs a Trust server too (github.com/GeraniumLabs/Trust), and Mergery started with TRUST_URL and
+// TRUST_BOOTSTRAP_TOKEN pointing at it. LOOM_E2E_TRUST=1 says that's set up.
+test("with the Trust add-on on, notes and decisions are mirrored, and a merge flags the memories on files it changed", { skip: !url || !process.env.LOOM_E2E_TRUST, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const name = project("e2e-trust");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "Trust add-on", files: SEED, requiredApprovals: 0 });
+  const off = await admin.req("POST", "/settings", {});
+  assert.equal(off.trust.on, false, "off until an owner turns it on");
+  assert.equal(off.trust.available, true);
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  await ada.req("POST", "/notes", { text: "Written before the add-on was on.", paths: ["src/db.js"] });
+  assert.equal((await admin.req("POST", "/settings", { trust: true })).trust.on, true);
+
+  const note = await ada.req("POST", "/notes", { text: "Titles are trimmed in db.js, not in the routes.", kind: "fact", paths: ["src/db.js"] });
+  await admin.req("POST", "/decisions", { question: "Max title length?", decision: "200 characters", paths: ["src/db.js"] });
+  const status = async () => (await admin.req("POST", "/settings", {})).trust;
+  const until = async (ok: (s: any) => boolean) => {
+    for (let i = 0; i < 40; i++) { const s = await status(); if (ok(s)) return s; await new Promise((r) => setTimeout(r, 250)); }
+    return status();
+  };
+  let s = await until((x) => x.mirrored >= 2 || x.lastError);
+  assert.equal(s.lastError, null);
+  assert.equal(s.mirrored, 2, "the note and the decision; the note from before is left alone");
+  assert.ok(s.space);
+  // Mergery's own notes are untouched by the add-on.
+  assert.ok(((await admin.req("GET", "/notes")) as any[]).some((n) => n.id === note.id));
+
+  const t = await ada.createTask("Trim titles to 200", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.intent(t.id, ["src/db.js"], "trim");
+  await ada.write(ws, { "src/db.js": (await ada.read("src/db.js", ws)) + "\n// trim to 200\n" }, "trim");
+  const ch = await ada.submit(t.id, t.title, "Trim", { plan: ["trim"] });
+  s = await until((x) => x.lastMerge?.change === ch.id || x.lastError);
+  assert.equal(s.lastError, null);
+  assert.equal(s.lastMerge.stale, 2, "both memories pinned to db.js went stale with the merge");
+
+  await ada.req("POST", `/notes/${note.id}/retire`);
+  s = await until((x) => x.lastError !== undefined);
+  assert.equal(s.lastError, null);
+});
