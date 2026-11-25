@@ -3,14 +3,15 @@
 // `analytics`). What goes to Google is deliberately small: a page path with no query string or hash ("/", "/pricing", "/app"), and a few named clicks
 // with no values. Never project names, import URLs, logins, keys or anything typed.
 //
-// Skipped entirely when the browser sends Global Privacy Control or Do Not Track, or when the
+// Skipped entirely when the browser sends Global Privacy Control, or when the
 // visitor said no. Visitors in the EU/EEA are asked first, and nothing loads until they allow it.
 // Google's ad features stay off for everyone.
 (() => {
   const PREF = "mergery-analytics"; // "yes" | "no"
   const pref = () => { try { return localStorage.getItem(PREF); } catch { return null; } };
   const setPref = (v) => { try { v ? localStorage.setItem(PREF, v) : localStorage.removeItem(PREF); } catch {} };
-  const optedOutByBrowser = () => navigator.globalPrivacyControl === true || navigator.doNotTrack === "1" || window.doNotTrack === "1";
+  // Global Privacy Control is the opt-out signal with legal weight (CCPA); Do Not Track is deprecated.
+  const optedOutByBrowser = () => navigator.globalPrivacyControl === true;
 
   const externalReferrer = () => {
     try { const r = new URL(document.referrer); return r.origin !== location.origin ? r.origin + "/" : ""; } catch { return ""; }

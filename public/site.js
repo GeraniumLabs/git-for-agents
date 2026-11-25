@@ -25,7 +25,7 @@
   if (choice && ga) {
     const show = () => {
       const c = ga.choice();
-      if (c === "browser") { choice.textContent = "Your browser asks sites not to track you, so analytics is off here."; return; }
+      if (c === "browser") { choice.textContent = "Your browser sends Global Privacy Control, so analytics is off here."; return; }
       choice.innerHTML = c === "no" ? `Analytics is <b>off</b> in this browser. <button type="button" data-v="">Allow it</button>` : `Analytics is <b>${c === "yes" ? "allowed" : "on unless you're asked first"}</b> in this browser. <button type="button" data-v="no">Turn it off</button>`;
       choice.querySelector("button").onclick = (e) => { ga.set(e.target.dataset.v === "" ? "yes" : "no"); show(); };
     };
