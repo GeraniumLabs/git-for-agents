@@ -69,6 +69,10 @@ test("made-up links become the guide; Mergery's own links stay", async () => {
   assert.equal(keepKnownLinks("[Docs](https://mergery.dev/docs)"), `[Docs](${guide})`);
   assert.equal(keepKnownLinks("Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm"), "Run claude mcp add --transport http mergery https://mergery.dev/mcp/todo-swarm");
   assert.equal(keepKnownLinks(`Read ${guide}, or https://mergery.dev/pricing`), `Read ${guide}, or https://mergery.dev/pricing`);
+  // A placeholder ends the URL rather than turning the whole command into the guide link (seen live, Nov 25).
+  assert.equal(keepKnownLinks("claude mcp add --transport http mergery https://mergery.dev/mcp/<project>"), "claude mcp add --transport http mergery https://mergery.dev/mcp/<project>");
+  assert.equal(keepKnownLinks("claude mcp add --transport http mergery https://mergery.dev/mcp/<project>", "slugify"), "claude mcp add --transport http mergery https://mergery.dev/mcp/slugify");
+  assert.equal(keepKnownLinks("Use `https://mergery.dev/mcp/<project-name>`.", "todo-swarm"), "Use `https://mergery.dev/mcp/todo-swarm`.");
 });
 
 test("a Claude catalog model gets Anthropic's shape through the AI binding, and any reply shape is read", async () => {

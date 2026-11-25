@@ -129,8 +129,11 @@ export function helpMessage(i: HelpInput): string {
 /** Links the answer may carry: Mergery's own pages and the guide. Smaller models make up docs sites, so anything else becomes the guide. */
 const GUIDE = "https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md";
 const ALLOWED_LINK = /^https:\/\/(mergery\.dev(\/(pricing|terms|privacy|welcome|benchmark|mcp(\/[a-z0-9-]+)?|api\/ask\/skill|\?project=[a-z0-9-]+)?)?\/?|github\.com\/GeraniumLabs\/git-for-agents(\/[\w./#-]*)?)$/;
-export function keepKnownLinks(answer: string): string {
-  return answer.replace(/https?:\/\/[^\s)\]>"'`]+/g, (u) => {
+export function keepKnownLinks(answer: string, project?: string | null): string {
+  // A placeholder like <project> ends the URL here, so the allowed part before it is kept as is. With a
+  // project open, the placeholder becomes its name, so a command such as claude mcp add works pasted.
+  if (project) answer = answer.replace(/(https:\/\/mergery\.dev\/mcp\/)<[^<>\s]{1,40}>/g, `$1${project}`);
+  return answer.replace(/https?:\/\/[^\s)\]<>"'`]+/g, (u) => {
     const bare = u.replace(/[.,;:!?]+$/, "");
     return ALLOWED_LINK.test(bare) ? u : GUIDE + u.slice(bare.length);
   });
@@ -171,7 +174,7 @@ export async function askHelp(m: HelpModel, i: HelpInput): Promise<HelpResult> {
       if (res.stop_reason === "refusal") return { ok: false, reason: "the model declined to answer that" };
       const text = res.content.filter((b) => b.type === "text").map((b) => (b as { text: string }).text).join("").trim();
       if (!text) return { ok: false, reason: "the model returned no answer" };
-      return { ok: true, answer: keepKnownLinks(text), model: "Claude Haiku" };
+      return { ok: true, answer: keepKnownLinks(text, i.project), model: "Claude Haiku" };
     } catch (e) {
       if (e instanceof Anthropic.APIError) return { ok: false, reason: `the model is unavailable (${e.status ?? "network"})` };
       throw e;
@@ -189,7 +192,7 @@ export async function askHelp(m: HelpModel, i: HelpInput): Promise<HelpResult> {
     const out = await m.ai.run(m.model as any, input as any, m.gateway ? { gateway: { id: m.gateway, metadata: { loom: "help" } } } : undefined);
     const text = replyText(out);
     if (!text) return { ok: false, reason: "the model returned no answer" };
-    return { ok: true, answer: keepKnownLinks(text), model: modelLabel(m.model) };
+    return { ok: true, answer: keepKnownLinks(text, i.project), model: modelLabel(m.model) };
   } catch (e: any) {
     return { ok: false, reason: `the model is unavailable (${String(e?.message ?? e).slice(0, 120)})` };
   }
