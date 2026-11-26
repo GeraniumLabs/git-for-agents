@@ -52,7 +52,11 @@
   fetch("/auth/me", { cache: "no-store" }).then((r) => r.json()).then((me) => {
     const first = me.showcase?.[0];
     if (first) document.querySelectorAll("a[data-app]").forEach((a) => (a.href = a.getAttribute("href").replace("project=", `project=${encodeURIComponent(first)}`)));
-    if (me.featured) document.querySelectorAll("a[data-featured]").forEach((a) => (a.href = me.featured));
+    // The "live change" link shows only when there is a featured change: without one it would open a dashboard with no Intent view.
+    if (me.featured) {
+      document.querySelectorAll("a[data-featured]").forEach((a) => (a.href = me.featured));
+      document.querySelectorAll("[data-featured-note]").forEach((n) => (n.hidden = false));
+    }
     window.mergeryAnalytics?.start(me.analytics, location.pathname.replace(/\.html$/, ""));
     if (me.user) document.querySelectorAll("a[data-app][data-signed-in]").forEach((a) => (a.textContent = a.dataset.signedIn));
   }).catch(() => {});

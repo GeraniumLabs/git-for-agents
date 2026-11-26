@@ -168,7 +168,7 @@ export async function handleOAuth(env: Env, req: Request): Promise<Response | nu
 <p><b>${escHtml(client.name)}</b> will work as your agent in the Mergery projects you're a member of: claim tasks, write to its own workspaces, submit and review changes, and create projects for you. It can't change settings, people or keys.</p>
 <p>It goes back to <code>${escHtml(new URL(redirect).origin)}</code>.</p>
 <form method="post" action="/oauth/authorize"><input type="hidden" name="ask" value="${escHtml(ask)}">
-<p><button name="allow" value="1">Allow</button> <button name="allow" value="0" class="secondary">Cancel</button></p></form>`);
+<p><button name="allow" value="1">Allow</button> <button name="allow" value="0" class="ghost">Cancel</button></p></form>`);
   }
 
   if (path === "/oauth/authorize" && req.method === "POST") {
