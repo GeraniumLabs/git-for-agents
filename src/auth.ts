@@ -140,16 +140,18 @@ export const devLogin = (env: Env) => env.LOOM_DEV_LOGIN === "1";
 
 type CodeExchange = { access_token?: string; error?: string; error_description?: string; message?: string; status: number; keys?: string[] };
 
-/** Trade an OAuth code for a user token. GitHub wants a User-Agent, and answers in more than one shape
- *  when it says no (an OAuth error, an API-style message, or a non-JSON page), so keep whatever it said. */
-async function exchangeCode(gh: GitHubApp, code: string, redirect_uri: string): Promise<CodeExchange> {
-  const body = new URLSearchParams({ client_id: gh.client_id, client_secret: gh.client_secret, code, redirect_uri });
+/** One POST to GitHub's token endpoint, answered as status and raw text. The Worker calls it directly,
+ *  and a Durable Object elsewhere calls it when github.com has rate-limited this location's egress. */
+export async function githubTokenRequest(form: string): Promise<{ status: number; text: string }> {
   const res = await fetch("https://github.com/login/oauth/access_token", {
     method: "POST",
     headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded", "user-agent": "mergery" },
-    body,
+    body: form,
   });
-  const text = await res.text();
+  return { status: res.status, text: await res.text() };
+}
+
+function readExchange({ status, text }: { status: number; text: string }): CodeExchange {
   let data: any = null;
   try { data = JSON.parse(text); } catch {}
   if (!data || typeof data !== "object") {
@@ -157,7 +159,32 @@ async function exchangeCode(gh: GitHubApp, code: string, redirect_uri: string): 
     const form = new URLSearchParams(text);
     data = form.has("access_token") || form.has("error") ? Object.fromEntries(form) : { message: text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160) || undefined };
   }
-  return { ...data, status: res.status, keys: Object.keys(data) };
+  return { ...data, status, keys: Object.keys(data) };
+}
+
+/** Where to retry from when github.com turns this location away. Each name is a Durable Object
+ *  created with that location hint, so its requests leave Cloudflare from a different place. */
+const EGRESS_HINTS: DurableObjectLocationHint[] = ["enam", "wnam", "weur"];
+
+/** Trade an OAuth code for a user token. github.com rate-limits by IP, and Workers share egress IPs,
+ *  so a 429 (or 403) from here is retried from Durable Objects in other regions. A refused request
+ *  doesn't use up the code, so the retry can still succeed. */
+async function exchangeCode(env: Env, gh: GitHubApp, code: string, redirect_uri: string): Promise<CodeExchange> {
+  const form = new URLSearchParams({ client_id: gh.client_id, client_secret: gh.client_secret, code, redirect_uri }).toString();
+  let tok = readExchange(await githubTokenRequest(form));
+  for (const hint of EGRESS_HINTS) {
+    if (tok.status !== 429 && tok.status !== 403) break;
+    console.log("github code exchange turned away here; retrying from", hint, tok.status);
+    try {
+      const stub = env.PROJECT.get(env.PROJECT.idFromName(`__egress-${hint}`), { locationHint: hint });
+      const res = await stub.fetch("https://do/egress/github-token", { method: "POST", body: JSON.stringify({ form }) });
+      if (!res.ok) continue;
+      tok = readExchange(await res.json<{ status: number; text: string }>());
+    } catch (e) {
+      console.log("egress retry failed", hint, String(e));
+    }
+  }
+  return tok;
 }
 
 export const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
@@ -313,7 +340,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     const state = await verified<{ nonce: string; to: string; grant?: boolean }>(env, cookie(req, STATE));
     const code = url.searchParams.get("code");
     if (!state || !code || url.searchParams.get("state") !== state.nonce) return Response.json({ error: "sign-in expired or was tampered with; try again" }, { status: 400 });
-    const tok = await exchangeCode(gh, code, `${url.origin}/auth/github/callback`);
+    const tok = await exchangeCode(env, gh, code, `${url.origin}/auth/github/callback`);
     if (!tok.access_token) {
       console.log("github code exchange failed", JSON.stringify({ status: tok.status, error: tok.error, description: tok.error_description, message: tok.message, keys: tok.keys }));
       const why = tok.error_description || tok.error || tok.message || `HTTP ${tok.status}, no token`;

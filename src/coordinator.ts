@@ -21,7 +21,7 @@ import { runCheck, untar, type CheckResult } from "./checks";
 import { EMPTY_RECORD, tally, trust, type TrackRecord } from "./reputation";
 import { skill } from "./skill";
 import { buildBrief, checkHint, countTests, fileStats, isHousekeeping, isTest, suggestCheck, withInstall } from "./brief";
-import { USER_HEADER, sameSecret, type User } from "./auth";
+import { USER_HEADER, githubTokenRequest, sameSecret, type User } from "./auth";
 import { KEY_KINDS, isKeyKind, seal, sealer, unseal, type KeyKind } from "./secrets";
 import { githubRepo, issueTask, openIssues, sourceUrl, type ImportSource, type Issue } from "./importer";
 import { AttachmentError, bytesOf, checkSize, cleanName, kindOf, serveHeaders, sha256 as digestOf, typeOf } from "./attachments";
@@ -822,6 +822,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const body = (m === "POST" || m === "PUT") && !rawUpload ? await req.json<any>().catch(() => ({})) : {};
     // Where links in webhooks point; the Durable Object only learns its origin from requests.
     if (url.hostname !== "do" && this.meta("project") && this.meta("origin") !== url.origin) this.setMeta("origin", url.origin);
+
+    // Egress instances: the Worker retries GitHub's token exchange from here when github.com
+    // rate-limits its own location. Only the Worker's internal calls (host "do") reach it.
+    if (a === "egress" && b === "github-token" && m === "POST" && url.hostname === "do" && typeof body?.form === "string") {
+      return json(await githubTokenRequest(body.form));
+    }
 
     // Registry (singleton instance)
     if (a === "registry" && b === "github") {
