@@ -138,6 +138,28 @@ export const page = (title: string, body: string) => new Response(`<!doctype htm
 export const escHtml = (t: string) => t.replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!);
 export const devLogin = (env: Env) => env.LOOM_DEV_LOGIN === "1";
 
+type CodeExchange = { access_token?: string; error?: string; error_description?: string; message?: string; status: number; keys?: string[] };
+
+/** Trade an OAuth code for a user token. GitHub wants a User-Agent, and answers in more than one shape
+ *  when it says no (an OAuth error, an API-style message, or a non-JSON page), so keep whatever it said. */
+async function exchangeCode(gh: GitHubApp, code: string, redirect_uri: string): Promise<CodeExchange> {
+  const body = new URLSearchParams({ client_id: gh.client_id, client_secret: gh.client_secret, code, redirect_uri });
+  const res = await fetch("https://github.com/login/oauth/access_token", {
+    method: "POST",
+    headers: { accept: "application/json", "content-type": "application/x-www-form-urlencoded", "user-agent": "mergery" },
+    body,
+  });
+  const text = await res.text();
+  let data: any = null;
+  try { data = JSON.parse(text); } catch {}
+  if (!data || typeof data !== "object") {
+    // Some proxies and older paths answer form-encoded even when asked for JSON.
+    const form = new URLSearchParams(text);
+    data = form.has("access_token") || form.has("error") ? Object.fromEntries(form) : { message: text.replace(/<[^>]*>/g, " ").replace(/\s+/g, " ").trim().slice(0, 160) || undefined };
+  }
+  return { ...data, status: res.status, keys: Object.keys(data) };
+}
+
 export const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
 
 async function startSession(env: Env, req: Request, user: User, to: string): Promise<Response> {
@@ -291,12 +313,12 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
     const state = await verified<{ nonce: string; to: string; grant?: boolean }>(env, cookie(req, STATE));
     const code = url.searchParams.get("code");
     if (!state || !code || url.searchParams.get("state") !== state.nonce) return Response.json({ error: "sign-in expired or was tampered with; try again" }, { status: 400 });
-    const tok = await fetch("https://github.com/login/oauth/access_token", {
-      method: "POST",
-      headers: { accept: "application/json", "content-type": "application/json" },
-      body: JSON.stringify({ client_id: gh.client_id, client_secret: gh.client_secret, code, redirect_uri: `${url.origin}/auth/github/callback` }),
-    }).then((r) => r.json<any>());
-    if (!tok.access_token) return Response.json({ error: `GitHub refused the sign-in (${tok.error ?? "no token"})` }, { status: 400 });
+    const tok = await exchangeCode(gh, code, `${url.origin}/auth/github/callback`);
+    if (!tok.access_token) {
+      console.log("github code exchange failed", JSON.stringify({ status: tok.status, error: tok.error, description: tok.error_description, message: tok.message, keys: tok.keys }));
+      const why = tok.error_description || tok.error || tok.message || `HTTP ${tok.status}, no token`;
+      return Response.json({ error: `GitHub refused the sign-in (${why})` }, { status: 400 });
+    }
     const profile = await fetch("https://api.github.com/user", {
       headers: { authorization: `Bearer ${tok.access_token}`, accept: "application/vnd.github+json", "user-agent": "loom" },
     }).then((r) => r.json<any>());
