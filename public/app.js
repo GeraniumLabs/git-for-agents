@@ -1775,7 +1775,7 @@ async function showAccount() {
   const plan = await planHtml();
   openDetail(`
     <h3>Your account</h3>
-    <p class="meta">Signed in with GitHub as <b>${esc(a.login)}</b>.</p>
+    <p class="meta">Signed in with GitHub as <b>${esc(a.login)}</b>.${a.owner ? ` You run this site: <a href="/admin">see signups and usage</a>.` : ""}</p>
     <h2>Email</h2>
     <p class="meta">Where Mergery emails you when something needs you. Each project emails you only once you turn it on in that project's Settings.</p>
     <div class="row"><input id="acct-email" type="email" class="grow" placeholder="you@example.com" value="${esc(a.email ?? "")}"><button class="ghost" id="acct-email-save">Save</button></div>

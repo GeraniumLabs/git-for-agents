@@ -189,7 +189,9 @@ async function exchangeCode(env: Env, gh: GitHubApp, code: string, redirect_uri:
 
 export const safeReturn = (r: string | null) => (r && r.startsWith("/") && !r.startsWith("//") ? r : "/");
 
-async function startSession(env: Env, req: Request, user: User, to: string): Promise<Response> {
+async function startSession(env: Env, req: Request, user: User, to: string, registry?: Registry): Promise<Response> {
+  // Count the sign-in for the admin page; a failure here never stops anyone signing in.
+  if (registry) await registry("/registry/signin", { method: "POST", body: JSON.stringify({ login: user.login, name: user.name, avatar: user.avatar }) }).catch(() => null);
   const token = await signed(env, { ...user, exp: Date.now() + SESSION_DAYS * 86400_000 });
   const headers = new Headers({ location: to });
   headers.append("set-cookie", setCookie(req, SESSION, token, SESSION_DAYS * 86400));
@@ -242,7 +244,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
   if (path === "/auth/dev" && devLogin(env)) {
     const login = (url.searchParams.get("login") ?? "").toLowerCase().replace(/[^a-z0-9-]/g, "");
     if (!login) return Response.json({ error: "add ?login=" }, { status: 400 });
-    return startSession(env, req, { id: `github:${login}`, login, name: login, avatar: "" }, safeReturn(url.searchParams.get("return")));
+    return startSession(env, req, { id: `github:${login}`, login, name: login, avatar: "" }, safeReturn(url.searchParams.get("return")), registry);
   }
 
   // One-click setup: Mergery asks GitHub to create a GitHub app for it (the
@@ -360,7 +362,7 @@ export async function handleAuth(env: Env, req: Request, registry: Registry): Pr
       headers.append("set-cookie", setCookie(req, STATE, "", 0));
       return new Response(null, { status: 302, headers });
     }
-    return startSession(env, req, { id: `github:${login}`, login: profile.login, name: profile.name || profile.login, avatar: profile.avatar_url ?? "" }, state.to);
+    return startSession(env, req, { id: `github:${login}`, login: profile.login, name: profile.name || profile.login, avatar: profile.avatar_url ?? "" }, state.to, registry);
   }
 
   return Response.json({ error: "not found" }, { status: 404 });
