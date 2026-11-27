@@ -73,12 +73,20 @@ async function act(method, path, body) {
   if (!res.ok) { toast(data.error ?? `HTTP ${res.status}`); throw new Error(data.error); }
   return data;
 }
+// A toast is a manual popover, so it sits in the top layer above any open dialog;
+// a plain fixed div lands under the dialog's backdrop and is never seen.
 function toast(msg) {
   const t = document.createElement("div");
   t.className = "toast";
+  t.setAttribute("role", "status");
   t.textContent = msg;
   document.body.appendChild(t);
-  setTimeout(() => t.remove(), 4000);
+  if (t.showPopover) {
+    t.popover = "manual";
+    try { t.showPopover(); } catch {}
+  }
+  // Long messages stay up long enough to read.
+  setTimeout(() => t.remove(), Math.min(12000, Math.max(4000, String(msg).length * 60)));
 }
 // Our own confirm/prompt: a small dialog that names the action on its button.
 // Resolves false/null on cancel; true (no input) or the trimmed text on OK.
@@ -1669,9 +1677,9 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
   if (importUrl && !draft) $("#np-url").oninput();
   $("#np-create").onclick = async () => {
     const name = $("#np-name").value.trim();
-    if (!/^[a-z0-9-]+$/.test(name)) return toast("Name: lowercase letters, digits and dashes");
+    if (!/^[a-z0-9-]+$/.test(name)) return stuck(name ? `The name can only have lowercase letters, digits and dashes, like <b>${esc(name.toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "") || "my-project")}</b>.` : "Give the project a name: lowercase letters, digits and dashes.");
     const imp = importing() ? { url: $("#np-url").value.trim(), branch: $("#np-branch").value.trim() || undefined, token: $("#np-token").value.trim() || undefined, issues: !$("#np-issues").disabled && $("#np-issues").checked } : undefined;
-    if (imp && !imp.url) return toast("Paste the URL you'd git clone");
+    if (imp && !imp.url) return stuck("Paste the URL you'd git clone.");
     // Only the first Create after coming back from GitHub counts as coming back.
     const resumed = draft?.resume;
     if (draft) draft.resume = null;
@@ -1692,13 +1700,11 @@ async function showNewProject(draft = null, org = "", importUrl = "") {
       if (a.access === "missing") return stuck(`Mergery can't see <b>${esc(a.repo)}</b>. Check the URL, or add a token that can read it.`);
     }
     $("#np-create").textContent = imp ? "Importing…" : "Creating…";
-    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-where")?.value ? { jurisdiction: $("#np-where").value } : {}), ...($("#np-place")?.value ? { placement: $("#np-place").value } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) });
+    const res = await fetch("/api/projects", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name, description: $("#np-desc").value.trim(), requiredApprovals: $("#np-review").checked ? 1 : 0, ...($("#np-checks").value.trim() ? { checks: { command: $("#np-checks").value.trim() } } : {}), visibility: $('input[name="np-vis"]:checked').value, ...($("#np-where")?.value ? { jurisdiction: $("#np-where").value } : {}), ...($("#np-place")?.value ? { placement: $("#np-place").value } : {}), ...(imp ? { import: imp } : {}), ...($("#np-org")?.value ? { org: $("#np-org").value } : {}) }) })
+      .catch((e) => ({ ok: false, status: 0, json: async () => ({ error: `Couldn't reach Mergery (${e.message || "network error"}). Check your connection and try again.` }) }));
     const data = await res.json().catch(() => ({}));
-    if (!res.ok) {
-      $("#np-create").disabled = false;
-      $("#np-create").textContent = "Create project";
-      return toast(data.error ?? `HTTP ${res.status}`);
-    }
+    // Say why on the form itself, where it stays until the next try.
+    if (!res.ok) return stuck(esc(data.error ?? `Mergery couldn't create the project (HTTP ${res.status}). Try again.`));
     if (data.issues) {
       try { sessionStorage.setItem("loom-toast", data.issues.error ? `The code is in, but the issues didn't come: ${data.issues.error}. Try again in Settings.` : `Imported ${data.issues.created} open issue${data.issues.created === 1 ? "" : "s"} as tasks`); } catch {}
     }
