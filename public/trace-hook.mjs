@@ -30,9 +30,11 @@
 //
 //   node ~/.loom/trace-hook.mjs --project <project> --file <session log> [--session <id>] [--change 12]
 //
-// Without --project it reads LOOM_URL, LOOM_PROJECT and LOOM_KEY (a trace key
-// or an agent key). LOOM_AGENT, if set, uploads as that named agent under the
-// key, which is what recipes/runner.mjs sets for each agent it starts. Mergery
+// Without --project it reads MERGERY_PROJECT and MERGERY_KEY (a trace key or an
+// agent key), and MERGERY_URL for a server other than https://mergery.dev.
+// MERGERY_AGENT, if set, uploads as that named agent under the key, which is
+// what recipes/runner.mjs sets for each agent it starts. The older LOOM_URL,
+// LOOM_PROJECT, LOOM_KEY and LOOM_AGENT still work. Mergery
 // removes secrets before storing anything, and uploading the same session
 // again adds a new version.
 //
@@ -303,7 +305,8 @@ async function upload(to, body, params) {
 }
 
 async function hookUpload() {
-  let to = { url: process.env.LOOM_URL, project: process.env.LOOM_PROJECT, key: process.env.LOOM_KEY, agent: process.env.LOOM_AGENT };
+  const env = (name) => process.env[`MERGERY_${name}`] || process.env[`LOOM_${name}`];
+  let to = { url: env("URL") || "https://mergery.dev", project: env("PROJECT"), key: env("KEY"), agent: env("AGENT") };
   const hook = arg("file") ? {} : await readStdin();
   if (arg("project")) {
     const cfg = loadConfig(arg("project"));
@@ -312,9 +315,9 @@ async function hookUpload() {
     const kind = arg("file") ? null : "claude-code";
     const r = cfg.repos.filter((x) => (!kind || x.for === kind) && (x.path === null || inside(dir, x.path))).sort((a, b) => (b.path?.length ?? 0) - (a.path?.length ?? 0))[0] ?? cfg.repos[0];
     if (!r) return console.error(`mergery trace: no saved key for ${arg("project")}; run --install again`);
-    to = { url: cfg.url, project: cfg.project, key: r.key, agent: process.env.LOOM_AGENT || r.agent };
+    to = { url: cfg.url, project: cfg.project, key: r.key, agent: env("AGENT") || r.agent };
   }
-  if (!to.url || !to.project || !to.key) return console.error("mergery trace: set LOOM_URL, LOOM_PROJECT and LOOM_KEY to upload session traces, or run --install");
+  if (!to.url || !to.project || !to.key) return console.error("mergery trace: set MERGERY_PROJECT and MERGERY_KEY (and MERGERY_URL if not mergery.dev) to upload session traces, or run --install");
   const file = arg("file") ?? hook.transcript_path;
   if (!file) return console.error("mergery trace: no transcript; pass --file <log>");
   if (statSync(file).size > MAX) return console.error(`mergery trace: ${file} is ${(statSync(file).size / 1024 / 1024).toFixed(1)} MB; Mergery takes up to 25 MB`);

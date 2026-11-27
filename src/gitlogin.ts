@@ -4,7 +4,7 @@
 //
 // Git asks the helper for a credential whenever it talks to the Artifacts host.
 // The helper posts git's own request (protocol, host, path) to Mergery with the
-// key in $LOOM_KEY or `git config mergery.key`, and Mergery answers with a
+// key in $MERGERY_KEY (or the older $LOOM_KEY) or `git config mergery.key`, and Mergery answers with a
 // fresh, short-lived Artifacts token for that one repository, in git's
 // credential format. The token is minted per call, so nothing expires on disk;
 // the key is what's stored, and revoking it in Settings ends the login.
@@ -51,7 +51,7 @@ export function formatCredential(c: { password: string; expiresAt: string }): st
  * why pushes are refused. An error's reason goes to stderr.
  */
 export function helperCommand(origin: string): string {
-  return `!f(){ if test "$1" = erase; then echo "mergery: refused. Main is written only by the merge queue, and a workspace only by the agent holding its task; claim a task and push to its workspace." >&2; return 0; fi; test "$1" = get || return 0; k="\${LOOM_KEY:-$(git config mergery.key)}"; out=$(curl -s --fail-with-body -X POST -H "Authorization: Bearer $k" \${LOOM_AGENT:+-H "X-Loom-Agent: $LOOM_AGENT"} --data-binary @- ${origin}/api/git/credential) && printf '%s\\n' "$out" || { printf 'mergery: %s\\n' "\${out:-could not reach ${origin}}" >&2; return 1; }; }; f`;
+  return `!f(){ if test "$1" = erase; then echo "mergery: refused. Main is written only by the merge queue, and a workspace only by the agent holding its task; claim a task and push to its workspace." >&2; return 0; fi; test "$1" = get || return 0; k="\${MERGERY_KEY:-\${LOOM_KEY:-$(git config mergery.key)}}"; a="\${MERGERY_AGENT:-$LOOM_AGENT}"; out=$(curl -s --fail-with-body -X POST -H "Authorization: Bearer $k" \${a:+-H "X-Loom-Agent: $a"} --data-binary @- ${origin}/api/git/credential) && printf '%s\\n' "$out" || { printf 'mergery: %s\\n' "\${out:-could not reach ${origin}}" >&2; return 1; }; }; f`;
 }
 
 /**
@@ -64,10 +64,11 @@ export function loginCommands(origin: string, remote: string): string {
   const host = new URL(remote).origin;
   const sq = (s: string) => `'${s.replace(/'/g, `'\\''`)}'`;
   return [
+    // First, and chained with &&, so a missing key stops the setup before it changes anything.
+    `git config --global mergery.key "\${MERGERY_KEY:?put your agent key in MERGERY_KEY first}"`,
     `git config --global --replace-all credential.${host}.helper ""`,
     `git config --global --add credential.${host}.helper ${sq(helperCommand(origin))}`,
     `git config --global credential.${host}.useHttpPath true`,
     `git config --global http.${host}.proactiveAuth basic`,
-    `git config --global mergery.key "$LOOM_KEY"`,
-  ].join("\n");
+  ].join(" &&\n");
 }

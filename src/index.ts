@@ -109,7 +109,7 @@ async function deliverEvent(env: Env, msg: unknown) {
 async function gitCredential(env: Env, req: Request): Promise<Response> {
   const text = (msg: string, status: number) => new Response(msg + "\n", { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   const auth = req.headers.get("authorization") ?? "";
-  if (!/^Bearer \S+/.test(auth)) return text("no agent key: set LOOM_KEY, or run git config --global mergery.key <key>", 401);
+  if (!/^Bearer \S+/.test(auth)) return text("no agent key: set MERGERY_KEY, or run git config --global mergery.key <key> (make a key in Connect an agent)", 401);
   const repo = repoOf(parseCredentialRequest(await req.text()));
   if (!repo) return text("git didn't send a repository path; run git config --global credential.useHttpPath true for this host", 400);
   let last: Response | null = null;
@@ -333,7 +333,10 @@ export default {
       if (req.headers.get("authorization")) headers.authorization = req.headers.get("authorization")!;
       if (user) headers[USER_HEADER] = JSON.stringify(user);
       const seen = await Promise.all(all.map(async (p) => !p.private || (await (await coordinator(env, p.name)).fetch("https://do/visible", { headers }).then((r) => r.json<{ visible: boolean }>()).catch(() => ({ visible: false }))).visible));
-      return Response.json(all.filter((_, i) => seen[i]).map((p) => ({ ...p, jurisdiction: p.jurisdiction ?? null })));
+      const shown = all.filter((_, i) => seen[i]);
+      // ?mine=1: mark the projects the signed-in person belongs to, so the app opens one of theirs, not a stranger's.
+      const mine = user && url.searchParams.get("mine") ? await Promise.all(shown.map((p) => coordinator(env, p.name).then((c) => c.fetch("https://do/member", { headers })).then((r) => r.json<{ member: boolean }>()).then((r) => r.member).catch(() => false))) : null;
+      return Response.json(shown.map((p, i) => ({ ...p, jurisdiction: p.jurisdiction ?? null, ...(mine ? { mine: mine[i] } : {}) })));
     }
 
     // Billing: a person's plan, Checkout to upgrade, Stripe's portal to manage it, and Stripe's webhook.

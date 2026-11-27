@@ -27,3 +27,14 @@ test("login commands scope the helper to the Artifacts host", () => {
   assert.match(c, /useHttpPath true/);
   assert.ok(c.includes(helperCommand("https://mergery.dev").replace(/'/g, `'\\''`)));
 });
+
+test("login setup stops first when MERGERY_KEY is missing", () => {
+  const c = loginCommands("https://mergery.dev", "https://acct.artifacts.cloudflare.net/git/loom/todo.git");
+  const lines = c.split(" &&\n");
+  assert.match(lines[0], /mergery\.key "\$\{MERGERY_KEY:\?/);
+  assert.equal(lines.length, 5);
+});
+
+test("the helper reads MERGERY_KEY, then the older LOOM_KEY, then git config", () => {
+  assert.match(helperCommand("https://mergery.dev"), /\$\{MERGERY_KEY:-\$\{LOOM_KEY:-\$\(git config mergery\.key\)\}\}/);
+});

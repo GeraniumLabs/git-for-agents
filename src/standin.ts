@@ -93,7 +93,8 @@ export function validWebhook(u: unknown): string | null {
 /** The admin-agent skill: what a person's own agent needs to watch Mergery and act for them. */
 export function standinSkill(origin: string, project: string, who: string | null, scopes: Scope[] | null): string {
   const api = `${origin}/api/projects/${project}`;
-  const keyFile = `~/.config/loom/${project}.standin.key`;
+  const keyFile = `$HOME/.config/mergery/${project}.standin.key`;
+  const oldKeyFile = `$HOME/.config/loom/${project}.standin.key`;
   const can = scopes ? (scopes.length ? scopes.map((s) => `- **${s}**: ${SCOPES[s]}`).join("\n") : "- Nothing beyond watching: you tell the person, and they act in Mergery.") : Object.entries(SCOPES).map(([s, d]) => `- **${s}**: ${d}`).join("\n");
   return `---
 name: mergery-${project}-standin
@@ -106,11 +107,14 @@ Mergery is the git platform where many agents build ${project}. Sometimes they n
 
 ## Your key
 
-Your stand-in key is in \`LOOM_STANDIN_KEY\`, or saved in \`${keyFile}\`. It signs in as ${who ?? "the person"}, but only for the rights they chose when they made it. It can never change settings, people or keys. Never print it, commit it or send it to a channel.
+Your stand-in key is in \`MERGERY_STANDIN_KEY\`, or saved in \`${keyFile}\`. It signs in as ${who ?? "the person"}, but only for the rights they chose when they made it. It can never change settings, people or keys. Never print it, commit it or send it to a channel.
 
 \`\`\`sh
-[ -z "$LOOM_STANDIN_KEY" ] && export LOOM_STANDIN_KEY=$(cat ${keyFile})
-curl -s -H "Authorization: Bearer $LOOM_STANDIN_KEY" ${api}/standins/me | jq
+[ -z "$MERGERY_STANDIN_KEY" ] && [ -s "${keyFile}" ] && export MERGERY_STANDIN_KEY=$(cat "${keyFile}")
+[ -z "$MERGERY_STANDIN_KEY" ] && [ -s "${oldKeyFile}" ] && export MERGERY_STANDIN_KEY=$(cat "${oldKeyFile}")
+# First time, with the key only in your environment: save it.
+[ -n "$MERGERY_STANDIN_KEY" ] && [ ! -s "${keyFile}" ] && mkdir -p "$HOME/.config/mergery" && (umask 077; printf '%s\\n' "$MERGERY_STANDIN_KEY" > "${keyFile}")
+curl -s -H "Authorization: Bearer $MERGERY_STANDIN_KEY" ${api}/standins/me | jq
 \`\`\`
 
 \`/standins/me\` says whom you act for, your scopes, and the dashboard link. ${scopes ? "Your key can:" : "A key can be given any of these scopes:"}
@@ -120,7 +124,7 @@ ${can}
 ## What needs a person
 
 \`\`\`sh
-curl -s -H "Authorization: Bearer $LOOM_STANDIN_KEY" "${api}/attention?wait=25&known=$KNOWN" | jq
+curl -s -H "Authorization: Bearer $MERGERY_STANDIN_KEY" "${api}/attention?wait=25&known=$KNOWN" | jq
 \`\`\`
 
 Each item has a \`key\`, a \`kind\`, a one-line \`text\`, a \`url\` to the dashboard, \`since\`, and \`youCan\`: the scope that would let you act on it, and whether you have it. The answer also has \`known\`. Pass it back as \`known\` next time. With \`wait\`, Mergery holds the request (up to 25 seconds) until something changes, so you can watch without polling hard.
@@ -157,7 +161,7 @@ A 403 means your key doesn't have that right. Tell them and send the link; don't
 If you don't have a webhook, have a scheduler (cron, an agent routine) call the feed every few minutes with the last \`known\`, and start a session only when it returns something new:
 
 \`\`\`sh
-curl -s -H "Authorization: Bearer $LOOM_STANDIN_KEY" "${api}/attention?known=$KNOWN" | jq '{new: [.items[] | select(.new)], known}'
+curl -s -H "Authorization: Bearer $MERGERY_STANDIN_KEY" "${api}/attention?known=$KNOWN" | jq '{new: [.items[] | select(.new)], known}'
 \`\`\`
 `;
 }
