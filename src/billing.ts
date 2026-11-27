@@ -101,7 +101,7 @@ export async function checkoutSession(env: Env, login: string, account: string, 
   const price = env.STRIPE_PRICE_ID
     ? { price: env.STRIPE_PRICE_ID, quantity: 1 }
     : { price_data: { currency: "usd", unit_amount: 1000, recurring: { interval: "month" }, product_data: { name: "Mergery Pro" } }, quantity: 1 };
-  const s = await stripe<{ url: string }>(env, "POST", "checkout/sessions", {
+  const open = (customer: string | null) => stripe<{ url: string }>(env, "POST", "checkout/sessions", {
     mode: "subscription",
     line_items: { 0: price },
     client_reference_id: login,
@@ -111,6 +111,12 @@ export async function checkoutSession(env: Env, login: string, account: string, 
     allow_promotion_codes: "true",
     success_url: `${origin}${back}${back.includes("?") ? "&" : "?"}billing=done`,
     cancel_url: `${origin}${back}`,
+  });
+  // A customer saved while billing ran on a sandbox key doesn't exist under a
+  // live key (and the other way round), so start fresh rather than fail.
+  const s = await open(customer).catch((e: Error) => {
+    if (customer && /no such customer/i.test(e.message)) return open(null);
+    throw e;
   });
   return s.url;
 }
