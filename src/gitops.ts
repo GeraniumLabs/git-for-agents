@@ -23,6 +23,13 @@ export interface Identity {
   email: string;
 }
 
+/** An outside copy's branch has commits Mergery's main doesn't: pushing would throw them away. */
+export class DivergedError extends Error {
+  constructor(public branch: string, public theirs: string) {
+    super(`${branch} there has commits that aren't on Mergery's main (it's at ${theirs.slice(0, 7)}); someone pushed to the copy`);
+  }
+}
+
 type Entry = { oid: string; mode: string };
 type FlatTree = Map<string, Entry>;
 
@@ -241,6 +248,54 @@ export class Workspace {
       onAuth: auth(remote.token),
     });
     if (!res.ok) throw new Error(`push rejected: ${JSON.stringify(res.refs)}`);
+  }
+
+  /**
+   * Where `branch` of an outside repository points (null when it doesn't
+   * exist yet), asked the way a push asks: so it also proves the token may
+   * push there, without sending anything.
+   */
+  static async remoteHead(url: string, token: string, branch = "main"): Promise<string | null> {
+    const onAuth = () => ({ username: "x-access-token", password: tokenSecret(token) });
+    const full = `refs/heads/${branch}`;
+    const refs = await git.listServerRefs({ http, url, onAuth, forPush: true, protocolVersion: 1, prefix: full });
+    return refs.find((r) => r.ref === full)?.oid ?? null;
+  }
+
+  /**
+   * Push `commit` to `branch` of an outside repository (GitHub, say): a
+   * one-off export, or a mirror keeping up with main. When the branch there
+   * is new, or Mergery doesn't have what it points at, the whole history goes.
+   * Refuses with a DivergedError, unless `force`, when the branch there has
+   * commits that aren't in `commit`'s history: someone pushed to the copy.
+   */
+  async pushOut(url: string, token: string, commit: string, branch = "main", force = false): Promise<{ before: string | null; pushed: boolean; forced: boolean }> {
+    const onAuth = () => ({ username: "x-access-token", password: tokenSecret(token) });
+    const before = await Workspace.remoteHead(url, token, branch);
+    if (before === commit) return { before, pushed: false, forced: false };
+    let forced = false;
+    if (before && !(await this.isAncestor(before, commit, true).catch(() => false))) {
+      if (!force) throw new DivergedError(branch, before);
+      forced = true;
+    }
+    // The remote has none of this history: walking to a shallow edge would leave it short.
+    if (!before || forced) await this.deepen();
+    // Its own remote name, so push never mistakes what origin (Mergery's own repository) has for what the copy has.
+    await git.addRemote({ fs: this.fs, dir: DIR, remote: "mirror", url, force: true });
+    await git.writeRef({ fs: this.fs, dir: DIR, ref: "refs/heads/loom-mirror", value: commit, force: true });
+    const go = async () => {
+      const res = await git.push({ fs: this.fs, http, dir: DIR, remote: "mirror", url, ref: "loom-mirror", remoteRef: branch, force: forced, onAuth });
+      if (!res.ok) throw new Error(`push rejected: ${[res.error, ...Object.values(res.refs ?? {}).map((r: any) => r.error)].filter(Boolean).join("; ") || "no reason given"}`);
+    };
+    try {
+      await go();
+    } catch (e: any) {
+      // A merge in the new commits can reach past the shallow edge, and the copy turns a short pack away:
+      // fetch everything once and send again.
+      if (/401|403|auth|not-fast-forward|protected|GH006|declined/i.test(String(e?.message ?? e)) || !(await this.deepen())) throw e;
+      await go();
+    }
+    return { before, pushed: true, forced };
   }
 
   /**

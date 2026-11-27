@@ -2280,3 +2280,59 @@ test("an owner connects the project's own Trust space with its URL and admin key
   assert.equal(off.own, null);
   assert.equal(off.mirrored, 0);
 });
+
+test("an owner mirrors main to another git host: each landing is pushed, a copy pushed to directly waits for an overwrite", { skip: !url, timeout: 120_000 }, async () => {
+  const { Mergery } = await import("../demo/client.mjs");
+  const { SEED } = await import("../demo/seed.mjs");
+  const shim = process.env.LOOM_E2E_SHIM ?? "http://127.0.0.1:8790";
+  // The shim stands in for GitHub: an empty repository and a token that can push to it.
+  const copy = await fetch(`${shim}/repos`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: project("e2e-copy") }) }).then((r) => r.json());
+  const token = String(copy.token).split("?expires=")[0];
+  const head = async () => (await run("git", ["ls-remote", copy.remote.replace("://", `://x:${token}@`), "refs/heads/main"])).stdout.split(/\s/)[0] || null;
+  const name = project("e2e-mirror");
+  const admin = new Mergery(url, name, env.LOOM_ADMIN_TOKEN);
+  await admin.createProject({ name, description: "main goes out", files: SEED, requiredApprovals: 1 });
+  await assert.rejects(admin.req("PUT", "/settings/mirror", { url: copy.remote, token: "art_v1_not-a-token" }), /won't let this token push/);
+  const set = await admin.req("PUT", "/settings/mirror", { url: copy.remote, token });
+  assert.equal(set.mirror.auto, true);
+  assert.equal(set.token.last4, token.slice(-4));
+  const main0 = (await admin.req("GET", "/state")).project.mainHead;
+  for (let i = 0; i < 40 && (await head()) !== main0; i++) await new Promise((r) => setTimeout(r, 250));
+  assert.equal(await head(), main0, "saving the mirror catches the copy up");
+
+  const ada = admin.as((await admin.addAgent("ada", "builder")).key);
+  const t = await ada.createTask("Note the mirror", "");
+  const ws = (await ada.claim(t.id)).workspace.name;
+  await ada.write(ws, { "MIRROR.md": "pushed out\n" }, "note");
+  const ch = await ada.submit(t.id, "Note the mirror", "a note", { plan: ["write it"], tested: ["read it"] });
+  await admin.review(ch.id, "approve", "ok");
+  for (let i = 0; i < 60 && (await admin.change(ch.id)).status !== "merged"; i++) await new Promise((r) => setTimeout(r, 500));
+  const main1 = (await admin.req("GET", "/state")).project.mainHead;
+  assert.notEqual(main1, main0);
+  for (let i = 0; i < 40 && (await head()) !== main1; i++) await new Promise((r) => setTimeout(r, 250));
+  assert.equal(await head(), main1, "the landing reached the copy");
+  const status = await admin.req("GET", "/settings/mirror");
+  assert.equal(status.last.ok, true);
+  assert.equal(status.last.commit, main1);
+
+  // Someone pushes to the copy: Push now refuses, Overwrite goes through.
+  const { mkdtemp } = await import("node:fs/promises");
+  const { tmpdir } = await import("node:os");
+  const { join } = await import("node:path");
+  const dir = await mkdtemp(join(tmpdir(), "loom-copy-"));
+  await run("git", ["clone", "-q", copy.remote.replace("://", `://x:${token}@`), dir]);
+  await run("git", ["-C", dir, "-c", "user.name=bo", "-c", "user.email=bo@example.com", "commit", "-q", "--allow-empty", "-m", "on the copy"]);
+  await run("git", ["-C", dir, "push", "-q", "origin", "main"]);
+  await assert.rejects(admin.req("POST", "/export", {}), /someone pushed to the copy directly/i);
+  const forced = await admin.req("POST", "/export", { force: true });
+  assert.equal(forced.forced, true);
+  assert.equal(await head(), main1);
+
+  // A one-off export somewhere else doesn't keep that token.
+  const other = await fetch(`${shim}/repos`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ name: project("e2e-export") }) }).then((r) => r.json());
+  const once = await admin.req("POST", "/export", { url: other.remote, token: String(other.token).split("?expires=")[0] });
+  assert.equal(once.commit, main1);
+  assert.equal((await admin.req("GET", "/settings/mirror")).mirror.url, copy.remote, "the saved mirror is unchanged");
+  await admin.req("DELETE", "/settings/mirror");
+  assert.equal((await admin.req("GET", "/settings/mirror")).mirror, null);
+});

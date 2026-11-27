@@ -357,6 +357,18 @@ A project can start from a repository you already have. In **+ New**, pick *A re
 - **Issues:** for a GitHub repository, tick *Bring its open GitHub issues in as tasks*. Each open issue becomes a task with its text, labels and a link back. Pull requests are left out. Later, **Settings › General › Imported › Bring in new open issues** files any issues opened since, and skips the ones already here.
 - **From a script:** `POST /api/projects {name, import: {url, branch?, token?, issues?}}`, and `POST /api/projects/<project>/import/issues {url?, token?}` for owners.
 
+## Copy main to GitHub
+
+Mergery is where the work happens, but people and tools that live on GitHub can still see the code. **Settings › General › Copy on GitHub** pushes main to a GitHub repository (or any git host that takes a token over https):
+
+- **Mirror:** name the repository (`owner/repo`), paste a token and Save. Main goes there right away with its whole history, and again each time changes land. Pushes run one at a time after the landing; a burst of landings shares one push. *Only push when asked* turns the automatic part off and leaves **Push now**.
+- **Once:** fill in the repository and token and press **Push once**. The token is used for that push and not kept.
+- **The token:** on GitHub, a [fine-grained token](https://github.com/settings/personal-access-tokens/new) with access to only that repository and *Contents: read and write* (a classic token with `repo` works too). Saving checks that it can push there, without sending anything. A saved token is kept encrypted with `LOOM_SECRET_KEY`, used only to push, and shown again only as its last four characters. Create the repository on GitHub first; empty is fine.
+- **The copy is an outlet.** Nothing is read back from it. If someone pushes to it directly, Mergery stops instead of throwing their commits away: the next push fails with that reason, **Needs a person** lists it, and an owner can press **Overwrite GitHub's copy** or point the mirror at another branch (say `mergery/main`). A push that fails for any other reason (a revoked token, a protected branch) shows up the same way and is tried again at the next landing.
+- **From a script:** `PUT /settings/mirror {url, token, branch?, auto?}`, `POST /export {url?, token?, branch?, force?}`.
+
+Only main is pushed: not workspaces, tags or git notes.
+
 Workspaces fetch the latest 200 generations of history, not all of it. A repository with thousands of commits stays as fast as a new one. A merge whose base is older than that fetches the rest.
 
 ## Connect an agent
@@ -422,6 +434,8 @@ All routes are under `/api/projects/<project>`. Writes need `Authorization: Bear
 | `GET /events?after=<seq>&wait=<s>&agent=<id>&mine=1` | Long-poll the event stream (`mine=1`: only what concerns that agent); `GET /ws` for a WebSocket |
 | `GET /tasks?status=` | List tasks |
 | `POST /import/issues` `{url?, token?}` | *Owners:* file a task for each open issue of the GitHub repository the project was imported from (or `url`), skipping issues already brought in |
+| `GET` / `PUT /settings/mirror` `{url, token?, branch?, auto?}`, `DELETE /settings/mirror` | *Owners set, members see:* where main is mirrored (`url` is `owner/repo` or a git URL), with a token that can push there, kept sealed. With `auto` (the default) main is pushed after every landing |
+| `POST /export` `{url?, token?, branch?, force?}` | *Owners:* push main now: to the saved mirror, or to `url` with a token used once. Refuses with 409 when the copy has commits main doesn't, unless `force` |
 | `DELETE /api/projects/<project>?confirm=<project>` | *Owners:* delete the project for good: its repository and workspaces, change context and attachments, and everything the coordinator holds. Also in **Settings › General › Delete project** |
 | `POST /tasks` `{title, description, dependsOn, related, attempts?}` | Add a task (`related`: earlier tasks whose history its agent should get; `attempts: 2..5` makes it a contest) |
 | `POST /join` `{code, name}` | *No key needed:* trade a join code for this agent's own key |

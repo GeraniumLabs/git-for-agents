@@ -4,7 +4,8 @@
 // into main through a queue. Main is only ever written by this object.
 
 import { DurableObject } from "cloudflare:workers";
-import { Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
+import { DivergedError, Workspace, diffFlat, unifiedDiff, type FileConflict, type FileChange, type Remote } from "./gitops";
+import { mirrorBranch, mirrorName, mirrorUrl, plausibleToken, pushError, type MirrorConfig, type MirrorRun } from "./mirror";
 import { anyOverlap, matches, normalizePattern, overlaps as patternsOverlap } from "./paths";
 import { makeStore, tokenSecret, type RepoStore } from "./store";
 import { loginCommands } from "./gitlogin";
@@ -1128,6 +1129,19 @@ export class ProjectCoordinator extends DurableObject<Env> {
       if (!c || !isKeyKind(c)) throw new HttpError(404, `no key kind ${c ?? ""}; use ${Object.keys(KEY_KINDS).join(" or ")}`);
       if (m === "PUT") return json(await this.saveKey(actor, c, body.value));
       if (m === "DELETE") return json(this.removeKey(actor, c));
+    }
+    // Main out to GitHub (or any git host): a mirror after every landing, or a push now.
+    if (a === "settings" && b === "mirror") {
+      if (actor.role !== "human") throw new HttpError(403, "only people can see or set where main is mirrored");
+      if (m === "GET") return json(this.mirrorStatus);
+      ownerOnly("set where main is mirrored");
+      if (m === "PUT") return json(await this.setMirror(actor, body));
+      if (m === "DELETE") return json(this.removeMirror(actor));
+    }
+    if (a === "export" && m === "POST") {
+      if (actor.role !== "human") throw new HttpError(403, "only people can push main to another repository");
+      ownerOnly("push main to another repository");
+      return json(await this.exportMain(actor, body));
     }
     if (a === "settings" && m === "POST") {
       ownerOnly("change settings");
@@ -2808,6 +2822,169 @@ export class ProjectCoordinator extends DurableObject<Env> {
     this.ctx.waitUntil(this.notesChain);
   }
 
+  // ── main out to GitHub: a mirror that keeps up, and one-off exports (src/mirror.ts) ──
+  // Mergery stays the home of the code. The copy is written, never read back, and a copy
+  // someone pushed to directly is left alone unless an owner says to overwrite it.
+
+  private mirrorChain: Promise<unknown> = Promise.resolve();
+  private mirrorQueued = false;
+
+  private get mirrorConfig(): MirrorConfig | null {
+    return JSON.parse(this.meta("mirror") ?? "null");
+  }
+  private get mirrorLast(): MirrorRun | null {
+    return JSON.parse(this.meta("mirror_last") ?? "null");
+  }
+  /** What the project page shows anyone who can see the project: where main goes, and whether the last push worked. */
+  private get mirrorSummary() {
+    const c = this.mirrorConfig;
+    if (!c) return null;
+    const l = this.mirrorLast;
+    const last = l && l.url === c.url ? { ok: l.ok, at: l.at, commit: l.commit } : null;
+    return { repo: mirrorName(c.url), branch: c.branch, auto: c.auto, last };
+  }
+  /** The whole picture, for the project's people: the token's last four, the last push and why it failed. */
+  private get mirrorStatus() {
+    const c = this.mirrorConfig;
+    const tok = JSON.parse(this.meta("mirror_token") ?? "null");
+    const last = this.mirrorLast;
+    return {
+      canSave: !!sealer(this.env),
+      mirror: c ? { ...c, repo: mirrorName(c.url), setByName: this.agentName(c.setBy) ?? c.setBy } : null,
+      token: tok ? { last4: tok.last4, setBy: tok.set_by, setByName: this.agentName(tok.set_by) ?? tok.set_by, setAt: tok.set_at, readable: !!this.env[tok.sealed_by === "secret" ? "LOOM_SECRET_KEY" : "LOOM_ADMIN_TOKEN"] } : null,
+      last: last ? { ...last, repo: mirrorName(last.url), byName: last.by ? this.agentName(last.by) ?? last.by : null } : null,
+      mainHead: this.meta("main_head"),
+    };
+  }
+
+  private async mirrorToken(): Promise<string | null> {
+    const row = JSON.parse(this.meta("mirror_token") ?? "null");
+    return row ? unseal(this.env, this.project, row) : null;
+  }
+
+  /**
+   * Save where main is mirrored: { url, branch?, auto?, token? }. A new token
+   * is checked by asking the host to accept a push (nothing is sent) and kept
+   * sealed. Changing the repository without a new token keeps the old one.
+   */
+  private async setMirror(actor: Agent, body: { url?: string; repo?: string; branch?: string; auto?: boolean; token?: string }) {
+    const prev = this.mirrorConfig;
+    let url: string, branch: string;
+    try {
+      url = body.url !== undefined || body.repo !== undefined ? mirrorUrl(body.url ?? body.repo ?? "") : prev?.url ?? mirrorUrl("");
+      branch = body.branch !== undefined ? mirrorBranch(body.branch) : prev?.branch ?? "main";
+    } catch (e: any) {
+      throw new HttpError(400, e.message);
+    }
+    let token: string | null = null;
+    if (body.token !== undefined && body.token !== null && body.token !== "") {
+      try { token = plausibleToken(body.token); } catch (e: any) { throw new HttpError(400, e.message); }
+      if (!sealer(this.env)) throw new HttpError(503, "set LOOM_SECRET_KEY on the Worker first, so the token can be kept encrypted");
+    } else if (!this.meta("mirror_token")) {
+      throw new HttpError(400, "add a token that can push to that repository: on GitHub, a fine-grained token with Contents: read and write on it");
+    }
+    const check = token ?? (await this.mirrorToken());
+    if (!check) throw new HttpError(400, "the saved token can't be read any more (the Worker secret that sealed it changed); paste it again");
+    // Is the token good for pushing there? The host's push advertisement answers that without sending anything.
+    try {
+      await Workspace.remoteHead(url, check, branch);
+    } catch (e: any) {
+      throw new HttpError(400, pushError(url, e));
+    }
+    if (token) {
+      const sealed = await seal(this.env, this.project, token);
+      this.setMeta("mirror_token", JSON.stringify({ ct: sealed.ct, iv: sealed.iv, sealed_by: sealed.by, last4: token.slice(-4), set_by: actor.id, set_at: Date.now() }));
+    }
+    const auto = body.auto !== undefined ? !!body.auto : prev?.auto ?? true;
+    const config: MirrorConfig = { url, branch, auto, setBy: actor.id, setAt: Date.now() };
+    this.setMeta("mirror", JSON.stringify(config));
+    this.emit("mirror.set", { actor: actor.id, data: { repo: mirrorName(url), branch, auto, newToken: !!token } });
+    // Catch the copy up now, rather than at the next landing.
+    if (auto) this.mirrorSoon();
+    return this.mirrorStatus;
+  }
+
+  private removeMirror(actor: Agent) {
+    const c = this.mirrorConfig;
+    this.setMeta("mirror", null);
+    this.setMeta("mirror_token", null);
+    if (c) this.emit("mirror.removed", { actor: actor.id, data: { repo: mirrorName(c.url) } });
+    return this.mirrorStatus;
+  }
+
+  /**
+   * Push main somewhere now. With no url, to the saved mirror with its token.
+   * With a url (and token), a one-off export: the token is used for this push
+   * and not kept. `force` overwrites a copy someone pushed to directly.
+   */
+  private async exportMain(actor: Agent, body: { url?: string; repo?: string; branch?: string; token?: string; force?: boolean }) {
+    const saved = this.mirrorConfig;
+    const target = body.url ?? body.repo;
+    let url: string, branch: string, token: string | null;
+    try {
+      url = target ? mirrorUrl(target) : saved?.url ?? mirrorUrl("");
+      branch = body.branch !== undefined ? mirrorBranch(body.branch) : !target || url === saved?.url ? saved?.branch ?? "main" : "main";
+      token = body.token ? plausibleToken(body.token) : url === saved?.url ? await this.mirrorToken() : null;
+    } catch (e: any) {
+      throw new HttpError(400, e.message);
+    }
+    if (!token) throw new HttpError(400, url === saved?.url ? "the saved token can't be read any more; save it again under Settings" : "add a token that can push to that repository: on GitHub, a fine-grained token with Contents: read and write on it");
+    const run = await this.serialMirror(() => this.pushMain(url, branch, token!, !!body.force, actor.id));
+    if (!run.ok) throw new HttpError(run.diverged ? 409 : 502, run.error!);
+    return { ...run, repo: mirrorName(url) };
+  }
+
+  /** The mirror keeping up: after a landing, push main if the mirror is on. Landings close together share one push. */
+  private mirrorSoon() {
+    const c = this.mirrorConfig;
+    if (!c?.auto || this.mirrorQueued) return;
+    this.mirrorQueued = true;
+    const run = this.serialMirror(async () => {
+      this.mirrorQueued = false;
+      const now = this.mirrorConfig;
+      if (!now?.auto) return null;
+      const token = await this.mirrorToken();
+      if (!token) return this.recordMirror({ url: now.url, branch: now.branch, commit: this.meta("main_head"), before: null, ok: false, error: "the saved token can't be read any more (the Worker secret that sealed it changed); save it again under Settings", by: null, at: Date.now() });
+      return this.pushMain(now.url, now.branch, token, false, null);
+    });
+    this.ctx.waitUntil(run.catch((e) => console.error("mirror", e)));
+  }
+
+  /** One push at a time, in order, so two never race to move the copy. */
+  private serialMirror<T>(work: () => Promise<T>): Promise<T> {
+    const next = this.mirrorChain.then(work, work);
+    this.mirrorChain = next.catch(() => {});
+    return next;
+  }
+
+  /** Push main's head as it is now. Never throws: the outcome is recorded and returned. */
+  private async pushMain(url: string, branch: string, token: string, force: boolean, by: string | null): Promise<MirrorRun> {
+    const commit = this.meta("main_head");
+    const base = { url, branch, commit, by, at: Date.now() };
+    if (!commit) return this.recordMirror({ ...base, before: null, ok: false, error: "main has no commits yet" });
+    try {
+      const w = await Workspace.open(await this.mainRemote("read"), "main", this.seed());
+      const r = await w.pushOut(url, token, commit, branch, force);
+      return this.recordMirror({ ...base, before: r.before, ok: true, upToDate: !r.pushed, forced: r.forced || undefined, at: Date.now() });
+    } catch (e: any) {
+      if (e instanceof DivergedError) {
+        return this.recordMirror({ ...base, before: e.theirs, ok: false, diverged: true, at: Date.now(),
+          error: `${mirrorName(url)} has commits on ${branch} that aren't on Mergery's main, so nothing was pushed. Someone pushed to the copy directly. An owner can overwrite it with Push now › Overwrite, or point the mirror at another branch` });
+      }
+      return this.recordMirror({ ...base, before: null, ok: false, error: pushError(url, e), at: Date.now() });
+    }
+  }
+
+  private recordMirror(run: MirrorRun): MirrorRun {
+    const prev = this.mirrorLast;
+    this.setMeta("mirror_last", JSON.stringify(run));
+    const data = { repo: mirrorName(run.url), branch: run.branch, commit: run.commit, before: run.before, forced: run.forced ?? false, by: run.by };
+    if (run.ok && !run.upToDate) this.emit("mirror.pushed", { actor: run.by, data });
+    // A failure is news once, not on every landing that fails the same way.
+    else if (!run.ok && (prev?.ok !== false || prev.error !== run.error || run.by)) this.emit("mirror.failed", { actor: run.by, data: { ...data, error: run.error, diverged: run.diverged ?? false } });
+    return run;
+  }
+
   private notesChain: Promise<void> = Promise.resolve();
 
   // Trust add-on (src/trust.ts): mirrors notes, decisions and merges into a Trust space when the
@@ -2931,6 +3108,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
   /** What follows a landing: the event, memory, stale-workspace advice, unblocked tasks. */
   private async afterMerged(ch: any, commit: string, version: number, files: FileChange[], data: Record<string, unknown>) {
     this.emit("change.merged", { actor: ch.agent_id, change: ch.id, task: ch.task_id, data: { commit, version, files, ...data } });
+    this.mirrorSoon();
     if (files.some((f) => isTest(f.path))) this.mainTestsStale = true;
     this.learn(ch.agent_id, "wrote", files, ch.symbols ?? {});
     await this.notesFromContext(ch).catch((e) => console.error("notes", e));
@@ -5482,7 +5660,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const waitedFor = (id: number) => (this.sql.exec("SELECT MAX(ts) AS t FROM events WHERE change_id = ? AND type = 'change.queued'", id).one().t as number) ?? now;
 
     return {
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), trust: this.trustStatus },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, noReviewPaths: this.noReviewPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, approvalMode: this.approvalMode, resolveThreads: this.threadsMustResolve, checks: this.checks, autoBisect: this.meta("auto_bisect") !== "off", preview: this.previewSettings, lastBisect: this.lastBisect(), suggestedCheck: this.checks ? null : this.meta("suggested_check"), mainTests: this.mainTests, plan: this.meta("plan"), org: this.meta("org"), limits: this.limits, agentLimits: this.defaultLimits, questions: this.questionRules, model: this.modelOptions, reviewAgent: { ...this.reviewAgent, uses: this.reviewAgentSource() }, traces: { thoughts: this.traceSettings.thoughts, agentsCanRead: this.traceSettings.agentsCanRead, askAll: this.traceSettings.askAll, public: this.tracesPublic, redactRules: this.traceSettings.redact.length, limits: this.traceLimits }, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), mirror: this.mirrorSummary, trust: this.trustStatus },
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
       health: {
         agents: { total: named.filter((a) => a.state !== "gone").length, records: agents.filter((a) => a.state !== "human" && a.state !== "gone").length, byState, releaseAfterMs: RELEASE_MS, goneAfterMs: GONE_MS },
@@ -5642,6 +5820,11 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const misconfigured = JSON.parse(this.meta("checks_misconfigured") ?? "null");
     if (misconfigured && misconfigured.command === this.checks?.command) {
       items.push({ kind: "stuck", reason: "the check command can't run", detail: misconfigured.hint, change: misconfigured.change, since: misconfigured.since, action: "settings" });
+    }
+    // A mirror that stopped keeping up: main moved on and the copy on GitHub didn't.
+    const mirror = this.mirrorConfig, mirrored = this.mirrorLast;
+    if (mirror?.auto && mirrored && !mirrored.ok && mirrored.url === mirror.url && mirrored.commit && mirrored.commit === this.meta("main_head")) {
+      items.push({ kind: "stuck", reason: `main isn't reaching ${mirrorName(mirror.url)}`, detail: mirrored.error ?? "the last push failed", since: mirrored.at, action: "settings", settings: "general" });
     }
     // The queue normally finishes these itself (reconcileMerging); listed so an owner can see and nudge it.
     for (const r of this.sql.exec("SELECT id, updated_at FROM changes WHERE status = 'merging' AND updated_at < ?", now - MERGE_STALL_MS).toArray()) {
@@ -7345,7 +7528,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const events = this.rowsToEvents(this.sql.exec("SELECT * FROM events ORDER BY seq DESC LIMIT 150").toArray()).reverse();
     return {
       delegate: { ...this.delegateConfig, id: DELEGATE_ID, jevConnected: !!this.jevSource(), jevUses: this.jevSource() },
-      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), trust: this.trustStatus },
+      project: { name: this.project, description: this.meta("description"), frozen: this.meta("frozen"), protectedPaths: this.protectedPaths, mainHead: this.meta("main_head"), mainVersion: this.mainVersion, requiredApprovals: this.requiredApprovals, checks: this.checks, visibility: this.isPrivate ? "private" : "public", jurisdiction: this.jurisdiction, placement: this.placement, remote: this.remoteUrl(this.mainRepo), importedFrom: JSON.parse(this.meta("imported_from") ?? "null"), mirror: this.mirrorSummary, trust: this.trustStatus },
       agents, agentStates: this.agentStates(), tasks, reviewTasks: this.reviewTasks(), intents: this.activeIntents(), changes, reviews, events,
       decisions: this.decisionRows("retired_at IS NULL ORDER BY id DESC LIMIT 40"),
       threads: this.sql.exec("SELECT id FROM threads WHERE status = 'open' OR updated_at > ? ORDER BY updated_at DESC LIMIT 50", Date.now() - 3600_000).toArray().map((r) => this.thread(r.id as number)),
