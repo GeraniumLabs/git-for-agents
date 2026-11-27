@@ -539,11 +539,11 @@ function personAskHtml(c) {
 function renderStuck() {
   const items = state.attention.filter((i) => i.kind === "stuck");
   paint($("#stuck"), items.slice(0, 12).map((it) => `<div class="card stuck"><div class="kicker">${esc(it.reason)} · ${ago(it.since)}</div>
-    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "settings" && isOwner() ? `<div class="row"><button class="ghost mini" data-open-settings>Fix it in Settings</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
+    <div>${it.change ? `<a data-change="${it.change}">${esc(it.detail)}</a>` : esc(it.detail)}${it.agent ? ` · ${who(it.agent)}` : ""}${it.agents ? ` · not yet: ${it.agents.slice(0, 6).map(who).join(", ")}${it.agents.length > 6 ? ` and ${it.agents.length - 6} more` : ""}` : ""}</div>${it.action === "review" && me ? `<div class="row"><button class="ghost mini" data-change="${it.change}">Review it yourself</button></div>` : ""}${it.action === "settings" && isOwner() ? `<div class="row"><button class="ghost mini" data-open-settings="${esc(it.settings ?? "checks")}">Fix it in Settings</button></div>` : ""}${it.action === "merge" && isOwner() ? `<div class="row"><button class="ghost mini" data-reconcile="${it.change}" title="Look at main: if the change is already there, mark it merged; otherwise put it back in the queue">Check main and finish</button><button class="ghost mini" data-withdraw="${it.change}" title="Take it out of the queue; its task goes back to its agent or to open">Withdraw</button></div>` : ""}</div>`).join("")
     + (items.length > 12 ? `<p class="meta">and ${items.length - 12} more</p>` : "")
     || `<p class="empty">Nothing is stuck.</p>`);
   wire($("#stuck"));
-  for (const b of $("#stuck").querySelectorAll("[data-open-settings]")) b.onclick = () => showSettings("checks");
+  for (const b of $("#stuck").querySelectorAll("[data-open-settings]")) b.onclick = () => showSettings(b.dataset.openSettings || "checks");
   for (const b of $("#stuck").querySelectorAll("[data-reconcile]")) b.onclick = async () => {
     let r; try { r = await act("POST", `/changes/${b.dataset.reconcile}/reconcile`, {}); } catch { return; }
     const o = r?.outcome;
@@ -1888,8 +1888,57 @@ async function showInvite(code) {
 // ── settings: grouped pages, a nav with each group's state, and search ──
 // Each <h2 data-sec> section is assigned to a group here; showSettings renders
 // them all (so every handler finds its inputs) and shows one group at a time.
+// Main out to GitHub: a mirror after every landing, or one push now. Mergery stays the home of the code.
+function mirrorSection(mir, when) {
+  const m = mir.mirror, last = mir.last, owner = isOwner();
+  const short = (oid) => (oid ? `<span class="mono">${esc(oid.slice(0, 7))}</span>` : "");
+  const lastLine = !last ? "" : last.ok
+    ? `<p class="meta">Last push ${ago(last.at)} ago${last.byName ? ` by ${esc(last.byName)}` : ""}: ${last.upToDate ? `${esc(last.repo)} already had main (${short(last.commit)})` : `main (${short(last.commit)}) to <span class="mono">${esc(last.repo)}</span> ${esc(last.branch)}${last.forced ? ", overwriting what was there" : ""}`}.${last.commit && last.commit !== mir.mainHead && m?.auto ? " Main has moved since; the next push follows shortly." : ""}</p>`
+    : `<p class="meta"><b>The last push${m && last.url === m.url ? "" : ` to ${esc(last.repo)}`} failed</b> ${ago(last.at)} ago: ${esc(last.error ?? "no reason given")}.</p>`;
+  const tokenHelp = `<a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">Make a fine-grained token</a> with access to only that repository and <b>Contents: read and write</b>. Create the repository on GitHub first (<a href="https://github.com/new" target="_blank" rel="noopener">github.com/new</a>); empty is fine, and the first push brings main's whole history.`;
+  return `<h2 data-sec="mirror">Copy on GitHub</h2>
+    <p class="meta">${m
+      ? `<b>Mirrored to <span class="mono">${esc(m.repo)}</span></b> (branch ${esc(m.branch)}). ${m.auto ? "Main is pushed there each time changes land." : "Pushed only when an owner presses Push now."} Mergery stays the home of the code: nothing is read back from the copy, and if someone pushes to it directly, Mergery stops and asks before overwriting.`
+      : "<b>No copy.</b> Push main to a GitHub repository: once, or every time changes land, so people and tools that live on GitHub see the code. Mergery stays where the work happens; the copy is an outlet."}</p>
+    ${lastLine}
+    ${m && mir.token ? `<p class="meta">Token ending <span class="mono">…${esc(mir.token.last4)}</span>, saved by ${esc(mir.token.setByName ?? "?")} on ${when(mir.token.setAt)}${mir.token.readable ? "" : " · <b>can't be read</b>: the Worker secret that sealed it is gone; paste it again"}. Kept encrypted and used only to push.</p>` : ""}
+    ${owner && m ? `<div class="row"><button class="ghost" id="mir-push">Push now</button>${last && last.diverged ? `<button class="ghost" id="mir-force">Overwrite GitHub's copy</button>` : ""}<button class="ghost" id="mir-auto">${m.auto ? "Only push when asked" : "Push after every landing"}</button><button class="ghost" id="mir-stop">Stop mirroring</button></div>` : ""}
+    ${owner ? `<details class="set-more"${m ? "" : " open"}><summary>${m ? "Change the repository or token" : "Set up a copy"}</summary>
+    <p class="meta">${tokenHelp}${mir.canSave ? "" : " This server can't keep tokens (set LOOM_SECRET_KEY on the Worker), so only a one-off push works here."}</p>
+    <div class="row"><input id="mir-repo" class="mono grow" placeholder="owner/repo or https://github.com/owner/repo" autocomplete="off" value="${esc(m?.repo ?? "")}"><input id="mir-branch" class="mono" style="width:8em" placeholder="main" value="${esc(m?.branch ?? "main")}"></div>
+    <div class="row"><input id="mir-token" class="grow" type="password" autocomplete="off" placeholder="${m && mir.token ? "Keep the saved token, or paste a new one" : "github_pat_…"}">${mir.canSave ? `<label class="check"><input type="checkbox" id="mir-every"${!m || m.auto ? " checked" : ""}> After every landing</label><button class="ghost" id="mir-save">Save</button>` : ""}<button class="ghost" id="mir-once" title="Push main there now; the token is used for this push and not kept">Push once</button></div></details>` : ""}`;
+}
+
+function wireMirror(mir) {
+  if (!mir) return;
+  const pushed = (r) => toast(r.upToDate ? `${r.repo} already has main` : `Main pushed to ${r.repo}${r.forced ? ", overwriting its copy" : ""}`);
+  const busy = async (id, work) => { const b = $(id); if (b) b.disabled = true; try { await work(); } catch {} finally { if (b) b.disabled = false; } showSettings(); };
+  if ($("#mir-push")) $("#mir-push").onclick = () => busy("#mir-push", async () => pushed(await act("POST", "/export", {})));
+  if ($("#mir-force")) $("#mir-force").onclick = async () => {
+    if (!await ask({ title: `Overwrite ${mir.mirror.repo}?`, body: `Its ${mir.mirror.branch} branch has commits that aren't on Mergery's main. Pushing main there throws them away on GitHub.`, ok: "Overwrite", danger: true })) return;
+    busy("#mir-force", async () => pushed(await act("POST", "/export", { force: true })));
+  };
+  if ($("#mir-auto")) $("#mir-auto").onclick = () => busy("#mir-auto", () => act("PUT", "/settings/mirror", { auto: !mir.mirror.auto }));
+  if ($("#mir-stop")) $("#mir-stop").onclick = async () => {
+    if (!await ask({ title: "Stop mirroring?", body: `Mergery forgets ${mir.mirror.repo} and its token. The copy on GitHub stays as it is.`, ok: "Stop", danger: true })) return;
+    busy("#mir-stop", () => act("DELETE", "/settings/mirror"));
+  };
+  const form = () => ({ url: $("#mir-repo").value.trim(), branch: $("#mir-branch").value.trim() || "main", token: $("#mir-token").value.trim() || undefined });
+  if ($("#mir-save")) $("#mir-save").onclick = () => busy("#mir-save", async () => {
+    const f = form();
+    if (!f.url) { toast("Name the GitHub repository, like owner/repo"); throw new Error("no repo"); }
+    const r = await act("PUT", "/settings/mirror", { ...f, auto: $("#mir-every").checked });
+    toast(r.mirror.auto ? `Mirroring to ${r.mirror.repo}; main is on its way` : `Saved. Press Push now to send main to ${r.mirror.repo}`);
+  });
+  if ($("#mir-once")) $("#mir-once").onclick = () => busy("#mir-once", async () => {
+    const f = form();
+    if (!f.url) { toast("Name the GitHub repository, like owner/repo"); throw new Error("no repo"); }
+    pushed(await act("POST", "/export", f));
+  });
+}
+
 const SETTINGS_GROUPS = [
-  ["general", "General", ["visibility", "imported", "residency", "delete"]],
+  ["general", "General", ["visibility", "imported", "mirror", "residency", "delete"]],
   ["people", "People", ["people", "organization"]],
   ["agents", "Agents", ["agents", "agent-limits", "questions"]],
   ["review", "Review", ["approvals", "review-agent", "evals"]],
@@ -1906,6 +1955,7 @@ async function showSettings(tab) {
   let s, people, si;
   let mail = null, account = null, hooks = [], cs = null, ev = null;
   try { [s, people, si, mail, account, hooks] = await Promise.all([act("GET", "/settings/keys"), act("GET", "/members"), act("GET", "/standins").catch(() => ({ scopes: {}, standins: [] })), me?.id && me.id !== "admin" && !me.standin ? act("GET", "/me/email").catch(() => null) : null, user ? site("GET", "/account").catch(() => null) : null, isOwner() ? api("/hooks").then((h) => (Array.isArray(h) ? h : [])).catch(() => []) : [], isOwner() ? act("GET", "/check-secrets").catch(() => null) : null, act("GET", "/evals").catch(() => null)]).then((r) => { ev = r.pop(); cs = r.pop(); return r; }); } catch { return; }
+  const mir = await act("GET", "/settings/mirror").catch(() => null);
   const org = state?.project?.org ?? null;
   const moveTo = (account?.orgs ?? []).filter((o) => o.role === "owner" && o.slug !== org);
   const vis = state?.project?.visibility ?? "public";
@@ -1917,6 +1967,7 @@ async function showSettings(tab) {
     ${state?.project?.importedFrom ? `<h2 data-sec="imported">Imported</h2>
     <p class="meta">From <span class="mono">${esc(state.project.importedFrom.url)}</span> (${esc(state.project.importedFrom.branch)}, now main). Mergery is its home: nothing is written back.</p>
     ${isOwner() && /^https:\/\/github\.com\//.test(state.project.importedFrom.url) ? `<div class="row"><input id="imp-token" type="password" autocomplete="off" placeholder="${auth.repoAccess ? "Uses your GitHub access" : "Token, if the repository is private"}"><button class="ghost" id="imp-issues">Bring in new open issues</button>${auth.github && !auth.repoAccess ? `<a class="button ghost" href="/auth/github?grant=repo&return=${encodeURIComponent(location.pathname + location.search)}">Use my GitHub access</a>` : ""}</div>` : ""}` : ""}
+    ${mir ? mirrorSection(mir, when) : ""}
     <h2 data-sec="residency">Where the data lives</h2>
     <p class="meta">${state?.project?.jurisdiction === "eu" ? "<b>In the EU.</b> The repositories, the coordinator and change context stay in the European Union." : state?.project?.jurisdiction === "fedramp" ? "<b>In the US, FedRAMP.</b> The repositories, the coordinator and change context stay in Cloudflare's FedRAMP-authorized US data centers." : "<b>Anywhere.</b> Cloudflare keeps the data where it serves it best."} ${state?.project?.placement ? `The coordinator was started near agents in ${esc(PLACEMENTS[state.project.placement] ?? state.project.placement)}.` : "The coordinator started near whoever made the project."} Both were chosen when the project was made; a project can't move.</p>
     <h2 data-sec="approvals">Approvals</h2>
@@ -2081,6 +2132,7 @@ async function showSettings(tab) {
       toast(`${r.created} new task${r.created === 1 ? "" : "s"} from ${r.repo}${r.skipped ? `; ${r.skipped} already here` : ""}`);
     } catch {} finally { $("#imp-issues").disabled = false; }
   };
+  wireMirror(mir);
   if ($("#vis-toggle")) $("#vis-toggle").onclick = async () => {
     const to = vis === "private" ? "public" : "private";
     if (!await ask(to === "private"
@@ -2236,7 +2288,7 @@ async function showSettings(tab) {
   const p = state?.project ?? {};
   const ra = p.reviewAgent ?? { enabled: true };
   const status = {
-    general: vis === "private" ? "Private" : "Public",
+    general: `${vis === "private" ? "Private" : "Public"}${mir?.mirror ? " · mirrored" : ""}`,
     people: `${people.length} ${people.length === 1 ? "person" : "people"}${org ? ` · ${org}` : ""}`,
     agents: p.agentLimits ? "Limits set" : "No limits",
     review: `${p.approvalMode === "count" ? "Counted" : "Weighted"} · reviewer ${ra.enabled ? "on" : "off"}`,
