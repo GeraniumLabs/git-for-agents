@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { PLANS, form, planUpdate, projectLimits, signStripe, testMode, verifyStripe } from "../src/billing";
+import { PLANS, checkoutSession, form, planUpdate, projectLimits, signStripe, testMode, verifyStripe } from "../src/billing";
 
 test("Stripe params are form-encoded with nested keys", () => {
   assert.equal(form({ mode: "subscription", line_items: { 0: { price: "p_1", quantity: 1 } }, skip: undefined }),
@@ -53,4 +53,24 @@ test("only a test or sandbox key counts as test mode", () => {
   assert.equal(testMode({ STRIPE_SECRET_KEY: "rk_test_x" } as any), true);
   assert.equal(testMode({ STRIPE_SECRET_KEY: "rk_live_x" } as any), false);
   assert.equal(testMode({} as any), false);
+});
+
+test("checkout starts fresh when a saved customer is from the other Stripe mode", async () => {
+  const seen: string[] = [];
+  const real = globalThis.fetch;
+  globalThis.fetch = (async (_u: string, init: RequestInit) => {
+    const body = String(init.body);
+    seen.push(body);
+    return body.includes("customer=cus_sandbox")
+      ? new Response(JSON.stringify({ error: { message: "No such customer: 'cus_sandbox'" } }), { status: 400 })
+      : new Response(JSON.stringify({ url: "https://checkout.stripe.com/c/pay/cs_live_1" }), { status: 200 });
+  }) as typeof fetch;
+  try {
+    const env = { STRIPE_SECRET_KEY: "sk_live_x", STRIPE_PRICE_ID: "price_1" } as any;
+    assert.equal(await checkoutSession(env, "mia", "mia", "cus_sandbox", "https://mergery.dev", "/"), "https://checkout.stripe.com/c/pay/cs_live_1");
+    assert.equal(seen.length, 2);
+    assert.ok(!seen[1].includes("customer="));
+  } finally {
+    globalThis.fetch = real;
+  }
 });
