@@ -243,16 +243,18 @@ async function boot() {
     if (user) { rest.delete("import"); history.replaceState(null, "", `${location.pathname}${rest.size ? `?${rest}` : ""}${location.hash}`); }
     startImport(importing);
   }
-  const projects = await fetch("/api/projects").then((r) => r.json());
+  const projects = await fetch(`/api/projects${user ? "?mine=1" : ""}`).then((r) => r.json());
   const showcase = (auth.showcase ?? []).filter((n) => projects.some((p) => p.name === n && !p.private));
-  if (!project) project = showcase[0] ?? projects.at(-1)?.name;
+  // Signed in, open one of your own projects; with none yet, the empty page says how to start one, rather than
+  // dropping you into a stranger's project as "not a member". Signed out, the showcase.
+  if (!project) project = user ? projects.filter((p) => p.mine).at(-1)?.name : showcase[0] ?? projects.at(-1)?.name;
   if (project && !projects.some((p) => p.name === project)) projects.push({ name: project });
   // Signed out, the picker offers the showcase projects rather than everyone's.
   const listed = !user && showcase.length ? projects.filter((p) => showcase.includes(p.name) || p.name === project) : projects;
-  $("#project").innerHTML = listed.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
+  $("#project").innerHTML = (project ? "" : `<option value="" selected disabled>${listed.length ? "Open a project…" : "No projects"}</option>`) + listed.map((p) => `<option value="${esc(p.name)}" ${p.name === project ? "selected" : ""}>${p.private ? "🔒 " : ""}${esc(p.name)}</option>`).join("");
   $("#project").onchange = (e) => (location.search = `?project=${e.target.value}`);
   if (!project) {
-    $("main").innerHTML = `<div class="empty"><p>No projects yet. Bring a repository you already have, and connect your agents to it in one line.</p>
+    $("main").innerHTML = `<div class="empty"><p>You don't have a project yet. Bring a repository you already have, and connect your agents to it in one line.</p>
       <form id="empty-import" class="row"><input id="empty-url" class="grow" placeholder="https://github.com/owner/repo"><button>Bring it to Mergery</button></form>
       <p class="meta">Or <a href="#" id="np-empty">start an empty project</a>.</p></div>`;
     $("#more").hidden = true;

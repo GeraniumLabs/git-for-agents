@@ -940,6 +940,13 @@ test("creating projects is invite-only: others join the waitlist until the admin
   assert.ok(!(await admin("GET", "waitlist")).some((w: any) => w.login === login));
   assert.equal((await create(name)).status, 200);
 
+  // ?mine=1 marks the projects a person belongs to, so the app opens theirs; a stranger's project isn't theirs.
+  const other = ((await fetch(`${url}/auth/dev?login=x${login}`, { redirect: "manual" })).headers.get("set-cookie") ?? "").split(";")[0];
+  const mine = async (c: string) => (await fetch(`${url}/api/projects?mine=1`, { headers: { cookie: c } }).then((r) => r.json())).find((p: any) => p.name === name)?.mine;
+  assert.equal(await mine(cookie), true);
+  assert.equal(await mine(other), false);
+  assert.equal(await mine(other), false, "asking adds nobody");
+
   const listed = async (auth: boolean) => (await fetch(`${url}/api/projects`, { headers: auth ? { authorization: `Bearer ${env.LOOM_ADMIN_TOKEN}` } : {} }).then((r) => r.json())).map((p: any) => p.name);
   assert.ok((await listed(false)).includes(name));
   await admin("PUT", `projects/${name}`, { hidden: true });

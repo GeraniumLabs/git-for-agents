@@ -333,7 +333,10 @@ export default {
       if (req.headers.get("authorization")) headers.authorization = req.headers.get("authorization")!;
       if (user) headers[USER_HEADER] = JSON.stringify(user);
       const seen = await Promise.all(all.map(async (p) => !p.private || (await (await coordinator(env, p.name)).fetch("https://do/visible", { headers }).then((r) => r.json<{ visible: boolean }>()).catch(() => ({ visible: false }))).visible));
-      return Response.json(all.filter((_, i) => seen[i]).map((p) => ({ ...p, jurisdiction: p.jurisdiction ?? null })));
+      const shown = all.filter((_, i) => seen[i]);
+      // ?mine=1: mark the projects the signed-in person belongs to, so the app opens one of theirs, not a stranger's.
+      const mine = user && url.searchParams.get("mine") ? await Promise.all(shown.map((p) => coordinator(env, p.name).then((c) => c.fetch("https://do/member", { headers })).then((r) => r.json<{ member: boolean }>()).then((r) => r.member).catch(() => false))) : null;
+      return Response.json(shown.map((p, i) => ({ ...p, jurisdiction: p.jurisdiction ?? null, ...(mine ? { mine: mine[i] } : {}) })));
     }
 
     // Billing: a person's plan, Checkout to upgrade, Stripe's portal to manage it, and Stripe's webhook.

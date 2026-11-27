@@ -950,6 +950,12 @@ export class ProjectCoordinator extends DurableObject<Env> {
     // A private project shows nothing, not even that it exists, to anyone
     // who isn't a member, an owner or one of its agents.
     if (a === "visible") return json({ visible: await this.canRead(req) });
+    // Whether the signed-in person belongs here, without adding anyone: picks the project a person lands on.
+    if (a === "member") {
+      const user = req.headers.get(USER_HEADER);
+      const id = user ? (JSON.parse(user) as User).id : null;
+      return json({ member: !!id && (this.sql.exec("SELECT 1 FROM agents WHERE identity = ?", id).toArray().length > 0 || this.siteOwner(id)) });
+    }
     if (this.isPrivate && (a === "ws" || m === "GET") && !(await this.canRead(req))) {
       throw new HttpError(404, `no project ${this.project ?? ""}; if it's private, sign in as one of its members`);
     }
