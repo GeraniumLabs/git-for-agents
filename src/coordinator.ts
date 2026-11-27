@@ -370,6 +370,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       CREATE TABLE IF NOT EXISTS creators (login TEXT PRIMARY KEY, added_by TEXT, added_at INTEGER);
       CREATE TABLE IF NOT EXISTS plans (login TEXT PRIMARY KEY, plan TEXT, status TEXT, customer TEXT, subscription TEXT, renews INTEGER, event_at INTEGER, updated_at INTEGER);
       CREATE TABLE IF NOT EXISTS waitlist (login TEXT PRIMARY KEY, name TEXT, asked_at INTEGER, asks INTEGER DEFAULT 1);
+      CREATE TABLE IF NOT EXISTS signins (login TEXT PRIMARY KEY, name TEXT, avatar TEXT, first_at INTEGER, last_at INTEGER, count INTEGER DEFAULT 1);
       CREATE TABLE IF NOT EXISTS help_quota (who TEXT NOT NULL, day TEXT NOT NULL, n INTEGER NOT NULL DEFAULT 0, minute INTEGER NOT NULL DEFAULT 0, mn INTEGER NOT NULL DEFAULT 0, PRIMARY KEY (who, day));
       ${ORG_TABLES}
       CREATE TABLE IF NOT EXISTS threads (
@@ -916,6 +917,30 @@ export class ProjectCoordinator extends DurableObject<Env> {
           u.login, u.plan, u.status, u.customer, u.subscription, u.renews, u.at, Date.now());
         return json({ applied: true, owned: this.ownedBy(u.login) });
       }
+      // Who signs in, first and last time (src/auth.ts records each GitHub sign-in).
+      if (b === "signin" && m === "POST") {
+        const login = String(body.login ?? "").trim().toLowerCase();
+        if (!login) throw new HttpError(400, "give a login");
+        const now = Date.now();
+        this.sql.exec(`INSERT INTO signins (login, name, avatar, first_at, last_at, count) VALUES (?, ?, ?, ?, ?, 1)
+          ON CONFLICT(login) DO UPDATE SET name = excluded.name, avatar = excluded.avatar, last_at = excluded.last_at, count = signins.count + 1`,
+          login, body.name ?? login, body.avatar ?? "", now, now);
+        return json({ ok: true });
+      }
+      // Everything the site's admin page reads from the registry (the Worker checks who's asking).
+      if (b === "admin" && m === "GET") {
+        const all = (q: string) => this.sql.exec(q).toArray();
+        return json({
+          signins: all("SELECT login, name, avatar, first_at, last_at, count FROM signins"),
+          projects: all("SELECT name, created_at, private, jurisdiction, owner, hidden, org FROM projects ORDER BY created_at").map((p) => ({ ...p, private: !!p.private, hidden: !!p.hidden })),
+          plans: all("SELECT login, plan, status, renews, updated_at FROM plans"),
+          waitlist: all("SELECT login, name, asked_at, asks FROM waitlist"),
+          creators: all("SELECT login, added_at FROM creators"),
+          orgs: all("SELECT slug, name, created_by, created_at FROM orgs"),
+          orgMembers: all("SELECT org, login, role, added_at FROM org_members"),
+          emails: all("SELECT login, email, updated_at FROM people WHERE email IS NOT NULL"),
+        });
+      }
       if (b === "hidden") {
         this.sql.exec("UPDATE projects SET hidden = ? WHERE name = ?", body.hidden ? 1 : 0, body.name);
         return json({ ok: true });
@@ -943,6 +968,8 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (a === "org-sync" && m === "POST" && url.hostname === "do") return json(await this.syncOrg(body));
     // Deleted (or never made): nothing here answers.
     if (!this.meta("project")) throw new HttpError(404, "no such project");
+    // From the Worker for the site's admin page; never routed from outside.
+    if (a === "admin-usage" && m === "GET" && url.hostname === "do") return json(this.adminUsage());
     // From the Worker's queue handler: a push to one of this project's repos (never routed from outside).
     if (a === "artifacts-event" && m === "POST") return json(await this.onPush(body));
 
@@ -4987,6 +5014,44 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (out.changesPerDay === 0) delete out.changesPerDay;
     if (out.checkMinutesPerDay === 0) delete out.checkMinutesPerDay;
     return out;
+  }
+
+  /** What this project holds and how busy it is, for the site's admin page. Counts only, no content. */
+  private adminUsage() {
+    const now = Date.now(), week = now - 7 * 86_400_000, month = now - 30 * 86_400_000;
+    const one = (q: string, ...v: unknown[]) => this.sql.exec(q, ...v).one() as Record<string, number | null>;
+    const count = (q: string, ...v: unknown[]) => Number(one(q, ...v).n ?? 0);
+    const changes = Object.fromEntries(this.sql.exec("SELECT status, COUNT(*) AS n FROM changes GROUP BY status").toArray().map((r) => [r.status, r.n]));
+    const traces = one("SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes, COALESCE(SUM(tokens_in + tokens_out), 0) AS tokens, COALESCE(SUM(cost_usd), 0) AS cost FROM traces WHERE removed_at IS NULL");
+    const attachments = one("SELECT COUNT(*) AS n, COALESCE(SUM(size), 0) AS bytes FROM attachments");
+    const day = (ts: number) => new Date(ts).toISOString().slice(0, 10);
+    const daily: Record<string, { events: number; merged: number }> = {};
+    for (const r of this.sql.exec("SELECT ts / 86400000 AS d, COUNT(*) AS n, SUM(type = 'change.merged') AS merged FROM events WHERE ts > ? GROUP BY d", month).toArray()) {
+      daily[day(Number(r.d) * 86_400_000)] = { events: Number(r.n), merged: Number(r.merged ?? 0) };
+    }
+    return {
+      project: this.project,
+      plan: this.meta("plan"),
+      visibility: this.isPrivate ? "private" : "public",
+      importedFrom: JSON.parse(this.meta("imported_from") ?? "null")?.url ?? null,
+      people: this.sql.exec("SELECT identity, name, owner, created_at, last_seen FROM agents WHERE role = 'human' AND identity LIKE 'github:%'").toArray()
+        .map((r) => ({ login: String(r.identity).slice(7), owner: !!r.owner, joined: r.created_at, lastSeen: r.last_seen })),
+      agents: count("SELECT COUNT(*) AS n FROM agents WHERE role <> 'human'"),
+      agentsActive7d: count("SELECT COUNT(*) AS n FROM agents WHERE role <> 'human' AND last_seen > ?", week),
+      tasks: count("SELECT COUNT(*) AS n FROM tasks"),
+      changes,
+      changesTotal: Object.values(changes).reduce<number>((a, n) => a + Number(n), 0),
+      changes7d: count("SELECT COUNT(*) AS n FROM changes WHERE created_at > ?", week),
+      merged7d: count("SELECT COUNT(*) AS n FROM events WHERE type = 'change.merged' AND ts > ?", week),
+      reviews: count("SELECT COUNT(*) AS n FROM reviews"),
+      events: count("SELECT COUNT(*) AS n FROM events"),
+      mainVersion: this.mainVersion,
+      traces: { count: Number(traces.n ?? 0), bytes: Number(traces.bytes ?? 0), tokens: Number(traces.tokens ?? 0), costUsd: Number(traces.cost ?? 0) },
+      attachments: { count: Number(attachments.n ?? 0), bytes: Number(attachments.bytes ?? 0) },
+      checkMinutes30d: Math.round(count("SELECT COALESCE(SUM(checks_ms), 0) AS n FROM agent_usage WHERE day >= ?", day(month)) / 600) / 100,
+      lastActivity: one("SELECT MAX(ts) AS t FROM events").t ?? null,
+      daily,
+    };
   }
 
   private usage(group: string) {

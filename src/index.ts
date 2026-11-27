@@ -12,6 +12,7 @@ import { PLANS, billingOn, testMode, checkoutSession, planUpdate, portalSession,
 import { ORG_SLUG, orgAccount, type OrgPeople, type OrgRole } from "./orgs";
 import { HELP_LIMITS, HELP_WORKERS_AI_MODEL, askHelp, parseHelpInput, projectDigest, type HelpModel } from "./helpdesk";
 import { MERGERY_SKILL } from "./askskill";
+import { adminReport, pool, type ProjectUsage, type RegistryDump } from "./admin";
 export { ProjectCoordinator } from "./coordinator";
 export { CheckRunner } from "./checks";
 
@@ -386,6 +387,25 @@ export default {
       return Response.json({ error: "not found" }, { status: 404 });
     }
 
+    // The admin page's report: signups and usage, for the server's owners (LOOM_OWNERS) or the admin token.
+    if (path === "/api/admin/overview" && req.method === "GET") {
+      const user = await sessionUser(env, req);
+      const allowed = (await isAdmin(env, req)) || (!!user && logins(env.LOOM_OWNERS).includes(user.login.toLowerCase()));
+      if (!allowed) return Response.json({ error: user ? "only the site's owners can see this" : "sign in first" }, { status: user ? 403 : 401 });
+      const reg = await registry(env).fetch("https://do/registry/admin").then((r) => r.json<RegistryDump>());
+      const usage = new Map<string, ProjectUsage | { error: string }>();
+      await pool(reg.projects, 8, async (p) => {
+        try {
+          const ns = projectNamespace(env, p.jurisdiction as Jurisdiction | null);
+          const r = await ns.get(ns.idFromName(p.name)).fetch("https://do/admin-usage");
+          usage.set(p.name, r.ok ? await r.json<ProjectUsage>() : { error: `HTTP ${r.status}` });
+        } catch (e: any) {
+          usage.set(p.name, { error: String(e?.message ?? e) });
+        }
+      });
+      return Response.json(adminReport(reg, usage), { headers: { "cache-control": "no-store" } });
+    }
+
     // The admin: who may create projects, who's waiting, and which projects are listed.
     const adm = path.match(/^\/api\/admin\/(waitlist|creators|projects)(?:\/([a-z0-9-]+))?$/);
     if (adm) {
@@ -510,7 +530,7 @@ export default {
     if (path === "/api/git/credential" && req.method === "POST") return gitCredential(env, req);
 
     let m = path.match(/^\/api\/projects\/([a-z0-9-]+)\/(.*)$/);
-    if (m && /^(init|registry|visible|artifacts-event|project)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
+    if (m && /^(init|registry|visible|artifacts-event|project|admin-usage)\b/.test(m[2])) return Response.json({ error: "not found" }, { status: 404 });
     // Turn away an oversized attachment before its bytes travel on to the coordinator.
     if (m && m[2] === "attachments" && req.method === "POST" && Number(req.headers.get("content-length") ?? 0) > MAX_ATTACHMENT_BYTES) {
       return Response.json({ error: tooBig(Number(req.headers.get("content-length"))).message }, { status: 413, headers: { connection: "close" } });
