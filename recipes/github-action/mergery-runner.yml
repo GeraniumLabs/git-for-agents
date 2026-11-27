@@ -3,10 +3,10 @@
 # .github/workflows/ (it doesn't need the project's code: Mergery is its home).
 #
 # Set in the repository's settings:
-#   variables  LOOM_URL      e.g. https://loom.example.dev
-#              LOOM_PROJECT  the project's name
-#   secrets    LOOM_KEY            an agent key for the project (trade a join code for one)
-#              ANTHROPIC_API_KEY   for Claude Code
+#   variables  MERGERY_PROJECT  the project's name
+#              MERGERY_URL      only for a Mergery other than https://mergery.dev
+#   secrets    MERGERY_KEY      an agent key for the project (trade a join code for one)
+#              ANTHROPIC_API_KEY  for Claude Code
 #
 # It runs every 30 minutes, and at once when Mergery posts a webhook: in the
 # project's Settings, under Runners, add
@@ -22,7 +22,7 @@ on:
   workflow_dispatch:
 
 concurrency:
-  group: loom-runner
+  group: mergery-runner
   cancel-in-progress: false
 
 jobs:
@@ -30,14 +30,14 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     env:
-      LOOM_URL: ${{ vars.LOOM_URL }}
-      LOOM_PROJECT: ${{ vars.LOOM_PROJECT }}
-      LOOM_KEY: ${{ secrets.LOOM_KEY }}
+      MERGERY_URL: ${{ vars.MERGERY_URL || 'https://mergery.dev' }}
+      MERGERY_PROJECT: ${{ vars.MERGERY_PROJECT }}
+      MERGERY_KEY: ${{ secrets.MERGERY_KEY }}
     steps:
       - name: Look for work
         id: work
         run: |
-          curl -sf -H "Authorization: Bearer $LOOM_KEY" "$LOOM_URL/api/projects/$LOOM_PROJECT/work" > work.json
+          curl -sf -H "Authorization: Bearer $MERGERY_KEY" "$MERGERY_URL/api/projects/$MERGERY_PROJECT/work" > work.json
           echo "count=$(jq '.items | length' work.json)" >> "$GITHUB_OUTPUT"
           jq -r '.items[] | "- \(.text)"' work.json
       - name: Start an agent
@@ -46,6 +46,6 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
           npm install -g @anthropic-ai/claude-code
-          jq -n --arg url "$LOOM_URL/mcp/$LOOM_PROJECT" --arg key "Bearer $LOOM_KEY" \
-            '{mcpServers: {loom: {type: "http", url: $url, headers: {Authorization: $key, "X-Loom-Agent": "github-runner"}}}}' > mcp.json
-          claude -p "$(jq -r .prompt work.json)" --mcp-config mcp.json --allowedTools mcp__loom
+          jq -n --arg url "$MERGERY_URL/mcp/$MERGERY_PROJECT" --arg key "Bearer $MERGERY_KEY" \
+            '{mcpServers: {mergery: {type: "http", url: $url, headers: {Authorization: $key, "X-Loom-Agent": "github-runner"}}}}' > mcp.json
+          claude -p "$(jq -r .prompt work.json)" --mcp-config mcp.json --allowedTools mcp__mergery

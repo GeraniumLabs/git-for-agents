@@ -144,7 +144,7 @@ function renderMe() {
   $("#me").innerHTML = me
     ? `${user ? `<a class="who-me" href="#account" title="Your account, plan and organizations">` : `<span class="who-me">`}${face}${esc(me.name)} <span class="role">${me.owner ? "owner" : me.role === "human" ? "member" : me.role}</span>${user ? "</a>" : "</span>"}<button id="signout" class="ghost">Sign out</button>`
     : user
-      ? `<a class="who-me" href="#account" title="Your account, plan and organizations">${face}${esc(user.login)} <span class="role">not a member</span></a><button id="signout" class="ghost">Sign out</button>`
+      ? `<a class="who-me" href="#account" title="Your account, plan and organizations">${face}${esc(user.login)}${project ? ` <span class="role">not a member</span>` : ""}</a><button id="signout" class="ghost">Sign out</button>`
       : `<button id="signin">Sign in</button>`;
   if ($("#signout")) $("#signout").onclick = async () => {
     // Sign out everywhere on this site: the GitHub session and any key pasted for any project.
@@ -1173,9 +1173,9 @@ async function showClone(box, target) {
   const cmds = { clone: r.clone + (r.compare ? `\n${r.compare}` : ""), pull: r.pull, key: r.pullWithKey, login: r.login, plain: r.plainClone };
   box.innerHTML = block("clone", "Clone", cmds.clone)
     + (r.pull ? block("pull", "Pull into a clone you have", r.pull, "Fetches the latest and merges it, with a fresh token, so it works after the one in your clone expires.") : "")
-    + (r.pullWithKey ? block("key", "Pull with an agent key, any time", r.pullWithKey, `Asks Mergery for a fresh pull command with the key in <span class="mono">$LOOM_KEY</span> and runs it. Needs <span class="mono">jq</span>. Good for scripts and agents that don't sign in.`) : "")
-    + (r.login ? `<details class="clone-login"><summary><b>Git login</b>: use plain git for everything</summary>`
-      + block("login", "Set up once, with your agent key in $LOOM_KEY", r.login, `Adds a git credential helper for this host. Every git command (fetch, pull, push, branch) then gets a fresh token from Mergery with your key, so nothing expires. Main stays read-only; a task's workspace is writable by the agent holding it. For a second project's key, run <span class="mono">git config mergery.key &lt;key&gt;</span> inside that clone, or set <span class="mono">$LOOM_KEY</span>. Revoking the key in Settings logs it out.`)
+    + (r.pullWithKey ? block("key", "Pull with an agent key, any time", r.pullWithKey, `For scripts and headless agents with their own key (make one in <b>Connect an agent › With its own key</b>). Asks Mergery for a fresh pull command with the key in <span class="mono">$MERGERY_KEY</span> and runs it. Needs <span class="mono">jq</span>.`) : "")
+    + (r.login ? `<details class="clone-login"><summary><b>Git login</b>: use plain git for everything, with an agent key</summary><p class="meta">Git can't use your browser sign-in, so this needs an agent key: an owner makes one in <b>Connect an agent › With its own key</b>. Agents connected through your account don't need it: <span class="mono">claim_task</span> gives them clone and push commands.</p>`
+      + block("login", "Set up once, with the key in $MERGERY_KEY", r.login, `Run <span class="mono">export MERGERY_KEY=&lt;agent key&gt;</span> first. This saves the key in your git config and adds a credential helper for this host. Every git command (fetch, pull, push, branch) then gets a fresh token from Mergery with the key, so nothing expires. Main stays read-only; a task's workspace is writable by the agent holding it. For a second project's key, run <span class="mono">git config mergery.key &lt;key&gt;</span> inside that clone, or set <span class="mono">$MERGERY_KEY</span>. Revoking the key in Settings logs it out.`)
       + block("plain", "Then clone with nothing extra", r.plainClone)
       + `</details>` : "")
     + `<p class="meta">${esc(r.note)}</p>`;
@@ -1366,12 +1366,35 @@ function showNewJoinCode() {
 let copiedPlainSkill = false;
 // Which way in the Connect dialog shows: "me" (signed in as you, through a browser) or "own" (headless, a join code and its own key).
 let connectPath = null;
+/** Connect an agent before there's a project: one line for every project you'll have, from an agent that can create them. */
+function showAccountConnect() {
+  const mcpUrl = `${location.origin}/mcp`;
+  const lines = [
+    ["Claude Code", `claude mcp add --transport http mergery ${mcpUrl}`],
+    ["Codex", `codex mcp add mergery --url ${mcpUrl}`],
+    ["OpenCode", JSON.stringify({ mcp: { mergery: { type: "remote", url: mcpUrl } } }), `Put this in <span class="mono">opencode.json</span>, then run <span class="mono">opencode mcp auth mergery</span> once to sign in.`],
+  ];
+  const ask = "Use the mergery MCP server: bring this repository to Mergery (create_project with its git URL), then file a few tasks for what you'd improve first.";
+  $("#detail-body").innerHTML = `<h3>Connect an agent</h3>
+    <p class="meta">You don't have a project yet. ${user ? `<a href="#" id="ac-new">Create one</a> and connect agents to it, or connect your coding agent now:` : `<a href="#" id="ac-signin">Sign in</a>, then connect your coding agent:`} it works across all your projects and can create one for you.</p>
+    <h2>Run this where your agent runs</h2>
+    <p class="meta">It opens your browser once to sign in with GitHub, then works as your agent. No key and no skill: Mergery's MCP server tells the agent how to work here.</p>
+    ${lines.map(([app, c, how]) => `<p class="meta connect-app"><b>${app}</b>${how ? `: ${how}` : ""}</p><div class="row code-row"><pre class="diff copy grow">${esc(c)}</pre><button class="ghost mini" data-copy="${esc(c)}">Copy</button></div>`).join("")}
+    <p class="meta">Then ask it, from inside the repository you want to bring:</p>
+    <pre class="diff copy">${esc(ask)}</pre><div class="row"><button class="ghost mini" data-copy="${esc(ask)}">Copy</button></div>
+    <p class="meta connect-foot">Headless agents (a swarm, CI, a server) connect to one project with its own join code: create the project first, then open <b>Connect an agent</b> again.</p>`;
+  if ($("#ac-new")) $("#ac-new").onclick = (e) => { e.preventDefault(); $("#detail").close(); showNewProject(); };
+  if ($("#ac-signin")) $("#ac-signin").onclick = (e) => { e.preventDefault(); showSignIn("Sign in to connect your agent."); };
+  wireCopy($("#detail-body"));
+  if (!$("#detail").open) $("#detail").showModal();
+}
 async function showSkill(joinCode, fresh = false) {
-  const text = await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
+  if (!project) return showAccountConnect();
+  const text =await fetch(`/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}`, { headers: keyHeader() }).then((r) => r.text());
   // A pasted code is checked by the server, which only puts a live join code into the skill.
   if (joinCode?.pasted && !text.includes(joinCode.code)) { toast(`That join code isn't valid for ${project}: it may have expired, been used up or revoked`); return showSkill(); }
   const codes = isOwner() ? await api("/join-codes").catch(() => []) : [];
-  const save = `mkdir -p .claude/skills/mergery-${project} && curl -s "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/mergery-${project}/SKILL.md`;
+  const save = `mkdir -p .claude/skills/mergery-${project} && curl -fsS "${location.origin}/api/projects/${project}/skill${joinCode ? `?code=${encodeURIComponent(joinCode.code)}` : ""}" > .claude/skills/mergery-${project}/SKILL.md`;
   const owner = isOwner();
   const codeRows = codes.map((c) => `<div class="qrow"><span class="grow">#${c.id} ${esc(c.label ?? "")} <span class="role">${esc(c.role)}</span> <span class="meta">${c.uses}/${c.maxUses} joined${c.agents.length ? `: ${c.agents.map((a) => esc(a.name)).join(", ")}` : ""} · ${c.revoked ? "revoked" : c.live ? `until ${new Date(c.expiresAt).toLocaleDateString()}` : "expired or used up"}</span></span>${c.live ? `<button class="ghost mini" data-jc-revoke="${c.id}">Revoke</button>` : ""}</div>`).join("");
   // Owners go in order: make a join code, then copy the skill that carries it.
@@ -1400,7 +1423,7 @@ async function showSkill(joinCode, fresh = false) {
   const ownStep1 = owner ? step1 : joinCode ? `<h2>1. Join code added</h2><div class="card fresh"><b>The skill below carries your join code</b><p class="meta">Any agent you give it registers itself once and saves its own key. Sub-agents use that key with their own names.</p></div>`
     : `<h2>1. Get a join code</h2>
       <p class="meta">Only a project's owners can make one.</p>
-      <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (loomjoin_…)"><button id="jc-use">Use code</button></div>
+      <div class="row"><input id="jc-paste" placeholder="Paste a join code an owner gave you (mergeryjoin_…)"><button id="jc-use">Use code</button></div>
       <p class="meta">${user ? `${me ? `You aren't an owner of ${esc(project)}: ask one for a join code.` : `Ask an owner of ${esc(project)} for a join code.`} Or <a href="#" id="jc-new-project">create your own project</a>: it comes with a join code.`
         : `Own ${esc(project)}? <a href="#" id="jc-signin">Sign in</a> to make one. Want your own? Sign in and create a project: it comes with a join code.`}</p>`;
   $("#detail-body").innerHTML = `
@@ -1422,12 +1445,12 @@ async function showSkill(joinCode, fresh = false) {
       <p class="meta">A <b>join code</b> lets many agents register: each trades it for its own key once and reuses that key, so Mergery shows every agent separately with its own history and track record. The <b>skill</b> is a SKILL.md file for the agent: it registers with the code, saves the key, connects over MCP with it and explains how to work here.</p>
       ${ownStep1}
       <h2>2. Give your agents the skill</h2>
-      <p class="meta" id="skill-why">${joinCode ? "It carries the join code." : `Needs a join code from step 1 first: without one, agents given the skill can't register.${owner ? " (Or make a key for a single agent below.)" : " If an owner gave you a key for one agent instead, open the skill below and give it that key as LOOM_KEY."}`}</p>
+      <p class="meta" id="skill-why">${joinCode ? "It carries the join code." : `Needs a join code from step 1 first: without one, agents given the skill can't register.${owner ? " (Or make a key for a single agent below.)" : " If an owner gave you a key for one agent instead, give the agent the skill and that key as MERGERY_KEY."}`}</p>
       <div class="row code-row"><button id="skill-copy" ${joinCode ? "" : "disabled"}>${joinCode ? "Copy skill with join code" : "Copy skill"}</button><button class="ghost" id="skill-copy-cmd" ${joinCode ? "" : "disabled"}>Copy install command</button></div>
       <pre class="diff copy" id="skill-cmd" ${joinCode ? "" : "hidden"}>${esc(save)}</pre>
       ${owner && codes.length ? `<h2>Join codes</h2>${codeRows}${joinCode ? `<div class="row"><button class="ghost mini" id="jc-another">Create another join code</button></div>` : ""}` : ""}
       <details class="alt key-section"><summary>Only one agent, set up by hand? Make a key just for it</summary>
-      ${isOwner() ? `<p class="meta">Instead of a join code, a key for one agent. It's shown once: give it to the agent as <span class="mono">LOOM_KEY</span>, with the skill. Keep one key per agent for its life; an agent can replace a leaked key without losing who it is. Anything that starts sub-agents or a swarm is better off with a join code.</p>
+      ${isOwner() ? `<p class="meta">Instead of a join code, a key for one agent. It's shown once: give it to the agent as <span class="mono">MERGERY_KEY</span> (in its environment or a CI secret), with the skill. The skill saves it to a file the first time, so it survives restarts. Keep one key per agent for its life; an agent can replace a leaked key without losing who it is. Anything that starts sub-agents or a swarm is better off with a join code.</p>
       <div class="row"><input id="mk-name" placeholder="Agent name, e.g. builder-7"><select id="mk-role"><option value="builder">builder</option><option value="reviewer">reviewer</option></select><button class="ghost" id="mk-go">Create key</button></div>
       <div id="mk-out"></div>` : `<p class="meta">${me ? "Only the project's owners can create agent keys." : "Sign in as one of the project's owners to create agent keys."}</p>`}
       </details>
@@ -1451,7 +1474,7 @@ async function showSkill(joinCode, fresh = false) {
       // A key for one agent is the other way past step 1: the skill without a code is now useful.
       for (const id of ["#skill-copy", "#skill-copy-cmd"]) $(id).disabled = false;
       $("#skill-cmd").hidden = false;
-      $("#skill-why").textContent = "Give this agent the skill and its key. The skill has no join code, so it uses LOOM_KEY.";
+      $("#skill-why").textContent = "Give this agent the skill and its key as MERGERY_KEY. The skill has no join code, so it uses the key.";
       wireCopy($("#mk-out"));
     } catch {}
   };
@@ -1504,7 +1527,7 @@ function traceSection(keys, p = state?.project ?? {}) {
   const intro = `<h2>Session traces <small>from every agent that makes decisions</small></h2>
     <p class="meta">Every agent makes decisions, whichever way it connects, so every agent can leave a trace: a reviewer switches a change to <b>Intent</b> and sees what was asked and why the agent did what it did. Nothing is collected until it's turned on. Secrets are removed before anything is stored, and only the project's people can read traces.</p>`;
   const all = `<p class="meta connect-app"><b>Every agent, including those with their own key</b></p>
-    <p class="meta">${askAll ? "<b>On.</b> Every agent is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change, until the change has its trace. Agents whose person runs a hook below aren't asked twice." : "<b>Off.</b> Turn it on and every agent, headless ones included, is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change."} A headless agent can also upload with the hook script, given <span class="mono">LOOM_URL</span>, <span class="mono">LOOM_PROJECT</span> and its <span class="mono">LOOM_KEY</span> (see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>).</p>
+    <p class="meta">${askAll ? "<b>On.</b> Every agent is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change, until the change has its trace. Agents whose person runs a hook below aren't asked twice." : "<b>Off.</b> Turn it on and every agent, headless ones included, is asked to attach its session with the <span class=\"mono\">attach_trace</span> tool when it submits a change."} A headless agent can also upload with the hook script, given <span class="mono">MERGERY_PROJECT</span> and its <span class="mono">MERGERY_KEY</span> (see <a href="https://github.com/GeraniumLabs/git-for-agents/blob/main/docs/guide.md#session-traces-review-decisions-after-the-fact" target="_blank" rel="noopener">the guide</a>).</p>
     ${isOwner() ? `<div class="row"><button class="ghost" id="tr-ask-all">${askAll ? "Stop asking every agent" : "Ask every agent for its trace"}</button></div>` : askAll ? "" : `<p class="meta">The project's owners turn this on.</p>`}`;
   const hookWhy = `A hook uploads your own agent's sessions in a repository (Claude Code when a session ends; Codex and OpenCode once a session has been idle for 5 minutes), with no work for the agent.`;
   const mine = `<p class="meta connect-app"><b>Your agents, through your account</b></p>`;
@@ -1552,8 +1575,8 @@ function wireTraceSection(redraw) {
 }
 
 const keyBox = (k, proj) => `<div class="card"><b>Key for ${esc(k.name)}</b> <span class="role">${k.role}</span>
-  <pre class="diff copy">export LOOM_KEY=${esc(k.key)}</pre>
-  <p class="meta">Shown once: Mergery keeps only its hash. Give it to the agent with the skill from <b>Connect an agent</b>; it works only on ${esc(proj)}. If the agent starts sub-agents, the skill has each one send its own name with this key, so Mergery shows them as separate agents under ${esc(k.name)}.</p>
+  <pre class="diff copy">export MERGERY_KEY=${esc(k.key)}</pre>
+  <p class="meta">Shown once: Mergery keeps only its hash. Give it to the agent as <span class="mono">MERGERY_KEY</span>, with the skill above (copy it again now: the buttons work without a join code). It works only on ${esc(proj)}; tell the agent to use <b>${esc(k.name)}</b> as its name. If the agent starts sub-agents, the skill has each one send its own name with this key, so Mergery shows them as separate agents under ${esc(k.name)}.</p>
   <button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button></div>`;
 function wireCopy(root) { for (const b of root.querySelectorAll("[data-copy]")) b.onclick = () => navigator.clipboard?.writeText(b.dataset.copy).then(() => toast("Copied")); }
 
@@ -2017,9 +2040,9 @@ async function showSettings(tab) {
     const scopes = [...$("#detail-body").querySelectorAll("[data-si-scope]")].filter((c) => c.checked).map((c) => c.dataset.siScope);
     let k;
     try { k = await act("POST", "/standins", { name, scopes, webhook: $("#si-hook").value.trim() || null }); } catch { return; }
-    const install = `mkdir -p .claude/skills/mergery-${project}-standin && curl -s -H \"Authorization: Bearer $LOOM_STANDIN_KEY\" "${k.skill}" > .claude/skills/mergery-${project}-standin/SKILL.md`;
+    const install = `mkdir -p .claude/skills/mergery-${project}-standin && curl -fsS -H \"Authorization: Bearer $MERGERY_STANDIN_KEY\" "${k.skill}" > .claude/skills/mergery-${project}-standin/SKILL.md`;
     $("#si-out").innerHTML = `<p class="meta">Shown once. Give your agent the skill and the key; Mergery keeps only the key's hash.</p>
-      <pre class="diff copy">export LOOM_STANDIN_KEY=${esc(k.key)}</pre>
+      <pre class="diff copy">export MERGERY_STANDIN_KEY=${esc(k.key)}</pre>
       ${k.webhookSecret ? `<p class="meta">Webhook signing secret: deliveries carry <span class="mono">x-loom-signature: sha256=&lt;HMAC of the body&gt;</span>.</p><pre class="diff copy">${esc(k.webhookSecret)}</pre>` : ""}
       <pre class="diff copy">${esc(install)}</pre>
       <div class="row"><button class="ghost mini" data-copy="${esc(k.key)}">Copy key</button><button class="ghost mini" data-copy="${esc(install)}">Copy install command</button></div>`;

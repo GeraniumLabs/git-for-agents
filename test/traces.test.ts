@@ -87,10 +87,10 @@ test("anything else is kept as text with no steps", () => {
 });
 
 test("secrets are redacted and JSON stays valid", () => {
-  const log = line({ content: "export ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123 and ghp_abcdefghijklmnopqrstuvwxyz0123456789 at https://bob:hunter22@db.example.com/x, password: \"correct-horse\", Authorization: Bearer abcdefghijklmnopqrstuvwx, loom_ABCDEFGHIJKLMNOPQRST" });
+  const log = line({ content: "export ANTHROPIC_API_KEY=sk-ant-api03-abcdefghijklmnopqrstuvwxyz0123 and ghp_abcdefghijklmnopqrstuvwxyz0123456789 at https://bob:hunter22@db.example.com/x, password: \"correct-horse\", Authorization: Bearer abcdefghijklmnopqrstuvwx, loom_ABCDEFGHIJKLMNOPQRST, mergery_0123456789abcdef0123, mergerytrace_0123456789abcdef01, loomtrace_0123456789abcdef01, mergeryjoin_0123456789abcdef" });
   const r = redact(log);
   assert.doesNotThrow(() => JSON.parse(r.text));
-  for (const secret of ["sk-ant-api03", "ghp_abc", "hunter22", "correct-horse", "Bearer abcdefgh", "loom_ABCD"]) assert.ok(!r.text.includes(secret), `${secret} is gone`);
+  for (const secret of ["sk-ant-api03", "ghp_abc", "hunter22", "correct-horse", "Bearer abcdefgh", "loom_ABCD", "mergery_0123", "mergerytrace_0123", "loomtrace_0123", "mergeryjoin_0123"]) assert.ok(!r.text.includes(secret), `${secret} is gone`);
   assert.ok(r.text.includes("ANTHROPIC_API_KEY="), "the name stays, only the value goes");
   assert.ok(r.count >= 6);
   assert.equal(r.kinds["github-token"], 1);

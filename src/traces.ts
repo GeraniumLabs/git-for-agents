@@ -93,7 +93,8 @@ const SECRET_PATTERNS: [string, RegExp][] = [
   ["slack-token", /\bxox[abprs]-[A-Za-z0-9-]{10,}/g],
   ["stripe-key", /\b(?:sk|rk|whsec)_(?:live|test)?_?[A-Za-z0-9]{16,}/g],
   ["google-key", /\bAIza[0-9A-Za-z_-]{35}/g],
-  ["loom-key", /\bloom(?:stand)?_[A-Za-z0-9]{16,}/g],
+  // Every kind of Mergery key, under the new prefix or the old one: agent, stand-in, trace key and join code.
+  ["loom-key", /\b(?:mergery|loom)(?:stand|trace|join)?_[A-Za-z0-9]{16,}/g],
   ["jwt", /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}/g],
 ];
 /** user:password@ in a URL. */

@@ -2,20 +2,21 @@
 // Call one Mergery MCP tool from a shell, so any agent with a terminal (Claude
 // Code, a subagent, a script) can work a project without an MCP client.
 //
-//   LOOM_KEY=... node demo/mcp-call.mjs <project> tools              list tools
-//   LOOM_KEY=... node demo/mcp-call.mjs <project> <tool> '<json args>'
+//   MERGERY_KEY=... node demo/mcp-call.mjs <project> tools              list tools
+//   MERGERY_KEY=... node demo/mcp-call.mjs <project> <tool> '<json args>'
 
-const BASE = process.env.LOOM_URL ?? "http://127.0.0.1:8787";
+const BASE = process.env.MERGERY_URL ?? process.env.LOOM_URL ?? "http://127.0.0.1:8787";
+const KEY = process.env.MERGERY_KEY ?? process.env.LOOM_KEY;
 const [project, tool, json] = process.argv.slice(2);
-if (!project || !tool || !process.env.LOOM_KEY) {
-  console.error("usage: LOOM_KEY=... node demo/mcp-call.mjs <project> tools | <tool> '<json args>'");
+if (!project || !tool || !KEY) {
+  console.error("usage: MERGERY_KEY=... node demo/mcp-call.mjs <project> tools | <tool> '<json args>'");
   process.exit(2);
 }
 
 async function rpc(method, params) {
   const res = await fetch(`${BASE}/mcp/${project}`, {
     method: "POST",
-    headers: { authorization: `Bearer ${process.env.LOOM_KEY}`, "content-type": "application/json" },
+    headers: { authorization: `Bearer ${KEY}`, "content-type": "application/json" },
     body: JSON.stringify({ jsonrpc: "2.0", id: 1, method, params }),
   });
   const msg = await res.json();

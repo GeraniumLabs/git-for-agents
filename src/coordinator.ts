@@ -1366,7 +1366,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!name?.trim()) throw new HttpError(400, "name is required");
     this.assertAgentRoom();
     const id = `${name.toLowerCase().replace(/[^a-z0-9]+/g, "-")}-${randomId(2)}`;
-    const key = `loom_${randomId(20)}`;
+    const key = `mergery_${randomId(20)}`;
     this.sql.exec("INSERT INTO agents (id, name, role, key_hash, created_at, last_seen) VALUES (?, ?, ?, ?, ?, ?)", id, name, role, await sha256(key), Date.now(), Date.now());
     this.emit("agent.joined", { actor: id, data: { name, role, by } });
     return { id, name, role, key };
@@ -1382,7 +1382,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if (!(maxUses >= 1 && maxUses <= 10_000)) throw new HttpError(400, "maxUses is between 1 and 10000");
     const hours = body.expiresInHours === undefined ? 72 : Number(body.expiresInHours);
     if (!(hours > 0 && hours <= 24 * 90)) throw new HttpError(400, "expiresInHours is between 0 and 2160 (90 days)");
-    const code = `loomjoin_${randomId(16)}`;
+    const code = `mergeryjoin_${randomId(16)}`;
     const expiresAt = Date.now() + hours * 3_600_000;
     const r = this.sql.exec("INSERT INTO join_codes (code_hash, label, role, max_uses, expires_at, created_by, created_at, limits) VALUES (?, ?, ?, ?, ?, ?, ?, ?) RETURNING id",
       await sha256(code), body.label?.trim() || null, role, maxUses, expiresAt, actor.id, Date.now(), limits ? JSON.stringify(limits) : null).one();
@@ -1392,7 +1392,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
 
   /** The code itself if it is a live join code of this project, so the skill never carries anything else someone put in a link. */
   private async liveJoinCode(code: string | null) {
-    if (!code || !/^loomjoin_[A-Za-z0-9_-]{8,64}$/.test(code)) return null;
+    if (!code || !/^(?:mergery|loom)join_[A-Za-z0-9_-]{8,64}$/.test(code)) return null;
     const r = this.sql.exec("SELECT revoked_at, expires_at, uses, max_uses FROM join_codes WHERE code_hash = ?", await sha256(code)).toArray()[0];
     return r && !r.revoked_at && (r.expires_at as number) > Date.now() && (r.uses as number) < (r.max_uses as number) ? code : null;
   }
@@ -1435,7 +1435,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const row = this.sql.exec("SELECT id, name, role FROM agents WHERE id = ?", agentId).toArray()[0];
     if (!row) throw new HttpError(404, `agent ${agentId} not found`);
     if (row.role === "human") throw new HttpError(400, "people sign in with GitHub; they have no key");
-    const key = `loom_${randomId(20)}`;
+    const key = `mergery_${randomId(20)}`;
     this.sql.exec("UPDATE agents SET key_hash = ? WHERE id = ?", await sha256(key), agentId);
     this.emit("agent.key_rotated", { actor: actor.id, to: agentId, data: { by: actor.name } });
     return { id: row.id, name: row.name, role: row.role, key };
@@ -1764,7 +1764,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       // Bring a clone you already have up to date. The token in it expires, so the remote and a fresh token go on the command itself.
       ...(at ? {} : { pull: `git -C ${dir} -c http.extraHeader="Authorization: Bearer ${token}" pull ${remote} main` }),
       // For keys and scripts: a fresh pull command whenever you need one, no browser.
-      ...(at || !origin ? {} : { pullWithKey: `curl -fsS -X POST -H "Authorization: Bearer $LOOM_KEY" -H "content-type: application/json" -d '${JSON.stringify(body.workspace ? { workspace: body.workspace } : body.change ? { change: body.change } : {})}' ${origin}/api/projects/${this.project}/checkout | jq -r .pull | sh` }),
+      ...(at || !origin ? {} : { pullWithKey: `curl -fsS -X POST -H "Authorization: Bearer $MERGERY_KEY" -H "content-type: application/json" -d '${JSON.stringify(body.workspace ? { workspace: body.workspace } : body.change ? { change: body.change } : {})}' ${origin}/api/projects/${this.project}/checkout | jq -r .pull | sh` }),
       // Set up once, then plain git works on every repository here: the helper fetches a fresh token per command.
       ...(origin && remote ? { login: loginCommands(origin, remote), plainClone: `git clone ${remote} ${dir}${at ? ` && git -C ${dir} checkout --detach ${at}` : ""}` } : {}),
       note: "Read-only, valid for an hour. To change code, claim a task: its workspace is yours to push to.",
@@ -4741,7 +4741,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     if ((this.sql.exec("SELECT COUNT(*) AS n FROM trace_keys WHERE person = ? AND revoked_at IS NULL", actor.id).one().n as number) >= 10) throw new HttpError(429, "you have 10 trace keys; revoke one first");
     const id = `tk_${randomId(6)}`;
     // "other": no hook to give a key to; Mergery asks the person's agents to upload their own sessions instead.
-    const key = kind === "other" ? null : `loomtrace_${randomId(20)}`;
+    const key = kind === "other" ? null : `mergerytrace_${randomId(20)}`;
     if (kind === "other" && this.asksForTraces(actor.id)) throw new HttpError(409, "your agents are already asked to attach their traces");
     this.sql.exec("INSERT INTO trace_keys (id, person, agent_name, key_hash, created_at, kind) VALUES (?, ?, ?, ?, ?, ?)", id, actor.id, agent, await sha256(key ?? `unused_${randomId(20)}`), Date.now(), kind);
     this.emit("trace_key.created", { actor: actor.id, data: { id, agent, kind } });
@@ -4946,7 +4946,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
     const webhook = this.webhookUrl(body.webhook ?? null);
     const hook = webhook ? await this.sealWebhookSecret() : null;
     const id = `si_${randomId(6)}`;
-    const key = `loomstand_${randomId(24)}`;
+    const key = `mergerystand_${randomId(24)}`;
     // Items already waiting count as seen, so a new webhook doesn't start with a flood.
     const seen = webhook ? this.attention(this.agentStates()).map((i) => shortKey(itemKey(i))) : [];
     this.sql.exec("INSERT INTO standins (id, name, person, key_hash, scopes, webhook, webhook_secret, seen, created_by, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -4956,7 +4956,7 @@ export class ProjectCoordinator extends DurableObject<Env> {
       ...this.standinView(this.sql.exec("SELECT * FROM standins WHERE id = ?", id).one()),
       key, webhookSecret: hook?.secret ?? null,
       skill: `${origin}/api/projects/${this.project}/standin-skill`,
-      howTo: `Give your agent the skill and this key as LOOM_STANDIN_KEY. Shown once: Mergery keeps only its hash.${hook ? " Check webhook deliveries with the secret: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>." : ""}`,
+      howTo: `Give your agent the skill and this key as MERGERY_STANDIN_KEY. Shown once: Mergery keeps only its hash.${hook ? " Check webhook deliveries with the secret: x-loom-signature is sha256=<hex HMAC-SHA256 of the body>." : ""}`,
     };
   }
 

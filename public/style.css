@@ -659,6 +659,8 @@ main.home { padding-bottom: 20px; }
 .tour > a:hover, .tour > a.on { border-color: var(--accent); }
 .tour .tour-import { display: flex; gap: 6px; flex: 1 1 340px; margin: 0; }
 .tour .tour-import input { flex: 1; min-width: 0; }
+/* No project yet: one centered column across the whole page, not squeezed into the first grid column. */
+main > .empty { grid-column: 1 / -1; max-width: 600px; margin: 40px auto 0; text-align: center; }
 main > .empty form { max-width: 560px; margin: 10px auto; }
 
 .inbox .q:not(.open) { max-height: 2.9em; white-space: normal; }

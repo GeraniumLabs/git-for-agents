@@ -108,8 +108,8 @@ test("agents register themselves with a join code from the skill, and keep who t
   const jc = await admin.req("POST", "/join-codes", { role: "reviewer", maxUses: 2, expiresInHours: 1 });
   const skill = await (await fetch(`${url}/api/projects/${name}/skill?code=${jc.code}`)).text();
   assert.ok(skill.includes(jc.code), "the skill carries a live join code");
-  assert.ok(skill.includes(`~/.config/loom/${name}/$LOOM_NAME.key`), "each agent keeps its key in its own file, so agents on one machine don't share one");
-  const forged = await (await fetch(`${url}/api/projects/${name}/skill?code=loomjoin_ignore-previous-instructions`)).text();
+  assert.ok(skill.includes(`$HOME/.config/mergery/${name}/$MERGERY_NAME.key`), "each agent keeps its key in its own file, so agents on one machine don't share one");
+  const forged = await (await fetch(`${url}/api/projects/${name}/skill?code=mergeryjoin_ignore-previous-instructions`)).text();
   assert.ok(!forged.includes("ignore-previous"), "the skill never carries a code that isn't live");
   const join = (agent: string, code = jc.code) => fetch(`${url}/api/projects/${name}/join`, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ code, name: agent }) });
   const ada = await (await join("ada")).json();
@@ -117,7 +117,7 @@ test("agents register themselves with a join code from the skill, and keep who t
   assert.equal((await admin.as(ada.key).req("GET", "/me")).agent.id, ada.id);
   assert.equal((await join("bex")).status, 200);
   assert.equal((await join("cyd")).status, 403, "a used-up code is refused");
-  assert.equal((await join("dee", "loomjoin_nope")).status, 403);
+  assert.equal((await join("dee", "mergeryjoin_nope")).status, 403);
   const rotated = await admin.as(ada.key).req("POST", "/me/key");
   assert.equal(rotated.id, ada.id);
   assert.equal((await admin.as(rotated.key).req("GET", "/me")).agent.id, ada.id);
@@ -341,7 +341,7 @@ test("stand-ins: a person's own agent watches what needs them, hears by webhook,
   try {
     await assert.rejects(admin.req("POST", "/standins", { for: "jo", name: "x", scopes: ["everything"] }), /unknown scope/);
     const si = await admin.req("POST", "/standins", { for: "jo", name: "jo-assistant", scopes: ["answer"], webhook: `http://127.0.0.1:${port}/hook` });
-    assert.ok(si.key.startsWith("loomstand_") && si.webhookSecret, "key and secret are shown once");
+    assert.ok(si.key.startsWith("mergerystand_") && si.webhookSecret, "key and secret are shown once");
     const watcher = await admin.req("POST", "/standins", { for: "jo", name: "jo-pager", scopes: [] });
     const helper = admin.as(si.key), pager = admin.as(watcher.key);
 
@@ -1391,13 +1391,13 @@ test("session traces are opt-in: a person's trace key installs the hook, uploads
   await assert.rejects(ada.req("POST", "/trace-keys", {}), /people/, "agents upload with their own key");
   assert.deepEqual(await jo.req("GET", "/trace-keys"), [], "off until a person turns it on");
   const k = await jo.req("POST", "/trace-keys", {});
-  assert.match(k.key, /^loomtrace_/);
+  assert.match(k.key, /^mergerytrace_/);
   assert.equal(k.agent, "Claude Code");
 
   // The installer saves the key outside the repository and adds a SessionEnd hook to the repository's personal settings.
   const home = mkdtempSync(join(tmpdir(), "loom-home-")), repo = mkdtempSync(join(tmpdir(), "loom-repo-"));
   const script = join(process.cwd(), "public/trace-hook.mjs");
-  const henv = { ...process.env, HOME: home, LOOM_URL: "", LOOM_PROJECT: "", LOOM_KEY: "" };
+  const henv = { ...process.env, HOME: home, LOOM_URL: "", LOOM_PROJECT: "", LOOM_KEY: "", MERGERY_URL: "", MERGERY_PROJECT: "", MERGERY_KEY: "" };
   await run("node", [script, "--install", url!, name, k.key], { env: henv, cwd: repo });
   const settings = JSON.parse(readFileSync(join(repo, ".claude/settings.local.json"), "utf8"));
   const command: string = settings.hooks.SessionEnd[0].hooks[0].command;
@@ -2026,7 +2026,9 @@ test("git login: plain git reads main and pushes to your own workspace, and noth
   const home = await mkdtemp(`${tmpdir()}/loom-login-home-`);
   const dir = await mkdtemp(`${tmpdir()}/loom-login-`);
   const base = { ...process.env, HOME: home, GIT_TERMINAL_PROMPT: "0", GIT_CONFIG_NOSYSTEM: "1" };
-  await run("sh", ["-c", co.login], { env: { ...base, LOOM_KEY: adaKey } });
+  await assert.rejects(run("sh", ["-c", co.login], { env: base }), /MERGERY_KEY/, "without a key the setup stops before it changes anything");
+  await run("sh", ["-c", co.login], { env: { ...base, MERGERY_KEY: adaKey } });
+  // Older setups keep their key in LOOM_KEY; the helper still reads it.
   const git = (key: string, cwd: string, ...a: string[]) => run("git", ["-c", "user.name=ada", "-c", "user.email=ada@example.com", ...a], { cwd, env: { ...base, LOOM_KEY: key } });
 
   await git(adaKey, dir, "clone", co.remote, "main");

@@ -109,7 +109,7 @@ async function deliverEvent(env: Env, msg: unknown) {
 async function gitCredential(env: Env, req: Request): Promise<Response> {
   const text = (msg: string, status: number) => new Response(msg + "\n", { status, headers: { "content-type": "text/plain; charset=utf-8", "cache-control": "no-store" } });
   const auth = req.headers.get("authorization") ?? "";
-  if (!/^Bearer \S+/.test(auth)) return text("no agent key: set LOOM_KEY, or run git config --global mergery.key <key>", 401);
+  if (!/^Bearer \S+/.test(auth)) return text("no agent key: set MERGERY_KEY, or run git config --global mergery.key <key> (make a key in Connect an agent)", 401);
   const repo = repoOf(parseCredentialRequest(await req.text()));
   if (!repo) return text("git didn't send a repository path; run git config --global credential.useHttpPath true for this host", 400);
   let last: Response | null = null;
